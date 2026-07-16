@@ -1,0 +1,16 @@
+[package]
+name = "zsql-postgres"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+zsql-core = { path = "../zsql-core" }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/zsql-core", "crates/zsql-postgres", "crates/zsql"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# UI (verified published: gpui 0.2.2). Pinned exact given pre-1.0 churn.
+gpui = "=0.2.2"
+
+# DB: sqlx on the smol runtime so its futures await on gpui's executor (no tokio).
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-smol",
+    "tls-rustls",
+    "chrono",
+    "uuid",
+    "json",
+    "bigdecimal",
+] }
+
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+flume = "0.11"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+[workspace.lints.clippy]
+# Pedantic on from day 1 (priority -1 so targeted allows can override).
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.dev]
+# gpui + sqlx are heavy; keep incremental builds snappy.
+opt-level = 1

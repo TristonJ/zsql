@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.env
+.env.*
+*.log
+
+# sqlx offline query cache is opt-in; ignore local editor cruft
+.DS_Store
