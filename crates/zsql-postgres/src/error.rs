@@ -74,9 +74,43 @@ fn describe_query(err: sqlx::Error) -> String {
     }
 }
 
+/// Convert a `sqlx::Error` encountered while introspecting the schema into a
+/// [`CoreError::Introspection`], with a short, useful description. Like
+/// [`map_connect_error`], it adds no SQL text or connection string of its
+/// own; it only summarizes the sqlx error itself with a category prefix.
+pub(crate) fn map_introspect_error(err: sqlx::Error) -> CoreError {
+    CoreError::Introspection(describe_introspect(err))
+}
+
+/// Render a short, useful description of an introspection-phase sqlx error.
+fn describe_introspect(err: sqlx::Error) -> String {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            format!(
+                "database rejected introspection query: {}",
+                db_err.message()
+            )
+        }
+        sqlx::Error::Io(io_err) => format!("network error: {io_err}"),
+        sqlx::Error::Protocol(msg) => format!("protocol error: {msg}"),
+        sqlx::Error::RowNotFound => "introspection query returned no rows".to_owned(),
+        sqlx::Error::ColumnNotFound(name) => format!("column not found: {name}"),
+        sqlx::Error::ColumnDecode { index, source } => {
+            format!("failed to decode column {index}: {source}")
+        }
+        sqlx::Error::PoolTimedOut => "timed out waiting for a pooled connection".to_owned(),
+        sqlx::Error::PoolClosed => "connection pool is closed".to_owned(),
+        sqlx::Error::WorkerCrashed => "connection pool background worker crashed".to_owned(),
+        // `sqlx::Error` is `#[non_exhaustive]`; every named variant relevant
+        // to introspection is matched above, so this is a real catch-all for
+        // whatever sqlx adds later, not dead code.
+        other => format!("introspection failed: {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{map_connect_error, map_query_error};
+    use super::{map_connect_error, map_introspect_error, map_query_error};
     use zsql_core::CoreError;
 
     #[test]
@@ -159,5 +193,27 @@ mod tests {
     fn pool_timed_out_maps_to_query_error() {
         let mapped = map_query_error(sqlx::Error::PoolTimedOut);
         assert!(matches!(mapped, CoreError::Query(_)));
+    }
+
+    #[test]
+    fn pool_timed_out_maps_to_introspection_error_with_useful_message() {
+        let mapped = map_introspect_error(sqlx::Error::PoolTimedOut);
+        match mapped {
+            CoreError::Introspection(msg) => assert!(msg.contains("timed out")),
+            other => panic!("expected CoreError::Introspection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn io_error_maps_to_introspection_error_with_network_prefix_and_no_added_dsn() {
+        let io_err = std::io::Error::other("connect failed: connection refused");
+        let mapped = map_introspect_error(sqlx::Error::Io(io_err));
+        match mapped {
+            CoreError::Introspection(msg) => {
+                assert_eq!(msg, "network error: connect failed: connection refused");
+                assert!(!msg.contains("postgres://"));
+            }
+            other => panic!("expected CoreError::Introspection, got {other:?}"),
+        }
     }
 }

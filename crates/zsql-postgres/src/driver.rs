@@ -115,13 +115,7 @@ impl Connection for PgConnection {
 
     #[tracing::instrument(name = "pg_introspect", skip_all, fields(pool_size = self.pool.size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        // TODO: schema introspection (pg_catalog / information_schema ->
-        // SchemaTree) is not implemented yet; this placeholder exists so the
-        // trait compiles and callers get a clear typed error instead of a
-        // panic or a silently empty tree.
-        Err(CoreError::Introspection(
-            "introspect is not implemented yet".to_owned(),
-        ))
+        crate::introspect::introspect(&self.pool).await
     }
 }
 
@@ -321,17 +315,298 @@ mod tests {
     /// `cargo test` passes with no database present.
     #[test]
     fn connect_succeeds_against_a_live_database_when_configured() {
+        let Some(_conn) = live_connection() else {
+            return;
+        };
+    }
+
+    /// `introspect` must map a `sqlx` failure to `CoreError::Introspection`
+    /// without panicking or hanging, exactly like `stream_query` does above:
+    /// a lazily-connected pool to an unreachable host never touches the
+    /// network until the first real query, which here is inside
+    /// `introspect` itself. Deliberately not gated on
+    /// `ZSQL_TEST_DATABASE_URL`: this must pass with no database present.
+    #[test]
+    fn introspect_maps_unreachable_host_to_core_introspection_error() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_DSN)
+            .expect("connect_lazy only parses the DSN; it must not touch the network");
+        let conn = PgConnection { pool };
+
+        let result = block_on(conn.introspect());
+        match result {
+            Err(zsql_core::CoreError::Introspection(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
+            Ok(_) => panic!("introspecting an unreachable host must fail"),
+        }
+    }
+
+    /// Builds a [`SchemaTree`] against the seeded dev database
+    /// (`scripts/pg-dev.sh` + `dev/seed.sql`) and checks it against what that
+    /// seed is known to contain: a `public` schema with `users` and `orders`
+    /// tables, a `recent_orders` view, a `recent_orders_mv` materialized
+    /// view, and a partitioned `events` table; no system schemas; and a
+    /// couple of columns whose nullability is known from the seed's DDL.
+    #[test]
+    fn introspect_builds_schema_tree_matching_the_seeded_database_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let tree = block_on(conn.introspect()).expect("introspect should succeed");
+
+        assert_eq!(
+            tree.catalogs.len(),
+            1,
+            "a postgres connection sees exactly one catalog"
+        );
+        let catalog = &tree.catalogs[0];
+        assert_eq!(
+            catalog.name,
+            database_name_from_url(&url),
+            "catalog name must be the connected database"
+        );
+
+        assert!(
+            catalog.schemas.iter().all(|s| {
+                s.name != "pg_catalog" && s.name != "information_schema" && s.name != "pg_toast"
+            }),
+            "system schemas must be excluded, got schemas: {:?}",
+            catalog.schemas.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        let public = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "public")
+            .expect("the seeded database has a public schema");
+
+        let users = public
+            .tables
+            .iter()
+            .find(|r| r.name == "users")
+            .expect("the seeded users table is present");
+        assert_eq!(users.kind, zsql_core::RelationKind::Table);
+
+        let orders = public
+            .tables
+            .iter()
+            .find(|r| r.name == "orders")
+            .expect("the seeded orders table is present");
+        assert_eq!(orders.kind, zsql_core::RelationKind::Table);
+
+        let recent_orders = public
+            .tables
+            .iter()
+            .find(|r| r.name == "recent_orders")
+            .expect("the seeded recent_orders view is present");
+        assert_eq!(recent_orders.kind, zsql_core::RelationKind::View);
+
+        // The only seeded object with `pg_class.relkind = 'm'`: proves the
+        // materialized-view arm of the mapping actually fires against a
+        // live server, not just in the offline `relation_kind` unit test.
+        let recent_orders_mv = public
+            .tables
+            .iter()
+            .find(|r| r.name == "recent_orders_mv")
+            .expect("the seeded recent_orders_mv materialized view is present");
+        assert_eq!(recent_orders_mv.kind, zsql_core::RelationKind::MatView);
+
+        // The only seeded object with `pg_class.relkind = 'p'`: proves the
+        // partitioned-table arm of the mapping surfaces as an ordinary
+        // `Table`, and that its partition is enumerated as its own table.
+        let events = public
+            .tables
+            .iter()
+            .find(|r| r.name == "events")
+            .expect("the seeded partitioned events table is present");
+        assert_eq!(events.kind, zsql_core::RelationKind::Table);
+
+        let events_2024 = public
+            .tables
+            .iter()
+            .find(|r| r.name == "events_2024")
+            .expect("the seeded events_2024 partition is present");
+        assert_eq!(events_2024.kind, zsql_core::RelationKind::Table);
+
+        let email = users
+            .columns
+            .iter()
+            .find(|c| c.name == "email")
+            .expect("users.email column is present");
+        assert!(!email.nullable, "users.email is declared NOT NULL");
+        assert!(
+            email.type_name.to_lowercase().contains("char")
+                || email.type_name.to_lowercase().contains("text"),
+            "users.email should be a text-family type, got {}",
+            email.type_name
+        );
+
+        let display_name = users
+            .columns
+            .iter()
+            .find(|c| c.name == "display_name")
+            .expect("users.display_name column is present");
+        assert!(
+            display_name.nullable,
+            "users.display_name has no NOT NULL constraint in the seed"
+        );
+    }
+
+    /// Schemas must be sorted by name, relations sorted by name within a
+    /// schema, and columns in ordinal-position order (not alphabetical) —
+    /// otherwise the sidebar this feeds would reorder on every refresh.
+    #[test]
+    fn introspect_orders_schemas_relations_and_columns_deterministically_when_configured() {
         let Some(conn) = live_connection() else {
             return;
         };
 
-        // introspect is still a placeholder in this scope; confirm it
-        // surfaces a typed error rather than panicking.
-        let introspect_result = block_on(conn.introspect());
-        assert!(matches!(
-            introspect_result,
-            Err(zsql_core::CoreError::Introspection(_))
-        ));
+        let tree = block_on(conn.introspect()).expect("introspect should succeed");
+        let catalog = &tree.catalogs[0];
+
+        let schema_names: Vec<&str> = catalog.schemas.iter().map(|s| s.name.as_str()).collect();
+        let mut sorted_schema_names = schema_names.clone();
+        sorted_schema_names.sort_unstable();
+        assert_eq!(
+            schema_names, sorted_schema_names,
+            "schemas must be sorted by name"
+        );
+
+        let public = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "public")
+            .expect("the seeded database has a public schema");
+        let relation_names: Vec<&str> = public.tables.iter().map(|r| r.name.as_str()).collect();
+        let mut sorted_relation_names = relation_names.clone();
+        sorted_relation_names.sort_unstable();
+        assert_eq!(
+            relation_names, sorted_relation_names,
+            "relations must be sorted by name within a schema"
+        );
+
+        let users = public
+            .tables
+            .iter()
+            .find(|r| r.name == "users")
+            .expect("the seeded users table is present");
+        let column_names: Vec<&str> = users.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            column_names,
+            vec!["id", "email", "display_name", "is_active", "created_at"],
+            "columns must be in table/ordinal-position order, not alphabetical"
+        );
+    }
+
+    /// Introspection must walk every non-system schema, not just `public`:
+    /// the seeded `analytics` schema (with a table) and `empty_ns` schema
+    /// (with none) must both appear, `empty_ns` with an empty relation list
+    /// rather than being dropped for having nothing in it.
+    #[test]
+    fn introspect_includes_non_public_schemas_including_an_empty_one_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let tree = block_on(conn.introspect()).expect("introspect should succeed");
+        let catalog = &tree.catalogs[0];
+
+        let analytics = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "analytics")
+            .expect("the seeded analytics schema is present");
+        let page_views = analytics
+            .tables
+            .iter()
+            .find(|r| r.name == "page_views")
+            .expect("the seeded analytics.page_views table is present");
+        assert_eq!(page_views.kind, zsql_core::RelationKind::Table);
+        assert!(
+            page_views.columns.iter().any(|c| c.name == "path"),
+            "analytics.page_views should carry its columns too"
+        );
+
+        let empty_ns = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "empty_ns")
+            .expect("the seeded empty_ns schema is present even though it holds nothing");
+        assert!(
+            empty_ns.tables.is_empty(),
+            "empty_ns has no tables/views in the seed"
+        );
+    }
+
+    /// Column attribution keys columns by `(schema, relation)`, not relation
+    /// name alone. `public.users` and `analytics.users` are two different
+    /// tables that only share a name (see `dev/seed.sql`); if columns were
+    /// ever matched back by relation name alone instead of the full
+    /// `(schema, relation)` pair, one of these two tables would silently end
+    /// up with the other's columns (or none at all) the moment a name
+    /// collision like this exists, even though every other seeded relation
+    /// name is unique and so would not catch that regression.
+    #[test]
+    fn introspect_attributes_columns_by_schema_and_relation_not_name_alone_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let tree = block_on(conn.introspect()).expect("introspect should succeed");
+        let catalog = &tree.catalogs[0];
+
+        let public_users = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "public")
+            .and_then(|s| s.tables.iter().find(|r| r.name == "users"))
+            .expect("public.users is present");
+        let analytics_users = catalog
+            .schemas
+            .iter()
+            .find(|s| s.name == "analytics")
+            .and_then(|s| s.tables.iter().find(|r| r.name == "users"))
+            .expect("analytics.users is present");
+
+        let public_names: Vec<&str> = public_users
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        let analytics_names: Vec<&str> = analytics_users
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+
+        assert_eq!(
+            public_names,
+            vec!["id", "email", "display_name", "is_active", "created_at"],
+            "public.users must keep its own columns"
+        );
+        assert_eq!(
+            analytics_names,
+            vec!["user_id", "username"],
+            "analytics.users must keep its own distinct columns, not public.users's"
+        );
+        assert_ne!(
+            public_names, analytics_names,
+            "same-named tables in different schemas must not share a column set"
+        );
+    }
+
+    /// Extract the database name (last path segment, query string stripped)
+    /// from a Postgres URL, to compare against a live-introspected catalog
+    /// name without hardcoding the seeded dev database's name in the test.
+    fn database_name_from_url(url: &str) -> &str {
+        let after_slash = url.rsplit('/').next().unwrap_or_default();
+        after_slash.split('?').next().unwrap_or(after_slash)
     }
 
     /// A pool that connects lazily never touches the network until first
@@ -786,14 +1061,21 @@ mod tests {
         drop(handle);
     }
 
-    /// Connects to `ZSQL_TEST_DATABASE_URL`, or returns `None` (after
-    /// printing why) so callers can skip. Centralizes the skip-when-unset
-    /// behavior all live tests in this module share.
-    fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
+    /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
+    /// so callers can skip. Centralizes the skip-when-unset behavior all live
+    /// tests in this module share.
+    fn live_database_url() -> Option<String> {
         let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
             eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
             return None;
         };
+        Some(url)
+    }
+
+    /// Connects to `ZSQL_TEST_DATABASE_URL` via [`live_database_url`], or
+    /// returns `None` so callers can skip.
+    fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
+        let url = live_database_url()?;
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_dsn(&url).unwrap();
         Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
