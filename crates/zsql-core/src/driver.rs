@@ -70,7 +70,11 @@ pub trait Driver: Send + Sync {
 /// A live connection to a database.
 #[async_trait]
 pub trait Connection: Send + Sync {
-    /// Stream a query's results into `sink`, returning a handle for cancellation.
+    /// Stream a query's results into `sink`, returning a handle for
+    /// cancellation. `sql` may contain more than one statement (e.g.
+    /// separated by `;`); implementations that support this concatenate
+    /// each statement's rows into the same stream, reporting a single
+    /// `Columns` taken from whichever statement's rows arrive first.
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle;
 
     /// Snapshot the reachable schema.

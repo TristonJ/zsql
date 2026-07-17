@@ -12,9 +12,8 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 flume = { workspace = true }
-
-[dev-dependencies]
 futures = { workspace = true }
+async-global-executor = { workspace = true }
 
 [lints]
 workspace = true

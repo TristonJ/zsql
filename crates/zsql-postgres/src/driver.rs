@@ -5,11 +5,25 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::Row as _;
+use futures::StreamExt as _;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use zsql_core::{BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, SchemaTree};
+use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
+use zsql_core::{
+    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RowBatch,
+    SchemaTree,
+};
 
-use crate::error::map_connect_error;
+use crate::error::{map_connect_error, map_query_error};
+use crate::values::{column_metas, decode_row};
+
+/// Rows are grouped into batches of at most this many rows before a
+/// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
+/// set streams to the UI incrementally instead of arriving as one huge
+/// allocation. This is an internal placeholder default: threading the app's
+/// configured batch size through from `Config` into the driver happens at
+/// the layer that wires a session's `Connection` up to its `Config`, not
+/// here.
+const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
 
 /// Bounded pool size for a single desktop client. Small on purpose: this app
 /// drives at most a handful of concurrent operations (one running query plus
@@ -87,15 +101,15 @@ pub struct PgConnection {
 
 #[async_trait]
 impl Connection for PgConnection {
-    fn stream_query(&self, _sql: String, sink: BatchSink) -> QueryHandle {
-        let (cancel_tx, _cancel_rx) = flume::unbounded();
-        // TODO: query streaming is not implemented yet; this placeholder
-        // exists so the trait compiles and callers get a clear typed error
-        // instead of a panic or a silently empty result.
-        let err = CoreError::Query("stream_query is not implemented yet".to_owned());
-        // Best-effort: if the receiver was already dropped, there is no one
-        // left to observe the error and nothing more to do.
-        let _ = sink.send(Err(err));
+    fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        let pool = self.pool.clone();
+        // Run on the smol-based executor sqlx's `runtime-smol` feature
+        // already drives its own futures with, so this never needs (or
+        // creates) a tokio runtime. The returned `Task` is detached: the
+        // caller drives the query lifecycle through `sink` and `cancel_rx`
+        // (via the returned `QueryHandle`), not by awaiting this task.
+        async_global_executor::spawn(run_query(pool, sql, sink, cancel_rx)).detach();
         QueryHandle::new(cancel_tx)
     }
 
@@ -109,6 +123,126 @@ impl Connection for PgConnection {
             "introspect is not implemented yet".to_owned(),
         ))
     }
+}
+
+/// Stream one query's results into `sink`. Runs on `pool` (cloned from the
+/// connection into this task) as: exactly one [`QueryEvent::Columns`], then
+/// zero or more [`QueryEvent::Batch`], then exactly one [`QueryEvent::Done`]
+/// — or, on any failure, a single `Err` in place of `Done`.
+///
+/// The rows themselves are fetched with [`sqlx::raw_sql`] (Postgres's simple
+/// query protocol) rather than a prepared statement, which keeps every
+/// column's wire representation in text format — see [`crate::values`] for
+/// why that matters for decoding types this driver does not explicitly map.
+/// The simple query protocol also accepts `sql` containing more than one
+/// `;`-separated statement (their results concatenate), unlike a `PREPARE`
+/// / describe cycle, which can only parse one statement at a time.
+///
+/// Column metadata for `Columns` is therefore taken from the first row any
+/// statement in `sql` produces (a [`sqlx::postgres::PgRow`] carries its own
+/// column list), not from an upfront describe: an upfront describe would
+/// reject any multi-statement `sql` even though the simple protocol executes
+/// it fine. If no statement ever produces a row (DDL, DML without
+/// `RETURNING`, or a zero-row `SELECT`), a describe is run as a fallback
+/// *after* execution has already completed successfully, purely to recover
+/// a zero-row `SELECT`'s column list; if that fallback describe itself
+/// fails (for instance because `sql` was multiple statements and none of
+/// them produced a row), the query has already succeeded, so this degrades
+/// to reporting no columns rather than failing an otherwise-successful
+/// query at this late stage.
+#[tracing::instrument(name = "pg_stream_query", skip_all, fields(pool_size = pool.size()))]
+async fn run_query(pool: PgPool, sql: String, sink: BatchSink, cancel_rx: flume::Receiver<()>) {
+    // The SQL text itself carries no connection secrets (those live only in
+    // the DSN, never logged here), so it is fine to record at debug level.
+    tracing::debug!(sql = %sql, "streaming query");
+
+    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&pool);
+    let mut batch = RowBatch::new();
+    let mut affected: u64 = 0;
+    let mut columns_sent = false;
+
+    loop {
+        // `futures::future::select` polls its first argument before its
+        // second, and only polls the second if the first is `Pending` — so
+        // the cancellation check goes first here. `rows.next()` can stay
+        // synchronously `Ready` for many consecutive polls once the client
+        // has a chunk of the wire response already buffered (no real
+        // `Pending` point to yield at), which would starve a cancellation
+        // future placed second indefinitely, up to the whole result set
+        // draining before cancellation is ever observed.
+        let step = futures::future::select(cancel_rx.recv_async(), rows.next());
+        match step.await {
+            futures::future::Either::Left(_) => {
+                // Cancelled: either an explicit `cancel()` call or every
+                // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
+                // Stop fetching further rows; `rows` is dropped here, which
+                // releases the underlying connection back to the pool.
+                tracing::debug!("query cancelled");
+                return;
+            }
+            futures::future::Either::Right((None, _)) => break,
+            futures::future::Either::Right((Some(Ok(sqlx::Either::Right(row))), _)) => {
+                if !columns_sent {
+                    let columns = column_metas(row.columns());
+                    if sink
+                        .send_async(Ok(QueryEvent::Columns(columns)))
+                        .await
+                        .is_err()
+                    {
+                        // Receiver already gone; no one left to stream rows to.
+                        return;
+                    }
+                    columns_sent = true;
+                }
+                batch.push(decode_row(&row));
+                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
+                    let full = std::mem::take(&mut batch);
+                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            futures::future::Either::Right((Some(Ok(sqlx::Either::Left(result))), _)) => {
+                affected += result.rows_affected();
+            }
+            futures::future::Either::Right((Some(Err(err)), _)) => {
+                let _ = sink.send_async(Err(map_query_error(err))).await;
+                return;
+            }
+        }
+    }
+
+    // A statement with no output columns (DDL, or DML without `RETURNING`)
+    // reports its row count as `affected` in `Done`. A statement that does
+    // produce columns (SELECT, or DML with `RETURNING`) instead lets the
+    // caller derive a count from the rows it already streamed, and reports
+    // `affected: None` — matching `QueryEvent::Done`'s doc comment that
+    // `affected` is for non-SELECT statements. When no row was ever seen,
+    // that distinction is only recoverable via the describe fallback below.
+    let reports_affected = if columns_sent {
+        false
+    } else {
+        let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
+            Ok(statement) => column_metas(statement.columns()),
+            Err(_) => Vec::new(),
+        };
+        let reports_affected = columns.is_empty();
+        if sink
+            .send_async(Ok(QueryEvent::Columns(columns)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        reports_affected
+    };
+
+    if !batch.is_empty() && sink.send_async(Ok(QueryEvent::Batch(batch))).await.is_err() {
+        return;
+    }
+
+    let affected = reports_affected.then_some(affected);
+    let _ = sink.send_async(Ok(QueryEvent::Done { affected })).await;
 }
 
 /// Build a pool for `url` and run a trivial liveness query while driven by a
@@ -128,9 +262,11 @@ pub async fn spike_select_one(url: &str) -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use zsql_core::{ConnConfig, Driver};
+    use std::time::Duration;
 
-    use super::PostgresDriver;
+    use zsql_core::{ConnConfig, Connection, Driver};
+
+    use super::{PgConnection, PostgresDriver};
 
     /// A host that can never resolve (`.invalid` is reserved by RFC 2606),
     /// so DNS lookup fails immediately. Deliberately not a "connection
@@ -185,28 +321,490 @@ mod tests {
     /// `cargo test` passes with no database present.
     #[test]
     fn connect_succeeds_against_a_live_database_when_configured() {
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping connect_succeeds_against_a_live_database_when_configured: \
-                 ZSQL_TEST_DATABASE_URL not set"
-            );
+        let Some(conn) = live_connection() else {
             return;
         };
-        let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
-        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
-        // stream_query and introspect are placeholders in this scope; confirm
-        // they surface typed errors rather than panicking.
-        let (tx, rx) = flume::unbounded();
-        let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
-        let evt = rx.recv().expect("placeholder should push one event");
-        assert!(matches!(evt, Err(zsql_core::CoreError::Query(_))));
-
+        // introspect is still a placeholder in this scope; confirm it
+        // surfaces a typed error rather than panicking.
         let introspect_result = block_on(conn.introspect());
         assert!(matches!(
             introspect_result,
             Err(zsql_core::CoreError::Introspection(_))
         ));
+    }
+
+    /// A pool that connects lazily never touches the network until first
+    /// use, so this builds a `PgConnection` directly (bypassing
+    /// `PostgresDriver::connect`, which would fail during its own eager
+    /// liveness check) to exercise `stream_query`'s error path in isolation:
+    /// the background task's first real query — `pool.prepare(..)` — is what
+    /// discovers the host is unreachable.
+    #[test]
+    fn stream_query_pushes_single_error_when_pool_is_unreachable() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_DSN)
+            .expect("connect_lazy only parses the DSN; it must not touch the network");
+        let conn = PgConnection { pool };
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
+
+        let evt = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stream_query must push exactly one event, not hang");
+        match evt {
+            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            other => panic!("expected a single CoreError::Query, got {other:?}"),
+        }
+
+        // No `Done` (or anything else) follows the error.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no further events should follow the error"
+        );
+    }
+
+    /// Runs a query with one column of each mapped type plus a NULL, an
+    /// array, and a JSON value, and asserts both the event sequence
+    /// (`Columns` -> `Batch`(es) -> `Done`) and the decoded `Value`s.
+    #[test]
+    fn stream_query_maps_a_representative_type_spread_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let sql = "SELECT \
+            true AS b, \
+            2::int2 AS i2, \
+            4::int4 AS i4, \
+            8::int8 AS i8, \
+            1.5::float4 AS f4, \
+            2.5::float8 AS f8, \
+            123.456::numeric AS num, \
+            'hi'::text AS t, \
+            NULL::text AS nothing, \
+            '11111111-1111-1111-1111-111111111111'::uuid AS u, \
+            ARRAY[1, NULL, 3]::int4[] AS arr, \
+            '{\"a\": 1}'::jsonb AS j, \
+            '\\x0102'::bytea AS by, \
+            '2024-01-15'::date AS d, \
+            '13:45:30'::time AS tm, \
+            '2024-01-15 13:45:30'::timestamp AS ts, \
+            '2024-01-15 13:45:30+00'::timestamptz AS tstz, \
+            '1 day'::interval AS iv"
+            .to_owned();
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+
+        let columns = match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => columns,
+            other => panic!("expected Columns first, got {other:?}"),
+        };
+        assert_eq!(columns.len(), 18, "one column per selected expression");
+
+        let mut rows = Vec::new();
+        let affected = loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { affected }) => break affected,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        };
+        // A SELECT reports its row count through the streamed rows
+        // themselves, not `affected`.
+        assert_eq!(affected, None);
+
+        assert_eq!(rows.len(), 1, "the query returns exactly one row");
+        let cells = &rows[0].0;
+        assert_eq!(cells[0], zsql_core::Value::Bool(true));
+        assert_eq!(cells[1], zsql_core::Value::Int(2));
+        assert_eq!(cells[2], zsql_core::Value::Int(4));
+        assert_eq!(cells[3], zsql_core::Value::Int(8));
+        assert_eq!(cells[4], zsql_core::Value::Float(1.5));
+        assert_eq!(cells[5], zsql_core::Value::Float(2.5));
+        assert_eq!(cells[6], zsql_core::Value::Numeric("123.456".to_owned()));
+        assert_eq!(cells[7], zsql_core::Value::Text("hi".to_owned()));
+        assert_eq!(cells[8], zsql_core::Value::Null);
+        assert_eq!(
+            cells[9],
+            zsql_core::Value::Uuid("11111111-1111-1111-1111-111111111111".to_owned())
+        );
+        assert_eq!(
+            cells[10],
+            zsql_core::Value::Array(vec![
+                zsql_core::Value::Int(1),
+                zsql_core::Value::Null,
+                zsql_core::Value::Int(3),
+            ])
+        );
+        // Postgres's own `jsonb` text output (`{"a": 1}`, with a space after
+        // the colon), not a serde_json re-serialization: decoding jsonb as a
+        // raw string preserves exactly what the server holds instead of
+        // risking precision loss or key reordering from a round-trip through
+        // `serde_json::Value`.
+        assert_eq!(cells[11], zsql_core::Value::Json("{\"a\": 1}".to_owned()));
+        assert_eq!(cells[12], zsql_core::Value::Bytes(vec![0x01, 0x02]));
+        assert_eq!(
+            cells[13],
+            zsql_core::Value::Timestamp("2024-01-15".to_owned())
+        );
+        assert_eq!(
+            cells[14],
+            zsql_core::Value::Timestamp("13:45:30".to_owned())
+        );
+        assert_eq!(
+            cells[15],
+            zsql_core::Value::Timestamp("2024-01-15T13:45:30".to_owned()),
+            "fractionless timestamp uses a T separator, not chrono's default space"
+        );
+        assert_eq!(
+            cells[16],
+            zsql_core::Value::Timestamp("2024-01-15T13:45:30+00:00".to_owned()),
+            "timestamptz renders as RFC3339"
+        );
+        // interval is not an explicitly mapped type: it must degrade to
+        // Value::Unknown via the raw-text fallback rather than erroring the
+        // whole query. This is the "never errors on an unmapped type" guarantee.
+        assert!(
+            matches!(cells[17], zsql_core::Value::Unknown(_)),
+            "an unmapped type (interval) must decode to Value::Unknown, got {:?}",
+            cells[17],
+        );
+    }
+
+    /// `json`/`jsonb` scalars and their 1-D array forms (`json[]`/`jsonb[]`)
+    /// must decode as `Value::Json` holding the server's own text, never a
+    /// `serde_json`-reserialized copy. This is checked three ways: (1) a
+    /// `jsonb` object whose two keys sort differently by length-then-byte
+    /// order (Postgres's own canonical `jsonb` key order) than
+    /// alphabetically — a `serde_json::Value` round trip through its
+    /// default `BTreeMap`-backed object would alphabetize and so diverge
+    /// from Postgres's actual canonical text; (2) a `jsonb` integer wider
+    /// than `i64`/`f64`, which a `serde_json::Value` round trip (no
+    /// `arbitrary_precision` feature enabled in this workspace) would
+    /// corrupt; (3) a `json` (not `jsonb`) scalar with irregular whitespace,
+    /// which `json` (unlike `jsonb`) preserves verbatim — any reformatting
+    /// proves a reserialization happened.
+    #[test]
+    fn stream_query_maps_json_and_jsonb_scalars_and_arrays_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let sql = "SELECT \
+            '{\"aa\": 1, \"b\": 2}'::jsonb AS jsonb_key_order, \
+            '{\"n\": 123456789012345678901234567890}'::jsonb AS jsonb_big_int, \
+            '{ \"a\" : 1 }'::json AS json_preserves_whitespace, \
+            NULL::jsonb AS jsonb_null, \
+            ARRAY['{\"a\":1}'::jsonb, NULL, '{\"b\":2}'::jsonb] AS jsonb_array, \
+            ARRAY['{\"a\":1}'::json, NULL] AS json_array"
+            .to_owned();
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 6),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 1);
+        let cells = &rows[0].0;
+
+        // Postgres's own canonical order for these two keys is length-then-
+        // byte-order ("b" before "aa"), not alphabetical ("aa" before "b").
+        // Getting this exact string proves no `BTreeMap`-backed
+        // `serde_json::Value` round trip happened.
+        assert_eq!(
+            cells[0],
+            zsql_core::Value::Json("{\"b\": 2, \"aa\": 1}".to_owned()),
+            "jsonb key order must match Postgres's own canonical order, not alphabetical"
+        );
+        assert_eq!(
+            cells[1],
+            zsql_core::Value::Json("{\"n\": 123456789012345678901234567890}".to_owned()),
+            "an integer wider than i64/f64 must survive with no precision loss"
+        );
+        assert_eq!(
+            cells[2],
+            zsql_core::Value::Json("{ \"a\" : 1 }".to_owned()),
+            "json (unlike jsonb) preserves the original whitespace exactly"
+        );
+        assert_eq!(cells[3], zsql_core::Value::Null);
+        assert_eq!(
+            cells[4],
+            zsql_core::Value::Array(vec![
+                zsql_core::Value::Json("{\"a\": 1}".to_owned()),
+                zsql_core::Value::Null,
+                zsql_core::Value::Json("{\"b\": 2}".to_owned()),
+            ]),
+            "jsonb[] must decode to an Array of Json values, NULL element included"
+        );
+        assert_eq!(
+            cells[5],
+            zsql_core::Value::Array(vec![
+                zsql_core::Value::Json("{\"a\":1}".to_owned()),
+                zsql_core::Value::Null,
+            ]),
+            "json[] must preserve each element's original text exactly"
+        );
+    }
+
+    /// Two `;`-separated statements must both run and have their rows
+    /// concatenated into the stream, proving `Columns` no longer comes from
+    /// an upfront `PREPARE`-style describe (which can only parse a single
+    /// statement and would error on input like this before either statement
+    /// ever executes).
+    #[test]
+    fn stream_query_supports_multiple_semicolon_separated_statements_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query("SELECT 1 AS n; SELECT 2 AS n".to_owned(), tx);
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "n");
+            }
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { affected }) => {
+                    assert_eq!(affected, None);
+                    break;
+                }
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(
+            rows.iter().map(|row| row.0[0].clone()).collect::<Vec<_>>(),
+            vec![zsql_core::Value::Int(1), zsql_core::Value::Int(2)],
+            "rows from both statements must concatenate in order"
+        );
+    }
+
+    /// A result set larger than the batch size must arrive as multiple
+    /// `Batch` events, each bounded by `DEFAULT_QUERY_BATCH_SIZE`, whose rows
+    /// concatenate back to the full result.
+    #[test]
+    fn stream_query_batches_large_result_sets_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(
+            format!("SELECT g FROM generate_series(1, {row_count}) AS g"),
+            tx,
+        );
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 1),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut total_rows = 0usize;
+        let mut batch_count = 0usize;
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    assert!(
+                        batch.len() <= super::DEFAULT_QUERY_BATCH_SIZE,
+                        "batch of {} rows exceeds the bound",
+                        batch.len()
+                    );
+                    assert!(!batch.is_empty(), "a sent Batch must never be empty");
+                    total_rows += batch.len();
+                    batch_count += 1;
+                }
+                Ok(zsql_core::QueryEvent::Done { affected }) => {
+                    assert_eq!(affected, None);
+                    break;
+                }
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(total_rows, row_count);
+        assert!(
+            batch_count >= 3,
+            "expected at least 3 batches for {row_count} rows at a bound of \
+             {}, got {batch_count}",
+            super::DEFAULT_QUERY_BATCH_SIZE
+        );
+    }
+
+    /// A statement with no output columns (here, an `UPDATE`) reports its
+    /// row count through `Done { affected }` instead of streaming rows.
+    #[test]
+    fn stream_query_reports_affected_rows_for_dml_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(
+            "UPDATE users SET display_name = display_name".to_owned(),
+            tx,
+        );
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => {
+                assert!(columns.is_empty(), "DML has no output columns");
+            }
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Done { affected }) => {
+                assert_eq!(affected, Some(3), "the seeded fixture has 3 users");
+            }
+            other => panic!("expected Done with no Batch in between, got {other:?}"),
+        }
+    }
+
+    /// A zero-row result set must still emit `Columns` before `Done`, with
+    /// no `Batch` events in between.
+    #[test]
+    fn stream_query_emits_columns_for_a_zero_row_result_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query("SELECT 1 AS one WHERE false".to_owned(), tx);
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 1),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Done { affected }) => assert_eq!(affected, None),
+            other => panic!("expected Done with no Batch in between, got {other:?}"),
+        }
+    }
+
+    /// Dropping the `QueryHandle` (here, its only clone) must promptly stop
+    /// the background task from fetching further rows: a long-running query
+    /// should not be able to push a `Done` after its handle is gone.
+    #[test]
+    fn dropping_the_query_handle_stops_further_rows_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let handle =
+            conn.stream_query("SELECT * FROM generate_series(1, 100000000)".to_owned(), tx);
+
+        // Let the query get started (past `Columns`) before cancelling.
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(_)) => {}
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+        drop(handle);
+
+        // Drain whatever was already in flight; a `Done` must never appear,
+        // and the channel must settle (close) promptly instead of hanging.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Batch(_))) => {}
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => {
+                    panic!("a cancelled query must not reach Done")
+                }
+                Ok(Err(err)) => panic!("unexpected error after cancellation: {err:?}"),
+                Ok(Ok(zsql_core::QueryEvent::Columns(_))) => {
+                    panic!("Columns must only be sent once")
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    panic!("cancellation did not stop the background task promptly")
+                }
+            }
+        }
+    }
+
+    /// Calling `QueryHandle::cancel()` explicitly (handle kept alive, unlike
+    /// the drop case above) must also promptly stop the background task from
+    /// fetching further rows: this exercises the live-sender-delivers-a-value
+    /// path through `cancel_rx.recv_async()`, distinct from the
+    /// sender-all-dropped path the drop test covers.
+    #[test]
+    fn calling_cancel_stops_further_rows_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let handle =
+            conn.stream_query("SELECT * FROM generate_series(1, 100000000)".to_owned(), tx);
+
+        // Let the query get started (past `Columns`) before cancelling.
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(_)) => {}
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+        handle.cancel();
+
+        // Drain whatever was already in flight; a `Done` must never appear,
+        // and the channel must settle (close) promptly instead of hanging.
+        // `handle` (and its `cancel_tx`) is kept alive for the whole loop, so
+        // this only passes if the explicit `cancel()` send is itself what
+        // stops the task, not a subsequent drop of the handle.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Batch(_))) => {}
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => {
+                    panic!("a cancelled query must not reach Done")
+                }
+                Ok(Err(err)) => panic!("unexpected error after cancellation: {err:?}"),
+                Ok(Ok(zsql_core::QueryEvent::Columns(_))) => {
+                    panic!("Columns must only be sent once")
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    panic!("cancellation did not stop the background task promptly")
+                }
+            }
+        }
+        drop(handle);
+    }
+
+    /// Connects to `ZSQL_TEST_DATABASE_URL`, or returns `None` (after
+    /// printing why) so callers can skip. Centralizes the skip-when-unset
+    /// behavior all live tests in this module share.
+    fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
+        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
+            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
+    }
+
+    /// Receive one event with a generous timeout so a broken implementation
+    /// fails the test instead of hanging it.
+    fn recv(
+        rx: &flume::Receiver<Result<zsql_core::QueryEvent, zsql_core::CoreError>>,
+    ) -> Result<zsql_core::QueryEvent, zsql_core::CoreError> {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("expected an event within the timeout")
     }
 }

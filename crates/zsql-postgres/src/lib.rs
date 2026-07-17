@@ -8,5 +8,6 @@
 
 mod driver;
 mod error;
+mod values;
 
 pub use driver::{PgConnection, PostgresDriver, spike_select_one};

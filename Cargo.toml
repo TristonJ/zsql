@@ -26,6 +26,12 @@ thiserror = "2"
 async-trait = "0.1"
 flume = "0.11"
 futures = "0.3"
+# Direct dependency: `zsql-postgres::stream_query` spawns its background query
+# task via `async_global_executor::spawn`. sqlx's `runtime-smol` feature does
+# NOT use this crate (sqlx spawns on `smol`/`async-executor`) — but both build
+# on the same process-global `async-io` reactor, so a task spawned here drives
+# sqlx's socket IO correctly without needing a tokio runtime.
+async-global-executor = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }

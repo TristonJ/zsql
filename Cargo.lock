@@ -7670,6 +7670,7 @@ name = "zsql-postgres"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-global-executor",
  "async-trait",
  "flume 0.11.1",
  "futures",
