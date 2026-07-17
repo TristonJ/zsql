@@ -2,14 +2,14 @@
 //! OS keyboard/IME input into the buffer via `EntityInputHandler`, paints the
 //! buffer's lines with a line-number gutter, a blinking-free cursor, and a
 //! selection highlight, and runs the buffer's query text through `Session`
-//! on cmd/ctrl-enter.
+//! on cmd/ctrl-enter or the toolbar's Run button.
 
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
-    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId,
+    Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString, Style,
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
     relative, rgb, rgba, size,
@@ -325,10 +325,15 @@ impl EditorView {
 
     // -- run -------------------------------------------------------------
 
+    fn run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_current_query(cx);
+    }
+
     /// Run the buffer's query text (the selection if there is one,
     /// otherwise the whole document) through `Session`, and label the
-    /// results grid to reflect the run. A blank query is a no-op.
-    fn run_query(&mut self, _: &RunQuery, _window: &mut Window, cx: &mut Context<Self>) {
+    /// results grid to reflect the run. A blank query is a no-op. Shared by
+    /// the `RunQuery` action and the toolbar's Run button.
+    fn run_current_query(&mut self, cx: &mut Context<Self>) {
         let sql = self.buffer.query_text();
         if sql.trim().is_empty() {
             return;
@@ -422,6 +427,64 @@ impl EditorView {
 
     // -- rendering helpers -------------------------------------------------
 
+    /// The toolbar above the code area: a pane label on the left and the Run
+    /// button on the right. The button runs the same query the `RunQuery`
+    /// keybinding does.
+    fn render_toolbar(cx: &mut Context<Self>) -> Div {
+        let run_shortcut = if cfg!(target_os = "macos") {
+            "Cmd+Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(theme::EDITOR_TOOLBAR_HEIGHT)
+            .px(px(theme::EDITOR_TOOLBAR_PADDING_X))
+            .bg(rgb(theme::PANEL))
+            .border_b_1()
+            .border_color(rgb(theme::LINE))
+            .child(
+                div()
+                    .text_size(px(theme::EDITOR_TOOLBAR_LABEL_TEXT_SIZE))
+                    .text_color(rgb(theme::MUTED))
+                    .child("SQL"),
+            )
+            .child(
+                div()
+                    .id("run-query-button")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(theme::RUN_BUTTON_HEIGHT)
+                    .px(px(theme::RUN_BUTTON_PADDING_X))
+                    .rounded(px(theme::RUN_BUTTON_RADIUS))
+                    .bg(rgb(theme::TEAL))
+                    .text_color(rgb(theme::INK))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::RUN_BUTTON_HOVER_BG)))
+                    .on_click(cx.listener(|editor, _event: &ClickEvent, _window, cx| {
+                        editor.run_current_query(cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))
+                            .child("Run"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
+                            .text_color(rgba(theme::RUN_BUTTON_HINT))
+                            .child(run_shortcut),
+                    ),
+            )
+    }
+
     /// The line-number gutter, one row per buffer line, matching the
     /// content element's row spacing so the two stay aligned.
     fn render_gutter(line_count: usize, cursor_line: usize) -> gpui::Stateful<Div> {
@@ -504,15 +567,12 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::run_query))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .child(Self::render_toolbar(cx))
             .child(
                 div()
                     .id("sql-editor-code")
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -520,17 +580,34 @@ impl Render for EditorView {
                     .font_family("monospace")
                     .text_size(px(theme::EDITOR_TEXT_SIZE))
                     .text_color(rgb(theme::TEXT))
-                    .child(Self::render_gutter(line_count, cursor_line))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .child(
+                        // A single content row with a definite height equal to
+                        // all the lines plus padding. The scroll container
+                        // measures its scrollable extent from this child's
+                        // height, so it must be the real content height rather
+                        // than stretch to the viewport (which would leave
+                        // nothing to scroll).
                         div()
-                            .id("sql-editor-text")
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(theme::EDITOR_PADDING_X))
-                            .py(px(theme::EDITOR_PADDING_Y))
-                            .child(EditorContentElement {
-                                editor: cx.entity(),
-                            }),
+                            .flex()
+                            .flex_row()
+                            .flex_none()
+                            .h(editor_content_height(line_count))
+                            .child(Self::render_gutter(line_count, cursor_line))
+                            .child(
+                                div()
+                                    .id("sql-editor-text")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px(px(theme::EDITOR_PADDING_X))
+                                    .py(px(theme::EDITOR_PADDING_Y))
+                                    .child(EditorContentElement {
+                                        editor: cx.entity(),
+                                    }),
+                            ),
                     ),
             )
     }
@@ -890,6 +967,13 @@ fn line_top(origin: Pixels, line_height: Pixels, line_index: usize) -> Pixels {
 #[allow(clippy::cast_precision_loss)]
 fn total_line_height(line_count: usize) -> Pixels {
     px(theme::EDITOR_LINE_HEIGHT * line_count as f32)
+}
+
+/// Height of the editor's scrollable content: every line plus the vertical
+/// padding above the first and below the last. Used as the scroll region's
+/// inner height so its scrollable extent matches the text, not the viewport.
+fn editor_content_height(line_count: usize) -> Pixels {
+    total_line_height(line_count) + px(theme::EDITOR_PADDING_Y * 2.0)
 }
 
 /// One highlight quad per line the selection spans, covering the selected

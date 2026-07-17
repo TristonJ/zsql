@@ -62,15 +62,15 @@ pub const CELL_CHAR_WIDTH: f32 = 7.2;
 /// next to the column name.
 pub const TYPE_TAG_EXTRA_WIDTH: f32 = 34.0;
 /// Narrowest a data column is allowed to shrink to.
-pub const MIN_COLUMN_WIDTH: f32 = 72.0;
+pub const MIN_COLUMN_WIDTH: f32 = 90.0;
 /// Widest a data column is allowed to grow to before the grid relies on
 /// horizontal scrolling instead of pushing columns further out.
 pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 /// Narrowest the leading row-number column is allowed to shrink to.
-pub const ROW_NUMBER_MIN_WIDTH: f32 = 40.0;
+pub const ROW_NUMBER_MIN_WIDTH: f32 = 80.0;
 
 /// Fixed width of the schema sidebar.
-pub const SIDEBAR_WIDTH: Pixels = px(248.0);
+pub const SIDEBAR_WIDTH: Pixels = px(300.0);
 /// Height of the sidebar's "SCHEMA" header bar.
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(34.0);
 /// Height of each row in the schema tree.
@@ -118,7 +118,28 @@ pub const TYPE_TAG_PADDING_X: f32 = 4.0;
 pub const TYPE_TAG_RADIUS: f32 = 4.0;
 
 /// Height of the SQL editor pane above the results grid.
-pub const EDITOR_HEIGHT: Pixels = px(220.0);
+pub const EDITOR_HEIGHT: Pixels = px(500.0);
+/// Height of the editor toolbar that holds the Run button.
+pub const EDITOR_TOOLBAR_HEIGHT: Pixels = px(38.0);
+/// Horizontal padding inside the editor toolbar.
+pub const EDITOR_TOOLBAR_PADDING_X: f32 = 10.0;
+/// Text size of the toolbar's left-hand pane label.
+pub const EDITOR_TOOLBAR_LABEL_TEXT_SIZE: f32 = 10.5;
+/// Height of the Run button.
+pub const RUN_BUTTON_HEIGHT: Pixels = px(25.0);
+/// Horizontal padding inside the Run button.
+pub const RUN_BUTTON_PADDING_X: f32 = 11.0;
+/// Corner radius of the Run button.
+pub const RUN_BUTTON_RADIUS: f32 = 5.0;
+/// Text size of the Run button's label.
+pub const RUN_BUTTON_TEXT_SIZE: f32 = 11.5;
+/// Text size of the Run button's keyboard-shortcut hint.
+pub const RUN_BUTTON_HINT_TEXT_SIZE: f32 = 10.0;
+/// Run button background when hovered: a lighter teal than the resting accent.
+pub const RUN_BUTTON_HOVER_BG: u32 = 0x46_cf_ba;
+/// Run button shortcut-hint color: the page ink at reduced opacity, so it
+/// reads as secondary against the teal fill.
+pub const RUN_BUTTON_HINT: u32 = 0x10_12_17_b3;
 /// Font size of the editor's text and gutter line numbers.
 pub const EDITOR_TEXT_SIZE: f32 = 13.0;
 /// Height of each row of editor text, content plus line spacing.

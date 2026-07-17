@@ -355,6 +355,7 @@ fn row_shell(indent: f32) -> Div {
         .pl(px(indent))
         .pr_3()
         .flex_shrink_0()
+        .w_full()
         .font_family("monospace")
         .text_size(px(theme::SIDEBAR_ROW_TEXT_SIZE))
         .text_color(rgb(theme::TEXT))

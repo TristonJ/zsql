@@ -226,6 +226,7 @@ impl ResultsView {
             .flex_row()
             .flex_1()
             .min_h_0()
+            .w_full()
             // The row-number pane is pinned outside the horizontally
             // scrolling data pane below, rather than using CSS-style
             // `position: sticky` as the mockup's `.rownum` does: gpui 0.2.2
@@ -259,7 +260,7 @@ impl ResultsView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w_0()
+                    .min_w_full()
                     .min_h_0()
                     .h_full()
                     .overflow_x_scroll()

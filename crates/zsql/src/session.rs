@@ -273,7 +273,14 @@ impl Session {
     fn apply_query_event(&mut self, event: Result<QueryEvent, CoreError>) {
         match event {
             Ok(QueryEvent::Columns(columns)) => {
-                self.accumulating.columns = columns;
+                // Each Columns event begins a fresh result set. A run of
+                // several statements only shows the last one, so discard any
+                // rows accumulated for a prior set rather than appending the
+                // new set's rows onto mismatched columns.
+                self.accumulating = ResultSet {
+                    columns,
+                    ..ResultSet::default()
+                };
                 self.state = SessionState::Running;
             }
             Ok(QueryEvent::Batch(batch)) => {
@@ -458,6 +465,56 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_second_result_set_replaces_the_first_keeping_only_the_last() {
+        let mut session = session_with_no_dsn();
+        session.state = SessionState::Running;
+
+        // First statement's result set.
+        session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
+            name: "a".to_owned(),
+            type_name: "int8".to_owned(),
+            nullable: false,
+        }])));
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: vec![Row(vec![Value::Int(1)]), Row(vec![Value::Int(2)])],
+        })));
+
+        // Second statement's result set: a fresh Columns event must drop the
+        // first set entirely rather than accumulate on top of it.
+        session.apply_query_event(Ok(QueryEvent::Columns(vec![
+            ColumnMeta {
+                name: "x".to_owned(),
+                type_name: "text".to_owned(),
+                nullable: true,
+            },
+            ColumnMeta {
+                name: "y".to_owned(),
+                type_name: "text".to_owned(),
+                nullable: true,
+            },
+        ])));
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: vec![Row(vec![Value::Text("last".to_owned()), Value::Null])],
+        })));
+        session.apply_query_event(Ok(QueryEvent::Done { affected: None }));
+
+        assert!(matches!(session.state(), SessionState::Results(_)));
+        let result = session.result();
+        let column_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            column_names,
+            vec!["x", "y"],
+            "only the last statement's columns should remain"
+        );
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "the first set's rows must not survive into the last set"
+        );
+        assert_eq!(result.rows[0].0[0], Value::Text("last".to_owned()));
     }
 
     #[test]

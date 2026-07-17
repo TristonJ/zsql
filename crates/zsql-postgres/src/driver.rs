@@ -183,10 +183,13 @@ impl Connection for PgConnection {
     }
 }
 
-/// Stream one query's results into `sink` as: exactly one
-/// [`QueryEvent::Columns`], then zero or more [`QueryEvent::Batch`], then
-/// exactly one [`QueryEvent::Done`] — or, on any failure, a single `Err` in
-/// place of `Done`.
+/// Stream a query's results into `sink`. `sql` may hold several statements;
+/// each result-producing statement emits its own [`QueryEvent::Columns`]
+/// followed by that set's [`QueryEvent::Batch`]es, and the whole stream ends
+/// with exactly one [`QueryEvent::Done`] - or, on any failure, a single `Err`
+/// in place of `Done`. Every statement still executes (so all side effects
+/// happen); a fresh `Columns` event marks each set boundary so the consumer
+/// can keep only the last set rather than concatenating mismatched rows.
 ///
 /// Runs on a single connection acquired from `pool` for the lifetime of this
 /// call (not the pool directly), so that connection's backend PID can be
@@ -204,6 +207,7 @@ impl Connection for PgConnection {
 /// degrades to reporting no columns rather than failing an
 /// otherwise-successful query.
 #[tracing::instrument(name = "pg_stream_query", skip_all, fields(pool_size = pool.size()))]
+#[allow(clippy::too_many_lines)]
 async fn run_query(
     pool: PgPool,
     cancel_pool: PgPool,
@@ -249,7 +253,12 @@ async fn run_query(
     let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&mut *conn);
     let mut batch = RowBatch::new();
     let mut affected: u64 = 0;
+    // Whether the statement currently streaming has already announced its
+    // columns. Reset at each statement boundary so a following statement
+    // starts a new result set.
     let mut columns_sent = false;
+    // Whether any statement in `sql` produced columns at all.
+    let mut any_columns_sent = false;
 
     loop {
         let step = futures::future::select(cancel_rx.recv_async(), rows.next());
@@ -276,6 +285,7 @@ async fn run_query(
                         return;
                     }
                     columns_sent = true;
+                    any_columns_sent = true;
                 }
                 batch.push(decode_row(&row));
                 if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
@@ -286,7 +296,18 @@ async fn run_query(
                 }
             }
             futures::future::Either::Right((Some(Ok(sqlx::Either::Left(result))), _)) => {
+                // End of one statement. Flush its rows and reset the per-set
+                // latch so a following statement's rows form a new result set
+                // (the consumer keeps only the last) instead of being appended
+                // onto this one's columns.
+                if !batch.is_empty() {
+                    let full = std::mem::take(&mut batch);
+                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
+                        return;
+                    }
+                }
                 affected += result.rows_affected();
+                columns_sent = false;
             }
             futures::future::Either::Right((Some(Err(err)), _)) => {
                 let _ = sink.send_async(Err(map_query_error(err))).await;
@@ -300,7 +321,7 @@ async fn run_query(
     // produce columns (SELECT, or DML with `RETURNING`) instead lets the
     // caller derive a count from the rows it already streamed, and reports
     // `affected: None`
-    let reports_affected = if columns_sent {
+    let reports_affected = if any_columns_sent {
         false
     } else {
         let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
@@ -848,37 +869,50 @@ mod tests {
     }
 
     #[test]
-    fn stream_query_supports_multiple_semicolon_separated_statements_when_configured() {
+    fn stream_query_keeps_statements_as_separate_result_sets_when_configured() {
         let Some(conn) = live_connection() else {
             return;
         };
 
+        // Both statements name their column "n", so a naive concatenation
+        // would look structurally valid while silently mixing two statements'
+        // rows. Each statement must instead open its own result set.
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS n; SELECT 2 AS n".to_owned(), tx);
 
-        match recv(&rx) {
-            Ok(zsql_core::QueryEvent::Columns(columns)) => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "n");
-            }
-            other => panic!("expected Columns first, got {other:?}"),
-        }
-
-        let mut rows = Vec::new();
-        loop {
+        let mut columns_events = 0usize;
+        let mut rows_per_set: Vec<Vec<zsql_core::Value>> = Vec::new();
+        let affected = loop {
             match recv(&rx) {
-                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
-                Ok(zsql_core::QueryEvent::Done { affected }) => {
-                    assert_eq!(affected, None);
-                    break;
+                Ok(zsql_core::QueryEvent::Columns(columns)) => {
+                    assert_eq!(columns.len(), 1);
+                    assert_eq!(columns[0].name, "n");
+                    columns_events += 1;
+                    rows_per_set.push(Vec::new());
                 }
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    let current = rows_per_set
+                        .last_mut()
+                        .expect("a Columns event must precede any Batch");
+                    current.extend(batch.rows.into_iter().map(|row| row.0[0].clone()));
+                }
+                Ok(zsql_core::QueryEvent::Done { affected }) => break affected,
                 other => panic!("unexpected event mid-stream: {other:?}"),
             }
-        }
+        };
+
+        assert_eq!(affected, None);
         assert_eq!(
-            rows.iter().map(|row| row.0[0].clone()).collect::<Vec<_>>(),
-            vec![zsql_core::Value::Int(1), zsql_core::Value::Int(2)],
-            "rows from both statements must concatenate in order"
+            columns_events, 2,
+            "each statement must announce its own result set"
+        );
+        assert_eq!(
+            rows_per_set,
+            vec![
+                vec![zsql_core::Value::Int(1)],
+                vec![zsql_core::Value::Int(2)]
+            ],
+            "each statement's single row stays within its own result set, not concatenated"
         );
     }
 
