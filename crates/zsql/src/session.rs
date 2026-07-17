@@ -304,7 +304,7 @@ impl Session {
     }
 }
 
-/// Test-only constructors used by `ui::results`'s render tests
+/// Test-only constructors used by the UI views' render and action tests.
 #[cfg(test)]
 impl Session {
     /// Build a session already in `state`, with `result` as its accumulated
@@ -335,6 +335,15 @@ impl Session {
     pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {
         let mut session = Self::new_for_render_test(SessionState::Connected, ResultSet::default());
         session.set_schema(schema);
+        session
+    }
+
+    /// Build a session already connected to `connection`, idle, with no
+    /// result set. Used by `ui::editor`'s tests to assert `RunQuery`
+    /// dispatches the expected SQL through `Session::run_query`.
+    pub(crate) fn new_for_query_test(connection: Arc<dyn Connection>) -> Self {
+        let mut session = Self::new_for_render_test(SessionState::Connected, ResultSet::default());
+        session.connection = Some(connection);
         session
     }
 }

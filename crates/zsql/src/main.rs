@@ -1,9 +1,6 @@
 //! zsql -- a lightweight Postgres-first SQL editor (gpui).
 
 mod config;
-// Unused outside its own tests until the gpui editor view is built on top of
-// it; that view is not part of this crate yet.
-#[allow(dead_code, unused_imports)]
 mod editor;
 mod observability;
 mod session;
@@ -31,17 +28,20 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(theme = %cfg.theme.name, has_configured_url, "zsql starting");
 
     Application::new().run(move |cx: &mut App| {
+        ui::editor::init(cx);
+
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_window, cx| {
+            |window, cx| {
                 let session = cx.new(|_cx| Session::new(&cfg));
 
                 let workspace_session = session.clone();
                 let workspace = cx.new(|cx| WorkspaceView::new(workspace_session, cx));
+                window.focus(&workspace.read(cx).editor_focus_handle(cx));
 
                 let startup_session = session.clone();
                 cx.spawn(async move |cx| {

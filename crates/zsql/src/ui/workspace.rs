@@ -1,7 +1,8 @@
 //! The root workspace view
 
-use gpui::{Context, Entity, Render, Window, div, prelude::*, rgb};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, Window, div, prelude::*, rgb};
 
+use super::editor::EditorView;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use super::theme;
@@ -9,6 +10,7 @@ use crate::session::Session;
 
 pub struct WorkspaceView {
     sidebar: Entity<SidebarView>,
+    editor: Entity<EditorView>,
     results: Entity<ResultsView>,
 }
 
@@ -17,8 +19,19 @@ impl WorkspaceView {
     #[must_use]
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
-        let sidebar = cx.new(|cx| SidebarView::new(session, results.clone(), cx));
-        Self { sidebar, results }
+        let sidebar = cx.new(|cx| SidebarView::new(session.clone(), results.clone(), cx));
+        let editor = cx.new(|cx| EditorView::new(session, results.clone(), cx));
+        Self {
+            sidebar,
+            editor,
+            results,
+        }
+    }
+
+    /// The editor pane's focus handle, so the app can focus it on startup.
+    #[must_use]
+    pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
     }
 }
 
@@ -40,10 +53,13 @@ impl Render for WorkspaceView {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.results.clone()),
+                    .child(self.editor.clone())
+                    .child(div().flex_1().min_h_0().child(self.results.clone())),
             )
     }
 }
@@ -57,9 +73,7 @@ mod render_tests {
     use crate::session::{SchemaState, Session};
 
     #[gpui::test]
-    fn renders_the_sidebar_and_results_grid_side_by_side_without_panicking(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn renders_the_sidebar_editor_and_results_without_panicking(cx: &mut gpui::TestAppContext) {
         let tree = SchemaTree {
             catalogs: vec![Catalog {
                 name: "zsql".to_owned(),

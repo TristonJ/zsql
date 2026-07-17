@@ -116,3 +116,28 @@ pub const TYPE_TAG_TEXT_SIZE: f32 = 9.5;
 pub const TYPE_TAG_PADDING_X: f32 = 4.0;
 /// Corner radius of a type-name badge.
 pub const TYPE_TAG_RADIUS: f32 = 4.0;
+
+/// Height of the SQL editor pane above the results grid.
+pub const EDITOR_HEIGHT: Pixels = px(220.0);
+/// Font size of the editor's text and gutter line numbers.
+pub const EDITOR_TEXT_SIZE: f32 = 13.0;
+/// Height of each row of editor text, content plus line spacing.
+pub const EDITOR_LINE_HEIGHT: f32 = 21.0;
+/// Width of the line-number gutter.
+pub const EDITOR_GUTTER_WIDTH: Pixels = px(44.0);
+/// Horizontal padding inside a gutter line-number cell.
+pub const EDITOR_GUTTER_PADDING_X: f32 = 12.0;
+/// Horizontal padding inside the editor's text area.
+pub const EDITOR_PADDING_X: f32 = 14.0;
+/// Vertical padding above the first line and below the last line of the
+/// editor's text area.
+pub const EDITOR_PADDING_Y: f32 = 12.0;
+/// Width of the text cursor.
+pub const EDITOR_CURSOR_WIDTH: Pixels = px(2.0);
+/// How far a selection highlight extends past the end of a line that isn't
+/// the selection's last line, so a selected line break reads as selected
+/// too instead of stopping abruptly at the last character.
+pub const EDITOR_SELECTION_EOL_PAD: f32 = 8.0;
+/// Background tint for the active selection highlight: teal at low opacity
+/// (`0x33c2ac` at ~20% alpha).
+pub const EDITOR_SELECTION_BG: u32 = 0x33_c2_ac_33;

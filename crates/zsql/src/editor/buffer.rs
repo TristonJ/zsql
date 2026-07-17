@@ -95,6 +95,11 @@ impl TextBuffer {
         }
     }
 
+    // Only ever constructed by tests today: nothing in the shipped app loads
+    // a buffer from existing text yet (the editor always starts empty). Kept
+    // `pub` under `cfg(test)` rather than deleted, since it is the natural
+    // constructor a future "open a saved query" feature will want.
+    #[cfg(test)]
     #[must_use]
     pub fn from_text(text: &str) -> Self {
         let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
@@ -250,6 +255,67 @@ impl TextBuffer {
         self.anchor = Some(Position::new(0, 0));
         self.cursor = self.document_end();
         self.desired_column = self.cursor.column;
+    }
+
+    /// Move the cursor to `position` with no active selection, clamped to
+    /// the document. Used by input handling that sets the cursor directly
+    /// (mouse clicks, IME) rather than via a movement action.
+    pub fn set_cursor(&mut self, position: Position) {
+        let clamped = self.clamp(position);
+        self.cursor = clamped;
+        self.anchor = None;
+        self.desired_column = clamped.column;
+    }
+
+    /// Set the selection to span `anchor` to `cursor`, both clamped to the
+    /// document. Used by input handling that sets a selection directly
+    /// (shift-click, IME, OS-driven range replacement) rather than via an
+    /// extend-movement action.
+    pub fn set_selection(&mut self, anchor: Position, cursor: Position) {
+        self.anchor = Some(self.clamp(anchor));
+        self.cursor = self.clamp(cursor);
+        self.desired_column = self.cursor.column;
+    }
+
+    // -- position <-> offset conversions --------------------------------
+
+    /// The byte offset of `position`'s column within its own line. Lets a
+    /// caller slice or index into that line's raw string -- for example,
+    /// mapping a cursor position to a pixel x-offset via a shaped text line.
+    #[must_use]
+    pub fn line_byte_offset(&self, position: Position) -> usize {
+        let line = position.line.min(self.lines.len() - 1);
+        byte_offset(&self.lines[line], position.column)
+    }
+
+    /// The document-flat character offset of `position`, treating each line
+    /// break as one character. Inverse of
+    /// [`TextBuffer::position_for_char_offset`]. Used to translate between
+    /// this buffer's line/column positions and the flat offsets an OS text
+    /// input API deals in.
+    #[must_use]
+    pub fn char_offset_for_position(&self, position: Position) -> usize {
+        let line = position.line.min(self.lines.len() - 1);
+        let mut offset = 0;
+        for earlier in &self.lines[..line] {
+            offset += char_len(earlier) + 1; // +1 for the newline joining it to the next line
+        }
+        offset + position.column.min(char_len(&self.lines[line]))
+    }
+
+    /// The document position at flat character `offset` (see
+    /// [`TextBuffer::char_offset_for_position`]), clamped to the document.
+    #[must_use]
+    pub fn position_for_char_offset(&self, offset: usize) -> Position {
+        let mut remaining = offset;
+        for (line, text) in self.lines.iter().enumerate() {
+            let len = char_len(text);
+            if remaining <= len {
+                return Position::new(line, remaining);
+            }
+            remaining -= len + 1; // + 1 to also consume the newline after this line
+        }
+        self.document_end()
     }
 
     // -- editing ---------------------------------------------------------
@@ -1076,5 +1142,88 @@ mod tests {
         }
         assert_eq!(buffer.query_text(), "select 2;");
         assert_eq!(buffer.text(), "select 1;\nselect 2;");
+    }
+
+    // -- set_cursor / set_selection --------------------------------------
+
+    #[test]
+    fn set_cursor_moves_the_cursor_and_clears_any_selection() {
+        let mut buffer = TextBuffer::from_text("abc\ndef");
+        buffer.extend_right();
+        assert!(buffer.has_selection());
+        buffer.set_cursor(Position::new(1, 2));
+        assert_eq!(buffer.cursor(), Position::new(1, 2));
+        assert!(!buffer.has_selection());
+    }
+
+    #[test]
+    fn set_cursor_clamps_to_the_document() {
+        let mut buffer = TextBuffer::from_text("ab\ncd");
+        buffer.set_cursor(Position::new(9, 9));
+        assert_eq!(buffer.cursor(), Position::new(1, 2));
+    }
+
+    #[test]
+    fn set_selection_spans_the_given_anchor_and_cursor() {
+        let mut buffer = TextBuffer::from_text("select *\nfrom orders");
+        buffer.set_selection(Position::new(0, 7), Position::new(1, 4));
+        let selection = buffer.selection().expect("expected an active selection");
+        assert_eq!(selection.anchor, Position::new(0, 7));
+        assert_eq!(selection.cursor, Position::new(1, 4));
+        assert_eq!(buffer.selected_text(), "*\nfrom");
+    }
+
+    #[test]
+    fn set_selection_clamps_both_endpoints_to_the_document() {
+        let mut buffer = TextBuffer::from_text("ab\ncd");
+        buffer.set_selection(Position::new(0, 0), Position::new(50, 50));
+        let selection = buffer.selection().expect("expected an active selection");
+        assert_eq!(selection.cursor, Position::new(1, 2));
+    }
+
+    // -- position <-> offset conversions ----------------------------------
+
+    #[test]
+    fn line_byte_offset_finds_the_byte_index_of_a_multi_byte_column() {
+        let buffer = TextBuffer::from_text("caf\u{e9} tea");
+        // column 4 is right after the e-acute (2 bytes), so byte offset 5
+        assert_eq!(buffer.line_byte_offset(Position::new(0, 4)), 5);
+    }
+
+    #[test]
+    fn char_offset_for_position_counts_newlines_as_one_character() {
+        let buffer = TextBuffer::from_text("ab\ncd");
+        assert_eq!(buffer.char_offset_for_position(Position::new(0, 0)), 0);
+        assert_eq!(
+            buffer.char_offset_for_position(Position::new(0, 2)),
+            2,
+            "end of the first line, just before the newline"
+        );
+        assert_eq!(
+            buffer.char_offset_for_position(Position::new(1, 0)),
+            3,
+            "start of the second line, just after the newline"
+        );
+        assert_eq!(buffer.char_offset_for_position(Position::new(1, 2)), 5);
+    }
+
+    #[test]
+    fn position_for_char_offset_is_the_inverse_of_char_offset_for_position() {
+        let buffer = TextBuffer::from_text("select *\nfrom orders\nwhere id = 1");
+        let total = buffer.text().chars().count();
+        for offset in 0..=total {
+            let position = buffer.position_for_char_offset(offset);
+            assert_eq!(
+                buffer.char_offset_for_position(position),
+                offset,
+                "round trip failed for offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn position_for_char_offset_clamps_past_the_document_end() {
+        let buffer = TextBuffer::from_text("ab\ncd");
+        assert_eq!(buffer.position_for_char_offset(999), Position::new(1, 2));
     }
 }
