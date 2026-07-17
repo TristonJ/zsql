@@ -14,10 +14,11 @@
 //! `cx.spawn` to consume the query's `flume` event stream) rather than any
 //! tokio runtime.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{Context, Task, prelude::*};
-use zsql_core::{ConnConfig, Connection, CoreError, Driver, QueryEvent, ResultSet};
+use zsql_core::{ConnConfig, Connection, CoreError, Driver, QueryEvent, ResultSet, SchemaTree};
 use zsql_postgres::PostgresDriver;
 
 use crate::config::Config;
@@ -60,6 +61,25 @@ pub enum SessionState {
     Error(String),
 }
 
+/// What the schema sidebar currently has to render, tracked independently of
+/// [`SessionState`]: introspection is best-effort metadata about the
+/// connection, not a precondition for using it, so a broken or in-flight
+/// schema fetch never turns into a fatal [`SessionState::Error`] and never
+/// blocks [`Session::run_query`]/[`Session::preview_relation`].
+#[derive(Debug, Clone)]
+pub enum SchemaState {
+    /// No introspection has completed yet (a fresh session, or one that
+    /// hasn't connected/introspected).
+    NotLoaded,
+    /// Introspection is in flight.
+    Loading,
+    /// Introspection succeeded; the sidebar renders this tree.
+    Ready(SchemaTree),
+    /// Introspection failed. The message is safe to show directly in the
+    /// UI, same as [`SessionState::Error`].
+    Error(String),
+}
+
 /// Owns the active connection and the current query's lifecycle.
 ///
 /// A gpui `Entity`: methods that touch the connection or run a query take
@@ -69,10 +89,27 @@ pub enum SessionState {
 pub struct Session {
     /// Resolved DSN (`Config::resolve_url`), if any.
     dsn: Option<String>,
-    /// The live connection, once `connect` succeeds.
-    connection: Option<Box<dyn Connection>>,
+    /// The live connection, once `connect` succeeds. An `Arc` (rather than a
+    /// plain `Box`) so [`Session::introspect`] can clone a handle to it into
+    /// a `'static` future for `cx.background_spawn`, the same way
+    /// `connect`'s own background future works, without borrowing `self`
+    /// across the `.await`.
+    connection: Option<Arc<dyn Connection>>,
     /// The current lifecycle state a view renders.
     state: SessionState,
+    /// The schema sidebar's current state, tracked independently of `state`
+    /// -- see [`SchemaState`]'s doc comment for why.
+    schema: SchemaState,
+    /// Bumped every time `schema` is reassigned (see [`Session::set_schema`]).
+    /// Lets a view such as `ui::sidebar::SidebarView` cheaply tell "the
+    /// schema actually changed" apart from "the session merely notified for
+    /// an unrelated reason" (e.g. a preview query's `QueryEvent`s streaming
+    /// in) without diffing or cloning the `SchemaTree` itself.
+    schema_generation: u64,
+    /// `LIMIT` applied to [`Session::preview_relation`]'s generated query,
+    /// resolved once from `Config` at construction rather than
+    /// hardcoded at each call site.
+    preview_limit: u64,
     /// Cancellation handle for whichever query is currently streaming.
     /// Holding this alive for the query's duration matters: dropping a
     /// `QueryHandle` is itself a cancellation signal (see
@@ -114,6 +151,9 @@ impl Session {
             dsn,
             connection: None,
             state,
+            schema: SchemaState::NotLoaded,
+            schema_generation: 0,
+            preview_limit: cfg.query.preview_limit,
             active_query: None,
             accumulating: ResultSet::default(),
             query_started_at: None,
@@ -125,6 +165,28 @@ impl Session {
     #[must_use]
     pub fn state(&self) -> &SessionState {
         &self.state
+    }
+
+    /// The schema sidebar's current state.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaState {
+        &self.schema
+    }
+
+    /// Monotonically increases every time `schema` is reassigned; unchanged
+    /// between calls that don't touch it. A view can cache the value it last
+    /// saw and skip re-deriving anything from `schema()` when this is still
+    /// the same, without needing to compare `SchemaTree`s for equality.
+    #[must_use]
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    /// Replace `schema` and bump [`Session::schema_generation`] in the same
+    /// step, so the two can never drift out of sync.
+    fn set_schema(&mut self, schema: SchemaState) {
+        self.schema = schema;
+        self.schema_generation = self.schema_generation.wrapping_add(1);
     }
 
     /// The result set accumulated by the most recently dispatched query.
@@ -171,7 +233,7 @@ impl Session {
                 match connect_result {
                     Ok(conn) => {
                         tracing::info!("session connected");
-                        session.connection = Some(conn);
+                        session.connection = Some(Arc::from(conn));
                         session.state = SessionState::Connected;
                     }
                     Err(err) => {
@@ -237,6 +299,64 @@ impl Session {
                 }
             }
         })
+    }
+
+    /// Snapshot the reachable schema via the active connection's
+    /// `Connection::introspect`, running on gpui's background executor like
+    /// `connect` and `run_query` do (no tokio, no UI-thread block).
+    ///
+    /// A failure here only updates [`Session::schema`], never
+    /// [`Session::state`]: a sidebar that cannot introspect the catalog must
+    /// not stop a connection that can still run queries just fine. If there
+    /// is no active connection, this sets [`SchemaState::Error`]
+    /// immediately and returns a completed task.
+    pub fn introspect(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let Some(connection) = self.connection.clone() else {
+            self.set_schema(SchemaState::Error(
+                "cannot introspect: not connected".to_owned(),
+            ));
+            cx.notify();
+            return Task::ready(());
+        };
+
+        self.set_schema(SchemaState::Loading);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(introspect_connection(connection)).await;
+
+            let _ = this.update(cx, |session, cx| {
+                match result {
+                    Ok(tree) => {
+                        tracing::info!(
+                            catalogs = tree.catalogs.len(),
+                            "session introspected schema"
+                        );
+                        session.set_schema(SchemaState::Ready(tree));
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "session introspection failed");
+                        session.set_schema(SchemaState::Error(err.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+    }
+
+    /// Preview a relation's rows: `SELECT * FROM "<schema>"."<relation>"
+    /// LIMIT <configured preview limit>`, dispatched the same way any other
+    /// query runs, via [`Session::run_query`]. Both identifiers are quoted
+    /// (see [`crate::sql`]), so a name that needs quoting -- or contains a
+    /// double quote -- cannot break out of the identifier position.
+    pub fn preview_relation(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let sql = crate::sql::preview_sql(schema, relation, self.preview_limit);
+        self.run_query(sql, cx)
     }
 
     /// Fold one `QueryEvent` (or a terminal error) into `state`/`accumulating`.
@@ -317,6 +437,9 @@ impl Session {
             dsn: None,
             connection: None,
             state,
+            schema: SchemaState::NotLoaded,
+            schema_generation: 0,
+            preview_limit: Config::default().query.preview_limit,
             active_query: None,
             accumulating: result,
             query_started_at: None,
@@ -331,6 +454,17 @@ impl Session {
     pub(crate) fn set_result_for_test(&mut self, result: ResultSet) {
         self.accumulating = result;
     }
+
+    /// Build a session already holding `schema` as its introspected schema
+    /// state, connected but idle, with no result set -- used by
+    /// `ui::sidebar`'s render tests, which need a `Session` entity parked in
+    /// a specific `SchemaState` without driving it through a real
+    /// `introspect()` call.
+    pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {
+        let mut session = Self::new_for_render_test(SessionState::Connected, ResultSet::default());
+        session.set_schema(schema);
+        session
+    }
 }
 
 /// Connect to Postgres via [`PostgresDriver`]. A free function (rather than
@@ -342,6 +476,15 @@ impl Session {
 #[tracing::instrument(name = "session_connect_postgres", skip_all)]
 async fn connect_postgres(cfg: ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
     PostgresDriver.connect(&cfg).await
+}
+
+/// Introspect `connection`'s reachable schema. A free function (rather than
+/// inlined into `Session::introspect`'s spawned closure) so it carries its
+/// own tracing span across the `.await` inside `cx.background_spawn`, same
+/// as [`connect_postgres`] above.
+#[tracing::instrument(name = "session_introspect", skip_all)]
+async fn introspect_connection(connection: Arc<dyn Connection>) -> Result<SchemaTree, CoreError> {
+    connection.introspect().await
 }
 
 #[cfg(test)]
@@ -526,9 +669,12 @@ mod gpui_tests {
     use std::sync::{Arc, Mutex};
 
     use gpui::{AppContext as _, TestAppContext};
-    use zsql_core::{BatchSink, ColumnMeta, Connection, QueryEvent, QueryHandle, SchemaTree};
+    use zsql_core::{
+        BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
+        RelationKind, SchemaNs, SchemaTree,
+    };
 
-    use super::{Config, Session, SessionState};
+    use super::{Config, SchemaState, Session, SessionState};
 
     fn session_with_no_dsn() -> Session {
         Session::new(&Config::default())
@@ -550,6 +696,33 @@ mod gpui_tests {
                 );
             }
             other => panic!("expected SessionState::Error, got {other:?}"),
+        });
+    }
+
+    #[gpui::test]
+    async fn introspect_without_a_connection_sets_a_schema_error_and_leaves_state_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        let session = cx.new(|_cx| session_with_no_dsn());
+        let state_before = session.read_with(cx, |session, _app| format!("{:?}", session.state()));
+
+        session.update(cx, Session::introspect).await;
+
+        session.read_with(cx, |session, _app| {
+            match session.schema() {
+                SchemaState::Error(message) => {
+                    assert!(
+                        message.contains("not connected"),
+                        "expected a 'not connected' schema error, got: {message}"
+                    );
+                }
+                other => panic!("expected SchemaState::Error, got {other:?}"),
+            }
+            assert_eq!(
+                format!("{:?}", session.state()),
+                state_before,
+                "an introspection failure must not touch session state"
+            );
         });
     }
 
@@ -625,40 +798,68 @@ mod gpui_tests {
         });
     }
 
-    /// A `Connection` double that records every `stream_query` call's sink
-    /// instead of running anything, so tests can drive the resulting
-    /// `QueryEvent`s by hand and control their timing relative to other
-    /// calls. Never touches the network — no `sqlx`/Postgres types appear
+    /// What [`FakeConnection::introspect`] returns. A plain enum (rather
+    /// than storing a `Result<SchemaTree, CoreError>` directly) because
+    /// `CoreError` has no `Clone` impl and this needs to be returned
+    /// (potentially more than once) from a `&self` method.
+    enum FakeIntrospectOutcome {
+        Ready(SchemaTree),
+        Failed(String),
+    }
+
+    /// A `Connection` double that records every `stream_query` call's SQL
+    /// text and sink instead of running anything, so tests can drive the
+    /// resulting `QueryEvent`s by hand, assert on exactly what SQL a
+    /// `Session` method generated, and control timing relative to other
+    /// calls. Never touches the network -- no `sqlx`/Postgres types appear
     /// here.
     struct FakeConnection {
         sinks: Arc<Mutex<Vec<BatchSink>>>,
+        queries: Arc<Mutex<Vec<String>>>,
+        introspect_outcome: FakeIntrospectOutcome,
+    }
+
+    impl FakeConnection {
+        fn new(sinks: Arc<Mutex<Vec<BatchSink>>>, queries: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                sinks,
+                queries,
+                introspect_outcome: FakeIntrospectOutcome::Ready(SchemaTree::default()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl Connection for FakeConnection {
-        fn stream_query(&self, _sql: String, sink: BatchSink) -> QueryHandle {
+        fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
+            self.queries
+                .lock()
+                .expect("queries lock poisoned")
+                .push(sql);
             self.sinks.lock().expect("sinks lock poisoned").push(sink);
             let (cancel_tx, _cancel_rx) = flume::unbounded();
             QueryHandle::new(cancel_tx)
         }
 
-        async fn introspect(&self) -> Result<SchemaTree, zsql_core::CoreError> {
-            // Not exercised by any test using this double: `Session` never
-            // calls `introspect`.
-            Ok(SchemaTree::default())
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            match &self.introspect_outcome {
+                FakeIntrospectOutcome::Ready(tree) => Ok(tree.clone()),
+                FakeIntrospectOutcome::Failed(message) => {
+                    Err(CoreError::Introspection(message.clone()))
+                }
+            }
         }
     }
 
     #[gpui::test]
     fn superseding_a_query_ignores_late_events_from_the_previous_query(cx: &mut TestAppContext) {
         let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
-        let connection = FakeConnection {
-            sinks: sinks.clone(),
-        };
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks.clone(), queries);
 
         let session = cx.new(|_cx| {
             let mut session = session_with_no_dsn();
-            session.connection = Some(Box::new(connection));
+            session.connection = Some(Arc::new(connection));
             session
         });
 
@@ -733,6 +934,209 @@ mod gpui_tests {
             assert_eq!(result.columns[0].name, "fresh");
         });
     }
+
+    /// A sample tree with one catalog, one schema, and one table, used by
+    /// the introspection tests below.
+    fn sample_schema_tree() -> SchemaTree {
+        SchemaTree {
+            catalogs: vec![Catalog {
+                name: "zsql".to_owned(),
+                schemas: vec![SchemaNs {
+                    name: "public".to_owned(),
+                    tables: vec![Relation {
+                        name: "orders".to_owned(),
+                        kind: RelationKind::Table,
+                        columns: vec![ColumnMeta {
+                            name: "id".to_owned(),
+                            type_name: "int8".to_owned(),
+                            nullable: false,
+                        }],
+                    }],
+                }],
+            }],
+        }
+    }
+
+    #[gpui::test]
+    async fn introspect_populates_schema_state_from_a_successful_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = FakeConnection::new(sinks, queries);
+        connection.introspect_outcome = FakeIntrospectOutcome::Ready(sample_schema_tree());
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session.update(cx, Session::introspect).await;
+
+        session.read_with(cx, |session, _app| match session.schema() {
+            SchemaState::Ready(tree) => {
+                assert_eq!(tree.catalogs.len(), 1);
+                assert_eq!(tree.catalogs[0].schemas[0].tables[0].name, "orders");
+            }
+            other => panic!("expected SchemaState::Ready, got {other:?}"),
+        });
+    }
+
+    /// Pins the contract `ui::sidebar::SidebarView` relies on to avoid
+    /// re-flattening its schema tree on every session notify: introspection
+    /// advances `schema_generation`, but a streaming query's `QueryEvent`s
+    /// (which also call `cx.notify()`) must not.
+    #[gpui::test]
+    async fn schema_generation_advances_on_introspection_but_not_on_query_events(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = FakeConnection::new(sinks.clone(), queries);
+        connection.introspect_outcome = FakeIntrospectOutcome::Ready(sample_schema_tree());
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        let generation_before_introspect =
+            session.read_with(cx, |session, _app| session.schema_generation());
+
+        session.update(cx, Session::introspect).await;
+
+        let generation_after_introspect =
+            session.read_with(cx, |session, _app| session.schema_generation());
+        assert!(
+            generation_after_introspect > generation_before_introspect,
+            "introspecting must advance schema_generation"
+        );
+
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 1", cx))
+            .detach();
+        cx.run_until_parked();
+
+        let sink = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            assert_eq!(sinks.len(), 1, "expected exactly one stream_query call");
+            sinks[0].clone()
+        };
+        sink.send(Ok(QueryEvent::Columns(vec![ColumnMeta {
+            name: "n".to_owned(),
+            type_name: "int8".to_owned(),
+            nullable: false,
+        }])))
+        .expect("sink send failed");
+        sink.send(Ok(QueryEvent::Done { affected: None }))
+            .expect("sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "expected the query to complete, got {:?}",
+                session.state()
+            );
+            assert_eq!(
+                session.schema_generation(),
+                generation_after_introspect,
+                "a query's QueryEvents must not touch schema_generation"
+            );
+        });
+    }
+
+    /// Pins the core "sidebar-level, not fatal" contract: an introspection
+    /// failure must land in `SchemaState::Error` and leave `SessionState`
+    /// completely untouched, and a query dispatched afterwards on the same
+    /// connection must still succeed.
+    #[gpui::test]
+    async fn a_failed_introspection_does_not_block_running_a_query_afterwards(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = FakeConnection::new(sinks.clone(), queries);
+        connection.introspect_outcome =
+            FakeIntrospectOutcome::Failed("permission denied for schema pg_catalog".to_owned());
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.state = SessionState::Connected;
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session.update(cx, Session::introspect).await;
+
+        session.read_with(cx, |session, _app| {
+            match session.schema() {
+                SchemaState::Error(message) => assert!(!message.is_empty()),
+                other => panic!("expected SchemaState::Error, got {other:?}"),
+            }
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "a failed introspection must not touch SessionState, got {:?}",
+                session.state()
+            );
+        });
+
+        // The connection must still be usable for an ordinary query.
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 1", cx))
+            .detach();
+        cx.run_until_parked();
+
+        let sink = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            assert_eq!(sinks.len(), 1, "expected exactly one stream_query call");
+            sinks[0].clone()
+        };
+        sink.send(Ok(QueryEvent::Done { affected: Some(0) }))
+            .expect("sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "a query after a failed introspection must still complete normally, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// `preview_relation` must build a quoted, `LIMIT`-bounded query from
+    /// `Config`'s `preview_limit` and dispatch it exactly like any other
+    /// query, through `run_query`.
+    #[gpui::test]
+    fn preview_relation_dispatches_a_quoted_limited_select(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks, queries.clone());
+
+        let mut cfg = Config::default();
+        cfg.query.preview_limit = 50;
+        let session = cx.new(|_cx| {
+            let mut session = Session::new(&cfg);
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("public", "orders", cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        let recorded = queries.lock().expect("queries lock poisoned");
+        assert_eq!(
+            recorded.as_slice(),
+            ["SELECT * FROM \"public\".\"orders\" LIMIT 50"],
+        );
+    }
 }
 
 /// Live-database end-to-end tests, gated on `ZSQL_TEST_DATABASE_URL` so
@@ -745,7 +1149,7 @@ mod live_tests {
     use gpui::{AppContext as _, TestAppContext};
     use zsql_core::Value;
 
-    use super::{Config, Session, SessionState};
+    use super::{Config, SchemaState, Session, SessionState};
 
     /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
     /// so callers can skip.
@@ -901,6 +1305,82 @@ mod live_tests {
                 );
             }
             other => panic!("expected SessionState::Error, got {other:?}"),
+        });
+    }
+
+    /// End-to-end: connect, introspect against the seeded dev database
+    /// (`scripts/pg-dev.sh` + `dev/seed.sql`), and confirm the resulting
+    /// `SchemaTree` carries the seeded `public` schema's `orders`/`users`
+    /// tables and `recent_orders` view; then preview one of those relations
+    /// and confirm it lands in `SessionState::Results` with rows.
+    #[gpui::test]
+    async fn session_introspects_and_previews_a_relation_when_configured(cx: &mut TestAppContext) {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        cx.executor().allow_parking();
+
+        let mut cfg = Config::default();
+        cfg.connection.default_url = Some(url);
+
+        let session = cx.new(|_cx| Session::new(&cfg));
+        session.update(cx, Session::connect).await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "connect should succeed against a reachable database, got {:?}",
+                session.state()
+            );
+        });
+
+        session.update(cx, Session::introspect).await;
+
+        session.read_with(cx, |session, _app| {
+            let tree = match session.schema() {
+                SchemaState::Ready(tree) => tree,
+                other => panic!("expected SchemaState::Ready, got {other:?}"),
+            };
+            let public = tree
+                .catalogs
+                .iter()
+                .flat_map(|catalog| &catalog.schemas)
+                .find(|schema| schema.name == "public")
+                .expect("the seeded database has a public schema");
+
+            assert!(
+                public.tables.iter().any(|r| r.name == "orders"),
+                "expected the seeded orders table in the introspected schema"
+            );
+            assert!(
+                public.tables.iter().any(|r| r.name == "users"),
+                "expected the seeded users table in the introspected schema"
+            );
+            let recent_orders = public
+                .tables
+                .iter()
+                .find(|r| r.name == "recent_orders")
+                .expect("expected the seeded recent_orders view in the introspected schema");
+            assert_eq!(recent_orders.kind, zsql_core::RelationKind::View);
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("public", "orders", cx)
+            })
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "expected a terminal SessionState::Results from previewing orders, got {:?}",
+                session.state()
+            );
+            assert_eq!(
+                session.result().rows.len(),
+                3,
+                "the seeded orders table has 3 rows"
+            );
         });
     }
 }

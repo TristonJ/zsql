@@ -157,14 +157,14 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
     Ok(grouped)
 }
 
-/// Map a `pg_class.relkind` code to the neutral [`RelationKind`]. Ordinary
-/// (`r`) and partitioned (`p`) tables both surface as `Table` — a partitioned
-/// table's own `pg_class` row is a table from the UI's point of view; its
-/// partitions are separate rows, enumerated like any other table if not
-/// excluded by schema.
+/// Map a `pg_class.relkind` code to the neutral [`RelationKind`]. A
+/// partitioned table's own `pg_class` row (`p`) is distinct from an ordinary
+/// table (`r`); its partitions are separate rows, each an ordinary table,
+/// enumerated like any other table if not excluded by schema.
 fn relation_kind(relkind: &str) -> Option<RelationKind> {
     match relkind {
-        "r" | "p" => Some(RelationKind::Table),
+        "r" => Some(RelationKind::Table),
+        "p" => Some(RelationKind::Partitioned),
         "v" => Some(RelationKind::View),
         "m" => Some(RelationKind::MatView),
         _ => None,
@@ -222,14 +222,15 @@ mod tests {
     use zsql_core::RelationKind;
 
     /// Pins the `pg_class.relkind` -> [`RelationKind`] mapping without a
-    /// database: an ordinary table and a partitioned table both surface as
-    /// `Table`, a view as `View`, a materialized view as `MatView`, and any
-    /// other code (e.g. `i` for index, `S` for sequence) as `None` so
-    /// `relations`/`columns` skip it instead of guessing at a kind.
+    /// database: an ordinary table surfaces as `Table`, a partitioned table
+    /// as its own distinct `Partitioned`, a view as `View`, a materialized
+    /// view as `MatView`, and any other code (e.g. `i` for index, `S` for
+    /// sequence) as `None` so `relations`/`columns` skip it instead of
+    /// guessing at a kind.
     #[test]
     fn maps_every_relkind_code() {
         assert_eq!(relation_kind("r"), Some(RelationKind::Table));
-        assert_eq!(relation_kind("p"), Some(RelationKind::Table));
+        assert_eq!(relation_kind("p"), Some(RelationKind::Partitioned));
         assert_eq!(relation_kind("v"), Some(RelationKind::View));
         assert_eq!(relation_kind("m"), Some(RelationKind::MatView));
         assert_eq!(relation_kind("i"), None, "index relkind is not a relation");

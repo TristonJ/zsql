@@ -47,4 +47,7 @@ pub enum RelationKind {
     View,
     /// A materialized view.
     MatView,
+    /// A partitioned table (the parent). Its partitions are ordinary tables
+    /// in their own right and are enumerated as separate [`Relation`]s.
+    Partitioned,
 }

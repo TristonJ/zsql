@@ -69,6 +69,41 @@ pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 /// Narrowest the leading row-number column is allowed to shrink to.
 pub const ROW_NUMBER_MIN_WIDTH: f32 = 40.0;
 
+/// Fixed width of the schema sidebar.
+pub const SIDEBAR_WIDTH: Pixels = px(248.0);
+/// Height of the sidebar's "SCHEMA" header bar.
+pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(34.0);
+/// Height of each row in the schema tree.
+pub const SIDEBAR_ROW_HEIGHT: Pixels = px(26.0);
+/// Left padding for a catalog row (tree depth 0).
+pub const SIDEBAR_INDENT_L0: f32 = 10.0;
+/// Left padding for a schema row (tree depth 1).
+pub const SIDEBAR_INDENT_L1: f32 = 24.0;
+/// Left padding for a relation row (tree depth 2).
+pub const SIDEBAR_INDENT_L2: f32 = 42.0;
+/// Width reserved for a row's disclosure glyph (`v`/`>`) or, for a
+/// non-disclosable relation row, the equivalent blank space that keeps its
+/// label aligned with its parent schema's children.
+pub const SIDEBAR_DISCLOSURE_WIDTH: f32 = 10.0;
+/// Horizontal gap between a tree row's disclosure glyph, label, and trailing
+/// affordances.
+pub const SIDEBAR_ROW_GAP: f32 = 7.0;
+/// Vertical padding above/below the scrollable tree body.
+pub const SIDEBAR_TREE_PADDING_Y: f32 = 6.0;
+
+/// Text size of the "SCHEMA" header label.
+pub const SIDEBAR_HEADER_TEXT_SIZE: f32 = 10.5;
+/// Text size of a tree row's label and disclosure glyph.
+pub const SIDEBAR_ROW_TEXT_SIZE: f32 = 12.5;
+/// Text size of a relation row's kind label (table/view/matview/partitioned).
+pub const SIDEBAR_KIND_TEXT_SIZE: f32 = 9.0;
+/// Text size of a row's trailing column-count/relation-count affordance.
+pub const SIDEBAR_META_TEXT_SIZE: f32 = 10.0;
+
+/// Background tint for the selected relation row: teal at low opacity
+/// (`0x33c2ac` at ~10% alpha), matching the results grid's teal accent.
+pub const SIDEBAR_SELECTED_BG: u32 = 0x33_c2_ac_1a;
+
 /// Text size of the "Results" label and row count in the results header bar.
 pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
 /// Text size of the source/relation label in the results header bar.

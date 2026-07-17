@@ -567,14 +567,14 @@ mod tests {
         assert_eq!(recent_orders_mv.kind, zsql_core::RelationKind::MatView);
 
         // The only seeded object with `pg_class.relkind = 'p'`: proves the
-        // partitioned-table arm of the mapping surfaces as an ordinary
-        // `Table`, and that its partition is enumerated as its own table.
+        // partitioned-table arm of the mapping surfaces as its own distinct
+        // kind, and that its partition is enumerated as its own table.
         let events = public
             .tables
             .iter()
             .find(|r| r.name == "events")
             .expect("the seeded partitioned events table is present");
-        assert_eq!(events.kind, zsql_core::RelationKind::Table);
+        assert_eq!(events.kind, zsql_core::RelationKind::Partitioned);
 
         let events_2024 = public
             .tables

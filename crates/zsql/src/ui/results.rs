@@ -82,6 +82,13 @@ impl ResultsView {
         view
     }
 
+    /// Update the results header's source/relation label, e.g. after the
+    /// schema sidebar previews a different relation.
+    pub fn set_source_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.source_label = label.into();
+        cx.notify();
+    }
+
     /// Bring `column_widths`/`row_number_width` up to date with the
     /// session's current result set, folding only rows that have arrived
     /// since the last call into the per-column max-width cache. Resets the
@@ -488,6 +495,17 @@ impl ResultsView {
         }
 
         bar
+    }
+}
+
+/// Test-only accessor used by `ui::sidebar`'s render tests to assert on the
+/// source label a click-to-preview set, without exposing it on the public
+/// surface. `pub(crate)` (rather than plain private) because that test
+/// module is a sibling of this one, not a descendant.
+#[cfg(test)]
+impl ResultsView {
+    pub(crate) fn source_label_for_test(&self) -> &str {
+        &self.source_label
     }
 }
 
