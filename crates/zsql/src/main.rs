@@ -1,6 +1,10 @@
 //! zsql -- a lightweight Postgres-first SQL editor (gpui).
 
 mod config;
+// Unused outside its own tests until the gpui editor view is built on top of
+// it; that view is not part of this crate yet.
+#[allow(dead_code, unused_imports)]
+mod editor;
 mod observability;
 mod session;
 mod sql;
