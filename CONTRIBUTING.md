@@ -31,6 +31,9 @@ cargo test --all                         # all tests
   from `Config` (`crates/zsql/src/config.rs`).
 - Instrument notable operations (connect / query / cancel / introspect) with
   `tracing` spans.
+- Keep code comments self-contained: never reference external plans, milestones,
+  or phases. State the actual context instead — e.g. `TODO: deferred until the
+  connection pool exists`, not `deferred until M1`. A plain `TODO:` is sometimes fine.
 - Prefer `thiserror` for typed errors in libraries, `anyhow` at the app edges.
 
 ## Local development database

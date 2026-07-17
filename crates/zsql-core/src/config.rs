@@ -2,8 +2,10 @@
 
 use crate::error::CoreError;
 
-/// Connection configuration. For v0 this wraps a DSN/URL string; fielded parsing
-/// (host / port / user / sslmode / …) lands in M1 alongside the real driver.
+/// Connection configuration. For now this wraps a DSN/URL string as-is;
+/// fielded parsing (host / port / user / sslmode / …) is not implemented yet
+/// because no driver currently needs the individual fields — they can be
+/// parsed from `url` on demand once one does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnConfig {
     /// The connection URL (e.g. `postgres://user:pass@host:5432/db`).

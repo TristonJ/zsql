@@ -7,7 +7,7 @@ NAME="${ZSQL_PG_NAME:-zsql-dev-pg}"
 PORT="${ZSQL_PG_PORT:-5432}"
 PASSWORD="${ZSQL_PG_PASSWORD:-zsql}"
 DB="${ZSQL_PG_DB:-zsql}"
-IMAGE="${ZSQL_PG_IMAGE:-postgres:17}"
+IMAGE="${ZSQL_PG_IMAGE:-postgres:18}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "${1:-up}" in

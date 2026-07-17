@@ -7671,6 +7671,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "flume 0.11.1",
+ "futures",
  "sqlx",
  "tracing",
  "zsql-core",
