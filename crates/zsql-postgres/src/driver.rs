@@ -36,6 +36,14 @@ const MAX_POOL_CONNECTIONS: u32 = 5;
 /// hanging the caller indefinitely.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounded size of the dedicated pool [`issue_server_side_cancel`] draws
+/// from. Deliberately separate from `MAX_POOL_CONNECTIONS` and small: a
+/// `pg_cancel_backend` call is a single scalar query, never more than a
+/// couple of which are ever in flight at once for this single-user desktop
+/// client, and keeping it off the query pool entirely is the point (see the
+/// doc comment on [`PostgresDriver::build_cancel_pool`]).
+const CANCEL_POOL_CONNECTIONS: u32 = 2;
+
 /// The Postgres [`Driver`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PostgresDriver;
@@ -56,6 +64,39 @@ impl PostgresDriver {
             .map_err(map_connect_error)?;
         liveness_check(&pool).await?;
         Ok(pool)
+    }
+
+    /// Build the small dedicated pool used only for issuing `SELECT
+    /// pg_cancel_backend($pid)` (see [`issue_server_side_cancel`]).
+    ///
+    /// This is deliberately a *different* pool from the one query
+    /// connections are drawn from (see [`build_pool`](Self::build_pool)),
+    /// not a second handle onto the same one. A query connection that is
+    /// cooperatively cancelled while blocked server-side does not
+    /// necessarily free its permit back to the query pool right away:
+    /// returning a pooled connection first pings it to confirm it is idle
+    /// before the permit is released, and that ping itself blocks until the
+    /// backend actually responds -- exactly the kind of response a
+    /// still-blocked query withholds until a server-side cancel reaches it.
+    /// If cancellation drew its own connection from that same pool, several
+    /// blocked-then-cancelled queries saturating every permit could starve
+    /// the very connection needed to unblock any of them, deadlocking the
+    /// pool for the queries' full natural duration. Drawing from an
+    /// entirely separate, independently-bounded pool means issuing a cancel
+    /// can never be blocked by query-pool saturation.
+    ///
+    /// Connects lazily: parsing/validating `url` cannot fail asynchronously
+    /// here, so this is synchronous, and no network round trip happens
+    /// against this pool until the first cancel is actually issued.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Connection`] if `url` cannot be parsed.
+    fn build_cancel_pool(url: &str) -> Result<PgPool, CoreError> {
+        PgPoolOptions::new()
+            .max_connections(CANCEL_POOL_CONNECTIONS)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .connect_lazy(url)
+            .map_err(map_connect_error)
     }
 }
 
@@ -89,14 +130,56 @@ impl Driver for PostgresDriver {
         // Never log `cfg.url`: it may embed a password. Only non-secret
         // fields (the driver id, above) are attached to this span.
         let pool = Self::build_pool(&cfg.url).await?;
+        let cancel_pool = Self::build_cancel_pool(&cfg.url)?;
         tracing::info!("postgres connection established");
-        Ok(Box::new(PgConnection { pool }))
+        Ok(Box::new(PgConnection { pool, cancel_pool }))
     }
 }
 
 /// A live Postgres connection, backed by a bounded sqlx connection pool.
 pub struct PgConnection {
     pool: PgPool,
+    /// Separate, independently-bounded pool used only for server-side
+    /// cancellation (`SELECT pg_cancel_backend($pid)`). Never draws from
+    /// `pool` -- see [`PostgresDriver::build_cancel_pool`] for why sharing
+    /// one pool between running queries and their own cancellation is
+    /// unsafe.
+    cancel_pool: PgPool,
+}
+
+/// Issue `SELECT pg_cancel_backend($pid)` on a connection acquired fresh
+/// from `cancel_pool` -- deliberately *not* the connection running the query
+/// being cancelled, which may be blocked server-side and unable to answer
+/// anything until the cancel itself takes effect, and deliberately *not* the
+/// shared query pool either (see [`PostgresDriver::build_cancel_pool`]) so
+/// this can never be starved by other queries that pool is busy running or
+/// cancelling. Best-effort: any failure (including the target backend having
+/// already finished on its own) is logged and swallowed here, never
+/// surfaced to the query's sink -- a query that finishes naturally in the
+/// small window before this fires is a success, not an error.
+#[tracing::instrument(name = "pg_cancel_backend", skip(cancel_pool))]
+async fn issue_server_side_cancel(cancel_pool: &PgPool, pid: i32) {
+    match sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+        .bind(pid)
+        .fetch_one(cancel_pool)
+        .await
+    {
+        Ok(signalled) => {
+            tracing::info!(pid, signalled, "server-side cancel issued");
+        }
+        Err(err) => {
+            tracing::warn!(pid, error = %err, "server-side cancel request failed");
+        }
+    }
+}
+
+/// Spawn [`issue_server_side_cancel`] as a detached background task so
+/// neither the query task (which may itself be about to return) nor the
+/// caller of `cancel()` has to wait for the cancel round-trip to complete.
+fn spawn_server_side_cancel(cancel_pool: &PgPool, pid: i32) {
+    let cancel_pool = cancel_pool.clone();
+    async_global_executor::spawn(async move { issue_server_side_cancel(&cancel_pool, pid).await })
+        .detach();
 }
 
 #[async_trait]
@@ -104,12 +187,13 @@ impl Connection for PgConnection {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
         let (cancel_tx, cancel_rx) = flume::unbounded();
         let pool = self.pool.clone();
+        let cancel_pool = self.cancel_pool.clone();
         // Run on the smol-based executor sqlx's `runtime-smol` feature
         // already drives its own futures with, so this never needs (or
         // creates) a tokio runtime. The returned `Task` is detached: the
         // caller drives the query lifecycle through `sink` and `cancel_rx`
         // (via the returned `QueryHandle`), not by awaiting this task.
-        async_global_executor::spawn(run_query(pool, sql, sink, cancel_rx)).detach();
+        async_global_executor::spawn(run_query(pool, cancel_pool, sql, sink, cancel_rx)).detach();
         QueryHandle::new(cancel_tx)
     }
 
@@ -119,10 +203,26 @@ impl Connection for PgConnection {
     }
 }
 
-/// Stream one query's results into `sink`. Runs on `pool` (cloned from the
-/// connection into this task) as: exactly one [`QueryEvent::Columns`], then
-/// zero or more [`QueryEvent::Batch`], then exactly one [`QueryEvent::Done`]
-/// — or, on any failure, a single `Err` in place of `Done`.
+/// Stream one query's results into `sink` as: exactly one
+/// [`QueryEvent::Columns`], then zero or more [`QueryEvent::Batch`], then
+/// exactly one [`QueryEvent::Done`] — or, on any failure, a single `Err` in
+/// place of `Done`.
+///
+/// Runs on a single connection acquired from `pool` for the lifetime of this
+/// call (not the pool directly), so that connection's backend PID can be
+/// captured via `SELECT pg_backend_pid()` *before* the row-streaming loop
+/// below ever starts checking `cancel_rx`. That ordering is what makes the
+/// PID capture and cancellation-observed steps purely sequential within this
+/// one task rather than a race to guard against: by the time this task can
+/// possibly observe a cancellation, the PID is either already known (the
+/// common case) or capture already failed and never will be (in which case
+/// only cooperative cancellation applies below; the server-side cancel is
+/// simply unavailable for this one query). Cancelling means running `SELECT
+/// pg_cancel_backend($pid)` for that PID on `cancel_pool` -- a separate pool
+/// from `pool` (see [`PostgresDriver::build_cancel_pool`]) -- which is the
+/// only way to actually interrupt work already blocked server-side
+/// (dropping/ignoring this task alone only stops the client from reading
+/// further rows).
 ///
 /// The rows themselves are fetched with [`sqlx::raw_sql`] (Postgres's simple
 /// query protocol) rather than a prepared statement, which keeps every
@@ -145,12 +245,53 @@ impl Connection for PgConnection {
 /// to reporting no columns rather than failing an otherwise-successful
 /// query at this late stage.
 #[tracing::instrument(name = "pg_stream_query", skip_all, fields(pool_size = pool.size()))]
-async fn run_query(pool: PgPool, sql: String, sink: BatchSink, cancel_rx: flume::Receiver<()>) {
+async fn run_query(
+    pool: PgPool,
+    cancel_pool: PgPool,
+    sql: String,
+    sink: BatchSink,
+    cancel_rx: flume::Receiver<()>,
+) {
     // The SQL text itself carries no connection secrets (those live only in
     // the DSN, never logged here), so it is fine to record at debug level.
     tracing::debug!(sql = %sql, "streaming query");
 
-    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&pool);
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            let _ = sink.send_async(Err(map_query_error(err))).await;
+            return;
+        }
+    };
+
+    // Capture this connection's backend PID so a later cancel can target it
+    // via `pg_cancel_backend` on `cancel_pool`. This always runs to
+    // completion (success or failure) before the row-streaming loop below
+    // ever checks `cancel_rx`, so `pid` is settled -- known or permanently
+    // unknown -- before cancellation can be observed; see this function's
+    // doc comment for why that ordering means no race needs guarding here.
+    let pid = match sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(pid) => {
+            tracing::debug!(pid, "dedicated connection backend pid captured");
+            Some(pid)
+        }
+        Err(err) => {
+            // Cooperative cancellation (the `select` loop below) still
+            // works without a known pid; only the server-side
+            // `pg_cancel_backend` path is unavailable for this one query.
+            // Never fatal to the query itself.
+            tracing::warn!(
+                error = %err,
+                "failed to capture backend pid; server-side cancel unavailable for this query"
+            );
+            None
+        }
+    };
+
+    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&mut *conn);
     let mut batch = RowBatch::new();
     let mut affected: u64 = 0;
     let mut columns_sent = false;
@@ -169,9 +310,16 @@ async fn run_query(pool: PgPool, sql: String, sink: BatchSink, cancel_rx: flume:
             futures::future::Either::Left(_) => {
                 // Cancelled: either an explicit `cancel()` call or every
                 // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
-                // Stop fetching further rows; `rows` is dropped here, which
-                // releases the underlying connection back to the pool.
+                // Stop fetching further rows; `rows` (and then `conn`) are
+                // dropped when this function returns, releasing the
+                // connection back to the pool. That alone only stops this
+                // client from reading further rows -- it does not interrupt
+                // work already running server-side, which is why the
+                // server-side cancel below is also needed.
                 tracing::debug!("query cancelled");
+                if let Some(pid) = pid {
+                    spawn_server_side_cancel(&cancel_pool, pid);
+                }
                 return;
             }
             futures::future::Either::Right((None, _)) => break,
@@ -331,7 +479,8 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(UNREACHABLE_DSN)
             .expect("connect_lazy only parses the DSN; it must not touch the network");
-        let conn = PgConnection { pool };
+        let cancel_pool = pool.clone();
+        let conn = PgConnection { pool, cancel_pool };
 
         let result = block_on(conn.introspect());
         match result {
@@ -620,7 +769,8 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(UNREACHABLE_DSN)
             .expect("connect_lazy only parses the DSN; it must not touch the network");
-        let conn = PgConnection { pool };
+        let cancel_pool = pool.clone();
+        let conn = PgConnection { pool, cancel_pool };
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
@@ -1059,6 +1209,94 @@ mod tests {
             }
         }
         drop(handle);
+    }
+
+    /// Proves cancellation is server-side, not merely client-side: starts a
+    /// `pg_sleep(30)` (a query that only a signal delivered on the server can
+    /// interrupt -- no amount of the client simply not reading rows stops
+    /// it), cancels it, and then confirms via a *separate* connection's
+    /// `pg_stat_activity` that no backend is still actively running that
+    /// `pg_sleep` well within the 30s sleep bound. Also asserts the
+    /// streaming side never reaches `Done`, so both halves of the
+    /// cancellation contract (cooperative + server-side) are checked
+    /// together.
+    #[test]
+    fn cancel_stops_a_server_side_blocking_query_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let (tx, rx) = flume::unbounded();
+        let handle = conn.stream_query("SELECT pg_sleep(30)".to_owned(), tx);
+
+        // The dedicated connection always captures its backend pid before
+        // this task ever checks for cancellation (see `run_query`'s doc
+        // comment), so this delay is not needed for that ordering. It exists
+        // so `pg_sleep` is genuinely in progress server-side by the time
+        // `cancel()` fires below, proving the assertions after this prove a
+        // cancel interrupting already-running server-side work, not a query
+        // that never got the chance to start.
+        std::thread::sleep(Duration::from_millis(500));
+        handle.cancel();
+
+        // No `Done` (or anything else past what was already in flight) may
+        // ever arrive: cooperative cancellation must still hold.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => {
+                    panic!("a cancelled query must not reach Done")
+                }
+                Ok(_) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    panic!("cancellation did not stop the stream promptly")
+                }
+            }
+        }
+        drop(handle);
+
+        // Now prove the *server* actually stopped executing pg_sleep, using
+        // a connection independent of the one the query ran on. Poll with a
+        // bound far short of the 30s sleep: if `pg_cancel_backend` was never
+        // issued, this loop will still see the backend active at the
+        // deadline and fail, whereas cooperative-only cancellation (just not
+        // reading more rows) would leave the server-side sleep running the
+        // entire 30 seconds.
+        let check_pool = block_on(sqlx::postgres::PgPoolOptions::new().connect(&url))
+            .expect("a separate verification connection must succeed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut still_running = true;
+        while std::time::Instant::now() < deadline {
+            // `pid <> pg_backend_pid()` excludes this very SELECT's own
+            // backend: without it, this query would always match itself
+            // (its own `query` text contains the literal substring
+            // `pg_sleep` from the `LIKE` pattern below, and `pg_stat_activity`
+            // reports it as `state = 'active'` while it executes), making
+            // `still_running` never go false regardless of whether the
+            // real `pg_sleep` backend was cancelled.
+            let count: i64 = block_on(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE query LIKE '%pg_sleep%' AND state = 'active' \
+                     AND pid <> pg_backend_pid()",
+                )
+                .fetch_one(&check_pool),
+            )
+            .expect("pg_stat_activity query should succeed");
+            if count == 0 {
+                still_running = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            !still_running,
+            "the pg_sleep backend should have been server-side cancelled \
+             well within the 30s sleep, but is still active after 10s"
+        );
     }
 
     /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
