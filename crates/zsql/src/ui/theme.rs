@@ -36,6 +36,10 @@ pub const BYTES: u32 = 0x2b_85_79;
 
 /// Type-tag badge border: teal at low opacity (`0x33c2ac` at ~28% alpha).
 pub const TYPE_TAG_BORDER: u32 = 0x33_c2_ac_47;
+/// Status-bar "connecting" indicator: a connection attempt is in flight.
+pub const STATUS_CONNECTING: u32 = 0xd9_a2_5a;
+/// Status-bar "error" indicator: connecting or the last query failed.
+pub const STATUS_ERROR: u32 = 0xe2_6d_78;
 
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
@@ -43,6 +47,10 @@ pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
 pub const HEADER_ROW_HEIGHT: Pixels = px(28.0);
 /// Height of each body row in the virtualized grid.
 pub const BODY_ROW_HEIGHT: Pixels = px(24.0);
+/// Height of the bottom connection/status bar.
+pub const STATUS_BAR_HEIGHT: Pixels = px(26.0);
+/// Diameter of the status bar's connection-state dot.
+pub const STATUS_DOT_SIZE: f32 = 6.0;
 
 /// Horizontal padding inside every grid cell.
 pub const CELL_PADDING_X: f32 = 11.0;
@@ -65,6 +73,8 @@ pub const ROW_NUMBER_MIN_WIDTH: f32 = 40.0;
 pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
 /// Text size of the source/relation label in the results header bar.
 pub const RESULTS_META_TEXT_SIZE: f32 = 11.0;
+/// Text size of the bottom connection/status bar.
+pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
 /// Text size of a column header's type-name badge.
 pub const TYPE_TAG_TEXT_SIZE: f32 = 9.5;
 /// Horizontal padding inside a type-name badge.

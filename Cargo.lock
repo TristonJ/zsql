@@ -7723,13 +7723,16 @@ name = "zsql"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
+ "flume 0.11.1",
  "gpui",
  "serde",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "zsql-core",
+ "zsql-postgres",
 ]
 
 [[package]]
