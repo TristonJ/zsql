@@ -1,5 +1,4 @@
-//! Logging / tracing setup. Called once at startup so every subsystem can
-//! instrument from the first line of code.
+//! Logging / tracing setup
 
 use tracing_subscriber::EnvFilter;
 

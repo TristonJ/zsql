@@ -1,6 +1,6 @@
 //! Dark color palette and spacing tokens for the results grid, matching the
 //! locked visual spec. Centralized here so no view hardcodes a raw hex or
-//! pixel literal inline. Not a theming system — just named constants.
+//! pixel literal inline. Not a theming system - just named constants.
 
 use gpui::{Pixels, px};
 

@@ -1,16 +1,13 @@
 //! Formats `zsql_core::Value` cells for display in the results grid, and
 //! classifies each value into a semantic [`ValueKind`] used to pick a
-//! per-kind text color/style. Pure Rust: no gpui, no database, so this is
-//! unit-testable on its own with no window and no connection.
+//! per-kind text color/style.
 
 use std::fmt::Write as _;
 
 use zsql_core::Value;
 
 /// Semantic category of a formatted cell, used to select a per-kind text
-/// color/style in the results grid. [`ValueKind::Null`] is its own kind
-/// (rendered faint and italic) so it never gets confused with an empty
-/// [`Value::Text`], which is ordinary text.
+/// color/style in the results grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     /// SQL NULL — the literal text `NULL`, styled distinctly from text.
@@ -27,8 +24,7 @@ pub enum ValueKind {
     Timestamp,
     /// Raw bytes, rendered as a hex literal.
     Bytes,
-    /// Anything that doesn't map to a more specific kind: arrays and the
-    /// backend's own fallback text rendering for unmapped types.
+    /// Anything that doesn't map to a more specific kind
     Unknown,
 }
 
@@ -66,7 +62,6 @@ pub fn format_value(value: &Value) -> FormattedValue {
             text: text.clone(),
             kind: ValueKind::Number,
         },
-        // UUIDs have no dedicated kind of their own: they render as plain text.
         Value::Text(text) | Value::Uuid(text) => FormattedValue {
             text: text.clone(),
             kind: ValueKind::Text,
@@ -94,9 +89,7 @@ pub fn format_value(value: &Value) -> FormattedValue {
     }
 }
 
-/// Render a float without a trailing-zero ambiguity: whole numbers still get
-/// one decimal place so `2.0` reads as a float rather than an integer that
-/// silently lost its type.
+/// Render a float without a trailing-zero ambiguity
 fn format_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")
@@ -118,7 +111,7 @@ fn format_bytes(bytes: &[u8]) -> String {
 }
 
 /// Render an array as a brace-delimited, comma-separated list of its
-/// formatted elements (Postgres' text array literal shape).
+/// formatted elements
 fn format_array(items: &[Value]) -> String {
     let rendered: Vec<String> = items.iter().map(|item| format_value(item).text).collect();
     format!("{{{}}}", rendered.join(","))

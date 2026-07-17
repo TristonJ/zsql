@@ -1,11 +1,4 @@
 //! zsql -- a lightweight Postgres-first SQL editor (gpui).
-//!
-//! The window opens into `ui::workspace::WorkspaceView`, which lays out the
-//! schema sidebar to the left of the results grid, both driven by a shared
-//! `Session`. Startup resolves the configured DSN, connects, and
-//! introspects the schema; the results grid stays idle (connected, no
-//! query run yet) until the user clicks a relation in the sidebar. There is
-//! no editor pane wired up yet -- that is a later addition.
 
 mod config;
 mod observability;
@@ -43,23 +36,9 @@ fn main() -> anyhow::Result<()> {
             |_window, cx| {
                 let session = cx.new(|_cx| Session::new(&cfg));
 
-                // `WorkspaceView` builds its own sidebar/results entities
-                // over this session (see `ui::workspace`), each of which
-                // subscribes to it directly: nothing here has to re-derive
-                // or push a snapshot of the session's state on each update.
                 let workspace_session = session.clone();
                 let workspace = cx.new(|cx| WorkspaceView::new(workspace_session, cx));
 
-                // Connect, then introspect, on gpui's own executors (no
-                // tokio runtime); the session updates itself (and, via the
-                // sidebar/results views' own subscriptions, the UI) as each
-                // step progresses. If `connect` finds no DSN configured, it
-                // leaves the session in `SessionState::Empty` (the prompt
-                // state) rather than erroring, and this skips introspecting
-                // a connection that was never made rather than turning that
-                // prompt into a fabricated error. No query is run here: the
-                // results grid stays in its idle `Connected` state until
-                // the user clicks a relation in the sidebar.
                 let startup_session = session.clone();
                 cx.spawn(async move |cx| {
                     let connect_task = startup_session.update(cx, Session::connect)?;

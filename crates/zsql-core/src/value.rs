@@ -1,4 +1,4 @@
-//! Engine-neutral result values. The UI never sees a backend-specific type.
+//! Engine-neutral result values
 
 /// Metadata for one result column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,8 +12,7 @@ pub struct ColumnMeta {
 }
 
 /// A single cell value, normalized across backends. Unknown/unsupported types
-/// degrade to [`Value::Unknown`] (the backend's text rendering) rather than
-/// erroring, so a novel column type never breaks a query.
+/// degrade to [`Value::Unknown`]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// SQL NULL.
@@ -46,7 +45,7 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row(pub Vec<Value>);
 
-/// A batch of rows, the unit streamed from driver to UI.
+/// A batch of rows
 #[derive(Debug, Clone, Default)]
 pub struct RowBatch {
     /// Rows in this batch.

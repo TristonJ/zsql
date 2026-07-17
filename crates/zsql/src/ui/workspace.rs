@@ -1,8 +1,4 @@
-//! The root workspace view: lays out the schema sidebar (left, bounded
-//! width) and the results grid (right), matching `design/mockup.html`'s
-//! two-region body split. No editor pane yet -- the results grid stays in
-//! whatever state the session is in (idle once connected, until a sidebar
-//! click or a future editor run dispatches a query).
+//! The root workspace view
 
 use gpui::{Context, Entity, Render, Window, div, prelude::*, rgb};
 
@@ -11,17 +7,13 @@ use super::sidebar::SidebarView;
 use super::theme;
 use crate::session::Session;
 
-/// Root view: owns the sidebar and results-grid entities and arranges them
-/// side by side.
 pub struct WorkspaceView {
     sidebar: Entity<SidebarView>,
     results: Entity<ResultsView>,
 }
 
 impl WorkspaceView {
-    /// Build a workspace over `session`. The results grid starts with an
-    /// empty source label (nothing has been previewed or run yet); the
-    /// sidebar previews relations into it once the session's schema loads.
+    /// Build a workspace over `session`
     #[must_use]
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
@@ -56,10 +48,6 @@ impl Render for WorkspaceView {
     }
 }
 
-/// gpui headless render-smoke test: building a `WorkspaceView` over a
-/// connected, schema-loaded session and painting one frame must not panic.
-/// Mirrors the render-smoke coverage `ui::sidebar` and `ui::results` each
-/// have for their own view.
 #[cfg(test)]
 mod render_tests {
     use gpui::AppContext as _;

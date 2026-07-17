@@ -1,19 +1,4 @@
 //! Schema introspection: `pg_catalog` -> [`zsql_core::SchemaTree`].
-//!
-//! A Postgres connection only ever sees one database (catalog): the one it is
-//! connected to. The whole tree — that catalog, its non-system schemas, each
-//! schema's tables/views/materialized views, and each relation's columns — is
-//! built from four bounded, set-based queries (current database name,
-//! schemas, relations, columns). None of them is run once per relation or
-//! once per column, so the round-trip count stays constant regardless of how
-//! many tables or columns the database has.
-//!
-//! All four queries run inside a single `REPEATABLE READ READ ONLY`
-//! transaction, so they observe one consistent snapshot of the catalog:
-//! without that, each query could land on a different pooled connection, and
-//! concurrent DDL landing between them could drop a relation whose schema
-//! vanished mid-way, or list a relation whose column set was only half
-//! populated.
 
 use std::collections::HashMap;
 
@@ -43,8 +28,7 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
     // Plain `BEGIN` defaults to READ WRITE READ COMMITTED, which lets each
     // statement in the transaction see a fresh (and potentially different)
     // snapshot of the catalog. REPEATABLE READ pins one snapshot for every
-    // statement below; READ ONLY documents (and lets the server enforce)
-    // that introspection never writes.
+    // statement below
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await
@@ -56,9 +40,8 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
     let mut columns_by_relation = columns(&mut tx).await?;
 
     // The transaction only ever read, so commit vs. rollback would leave the
-    // database in the same state either way; committing is the conventional
-    // way to close out a transaction that finished without error.
-    tx.commit().await.map_err(map_introspect_error)?;
+    // database in the same state either way
+    tx.rollback().await.map_err(map_introspect_error)?;
 
     let schemas = schema_names
         .into_iter()
@@ -83,9 +66,7 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
     })
 }
 
-/// The name of the database the current connection is attached to. A
-/// Postgres connection can never see another database's catalog, so this is
-/// always exactly the tree's single [`Catalog`] name.
+/// The name of the database the current connection is attached to
 async fn current_database(conn: &mut PgConnection) -> Result<String, CoreError> {
     sqlx::query_scalar("SELECT current_database()")
         .fetch_one(conn)
@@ -93,8 +74,7 @@ async fn current_database(conn: &mut PgConnection) -> Result<String, CoreError> 
         .map_err(map_introspect_error)
 }
 
-/// Every non-system schema, sorted by name (so the sidebar and tests get a
-/// stable order without re-sorting downstream).
+/// Every non-system schema, sorted by name
 async fn schema_names(conn: &mut PgConnection) -> Result<Vec<String>, CoreError> {
     let sql = format!(
         "SELECT n.nspname \
@@ -104,8 +84,7 @@ async fn schema_names(conn: &mut PgConnection) -> Result<Vec<String>, CoreError>
     );
     // `sql` is assembled purely from compile-time-constant string fragments
     // (this function's own literal plus `NAMESPACE_FILTER`) via `format!`,
-    // never from anything read at runtime, so there is no injectable input
-    // for `AssertSqlSafe` to be asserting past.
+    // never from anything read at runtime
     sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
@@ -113,14 +92,11 @@ async fn schema_names(conn: &mut PgConnection) -> Result<Vec<String>, CoreError>
 }
 
 /// Every table, view, and materialized view across all non-system schemas,
-/// grouped by schema name. Within each schema's list, relations are in the
-/// order the query returned them: sorted by name, since the query orders by
-/// `(nspname, relname)`.
+/// grouped by schema name. Within each schema's list, relations are sorted
+/// by name
 async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relation>>, CoreError> {
     // `relkind` is Postgres's internal one-byte `"char"` type, which sqlx has
-    // no built-in text decode for; casting to `text` in the query keeps the
-    // decode on the Rust side to a plain `String`, matching every other
-    // column read here.
+    // no built-in text decode for
     let sql = format!(
         "SELECT n.nspname, c.relname, c.relkind::text AS relkind \
          FROM pg_catalog.pg_class c \
@@ -128,8 +104,6 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
          WHERE c.relkind IN ('r', 'p', 'v', 'm') AND {NAMESPACE_FILTER} \
          ORDER BY n.nspname, c.relname"
     );
-    // See `schema_names` above: `sql` is built only from compile-time
-    // constant fragments, never from runtime input.
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
@@ -140,11 +114,6 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
         let schema: String = row.try_get("nspname").map_err(map_introspect_error)?;
         let name: String = row.try_get("relname").map_err(map_introspect_error)?;
         let relkind: String = row.try_get("relkind").map_err(map_introspect_error)?;
-        // The query's own `relkind IN (...)` filter already restricts rows to
-        // the four kinds `relation_kind` maps; a row this defensive `None`
-        // branch would skip should therefore never actually occur, but
-        // skipping (instead of panicking or guessing a kind) keeps this code
-        // correct even if that filter and this match ever drift apart.
         let Some(kind) = relation_kind(&relkind) else {
             continue;
         };
@@ -157,10 +126,7 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
     Ok(grouped)
 }
 
-/// Map a `pg_class.relkind` code to the neutral [`RelationKind`]. A
-/// partitioned table's own `pg_class` row (`p`) is distinct from an ordinary
-/// table (`r`); its partitions are separate rows, each an ordinary table,
-/// enumerated like any other table if not excluded by schema.
+/// Map a `pg_class.relkind` code to the neutral [`RelationKind`].
 fn relation_kind(relkind: &str) -> Option<RelationKind> {
     match relkind {
         "r" => Some(RelationKind::Table),
@@ -173,8 +139,7 @@ fn relation_kind(relkind: &str) -> Option<RelationKind> {
 
 /// Every column of every table/view/matview across all non-system schemas,
 /// grouped by `(schema name, relation name)`. Within each group, columns are
-/// in the order the query returned them: ordinal position, since the query
-/// orders by `(nspname, relname, attnum)` — never alphabetical.
+/// in ordinal position
 async fn columns(
     conn: &mut PgConnection,
 ) -> Result<HashMap<(String, String), Vec<ColumnMeta>>, CoreError> {
@@ -190,8 +155,7 @@ async fn columns(
            AND {NAMESPACE_FILTER} \
          ORDER BY n.nspname, c.relname, a.attnum"
     );
-    // See `schema_names` above: `sql` is built only from compile-time
-    // constant fragments, never from runtime input.
+    //`sql` is built only from compile-time constant fragments
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
@@ -221,12 +185,6 @@ mod tests {
     use super::relation_kind;
     use zsql_core::RelationKind;
 
-    /// Pins the `pg_class.relkind` -> [`RelationKind`] mapping without a
-    /// database: an ordinary table surfaces as `Table`, a partitioned table
-    /// as its own distinct `Partitioned`, a view as `View`, a materialized
-    /// view as `MatView`, and any other code (e.g. `i` for index, `S` for
-    /// sequence) as `None` so `relations`/`columns` skip it instead of
-    /// guessing at a kind.
     #[test]
     fn maps_every_relkind_code() {
         assert_eq!(relation_kind("r"), Some(RelationKind::Table));

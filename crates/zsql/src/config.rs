@@ -1,6 +1,5 @@
 //! Application configuration: theme placeholder, query limits, and the other
-//! constants that must never be hardcoded at call sites. Loaded from TOML with
-//! defaults; missing file is not an error.
+//! constants
 
 use std::path::{Path, PathBuf};
 

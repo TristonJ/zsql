@@ -1,28 +1,15 @@
 //! Mapping from `sqlx::Error` to the driver-agnostic [`zsql_core::CoreError`].
-//!
-//! `zsql-core` must never see a `sqlx` type, so every fallible sqlx call in
-//! this crate funnels its error through [`map_connect_error`] before it can
-//! cross the trait boundary. The mapped message is built from sqlx's own
-//! `Display` output plus a short category prefix; the mapper itself never
-//! appends the connection string. It does not scrub the underlying sqlx
-//! error's own text, so if some future sqlx error variant embedded a DSN in
-//! its `Display` output, that text would still surface here unredacted.
 
 use zsql_core::CoreError;
 
 /// Convert a `sqlx::Error` encountered while establishing (or verifying) a
 /// connection into a [`CoreError::Connection`], with a short, useful
-/// description. The mapper adds no connection string of its own; it only
-/// prepends a category prefix to sqlx's own `Display` text.
-///
-/// Takes ownership (rather than `&sqlx::Error`) because its only call site is
-/// `Result::map_err`, which hands over the error by value.
+/// description
 pub(crate) fn map_connect_error(err: sqlx::Error) -> CoreError {
     CoreError::Connection(describe(err))
 }
 
-/// Render a short, useful description of a connect-phase sqlx error. Adds a
-/// category prefix but introduces no connection string of its own.
+/// Render a short, useful description of a connect-phase sqlx error.
 fn describe(err: sqlx::Error) -> String {
     match err {
         sqlx::Error::Database(db_err) => {
@@ -36,17 +23,12 @@ fn describe(err: sqlx::Error) -> String {
         sqlx::Error::PoolTimedOut => "timed out waiting for a pooled connection".to_owned(),
         sqlx::Error::PoolClosed => "connection pool is closed".to_owned(),
         sqlx::Error::WorkerCrashed => "connection pool background worker crashed".to_owned(),
-        // `sqlx::Error` is `#[non_exhaustive]`; every named variant relevant
-        // to the connect phase is matched above, so this is a real catch-all
-        // for whatever sqlx adds later, not dead code.
         other => format!("connection failed: {other}"),
     }
 }
 
 /// Convert a `sqlx::Error` encountered while streaming a query's results
-/// into a [`CoreError::Query`], with a short, useful description. Like
-/// [`map_connect_error`], it adds no SQL text or connection string of its
-/// own; it only summarizes the sqlx error itself with a category prefix.
+/// into a [`CoreError::Query`], with a short, useful description.
 pub(crate) fn map_query_error(err: sqlx::Error) -> CoreError {
     CoreError::Query(describe_query(err))
 }
@@ -67,17 +49,12 @@ fn describe_query(err: sqlx::Error) -> String {
         sqlx::Error::PoolTimedOut => "timed out waiting for a pooled connection".to_owned(),
         sqlx::Error::PoolClosed => "connection pool is closed".to_owned(),
         sqlx::Error::WorkerCrashed => "connection pool background worker crashed".to_owned(),
-        // `sqlx::Error` is `#[non_exhaustive]`; every named variant relevant
-        // to the query phase is matched above, so this is a real catch-all
-        // for whatever sqlx adds later, not dead code.
         other => format!("query failed: {other}"),
     }
 }
 
 /// Convert a `sqlx::Error` encountered while introspecting the schema into a
-/// [`CoreError::Introspection`], with a short, useful description. Like
-/// [`map_connect_error`], it adds no SQL text or connection string of its
-/// own; it only summarizes the sqlx error itself with a category prefix.
+/// [`CoreError::Introspection`], with a short, useful description.
 pub(crate) fn map_introspect_error(err: sqlx::Error) -> CoreError {
     CoreError::Introspection(describe_introspect(err))
 }
@@ -101,9 +78,6 @@ fn describe_introspect(err: sqlx::Error) -> String {
         sqlx::Error::PoolTimedOut => "timed out waiting for a pooled connection".to_owned(),
         sqlx::Error::PoolClosed => "connection pool is closed".to_owned(),
         sqlx::Error::WorkerCrashed => "connection pool background worker crashed".to_owned(),
-        // `sqlx::Error` is `#[non_exhaustive]`; every named variant relevant
-        // to introspection is matched above, so this is a real catch-all for
-        // whatever sqlx adds later, not dead code.
         other => format!("introspection failed: {other}"),
     }
 }
@@ -130,11 +104,6 @@ mod tests {
 
     #[test]
     fn io_error_maps_to_connection_error_with_network_prefix_and_no_added_dsn() {
-        // The mapper adds no connection string of its own: it only prepends
-        // a fixed category prefix to whatever the underlying io error says.
-        // This test uses a DSN-free io error precisely so the assertion can
-        // prove that property -- if the mapper appended a DSN, it would show
-        // up here even though this io error never mentioned one.
         let io_err = std::io::Error::other("connect failed: connection refused");
         let mapped = map_connect_error(sqlx::Error::Io(io_err));
         match mapped {
@@ -176,8 +145,6 @@ mod tests {
 
     #[test]
     fn io_error_maps_to_query_error_with_network_prefix_and_no_added_dsn() {
-        // Same guarantee as the connect-side test above: the mapper adds no
-        // connection string of its own, only a fixed category prefix.
         let io_err = std::io::Error::other("connect failed: connection refused");
         let mapped = map_query_error(sqlx::Error::Io(io_err));
         match mapped {

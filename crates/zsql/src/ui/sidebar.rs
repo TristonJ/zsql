@@ -1,28 +1,6 @@
 //! The schema sidebar: a tree of the connected database's catalog ->
 //! schema -> relation structure, driven by a `Session`'s introspected
-//! [`SchemaTree`]. Clicking a relation previews it into the results grid.
-//!
-//! Disclosure is ASCII-only (`v` expanded, `>` collapsed) and every kind
-//! label is plain text (`table`/`view`/`matview`/`partitioned`) rather than
-//! a glyph icon, per this crate's ASCII-only source convention; icons are a
-//! later polish.
-//!
-//! This view holds an `Entity<Session>` and reads `session.schema()` fresh
-//! on every sync rather than receiving a cloned `SchemaTree`, the same
-//! entity-read pattern `ui::results::ResultsView` uses for its `Session`.
-//! Expand/collapse state lives entirely in this view (`collapsed_catalogs`/
-//! `collapsed_schemas`); the flattened, currently-visible row list
-//! (`rows`) is cached and only recomputed when the session's schema
-//! changes or a disclosure is toggled, and only the rows actually scrolled
-//! into view are ever built into elements (`uniform_list`), so this stays
-//! efficient for a schema with many relations.
-//!
-//! `Session` notifies on every `QueryEvent` a streaming preview query emits,
-//! not only when its schema changes (e.g. once per batch while rows are
-//! still arriving). This view's `cx.observe` callback therefore compares
-//! `Session::schema_generation()` against the generation it last flattened
-//! and skips re-flattening entirely when it is unchanged, so a streaming
-//! preview never re-walks the (unchanged) schema tree once per batch.
+//! [`SchemaTree`]
 
 use std::collections::HashSet;
 
@@ -38,9 +16,7 @@ use crate::session::{SchemaState, Session};
 
 /// One flattened, currently-visible sidebar row. Built by
 /// [`flatten_schema_tree`] from a `SchemaTree` plus the view's collapse
-/// state; owns small copies of the names it needs (never the whole tree),
-/// so rebuilding this list is proportional to the number of *visible* rows,
-/// not the size of a collapsed subtree.
+/// state
 #[derive(Debug, Clone, PartialEq)]
 enum SidebarRow {
     /// A catalog (database) row.
@@ -75,23 +51,13 @@ pub struct SidebarView {
     selected_relation: Option<(String, String)>,
     rows: Vec<SidebarRow>,
     /// The session's `schema_generation()` as of the last time `rows` was
-    /// rebuilt from it. Lets the `cx.observe` callback tell "the schema
-    /// itself changed" apart from "the session notified for some other
-    /// reason" without diffing or cloning the `SchemaTree`.
+    /// rebuilt from it
     synced_schema_generation: u64,
 }
 
 impl SidebarView {
     /// Build a sidebar over `session`, previewing clicked relations into
     /// `results`.
-    ///
-    /// Subscribes to `session` for the lifetime of this view: whenever
-    /// `session`'s `schema_generation()` has advanced since the last sync
-    /// (including once introspection completes or fails), this re-syncs the
-    /// flattened row list from its latest `schema()` state. A `cx.notify()`
-    /// the session fires for an unrelated reason (e.g. a streaming preview
-    /// query's batches) leaves the schema generation unchanged and is
-    /// skipped.
     #[must_use]
     pub fn new(
         session: Entity<Session>,
@@ -120,14 +86,7 @@ impl SidebarView {
 
     /// Rebuild `rows` from the session's current schema state and this
     /// view's collapse sets, and record the schema generation it was built
-    /// from. Everything is expanded by default (nothing in
-    /// `collapsed_catalogs`/`collapsed_schemas` yet), so a freshly
-    /// introspected tree shows its relations immediately without requiring
-    /// any clicks. Always re-flattens regardless of generation -- callers
-    /// that already know the schema (or the collapse state) changed, such as
-    /// `toggle_catalog`/`toggle_schema` and the initial build in `new`,
-    /// should call this directly; [`Self::sync_rows_if_schema_changed`] is
-    /// for the generation-gated `cx.observe` path.
+    /// from
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
         self.synced_schema_generation = session.schema_generation();
@@ -141,8 +100,7 @@ impl SidebarView {
 
     /// Re-flatten `rows` only if the session's schema has actually changed
     /// since the last sync. Returns whether it did (and thus whether `rows`
-    /// was rebuilt), so the `cx.observe` callback knows whether a
-    /// `cx.notify()` of its own is warranted.
+    /// was rebuilt)
     fn sync_rows_if_schema_changed(&mut self, cx: &mut Context<Self>) -> bool {
         let current_generation = self.session.read(cx).schema_generation();
         if current_generation == self.synced_schema_generation {
@@ -411,20 +369,17 @@ fn disclosure_glyph(expanded: bool) -> Div {
         .child(if expanded { "v" } else { ">" })
 }
 
-/// Blank space the width of a disclosure glyph, keeping a leaf relation
-/// row's label aligned with its parent schema's disclosure-bearing rows.
+/// Blank space the width of a disclosure glyph
 fn disclosure_spacer() -> Div {
     div().flex_shrink_0().w(px(theme::SIDEBAR_DISCLOSURE_WIDTH))
 }
 
-/// A row's primary label, truncating rather than wrapping or overflowing.
+/// A row's primary label
 fn row_label(text: impl Into<SharedString>) -> Div {
     div().flex_1().min_w_0().truncate().child(text.into())
 }
 
-/// A row's trailing affordance (a relation/column count), right-aligned via
-/// `ml_auto` when it is the first such child, and otherwise simply
-/// following the previous one.
+/// A row's trailing affordance (a relation/column count)
 fn row_meta(text: impl Into<SharedString>) -> Div {
     div()
         .flex_shrink_0()
@@ -436,10 +391,7 @@ fn row_meta(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// A relation row's kind label (table/view/matview/partitioned): smaller
-/// than [`row_count`]'s text, and always the first trailing affordance, so
-/// it alone carries the `ml_auto` that pushes the whole trailing group
-/// (kind label + column count) to the row's right edge.
+/// A relation row's kind label (table/view/matview/partitioned)
 fn row_kind(text: impl Into<SharedString>) -> Div {
     div()
         .flex_shrink_0()
@@ -452,8 +404,6 @@ fn row_kind(text: impl Into<SharedString>) -> Div {
 }
 
 /// A relation row's column count, following [`row_kind`] in normal flow
-/// (no `ml_auto` of its own -- `row_kind` already pushed the pair to the
-/// right edge).
 fn row_count(text: impl Into<SharedString>) -> Div {
     div()
         .flex_shrink_0()
@@ -475,9 +425,7 @@ fn kind_label(kind: RelationKind) -> &'static str {
 }
 
 /// Flatten `tree` into the currently-visible sidebar rows, honoring which
-/// catalogs/schemas are collapsed. A collapsed node's descendants are never
-/// walked, so this costs time proportional to the rows actually produced,
-/// not the full size of a schema with many collapsed relations.
+/// catalogs/schemas are collapsed
 fn flatten_schema_tree(
     tree: &SchemaTree,
     collapsed_catalogs: &HashSet<String>,
@@ -697,11 +645,6 @@ mod tests {
     }
 }
 
-/// gpui headless render-smoke tests: no assertion on rendered content, only
-/// that building and painting one frame over each `SchemaState` (and a
-/// populated `SchemaTree`) never panics. Uses `TestAppContext`'s
-/// `TestPlatform` (a headless mock of the platform layer), so this needs no
-/// real display server, matching `ui::results`'s render tests.
 #[cfg(test)]
 mod render_tests {
     use gpui::AppContext as _;
@@ -780,11 +723,6 @@ mod render_tests {
         }
     }
 
-    /// Pins the guard `sync_rows_if_schema_changed` adds: a session
-    /// `cx.notify()` that does not advance `schema_generation` (e.g. one
-    /// fired mid-stream by a preview query's `QueryEvent`s) must leave the
-    /// sidebar's cached `rows`/`synced_schema_generation` exactly as they
-    /// were, not re-flatten the (unchanged) schema tree.
     #[gpui::test]
     fn an_unrelated_session_notify_does_not_reflatten_the_row_cache(cx: &mut gpui::TestAppContext) {
         let session =
@@ -823,10 +761,6 @@ mod render_tests {
         );
     }
 
-    /// Pins AC3's click-to-preview glue end to end at the view layer: a
-    /// clicked relation must both mark itself selected on the sidebar and
-    /// set the results grid's source label to the qualified
-    /// `schema.relation` name, not just dispatch the preview query.
     #[gpui::test]
     fn preview_selects_the_relation_and_sets_the_results_source_label(
         cx: &mut gpui::TestAppContext,
@@ -855,9 +789,6 @@ mod render_tests {
         });
     }
 
-    /// Pins AC2's "expand/collapse state lives in the view": collapsing a
-    /// catalog or schema drops its descendants from `rows` and records the
-    /// collapse; toggling again restores both.
     #[gpui::test]
     fn toggling_a_catalog_or_schema_collapses_then_re_expands(cx: &mut gpui::TestAppContext) {
         let session =

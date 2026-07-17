@@ -1,6 +1,6 @@
 //! The Postgres [`Driver`] and its live [`Connection`] implementation, built
 //! on sqlx with the **smol** runtime so its futures await directly on gpui's
-//! executor — no tokio runtime, no bridge thread.
+//! executor
 
 use std::time::Duration;
 
@@ -19,10 +19,7 @@ use crate::values::{column_metas, decode_row};
 /// Rows are grouped into batches of at most this many rows before a
 /// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
 /// set streams to the UI incrementally instead of arriving as one huge
-/// allocation. This is an internal placeholder default: threading the app's
-/// configured batch size through from `Config` into the driver happens at
-/// the layer that wires a session's `Connection` up to its `Config`, not
-/// here.
+/// allocation. This is an internal placeholder default
 const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
 
 /// Bounded pool size for a single desktop client. Small on purpose: this app
@@ -32,8 +29,7 @@ const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
 const MAX_POOL_CONNECTIONS: u32 = 5;
 
 /// How long to wait for the initial connection (and later, a free pooled
-/// connection) before giving up. Bounded so a stuck DSN fails fast instead of
-/// hanging the caller indefinitely.
+/// connection) before giving up.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded size of the dedicated pool [`issue_server_side_cancel`] draws
@@ -76,14 +72,11 @@ impl PostgresDriver {
     /// necessarily free its permit back to the query pool right away:
     /// returning a pooled connection first pings it to confirm it is idle
     /// before the permit is released, and that ping itself blocks until the
-    /// backend actually responds -- exactly the kind of response a
-    /// still-blocked query withholds until a server-side cancel reaches it.
+    /// backend actually responds.
     /// If cancellation drew its own connection from that same pool, several
     /// blocked-then-cancelled queries saturating every permit could starve
     /// the very connection needed to unblock any of them, deadlocking the
-    /// pool for the queries' full natural duration. Drawing from an
-    /// entirely separate, independently-bounded pool means issuing a cancel
-    /// can never be blocked by query-pool saturation.
+    /// pool for the queries' full natural duration.
     ///
     /// Connects lazily: parsing/validating `url` cannot fail asynchronously
     /// here, so this is synchronous, and no network round trip happens
@@ -140,23 +133,14 @@ impl Driver for PostgresDriver {
 pub struct PgConnection {
     pool: PgPool,
     /// Separate, independently-bounded pool used only for server-side
-    /// cancellation (`SELECT pg_cancel_backend($pid)`). Never draws from
-    /// `pool` -- see [`PostgresDriver::build_cancel_pool`] for why sharing
-    /// one pool between running queries and their own cancellation is
-    /// unsafe.
+    /// cancellation (`SELECT pg_cancel_backend($pid)`)
     cancel_pool: PgPool,
 }
 
 /// Issue `SELECT pg_cancel_backend($pid)` on a connection acquired fresh
-/// from `cancel_pool` -- deliberately *not* the connection running the query
-/// being cancelled, which may be blocked server-side and unable to answer
-/// anything until the cancel itself takes effect, and deliberately *not* the
-/// shared query pool either (see [`PostgresDriver::build_cancel_pool`]) so
-/// this can never be starved by other queries that pool is busy running or
-/// cancelling. Best-effort: any failure (including the target backend having
-/// already finished on its own) is logged and swallowed here, never
-/// surfaced to the query's sink -- a query that finishes naturally in the
-/// small window before this fires is a success, not an error.
+/// from `cancel_pool`.
+/// Best-effort: any failure (including the target backend having
+/// already finished on its own) is logged and swallowed here.
 #[tracing::instrument(name = "pg_cancel_backend", skip(cancel_pool))]
 async fn issue_server_side_cancel(cancel_pool: &PgPool, pid: i32) {
     match sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
@@ -189,10 +173,6 @@ impl Connection for PgConnection {
         let pool = self.pool.clone();
         let cancel_pool = self.cancel_pool.clone();
         // Run on the smol-based executor sqlx's `runtime-smol` feature
-        // already drives its own futures with, so this never needs (or
-        // creates) a tokio runtime. The returned `Task` is detached: the
-        // caller drives the query lifecycle through `sink` and `cancel_rx`
-        // (via the returned `QueryHandle`), not by awaiting this task.
         async_global_executor::spawn(run_query(pool, cancel_pool, sql, sink, cancel_rx)).detach();
         QueryHandle::new(cancel_tx)
     }
@@ -211,39 +191,18 @@ impl Connection for PgConnection {
 /// Runs on a single connection acquired from `pool` for the lifetime of this
 /// call (not the pool directly), so that connection's backend PID can be
 /// captured via `SELECT pg_backend_pid()` *before* the row-streaming loop
-/// below ever starts checking `cancel_rx`. That ordering is what makes the
-/// PID capture and cancellation-observed steps purely sequential within this
-/// one task rather than a race to guard against: by the time this task can
-/// possibly observe a cancellation, the PID is either already known (the
-/// common case) or capture already failed and never will be (in which case
-/// only cooperative cancellation applies below; the server-side cancel is
-/// simply unavailable for this one query). Cancelling means running `SELECT
-/// pg_cancel_backend($pid)` for that PID on `cancel_pool` -- a separate pool
-/// from `pool` (see [`PostgresDriver::build_cancel_pool`]) -- which is the
-/// only way to actually interrupt work already blocked server-side
-/// (dropping/ignoring this task alone only stops the client from reading
-/// further rows).
-///
-/// The rows themselves are fetched with [`sqlx::raw_sql`] (Postgres's simple
-/// query protocol) rather than a prepared statement, which keeps every
-/// column's wire representation in text format — see [`crate::values`] for
-/// why that matters for decoding types this driver does not explicitly map.
-/// The simple query protocol also accepts `sql` containing more than one
-/// `;`-separated statement (their results concatenate), unlike a `PREPARE`
-/// / describe cycle, which can only parse one statement at a time.
+/// below ever starts checking `cancel_rx`.
 ///
 /// Column metadata for `Columns` is therefore taken from the first row any
 /// statement in `sql` produces (a [`sqlx::postgres::PgRow`] carries its own
-/// column list), not from an upfront describe: an upfront describe would
-/// reject any multi-statement `sql` even though the simple protocol executes
-/// it fine. If no statement ever produces a row (DDL, DML without
-/// `RETURNING`, or a zero-row `SELECT`), a describe is run as a fallback
-/// *after* execution has already completed successfully, purely to recover
-/// a zero-row `SELECT`'s column list; if that fallback describe itself
-/// fails (for instance because `sql` was multiple statements and none of
-/// them produced a row), the query has already succeeded, so this degrades
-/// to reporting no columns rather than failing an otherwise-successful
-/// query at this late stage.
+/// column list), not from an upfront describe. If no statement ever produces
+/// a row (DDL, DML without `RETURNING`, or a zero-row `SELECT`), a describe
+/// is run as a fallback *after* execution has already completed successfully,
+/// purely to recover a zero-row `SELECT`'s column list; if that fallback
+/// describe itself fails (for instance because `sql` was multiple statements
+/// and none of them produced a row), the query has already succeeded, so this
+/// degrades to reporting no columns rather than failing an
+/// otherwise-successful query.
 #[tracing::instrument(name = "pg_stream_query", skip_all, fields(pool_size = pool.size()))]
 async fn run_query(
     pool: PgPool,
@@ -265,11 +224,7 @@ async fn run_query(
     };
 
     // Capture this connection's backend PID so a later cancel can target it
-    // via `pg_cancel_backend` on `cancel_pool`. This always runs to
-    // completion (success or failure) before the row-streaming loop below
-    // ever checks `cancel_rx`, so `pid` is settled -- known or permanently
-    // unknown -- before cancellation can be observed; see this function's
-    // doc comment for why that ordering means no race needs guarding here.
+    // via `pg_cancel_backend` on `cancel_pool`
     let pid = match sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
         .fetch_one(&mut *conn)
         .await
@@ -297,25 +252,11 @@ async fn run_query(
     let mut columns_sent = false;
 
     loop {
-        // `futures::future::select` polls its first argument before its
-        // second, and only polls the second if the first is `Pending` — so
-        // the cancellation check goes first here. `rows.next()` can stay
-        // synchronously `Ready` for many consecutive polls once the client
-        // has a chunk of the wire response already buffered (no real
-        // `Pending` point to yield at), which would starve a cancellation
-        // future placed second indefinitely, up to the whole result set
-        // draining before cancellation is ever observed.
         let step = futures::future::select(cancel_rx.recv_async(), rows.next());
         match step.await {
             futures::future::Either::Left(_) => {
                 // Cancelled: either an explicit `cancel()` call or every
                 // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
-                // Stop fetching further rows; `rows` (and then `conn`) are
-                // dropped when this function returns, releasing the
-                // connection back to the pool. That alone only stops this
-                // client from reading further rows -- it does not interrupt
-                // work already running server-side, which is why the
-                // server-side cancel below is also needed.
                 tracing::debug!("query cancelled");
                 if let Some(pid) = pid {
                     spawn_server_side_cancel(&cancel_pool, pid);
@@ -358,9 +299,7 @@ async fn run_query(
     // reports its row count as `affected` in `Done`. A statement that does
     // produce columns (SELECT, or DML with `RETURNING`) instead lets the
     // caller derive a count from the rows it already streamed, and reports
-    // `affected: None` — matching `QueryEvent::Done`'s doc comment that
-    // `affected` is for non-SELECT statements. When no row was ever seen,
-    // that distinction is only recoverable via the describe fallback below.
+    // `affected: None`
     let reports_affected = if columns_sent {
         false
     } else {
@@ -387,10 +326,8 @@ async fn run_query(
     let _ = sink.send_async(Ok(QueryEvent::Done { affected })).await;
 }
 
-/// Build a pool for `url` and run a trivial liveness query while driven by a
-/// non-tokio executor. Returns the value of `SELECT 1`. Used by the app shell
-/// as a lightweight standalone connectivity check independent of the
-/// `Driver`/`Connection` trait objects.
+/// Build a pool for `url` and run a trivial liveness query. Returns
+/// the value of `SELECT 1`
 ///
 /// # Errors
 /// Returns an error if the connection or query fails.
@@ -410,11 +347,6 @@ mod tests {
 
     use super::{PgConnection, PostgresDriver};
 
-    /// A host that can never resolve (`.invalid` is reserved by RFC 2606),
-    /// so DNS lookup fails immediately. Deliberately not a "connection
-    /// refused" address: sqlx's pool treats a refused connection as the
-    /// server still starting up and retries with backoff until the acquire
-    /// timeout, which would make this test slow for no benefit.
     const UNREACHABLE_DSN: &str = "postgres://user:pass@zsql-test-nonexistent-host.invalid/db";
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -468,12 +400,6 @@ mod tests {
         };
     }
 
-    /// `introspect` must map a `sqlx` failure to `CoreError::Introspection`
-    /// without panicking or hanging, exactly like `stream_query` does above:
-    /// a lazily-connected pool to an unreachable host never touches the
-    /// network until the first real query, which here is inside
-    /// `introspect` itself. Deliberately not gated on
-    /// `ZSQL_TEST_DATABASE_URL`: this must pass with no database present.
     #[test]
     fn introspect_maps_unreachable_host_to_core_introspection_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -492,12 +418,6 @@ mod tests {
         }
     }
 
-    /// Builds a [`SchemaTree`] against the seeded dev database
-    /// (`scripts/pg-dev.sh` + `dev/seed.sql`) and checks it against what that
-    /// seed is known to contain: a `public` schema with `users` and `orders`
-    /// tables, a `recent_orders` view, a `recent_orders_mv` materialized
-    /// view, and a partitioned `events` table; no system schemas; and a
-    /// couple of columns whose nullability is known from the seed's DDL.
     #[test]
     fn introspect_builds_schema_tree_matching_the_seeded_database_when_configured() {
         let Some(url) = live_database_url() else {
@@ -556,9 +476,6 @@ mod tests {
             .expect("the seeded recent_orders view is present");
         assert_eq!(recent_orders.kind, zsql_core::RelationKind::View);
 
-        // The only seeded object with `pg_class.relkind = 'm'`: proves the
-        // materialized-view arm of the mapping actually fires against a
-        // live server, not just in the offline `relation_kind` unit test.
         let recent_orders_mv = public
             .tables
             .iter()
@@ -566,9 +483,6 @@ mod tests {
             .expect("the seeded recent_orders_mv materialized view is present");
         assert_eq!(recent_orders_mv.kind, zsql_core::RelationKind::MatView);
 
-        // The only seeded object with `pg_class.relkind = 'p'`: proves the
-        // partitioned-table arm of the mapping surfaces as its own distinct
-        // kind, and that its partition is enumerated as its own table.
         let events = public
             .tables
             .iter()
@@ -607,9 +521,6 @@ mod tests {
         );
     }
 
-    /// Schemas must be sorted by name, relations sorted by name within a
-    /// schema, and columns in ordinal-position order (not alphabetical) —
-    /// otherwise the sidebar this feeds would reorder on every refresh.
     #[test]
     fn introspect_orders_schemas_relations_and_columns_deterministically_when_configured() {
         let Some(conn) = live_connection() else {
@@ -653,10 +564,6 @@ mod tests {
         );
     }
 
-    /// Introspection must walk every non-system schema, not just `public`:
-    /// the seeded `analytics` schema (with a table) and `empty_ns` schema
-    /// (with none) must both appear, `empty_ns` with an empty relation list
-    /// rather than being dropped for having nothing in it.
     #[test]
     fn introspect_includes_non_public_schemas_including_an_empty_one_when_configured() {
         let Some(conn) = live_connection() else {
@@ -693,14 +600,6 @@ mod tests {
         );
     }
 
-    /// Column attribution keys columns by `(schema, relation)`, not relation
-    /// name alone. `public.users` and `analytics.users` are two different
-    /// tables that only share a name (see `dev/seed.sql`); if columns were
-    /// ever matched back by relation name alone instead of the full
-    /// `(schema, relation)` pair, one of these two tables would silently end
-    /// up with the other's columns (or none at all) the moment a name
-    /// collision like this exists, even though every other seeded relation
-    /// name is unique and so would not catch that regression.
     #[test]
     fn introspect_attributes_columns_by_schema_and_relation_not_name_alone_when_configured() {
         let Some(conn) = live_connection() else {
@@ -750,20 +649,11 @@ mod tests {
         );
     }
 
-    /// Extract the database name (last path segment, query string stripped)
-    /// from a Postgres URL, to compare against a live-introspected catalog
-    /// name without hardcoding the seeded dev database's name in the test.
     fn database_name_from_url(url: &str) -> &str {
         let after_slash = url.rsplit('/').next().unwrap_or_default();
         after_slash.split('?').next().unwrap_or(after_slash)
     }
 
-    /// A pool that connects lazily never touches the network until first
-    /// use, so this builds a `PgConnection` directly (bypassing
-    /// `PostgresDriver::connect`, which would fail during its own eager
-    /// liveness check) to exercise `stream_query`'s error path in isolation:
-    /// the background task's first real query — `pool.prepare(..)` — is what
-    /// discovers the host is unreachable.
     #[test]
     fn stream_query_pushes_single_error_when_pool_is_unreachable() {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -790,9 +680,6 @@ mod tests {
         );
     }
 
-    /// Runs a query with one column of each mapped type plus a NULL, an
-    /// array, and a JSON value, and asserts both the event sequence
-    /// (`Columns` -> `Batch`(es) -> `Done`) and the decoded `Value`s.
     #[test]
     fn stream_query_maps_a_representative_type_spread_when_configured() {
         let Some(conn) = live_connection() else {
@@ -837,8 +724,6 @@ mod tests {
                 other => panic!("unexpected event mid-stream: {other:?}"),
             }
         };
-        // A SELECT reports its row count through the streamed rows
-        // themselves, not `affected`.
         assert_eq!(affected, None);
 
         assert_eq!(rows.len(), 1, "the query returns exactly one row");
@@ -864,11 +749,6 @@ mod tests {
                 zsql_core::Value::Int(3),
             ])
         );
-        // Postgres's own `jsonb` text output (`{"a": 1}`, with a space after
-        // the colon), not a serde_json re-serialization: decoding jsonb as a
-        // raw string preserves exactly what the server holds instead of
-        // risking precision loss or key reordering from a round-trip through
-        // `serde_json::Value`.
         assert_eq!(cells[11], zsql_core::Value::Json("{\"a\": 1}".to_owned()));
         assert_eq!(cells[12], zsql_core::Value::Bytes(vec![0x01, 0x02]));
         assert_eq!(
@@ -889,9 +769,6 @@ mod tests {
             zsql_core::Value::Timestamp("2024-01-15T13:45:30+00:00".to_owned()),
             "timestamptz renders as RFC3339"
         );
-        // interval is not an explicitly mapped type: it must degrade to
-        // Value::Unknown via the raw-text fallback rather than erroring the
-        // whole query. This is the "never errors on an unmapped type" guarantee.
         assert!(
             matches!(cells[17], zsql_core::Value::Unknown(_)),
             "an unmapped type (interval) must decode to Value::Unknown, got {:?}",
@@ -899,19 +776,6 @@ mod tests {
         );
     }
 
-    /// `json`/`jsonb` scalars and their 1-D array forms (`json[]`/`jsonb[]`)
-    /// must decode as `Value::Json` holding the server's own text, never a
-    /// `serde_json`-reserialized copy. This is checked three ways: (1) a
-    /// `jsonb` object whose two keys sort differently by length-then-byte
-    /// order (Postgres's own canonical `jsonb` key order) than
-    /// alphabetically — a `serde_json::Value` round trip through its
-    /// default `BTreeMap`-backed object would alphabetize and so diverge
-    /// from Postgres's actual canonical text; (2) a `jsonb` integer wider
-    /// than `i64`/`f64`, which a `serde_json::Value` round trip (no
-    /// `arbitrary_precision` feature enabled in this workspace) would
-    /// corrupt; (3) a `json` (not `jsonb`) scalar with irregular whitespace,
-    /// which `json` (unlike `jsonb`) preserves verbatim — any reformatting
-    /// proves a reserialization happened.
     #[test]
     fn stream_query_maps_json_and_jsonb_scalars_and_arrays_when_configured() {
         let Some(conn) = live_connection() else {
@@ -948,8 +812,6 @@ mod tests {
 
         // Postgres's own canonical order for these two keys is length-then-
         // byte-order ("b" before "aa"), not alphabetical ("aa" before "b").
-        // Getting this exact string proves no `BTreeMap`-backed
-        // `serde_json::Value` round trip happened.
         assert_eq!(
             cells[0],
             zsql_core::Value::Json("{\"b\": 2, \"aa\": 1}".to_owned()),
@@ -985,11 +847,6 @@ mod tests {
         );
     }
 
-    /// Two `;`-separated statements must both run and have their rows
-    /// concatenated into the stream, proving `Columns` no longer comes from
-    /// an upfront `PREPARE`-style describe (which can only parse a single
-    /// statement and would error on input like this before either statement
-    /// ever executes).
     #[test]
     fn stream_query_supports_multiple_semicolon_separated_statements_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1025,9 +882,6 @@ mod tests {
         );
     }
 
-    /// A result set larger than the batch size must arrive as multiple
-    /// `Batch` events, each bounded by `DEFAULT_QUERY_BATCH_SIZE`, whose rows
-    /// concatenate back to the full result.
     #[test]
     fn stream_query_batches_large_result_sets_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1076,8 +930,6 @@ mod tests {
         );
     }
 
-    /// A statement with no output columns (here, an `UPDATE`) reports its
-    /// row count through `Done { affected }` instead of streaming rows.
     #[test]
     fn stream_query_reports_affected_rows_for_dml_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1104,8 +956,6 @@ mod tests {
         }
     }
 
-    /// A zero-row result set must still emit `Columns` before `Done`, with
-    /// no `Batch` events in between.
     #[test]
     fn stream_query_emits_columns_for_a_zero_row_result_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1125,9 +975,6 @@ mod tests {
         }
     }
 
-    /// Dropping the `QueryHandle` (here, its only clone) must promptly stop
-    /// the background task from fetching further rows: a long-running query
-    /// should not be able to push a `Done` after its handle is gone.
     #[test]
     fn dropping_the_query_handle_stops_further_rows_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1145,8 +992,7 @@ mod tests {
         }
         drop(handle);
 
-        // Drain whatever was already in flight; a `Done` must never appear,
-        // and the channel must settle (close) promptly instead of hanging.
+        // Drain whatever was already in flight
         loop {
             match rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(Ok(zsql_core::QueryEvent::Batch(_))) => {}
@@ -1165,11 +1011,6 @@ mod tests {
         }
     }
 
-    /// Calling `QueryHandle::cancel()` explicitly (handle kept alive, unlike
-    /// the drop case above) must also promptly stop the background task from
-    /// fetching further rows: this exercises the live-sender-delivers-a-value
-    /// path through `cancel_rx.recv_async()`, distinct from the
-    /// sender-all-dropped path the drop test covers.
     #[test]
     fn calling_cancel_stops_further_rows_when_configured() {
         let Some(conn) = live_connection() else {
@@ -1187,11 +1028,6 @@ mod tests {
         }
         handle.cancel();
 
-        // Drain whatever was already in flight; a `Done` must never appear,
-        // and the channel must settle (close) promptly instead of hanging.
-        // `handle` (and its `cancel_tx`) is kept alive for the whole loop, so
-        // this only passes if the explicit `cancel()` send is itself what
-        // stops the task, not a subsequent drop of the handle.
         loop {
             match rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(Ok(zsql_core::QueryEvent::Batch(_))) => {}
@@ -1211,15 +1047,6 @@ mod tests {
         drop(handle);
     }
 
-    /// Proves cancellation is server-side, not merely client-side: starts a
-    /// `pg_sleep(30)` (a query that only a signal delivered on the server can
-    /// interrupt -- no amount of the client simply not reading rows stops
-    /// it), cancels it, and then confirms via a *separate* connection's
-    /// `pg_stat_activity` that no backend is still actively running that
-    /// `pg_sleep` well within the 30s sleep bound. Also asserts the
-    /// streaming side never reaches `Done`, so both halves of the
-    /// cancellation contract (cooperative + server-side) are checked
-    /// together.
     #[test]
     fn cancel_stops_a_server_side_blocking_query_when_configured() {
         let Some(url) = live_database_url() else {
@@ -1232,18 +1059,11 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query("SELECT pg_sleep(30)".to_owned(), tx);
 
-        // The dedicated connection always captures its backend pid before
-        // this task ever checks for cancellation (see `run_query`'s doc
-        // comment), so this delay is not needed for that ordering. It exists
-        // so `pg_sleep` is genuinely in progress server-side by the time
-        // `cancel()` fires below, proving the assertions after this prove a
-        // cancel interrupting already-running server-side work, not a query
-        // that never got the chance to start.
+        // This delay exists so `pg_sleep` is genuinely in progress
+        // server-side by the time `cancel()` fires below
         std::thread::sleep(Duration::from_millis(500));
         handle.cancel();
 
-        // No `Done` (or anything else past what was already in flight) may
-        // ever arrive: cooperative cancellation must still hold.
         loop {
             match rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(Ok(zsql_core::QueryEvent::Done { .. })) => {
@@ -1272,11 +1092,8 @@ mod tests {
         while std::time::Instant::now() < deadline {
             // `pid <> pg_backend_pid()` excludes this very SELECT's own
             // backend: without it, this query would always match itself
-            // (its own `query` text contains the literal substring
-            // `pg_sleep` from the `LIKE` pattern below, and `pg_stat_activity`
-            // reports it as `state = 'active'` while it executes), making
-            // `still_running` never go false regardless of whether the
-            // real `pg_sleep` backend was cancelled.
+            // making `still_running` never go false regardless of whether
+            // the real `pg_sleep` backend was cancelled.
             let count: i64 = block_on(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT count(*) FROM pg_stat_activity \
@@ -1300,8 +1117,6 @@ mod tests {
     }
 
     /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
-    /// so callers can skip. Centralizes the skip-when-unset behavior all live
-    /// tests in this module share.
     fn live_database_url() -> Option<String> {
         let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
             eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");

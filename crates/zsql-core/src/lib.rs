@@ -1,6 +1,5 @@
 //! `zsql-core`: UI- and driver-agnostic domain types plus the pluggable driver
-//! contract. This crate depends on no UI framework and no database client, so
-//! every backend and every view speaks only in these neutral types.
+//! contract
 
 pub mod config;
 pub mod driver;

@@ -1,11 +1,4 @@
 //! Mapping from Postgres wire values to the engine-neutral [`zsql_core::Value`].
-//!
-//! `stream_query` executes with [`sqlx::raw_sql`], which always uses
-//! Postgres's simple query protocol and therefore always returns column data
-//! in **text** format. That means every column, known or not, always has a
-//! readable textual form available: types this module does not explicitly
-//! recognize still decode to [`Value::Unknown`] via that text instead of
-//! failing the whole query.
 
 use sqlx::postgres::{PgColumn, PgRow, PgValueFormat};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -39,8 +32,7 @@ pub(crate) fn decode_row(row: &PgRow) -> CoreRow {
 /// Decode a single column of `row` into a [`Value`], dispatching on the
 /// column's own runtime type name. Falls back to a raw text decode for any
 /// type this module does not explicitly recognize, or if a recognized-type
-/// decode unexpectedly fails — a novel or malformed column must never abort
-/// the whole query.
+/// decode unexpectedly fails
 fn decode_value(row: &PgRow, idx: usize) -> Value {
     let type_name = row.column(idx).type_info().name();
     known_value(row, idx, type_name).unwrap_or_else(|| raw_fallback(row, idx))
@@ -48,8 +40,7 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
 
 /// Attempt to decode `row[idx]` using a type-specific mapping. Returns
 /// `None` when the type name is not one this module maps (including array
-/// suffixes it does not recognize) or when decoding it unexpectedly errors,
-/// so the caller can fall back to a raw text decode either way.
+/// suffixes it does not recognize) or when decoding it unexpectedly errors
 fn known_value(row: &PgRow, idx: usize, type_name: &str) -> Option<Value> {
     match type_name {
         "BOOL" => scalar::<bool, _>(row, idx, Value::Bool),
@@ -87,16 +78,7 @@ fn known_value(row: &PgRow, idx: usize, type_name: &str) -> Option<Value> {
         // `String`'s sqlx `Type::compatible` only accepts text-family OIDs
         // (text/varchar/bpchar/name/unknown), not json/jsonb, so
         // `try_get::<String>` on a json/jsonb column always errors and would
-        // silently fall through to the raw-text `Unknown` fallback below —
-        // same text, wrong `Value` variant. `Json<Box<JsonRawValue>>`
-        // decodes as json/jsonb correctly (its `Type::compatible` accepts
-        // both), and `JsonRawValue` captures the server's own text
-        // untouched rather than parsing it into `serde_json::Value` and
-        // re-serializing: that round trip would risk losing precision on
-        // integers wider than `i64`/`f64` (no `arbitrary_precision` feature
-        // enabled here) and reordering object keys (its default
-        // `BTreeMap`-backed object sorts alphabetically, which does not
-        // match Postgres's own length-then-byte-order `jsonb` key order).
+        // silently fall through to the raw-text `Unknown` fallback below
         "JSON" | "JSONB" => scalar::<Json<Box<JsonRawValue>>, _>(row, idx, |v| json_text(&v)),
         "JSON[]" | "JSONB[]" => array::<Json<Box<JsonRawValue>>, _>(row, idx, |v| json_text(&v)),
         "BYTEA" => scalar::<Vec<u8>, _>(row, idx, Value::Bytes),
@@ -113,16 +95,13 @@ fn format_naive_timestamp(dt: NaiveDateTime) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
 }
 
-/// Extract a decoded json/jsonb value's raw text as a [`Value::Json`],
-/// owning a copy since the decoded [`Json`] wrapper is dropped at the end of
-/// the call site's closure.
+/// Extract a decoded json/jsonb value's raw text as a [`Value::Json`]
 fn json_text(value: &Json<Box<JsonRawValue>>) -> Value {
     Value::Json(value.0.get().to_owned())
 }
 
 /// Decode column `idx` as `Option<T>` and wrap it, treating SQL NULL as
 /// [`Value::Null`] and any decode error as "not this type after all" (`None`)
-/// so the caller falls back to a raw text decode instead of failing.
 fn scalar<T, F>(row: &PgRow, idx: usize, to_value: F) -> Option<Value>
 where
     T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
@@ -137,8 +116,7 @@ where
 
 /// Decode column `idx` as a 1-D Postgres array, `Option<Vec<Option<T>>>`,
 /// mapping element NULLs and the whole-array NULL to [`Value::Null`]. Any
-/// decode error is treated as "not this type after all" (`None`) so the
-/// caller falls back to a raw text decode instead of failing.
+/// decode error is treated as "not this type after all" (`None`)
 fn array<T, F>(row: &PgRow, idx: usize, to_value: F) -> Option<Value>
 where
     T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
@@ -158,10 +136,7 @@ where
 }
 
 /// Fallback decode for a column whose type this module does not map (or
-/// whose typed decode unexpectedly failed): read it as raw text. Since
-/// `stream_query` always executes via the simple query protocol, columns are
-/// always in text format in practice; the binary branch below is a defensive
-/// hex dump for correctness if that ever changes, not the expected path.
+/// whose typed decode unexpectedly failed): read it as raw text
 fn raw_fallback(row: &PgRow, idx: usize) -> Value {
     let Ok(raw) = row.try_get_raw(idx) else {
         return Value::Unknown(String::new());

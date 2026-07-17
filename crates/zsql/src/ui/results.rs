@@ -1,20 +1,5 @@
 //! The results grid: a virtualized table view over a `Session`'s current
-//! [`SessionState`] and accumulated result set. Renders a results header bar
-//! (row count + a source/relation label) above a sticky column-header row
-//! and a `gpui::uniform_list` body when results are available, and a
-//! centered prompt/status message for every other state (empty, connecting,
-//! connected-idle, running, error) — plus a bottom connection/status bar
-//! (connection state, row count, elapsed query time) reporting the same
-//! state, so nothing shown is ever fabricated.
-//!
-//! This view holds an `Entity<Session>` rather than a snapshot of its state:
-//! it reads `session.read(cx)` fresh on every render (and re-renders
-//! whenever the session notifies), instead of receiving a cloned
-//! `SessionState`/`ResultSet` each time something changes. Combined with
-//! [`Session::result`] returning the same underlying storage throughout a
-//! query's lifetime, this is what keeps painting an N-row streaming result
-//! O(N) total: nothing here ever clones or rescans the full accumulated
-//! result on every batch.
+//! [`SessionState`] and accumulated result set
 
 use std::ops::Range;
 
@@ -33,18 +18,14 @@ pub struct ResultsView {
     session: Entity<Session>,
     source_label: SharedString,
     column_widths: Vec<Pixels>,
-    /// Per-column max formatted-text char count seen so far, folded in
-    /// incrementally as rows stream in (see `sync_dimensions`) rather than
-    /// recomputed by rescanning every accumulated row on every update.
+    /// Per-column max formatted-text char count seen so far
     column_max_body_chars: Vec<usize>,
     /// How many of `session.result().rows` have already been folded into
-    /// `column_max_body_chars`. The next `sync_dimensions` call only walks
-    /// rows past this index.
+    /// `column_max_body_chars`
     folded_row_count: usize,
     row_number_width: Pixels,
     /// Shared vertical scroll state between the row-number pane's list and
-    /// the data pane's list, so the two stay in lockstep. See the comment in
-    /// `render_grid` for why the grid is split into two panes at all.
+    /// the data pane's list, so the two stay in lockstep
     row_scroll_handle: UniformListScrollHandle,
 }
 
@@ -52,11 +33,6 @@ impl ResultsView {
     /// Build a view over `session`. `source_label` names where the rows came
     /// from (a relation like `public.orders`, or a query kind) and is shown
     /// in the results header bar next to the row count.
-    ///
-    /// Subscribes to `session` for the lifetime of this view, so every
-    /// `cx.notify()` the session fires (connecting, streaming, done, error)
-    /// re-renders the grid from its latest state without the caller having
-    /// to wire that up itself.
     #[must_use]
     pub fn new(
         session: Entity<Session>,
@@ -90,11 +66,7 @@ impl ResultsView {
     }
 
     /// Bring `column_widths`/`row_number_width` up to date with the
-    /// session's current result set, folding only rows that have arrived
-    /// since the last call into the per-column max-width cache. Resets the
-    /// cache whenever the column count changes (a new query started, or its
-    /// `Columns` event just landed), since a stale per-column cache from a
-    /// previous/different query would no longer line up.
+    /// session's current result set
     fn sync_dimensions(&mut self, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
         let result = session.result();
@@ -179,8 +151,7 @@ impl ResultsView {
     }
 
     /// The main content area: the virtualized grid when results are
-    /// available, or a centered prompt/status message otherwise. Never shows
-    /// stale grid content for a non-`Results` state.
+    /// available, or a centered prompt/status message otherwise
     fn render_body(&mut self, cx: &mut Context<Self>) -> Div {
         let session = self.session.read(cx);
         let state = session.state().clone();
@@ -190,10 +161,7 @@ impl ResultsView {
             SessionState::Results(_) => self.render_grid(cx),
             // Once the streaming query's `Columns` event has arrived there
             // is a real (if partial) result set to paint, so switch to the
-            // grid immediately rather than waiting for `Done` — see
-            // `SessionState::Running`'s doc comment. Before that (no
-            // columns known yet) there is nothing to grid, so the running
-            // placeholder still applies.
+            // grid immediately rather than waiting for `Done`
             SessionState::Running if has_columns => self.render_grid(cx),
             SessionState::Empty => Self::render_placeholder(
                 theme::FAINT,
@@ -248,11 +216,7 @@ impl ResultsView {
     }
 
     /// The two-pane virtualized grid (pinned row numbers + horizontally
-    /// scrolling data columns). Only meaningful once the session's result
-    /// set has known columns — `SessionState::Results`, or a
-    /// `SessionState::Running` that has streamed in at least its `Columns`
-    /// event — so this is only ever reached from `render_body`'s matching
-    /// arms.
+    /// scrolling data columns)
     fn render_grid(&mut self, cx: &mut Context<Self>) -> Div {
         let row_count = self.session.read(cx).result().rows.len();
         let row_number_width = self.row_number_width;
@@ -266,12 +230,7 @@ impl ResultsView {
             // scrolling data pane below, rather than using CSS-style
             // `position: sticky` as the mockup's `.rownum` does: gpui 0.2.2
             // has no sticky-positioning primitive, so a fixed-width left
-            // pane plus a horizontally-scrolling right pane is used instead.
-            // Both panes' uniform_lists are given clones of the same
-            // `UniformListScrollHandle` (an `Rc<RefCell<_>>`), so they track
-            // one shared vertical offset and scroll in lockstep, while only
-            // the right pane's own horizontal scroll state moves its
-            // content underneath the pinned row numbers.
+            // pane plus a horizontally-scrolling right pane is used instead
             .child(
                 div()
                     .flex()
@@ -319,8 +278,7 @@ impl ResultsView {
             )
     }
 
-    /// The sticky header cell for the pinned row-number pane: just the `#`
-    /// label, matching the column-header row's height and background.
+    /// The sticky header cell for the pinned row-number pane
     fn render_row_number_header() -> Div {
         div()
             .flex()
@@ -336,9 +294,7 @@ impl ResultsView {
             .child("#")
     }
 
-    /// The sticky column-header row for the data pane: each column's name
-    /// plus its backend type tag. Does not include the row-number cell,
-    /// which lives in the separate pinned pane (see `render_row_number_header`).
+    /// The sticky column-header row for the data pane
     fn render_column_headers(&self, cx: &Context<Self>) -> Div {
         let mut row = div()
             .flex()
@@ -371,8 +327,7 @@ impl ResultsView {
     }
 
     /// Render the row-number cells in `range` for the pinned pane's
-    /// virtualized list. Only the rows currently scrolled into view are ever
-    /// built.
+    /// virtualized list
     fn render_row_number_cells(
         &mut self,
         range: Range<usize>,
@@ -401,17 +356,13 @@ impl ResultsView {
     }
 
     /// Render the data-cell rows in `range` for the data pane's virtualized
-    /// list. Only the rows currently scrolled into view are ever built.
+    /// list
     fn render_data_row_cells(
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Div> {
-        // Shared borrows: every use below only reads column widths and rows,
-        // so there is no need to clone either on every render/scroll frame.
-        // `session.read(cx)` borrows `cx`, not `self`, so this coexists with
-        // the `&self.column_widths` borrow just above it.
         let column_widths = &self.column_widths;
         let session = self.session.read(cx);
         let rows: &[zsql_core::Row] = &session.result().rows;
@@ -445,12 +396,7 @@ impl ResultsView {
     }
 
     /// The bottom connection/status bar: connection state + label, row
-    /// count, and elapsed query time — all read directly from the session's
-    /// current state, so nothing shown here is ever fabricated. Matches
-    /// `design/mockup.html`'s `.statusbar` for the states it depicts; states
-    /// the static mockup doesn't show (connecting, connected-idle, running,
-    /// error) get their own readable label and dot color instead of reusing
-    /// "Connected".
+    /// count, and elapsed query time
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
         let session = self.session.read(cx);
         let state = session.state();
@@ -498,10 +444,7 @@ impl ResultsView {
     }
 }
 
-/// Test-only accessor used by `ui::sidebar`'s render tests to assert on the
-/// source label a click-to-preview set, without exposing it on the public
-/// surface. `pub(crate)` (rather than plain private) because that test
-/// module is a sibling of this one, not a descendant.
+/// Test-only accessor used by `ui::sidebar`'s render tests
 #[cfg(test)]
 impl ResultsView {
     pub(crate) fn source_label_for_test(&self) -> &str {
@@ -522,9 +465,7 @@ impl Render for ResultsView {
     }
 }
 
-/// Shared chrome for a header cell: fixed width, right hairline, padding,
-/// clipped to its column so overlong content never bleeds into the next
-/// column.
+/// Shared chrome for a header cell
 fn header_cell_shell(width: Pixels) -> Div {
     div()
         .flex()
@@ -538,9 +479,7 @@ fn header_cell_shell(width: Pixels) -> Div {
         .border_color(rgb(theme::LINE_SOFT))
 }
 
-/// Shared chrome for a body cell: fixed width matching the header cell in
-/// the same column, right hairline, padding, single line (wide tables
-/// scroll horizontally rather than wrapping).
+/// Shared chrome for a body cell
 fn body_cell_shell(width: Pixels) -> Div {
     div()
         .flex()
@@ -566,16 +505,11 @@ fn type_tag(type_name: &str) -> Div {
         .child(type_name.to_owned())
 }
 
-/// The bottom status bar's dot color and label for `state`. Pure (no gpui
-/// dependency), so the state -> (color, label) mapping is unit testable on
-/// its own — see the `status_indicator_*` tests below — rather than only
-/// exercised indirectly through a no-panic render smoke test.
+/// The bottom status bar's dot color and label for `state`
 fn status_indicator(state: &SessionState) -> (u32, &'static str) {
     match state {
         SessionState::Empty => (theme::FAINT, "Not connected"),
         SessionState::Connecting => (theme::STATUS_CONNECTING, "Connecting…"),
-        // Both idle-connected and just-finished-a-query are, in fact,
-        // simply "connected" as far as the status dot is concerned.
         SessionState::Connected | SessionState::Results(_) => (theme::TEAL, "Connected"),
         SessionState::Running => (theme::TEAL, "Running…"),
         SessionState::Error(_) => (theme::STATUS_ERROR, "Error"),
@@ -583,13 +517,8 @@ fn status_indicator(state: &SessionState) -> (u32, &'static str) {
 }
 
 /// The bottom status bar's "N rows" / "N ms" text for `state`, given
-/// `row_count` (the session's current result row count, read separately
-/// since `state` itself no longer carries the result set — see
-/// `SessionState`'s doc comment). `None` for any state with no completed
-/// query to report timing/row-count for (there is nothing real to show
-/// while `Empty`/`Connecting`/`Connected`/`Running`/`Error`, so the status
-/// bar omits these entirely rather than fabricating zeros). Pure, like
-/// [`status_indicator`], so it is unit testable on its own.
+/// `row_count`. `None` for any state with no completed query to
+/// report timing/row-count for
 fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, String)> {
     if let SessionState::Results(elapsed) = state {
         Some((
@@ -601,8 +530,7 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
     }
 }
 
-/// The small round indicator dot in the bottom status bar, colored per the
-/// current connection/query state.
+/// The small round indicator dot in the bottom status bar
 fn status_dot(color: u32) -> Div {
     div()
         .flex_shrink_0()
@@ -627,12 +555,7 @@ fn kind_color(kind: ValueKind) -> u32 {
 }
 
 /// Estimate a column's pixel width from its header (name + type tag) and
-/// `max_body_chars` — the longest formatted cell seen so far in that column
-/// — so the header and every virtualized body row line up under the same
-/// column boundaries. `max_body_chars` is expected to come from
-/// `ResultsView::sync_dimensions`'s incremental per-column cache rather than
-/// a fresh scan of every row, so this function itself never walks a
-/// `ResultSet`'s rows.
+/// `max_body_chars`.
 // Cell content lengths here are always small (column names, formatted
 // scalar values), so the `usize -> f32` conversions below cannot lose
 // meaningful precision.
@@ -700,10 +623,6 @@ mod tests {
         }
     }
 
-    /// Test-only mirror of `ResultsView::sync_dimensions`'s per-column fold,
-    /// scanning every row: used only to build expected values for the
-    /// `column_width_from_parts` tests below, not exercised by production
-    /// code (which folds incrementally instead — see `sync_dimensions`).
     fn max_body_chars(result: &ResultSet, index: usize) -> usize {
         result
             .rows
@@ -731,14 +650,10 @@ mod tests {
 
     #[test]
     // `clamp`'s ceiling arm returns `MAX_COLUMN_WIDTH` verbatim (no further
-    // arithmetic on it), so an exact comparison here is intentional, not a
-    // fragile computed-float equality check.
+    // arithmetic on it), so an exact comparison here is intentional
     #[allow(clippy::float_cmp)]
     fn column_width_clamps_to_the_maximum() {
         let mut result = sample_result();
-        // Comfortably longer than any header/body width formula could stay
-        // under the clamp for, so this exercises the ceiling arm of the
-        // `clamp` in `column_width_from_parts` rather than the growth path.
         result.rows[1].0[1] = Value::Text("x".repeat(500));
         let width = column_width_from_parts(&result.columns[1], max_body_chars(&result, 1));
         assert_eq!(f32::from(width), super::theme::MAX_COLUMN_WIDTH);
@@ -802,17 +717,6 @@ mod tests {
         }
     }
 
-    // gpui's `TestAppContext` runs on `TestPlatform`, a headless mock of the
-    // platform layer (window system, display list) used purely for
-    // deterministic tests, so this does not require a real display server.
-    //
-    // This is a no-panic smoke test over a spread of `Value` variants
-    // (Bool, Float, Numeric, Bytes, Uuid, Timestamp, Json, Array, and
-    // Unknown), not an assertion on rendered colors or text: the grid is
-    // virtualized, so only the rows scrolled into view (here, all of them —
-    // the window is tall enough) actually get built by
-    // `render_data_row_cells`, and this test only checks that building and
-    // painting one frame over all of them completes without panicking.
     #[gpui::test]
     fn renders_one_frame_without_panicking(cx: &mut gpui::TestAppContext) {
         let mut result = sample_result();
@@ -846,9 +750,6 @@ mod tests {
         cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
     }
 
-    /// Every non-`Results` state must also render one frame without
-    /// panicking: the empty/connecting/connected/running/error prompts are
-    /// real render paths, not just theoretical `match` arms.
     #[gpui::test]
     fn renders_every_non_results_state_without_panicking(cx: &mut gpui::TestAppContext) {
         for state in [
@@ -865,10 +766,6 @@ mod tests {
         }
     }
 
-    /// A streaming query that already has columns (and some rows) must
-    /// render through the grid path, not the "Running query…" placeholder —
-    /// this is what lets results paint incrementally instead of only once
-    /// the whole query is done. See `SessionState::Running`'s doc comment.
     #[gpui::test]
     fn renders_the_grid_for_a_running_query_with_partial_results(cx: &mut gpui::TestAppContext) {
         let mut result = sample_result();
@@ -878,11 +775,6 @@ mod tests {
         cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
     }
 
-    /// Guards the incremental width-folding refactor: as more rows stream
-    /// in, `sync_dimensions` must fold exactly the newly-arrived rows (never
-    /// re-fold ones already accounted for) and the resulting column width
-    /// must reflect the longest cell seen across all rows folded so far, not
-    /// just the most recent batch.
     #[gpui::test]
     fn column_widths_grow_incrementally_as_rows_stream_in(cx: &mut gpui::TestAppContext) {
         let columns = vec![ColumnMeta {
@@ -927,9 +819,7 @@ mod tests {
             });
         });
         // `Session::set_result_for_test` bypasses `cx.notify()`, so the view
-        // is synced explicitly here rather than relying on the observer —
-        // pinning `sync_dimensions`'s own folding behavior, not gpui's
-        // notify/observe plumbing (already covered elsewhere).
+        // is synced explicitly here rather than relying on the observer
         view.update(vcx, super::ResultsView::sync_dimensions);
 
         view.update(vcx, |view, _cx| {

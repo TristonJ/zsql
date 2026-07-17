@@ -1,5 +1,4 @@
-//! The pluggable driver contract. Postgres is the first implementation; new
-//! backends implement these traits with zero UI changes.
+//! The pluggable driver contract
 
 use async_trait::async_trait;
 
