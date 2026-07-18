@@ -10,8 +10,9 @@ use gpui::{
 };
 use zsql_ui::colors;
 
-use super::connections::ConnectionManagerView;
+use super::connections::{ActiveConnection, ConnectionManagerView};
 use super::editor_adapter;
+use super::footer::ConnectionFooterView;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use crate::config::LayoutConfig;
@@ -39,6 +40,7 @@ enum DividerDrag {
 
 pub struct WorkspaceView {
     connections: Entity<ConnectionManagerView>,
+    footer: Entity<ConnectionFooterView>,
     sidebar: Entity<SidebarView>,
     editor: Entity<EditorView>,
     results: Entity<ResultsView>,
@@ -56,7 +58,7 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     /// Build a workspace over `session`, with pane sizes seeded from `layout`
-    /// and `connection_store` backing the connection manager bar.
+    /// and `connection_store` backing the connection-manager modal.
     #[must_use]
     pub fn new(
         session: Entity<Session>,
@@ -68,12 +70,22 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), results.clone(), cx));
         let connections =
             cx.new(|cx| ConnectionManagerView::new(session.clone(), connection_store, cx));
+        let footer =
+            cx.new(|cx| ConnectionFooterView::new(session.clone(), connections.clone(), cx));
         let editor = cx.new(|cx| editor_adapter::new_editor_view(session, results.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
 
+        // Opening/closing the modal (or switching its list/add-form panel)
+        // lives entirely inside `connections`' own state; this workspace
+        // must still re-render to mount or unmount that entity as the modal
+        // overlay child below.
+        cx.observe(&connections, |_this, _connections, cx| cx.notify())
+            .detach();
+
         Self {
             connections,
+            footer,
             sidebar,
             editor,
             results,
@@ -89,6 +101,16 @@ impl WorkspaceView {
     #[must_use]
     pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
+    }
+
+    /// Set the tracked active connection, e.g. once the startup connect
+    /// (`main.rs`, via [`Session::connect`]'s resolved DSN) succeeds. Threads
+    /// straight through to the connection-manager modal, which is the single
+    /// owner of this state; the footer observes that entity and updates
+    /// itself.
+    pub fn set_active_connection(&mut self, active: ActiveConnection, cx: &mut Context<Self>) {
+        self.connections
+            .update(cx, |view, cx| view.set_active(Some(active), cx));
     }
 
     fn start_sidebar_drag(
@@ -198,13 +220,15 @@ impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let divider_thickness = self.layout.divider_thickness;
         let column_height = self.column_height.clone();
+        let modal_open = self.connections.read(cx).is_open();
 
         div()
+            .id("workspace-root")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(colors::INK))
-            .child(self.connections.clone())
             .child(
                 div()
                     .flex()
@@ -216,10 +240,13 @@ impl Render for WorkspaceView {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_drag))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_shrink_0()
                             .w(self.sidebar_width)
                             .h_full()
-                            .child(self.sidebar.clone()),
+                            .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
+                            .child(self.footer.clone()),
                     )
                     .child(
                         div()
@@ -281,6 +308,7 @@ impl Render for WorkspaceView {
                             .child(div().flex_1().min_h_0().child(self.results.clone())),
                     ),
             )
+            .when(modal_open, |el| el.child(self.connections.clone()))
     }
 }
 

@@ -78,11 +78,26 @@ pub fn status_dot(color: u32) -> Div {
         .bg(rgb(color))
 }
 
+/// The hollow counterpart to [`status_dot`]: an outline only, no fill, for
+/// an "inactive" state (e.g. a disconnected footer, an unselected list row).
+#[must_use]
+pub fn status_dot_outline(border_color: u32) -> Div {
+    div()
+        .flex_shrink_0()
+        .w(px(STATUS_DOT_SIZE))
+        .h(px(STATUS_DOT_SIZE))
+        .rounded(px(STATUS_DOT_SIZE / 2.0))
+        .border_1()
+        .border_color(rgb(border_color))
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::px;
 
-    use super::{body_cell_shell, colors, header_cell_shell, status_dot, type_tag};
+    use super::{
+        body_cell_shell, colors, header_cell_shell, status_dot, status_dot_outline, type_tag,
+    };
 
     #[test]
     fn header_and_body_cell_shells_build_for_a_width() {
@@ -98,5 +113,10 @@ mod tests {
     #[test]
     fn status_dot_builds_for_a_color() {
         let _dot = status_dot(colors::TEAL);
+    }
+
+    #[test]
+    fn status_dot_outline_builds_for_a_border_color() {
+        let _dot = status_dot_outline(colors::FAINT);
     }
 }

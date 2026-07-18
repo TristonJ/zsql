@@ -6,12 +6,15 @@ mod drivers;
 mod observability;
 mod session;
 mod sql;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use config::Config;
 use connections::ConnectionStore;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use session::{Session, SessionState};
+use ui::connections::active_connection_for_url;
 use ui::workspace::WorkspaceView;
 
 /// Default window size for the workspace.
@@ -33,9 +36,16 @@ fn main() -> anyhow::Result<()> {
         Some(path) => ConnectionStore::load(&path)?,
         None => ConnectionStore::in_memory(),
     };
+    // Snapshot before `connection_store` is moved into `WorkspaceView::new`
+    // below: the startup connect task still needs it to resolve the footer's
+    // active-connection label for a `DATABASE_URL`/`Config`-fallback DSN
+    // that matches (or doesn't match) a saved connection.
+    let saved_connections = connection_store.connections().to_vec();
+    let resolved_dsn = cfg.resolve_url();
 
     Application::new().run(move |cx: &mut App| {
         zsql_editor::init(cx);
+        zsql_ui::text_field::init(cx);
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
@@ -54,6 +64,7 @@ fn main() -> anyhow::Result<()> {
                 window.focus(&workspace.read(cx).editor_focus_handle(cx));
 
                 let startup_session = session.clone();
+                let startup_workspace = workspace.clone();
                 cx.spawn(async move |cx| {
                     let connect_task = startup_session.update(cx, Session::connect)?;
                     connect_task.await;
@@ -66,6 +77,12 @@ fn main() -> anyhow::Result<()> {
                     })?;
 
                     if is_connected {
+                        if let Some(dsn) = &resolved_dsn {
+                            let active = active_connection_for_url(dsn, &saved_connections);
+                            startup_workspace.update(cx, |workspace, cx| {
+                                workspace.set_active_connection(active, cx);
+                            })?;
+                        }
                         let introspect_task = startup_session.update(cx, Session::introspect)?;
                         introspect_task.await;
                     }

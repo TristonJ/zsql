@@ -77,3 +77,28 @@ pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
 pub const RESULTS_META_TEXT_SIZE: f32 = 11.0;
 /// Text size of the bottom connection/status bar.
 pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
+
+/// Width of the centered connection-manager modal panel.
+pub const MODAL_WIDTH: Pixels = px(468.0);
+/// Corner radius of the modal panel.
+pub const MODAL_RADIUS: f32 = 10.0;
+/// Height of the modal's title bar.
+pub const MODAL_HEAD_HEIGHT: Pixels = px(44.0);
+/// Dimmed backdrop behind the modal: near-black at ~62% alpha
+/// (`rgba(8,9,12,.62)`).
+pub const MODAL_BACKDROP: u32 = 0x08_09_0c_9e;
+/// Tallest the modal's connection list is allowed to grow before it scrolls.
+pub const MODAL_LIST_MAX_HEIGHT: Pixels = px(300.0);
+/// Corner radius of a connection-list row.
+pub const MODAL_ROW_RADIUS: f32 = 7.0;
+/// Background tint marking the currently-connected row in the modal list:
+/// teal at low opacity (`0x33c2ac` at ~9% alpha).
+pub const MODAL_ROW_ACTIVE_BG: u32 = 0x33_c2_ac_17;
+/// Text size of a connection-list row's name.
+pub const MODAL_ROW_NAME_TEXT_SIZE: f32 = 12.5;
+/// Text size of a connection-list row's url.
+pub const MODAL_ROW_URL_TEXT_SIZE: f32 = 10.5;
+/// Text size of the "connected" label shown next to the active row's name.
+pub const MODAL_ROW_CONNECTED_LABEL_TEXT_SIZE: f32 = 9.5;
+/// Vertical gap between a connection-list row's name line and its url line.
+pub const MODAL_ROW_INNER_GAP: Pixels = px(3.0);

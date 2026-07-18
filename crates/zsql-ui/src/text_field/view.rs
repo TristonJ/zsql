@@ -363,7 +363,11 @@ impl Render for TextFieldState {
         };
 
         div()
-            .id("text-field")
+            // Unique per instance: two fields on the same screen (e.g. a
+            // name + URL form) must not share an element id, or gpui conflates
+            // their interactivity state and mouse hit-testing so clicks stop
+            // reaching one of them.
+            .id(("text-field", cx.entity_id()))
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)

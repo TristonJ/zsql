@@ -152,6 +152,17 @@ impl Session {
         &self.state
     }
 
+    /// Whether a live connection is currently held, independent of
+    /// [`SessionState`]: a query error (see [`Session::run_query`]) moves
+    /// `state` to [`SessionState::Error`] without dropping the connection
+    /// itself, so callers that need to know "is the database actually
+    /// reachable" (e.g. the connection footer) must check this rather than
+    /// pattern-matching `state` alone.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connection.is_some()
+    }
+
     /// The active connection's liveliness, as tracked by the recurring
     /// probe loop, independent of [`Session::state`].
     #[must_use]
@@ -911,6 +922,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn connect_to_an_unreachable_host_reports_a_readable_error(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url =
@@ -937,6 +949,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn connect_resolves_a_sqlite_url_and_actually_opens_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some("sqlite::memory:".to_owned());
@@ -962,6 +975,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         // No configured DSN at all: `connect_to` must still work on its own.
         let session = cx.new(|_cx| Session::new(&Config::default()));
@@ -986,6 +1000,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn a_failed_connect_switch_clears_the_previous_connection(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let session = cx.new(|_cx| Session::new(&Config::default()));
 
@@ -1465,6 +1480,46 @@ mod gpui_tests {
         });
     }
 
+    #[gpui::test]
+    fn a_query_error_leaves_the_underlying_connection_in_place(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks.clone(), queries);
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| session.run_query("SELECT bad", cx))
+            .detach();
+        cx.run_until_parked();
+
+        let sink = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            sinks[0].clone()
+        };
+        sink.send(Err(CoreError::Query("syntax error".to_owned())))
+            .expect("sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected SessionState::Error after a query failure, got {:?}",
+                session.state()
+            );
+            assert!(
+                session.is_connected(),
+                "a query error must not drop the underlying connection -- \
+                 Session::is_connected() must stay true so the connection \
+                 footer keeps showing the still-live database"
+            );
+        });
+    }
+
     /// A sample tree with one catalog, one schema, and one table, used by
     /// the introspection tests below.
     fn sample_schema_tree() -> SchemaTree {
@@ -1715,6 +1770,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);
@@ -1779,6 +1835,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);
@@ -1803,6 +1860,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);
@@ -1843,6 +1901,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);
@@ -1916,6 +1975,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         // Tag this session's own connections with a unique `application_name`
         // so the disconnect below can target exactly this test's backends,
@@ -2028,6 +2088,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);
