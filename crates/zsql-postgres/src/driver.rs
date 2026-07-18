@@ -37,8 +37,17 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `pg_cancel_backend` call is a single scalar query, never more than a
 /// couple of which are ever in flight at once for this single-user desktop
 /// client, and keeping it off the query pool entirely is the point (see the
-/// doc comment on [`PostgresDriver::build_cancel_pool`]).
+/// doc comment on [`PostgresDriver::build_side_pool`]).
 const CANCEL_POOL_CONNECTIONS: u32 = 2;
+
+/// Bounded size of the dedicated pool [`PgConnection::ping`] draws from.
+/// Separate from both `MAX_POOL_CONNECTIONS` and `CANCEL_POOL_CONNECTIONS` so
+/// a liveness probe can never be blocked behind an in-flight query, nor
+/// blocked behind (or itself block) a `pg_cancel_backend` call. Sized at 2,
+/// not 1: the session only ever runs one probe at a time, but a second
+/// connection lets one probe's acquire succeed promptly even if the prior
+/// probe's connection has not yet been returned to the pool.
+const PROBE_POOL_CONNECTIONS: u32 = 2;
 
 /// The Postgres [`Driver`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -62,32 +71,49 @@ impl PostgresDriver {
         Ok(pool)
     }
 
-    /// Build the small dedicated pool used only for issuing `SELECT
-    /// pg_cancel_backend($pid)` (see [`issue_server_side_cancel`]).
-    ///
-    /// This is deliberately a *different* pool from the one query
-    /// connections are drawn from (see [`build_pool`](Self::build_pool)),
-    /// not a second handle onto the same one. A query connection that is
+    /// Build a small side pool of `max_connections`, used for an operation
+    /// that must never share a connection with the main query pool (see
+    /// [`build_pool`](Self::build_pool)). [`issue_server_side_cancel`]'s
+    /// cancel pool is built this way: a query connection that is
     /// cooperatively cancelled while blocked server-side does not
-    /// necessarily free its permit back to the query pool right away:
-    /// returning a pooled connection first pings it to confirm it is idle
-    /// before the permit is released, and that ping itself blocks until the
-    /// backend actually responds.
-    /// If cancellation drew its own connection from that same pool, several
-    /// blocked-then-cancelled queries saturating every permit could starve
-    /// the very connection needed to unblock any of them, deadlocking the
-    /// pool for the queries' full natural duration.
+    /// necessarily free its permit back to the query pool right away
+    /// (returning a pooled connection first pings it to confirm it is idle,
+    /// which itself blocks until the backend actually responds), and
+    /// cancellation must not be starved behind that same query pool.
     ///
     /// Connects lazily: parsing/validating `url` cannot fail asynchronously
     /// here, so this is synchronous, and no network round trip happens
-    /// against this pool until the first cancel is actually issued.
+    /// against this pool until its first query is actually issued.
     ///
     /// # Errors
     /// Returns [`CoreError::Connection`] if `url` cannot be parsed.
-    fn build_cancel_pool(url: &str) -> Result<PgPool, CoreError> {
+    fn build_side_pool(url: &str, max_connections: u32) -> Result<PgPool, CoreError> {
         PgPoolOptions::new()
-            .max_connections(CANCEL_POOL_CONNECTIONS)
+            .max_connections(max_connections)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .connect_lazy(url)
+            .map_err(map_connect_error)
+    }
+
+    /// Build the small dedicated pool [`PgConnection::ping`] draws from.
+    ///
+    /// Deliberately disables sqlx's default `test_before_acquire`: sqlx's
+    /// pool otherwise pings an idle connection *before* handing it back and,
+    /// on failure, silently discards it and hands the caller a freshly
+    /// opened one instead - transparent self-healing that is exactly right
+    /// for the query pool, but wrong here, since it would mean a probe never
+    /// observes a dead connection at all (the pool quietly repairs itself
+    /// first). A liveness probe's entire purpose is to be the thing that
+    /// notices staleness, so this pool must hand back whatever connection it
+    /// has, dead or not, and let the probe's own query surface the failure.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Connection`] if `url` cannot be parsed.
+    fn build_probe_pool(url: &str) -> Result<PgPool, CoreError> {
+        PgPoolOptions::new()
+            .max_connections(PROBE_POOL_CONNECTIONS)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .test_before_acquire(false)
             .connect_lazy(url)
             .map_err(map_connect_error)
     }
@@ -123,9 +149,14 @@ impl Driver for PostgresDriver {
         // Never log `cfg.url`: it may embed a password. Only non-secret
         // fields (the driver id, above) are attached to this span.
         let pool = Self::build_pool(&cfg.url).await?;
-        let cancel_pool = Self::build_cancel_pool(&cfg.url)?;
+        let cancel_pool = Self::build_side_pool(&cfg.url, CANCEL_POOL_CONNECTIONS)?;
+        let probe_pool = Self::build_probe_pool(&cfg.url)?;
         tracing::info!("postgres connection established");
-        Ok(Box::new(PgConnection { pool, cancel_pool }))
+        Ok(Box::new(PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        }))
     }
 }
 
@@ -135,6 +166,11 @@ pub struct PgConnection {
     /// Separate, independently-bounded pool used only for server-side
     /// cancellation (`SELECT pg_cancel_backend($pid)`)
     cancel_pool: PgPool,
+    /// Separate, independently-bounded pool used only for the liveness
+    /// probe (see [`PgConnection::ping`]), so a probe can never be blocked
+    /// behind an in-flight query or a cancel request, nor block either of
+    /// those in turn.
+    probe_pool: PgPool,
 }
 
 /// Issue `SELECT pg_cancel_backend($pid)` on a connection acquired fresh
@@ -180,6 +216,12 @@ impl Connection for PgConnection {
     #[tracing::instrument(name = "pg_introspect", skip_all, fields(pool_size = self.pool.size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
         crate::introspect::introspect(&self.pool).await
+    }
+
+    #[tracing::instrument(name = "pg_ping", skip_all, fields(pool_size = self.probe_pool.size()))]
+    async fn ping(&self) -> Result<(), CoreError> {
+        liveness_check(&self.probe_pool).await?;
+        Ok(())
     }
 }
 
@@ -427,7 +469,12 @@ mod tests {
             .connect_lazy(UNREACHABLE_DSN)
             .expect("connect_lazy only parses the DSN; it must not touch the network");
         let cancel_pool = pool.clone();
-        let conn = PgConnection { pool, cancel_pool };
+        let probe_pool = pool.clone();
+        let conn = PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        };
 
         let result = block_on(conn.introspect());
         match result {
@@ -437,6 +484,76 @@ mod tests {
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(_) => panic!("introspecting an unreachable host must fail"),
         }
+    }
+
+    #[test]
+    fn ping_maps_unreachable_host_to_core_connection_error() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_DSN)
+            .expect("connect_lazy only parses the DSN; it must not touch the network");
+        let cancel_pool = pool.clone();
+        let probe_pool = pool.clone();
+        let conn = PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        };
+
+        let result = block_on(conn.ping());
+        match result {
+            Err(zsql_core::CoreError::Connection(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
+            Ok(()) => panic!("pinging an unreachable host must fail"),
+        }
+    }
+
+    #[test]
+    fn ping_succeeds_against_a_live_database_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+        block_on(conn.ping()).expect("ping should succeed against a reachable database");
+    }
+
+    #[test]
+    fn ping_completes_while_a_slow_query_is_streaming_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let (tx, rx) = flume::unbounded();
+        let handle = conn.stream_query("SELECT pg_sleep(3)".to_owned(), tx);
+
+        // Let `pg_sleep` actually start server-side before probing, so the
+        // ping genuinely races a query that is mid-flight, not one that
+        // hasn't been dispatched yet.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The probe uses its own pool, so it must complete promptly instead
+        // of waiting behind the slow query's connection.
+        let ping_started = std::time::Instant::now();
+        block_on(conn.ping()).expect("ping must succeed independently of the slow query");
+        assert!(
+            ping_started.elapsed() < Duration::from_secs(2),
+            "ping took {:?}, which suggests it was blocked behind the slow query",
+            ping_started.elapsed()
+        );
+
+        // The slow query must still reach its normal terminal state,
+        // unaffected by the probe that ran alongside it.
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Columns(_) | zsql_core::QueryEvent::Batch(_)) => {}
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                Err(err) => panic!("slow query must not fail alongside a probe: {err:?}"),
+            }
+        }
+        drop(handle);
     }
 
     #[test]
@@ -681,7 +798,12 @@ mod tests {
             .connect_lazy(UNREACHABLE_DSN)
             .expect("connect_lazy only parses the DSN; it must not touch the network");
         let cancel_pool = pool.clone();
-        let conn = PgConnection { pool, cancel_pool };
+        let probe_pool = pool.clone();
+        let conn = PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        };
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1".to_owned(), tx);

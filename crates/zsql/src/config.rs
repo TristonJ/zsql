@@ -2,6 +2,7 @@
 //! constants
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,8 @@ pub struct Config {
     pub query: QueryConfig,
     /// Connection defaults.
     pub connection: ConnectionConfig,
+    /// Connection liveliness probe timing.
+    pub liveness: LivenessConfig,
 }
 
 /// Appearance settings. Placeholder for the eventual theming system.
@@ -45,6 +48,20 @@ pub struct ConnectionConfig {
     pub default_url: Option<String>,
 }
 
+/// Timing for the recurring connection liveliness probe that runs once a
+/// [`crate::session::Session`] is connected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LivenessConfig {
+    /// How often the liveliness probe fires, in milliseconds, while a
+    /// connection is idle. The probe never overlaps itself: a slow probe
+    /// defers, rather than duplicates, the next tick.
+    pub probe_interval_ms: u64,
+    /// How long a single probe may run before it is treated as a failure, in
+    /// milliseconds.
+    pub probe_timeout_ms: u64,
+}
+
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
@@ -60,6 +77,29 @@ impl Default for QueryConfig {
             preview_limit: 200,
             statement_timeout_ms: 30_000,
         }
+    }
+}
+
+impl Default for LivenessConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval_ms: 5_000,
+            probe_timeout_ms: 2_000,
+        }
+    }
+}
+
+impl LivenessConfig {
+    /// The probe interval as a [`Duration`].
+    #[must_use]
+    pub fn probe_interval(&self) -> Duration {
+        Duration::from_millis(self.probe_interval_ms)
+    }
+
+    /// The probe timeout as a [`Duration`].
+    #[must_use]
+    pub fn probe_timeout(&self) -> Duration {
+        Duration::from_millis(self.probe_timeout_ms)
     }
 }
 
@@ -89,5 +129,56 @@ impl Config {
         std::env::var("DATABASE_URL")
             .ok()
             .or_else(|| self.connection.default_url.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Config;
+
+    #[test]
+    fn liveness_defaults_are_positive_and_the_timeout_is_shorter_than_the_interval() {
+        let cfg = Config::default();
+        assert!(cfg.liveness.probe_interval_ms > 0);
+        assert!(cfg.liveness.probe_timeout_ms > 0);
+        assert!(
+            cfg.liveness.probe_timeout_ms < cfg.liveness.probe_interval_ms,
+            "a probe must be able to time out within a single interval"
+        );
+    }
+
+    #[test]
+    fn liveness_duration_helpers_convert_from_the_configured_milliseconds() {
+        let mut cfg = Config::default();
+        cfg.liveness.probe_interval_ms = 7_500;
+        cfg.liveness.probe_timeout_ms = 1_200;
+        assert_eq!(cfg.liveness.probe_interval(), Duration::from_millis(7_500));
+        assert_eq!(cfg.liveness.probe_timeout(), Duration::from_millis(1_200));
+    }
+
+    #[test]
+    fn liveness_config_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.liveness.probe_interval_ms = 9_000;
+        cfg.liveness.probe_timeout_ms = 1_500;
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.liveness.probe_interval_ms, 9_000);
+        assert_eq!(parsed.liveness.probe_timeout_ms, 1_500);
+    }
+
+    #[test]
+    fn liveness_section_is_optional_in_toml_and_falls_back_to_defaults() {
+        let parsed: Config =
+            toml::from_str("[connection]\ndefault_url = \"postgres://localhost/db\"\n")
+                .expect("config without a [liveness] section must still parse");
+        assert_eq!(
+            parsed.liveness.probe_interval_ms,
+            Config::default().liveness.probe_interval_ms
+        );
     }
 }

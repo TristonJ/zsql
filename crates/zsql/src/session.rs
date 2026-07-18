@@ -4,7 +4,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{Context, Task, prelude::*};
+use futures::future::Either;
+use gpui::{BackgroundExecutor, Context, Task, prelude::*};
 use zsql_core::{ConnConfig, Connection, CoreError, Driver, QueryEvent, ResultSet, SchemaTree};
 use zsql_postgres::PostgresDriver;
 
@@ -44,6 +45,21 @@ pub enum SchemaState {
     Error(String),
 }
 
+/// The active connection's liveliness, as tracked by the recurring probe
+/// loop. Kept independent of [`SessionState`] so a probe result never
+/// overwrites query-lifecycle state such as `Running`/`Results(_)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivenessState {
+    /// No probe has completed yet for the current connection (including
+    /// while there is no connection at all).
+    Unknown,
+    /// The most recent probe succeeded.
+    Healthy,
+    /// The most recent probe failed or timed out. The message is safe to
+    /// show directly in the UI.
+    Unreachable(String),
+}
+
 /// Owns the active connection and the current query's lifecycle.
 pub struct Session {
     /// Resolved DSN (`Config::resolve_url`), if any.
@@ -68,6 +84,37 @@ pub struct Session {
     /// captures the generation it was started with and compares it against
     /// this field before folding an event into `state`/`accumulating`.
     query_generation: u64,
+    /// The active connection's liveliness, as tracked by the recurring
+    /// probe loop, independent of `state`.
+    liveness: LivenessState,
+    /// Incremented at the start of every `connect` attempt. A probe loop
+    /// captures the generation of the connection it was started for and
+    /// stops folding results into `liveness` once this no longer matches,
+    /// so a stale probe from a superseded connection is ignored.
+    connection_generation: u64,
+    /// Whether a liveliness probe is currently awaiting its result. Guards
+    /// against starting an overlapping probe if one is still outstanding
+    /// when the next interval elapses; that tick is skipped instead.
+    probe_in_flight: bool,
+    /// How often the liveliness probe fires, from [`Config::liveness`].
+    probe_interval: Duration,
+    /// How long a single liveliness probe may run before it is treated as a
+    /// failure, from [`Config::liveness`].
+    probe_timeout: Duration,
+}
+
+/// What a liveliness probe loop's tick did, decided under a single
+/// `Session::update` so the in-flight guard and generation check are
+/// atomic with respect to the rest of `Session`'s state.
+enum ProbeTick {
+    /// A probe was dispatched (as its own task, so this loop's next timer
+    /// starts on schedule regardless of how long the probe takes).
+    Started,
+    /// A probe is already outstanding; this tick was skipped.
+    Skipped,
+    /// The connection this loop was started for has been superseded (or is
+    /// gone entirely); the loop must stop.
+    Stale,
 }
 
 impl Session {
@@ -91,6 +138,11 @@ impl Session {
             accumulating: ResultSet::default(),
             query_started_at: None,
             query_generation: 0,
+            liveness: LivenessState::Unknown,
+            connection_generation: 0,
+            probe_in_flight: false,
+            probe_interval: cfg.liveness.probe_interval(),
+            probe_timeout: cfg.liveness.probe_timeout(),
         }
     }
 
@@ -98,6 +150,13 @@ impl Session {
     #[must_use]
     pub fn state(&self) -> &SessionState {
         &self.state
+    }
+
+    /// The active connection's liveliness, as tracked by the recurring
+    /// probe loop, independent of [`Session::state`].
+    #[must_use]
+    pub fn liveness(&self) -> &LivenessState {
+        &self.liveness
     }
 
     /// The schema sidebar's current state.
@@ -134,6 +193,17 @@ impl Session {
         };
 
         self.state = SessionState::Connecting;
+        self.liveness = LivenessState::Unknown;
+        // A fresh connect attempt invalidates any liveness probe loop tied
+        // to whatever connection preceded it, even if this attempt goes on
+        // to fail: that prior loop's next tick (or in-flight probe) must
+        // not fold a stale result into this attempt's state. `probe_in_flight`
+        // is reset too, since it tracks the *current* generation's probe:
+        // a stale probe's own completion knows not to touch it (see
+        // `spawn_probe_and_apply`), so nothing else ever would.
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.probe_in_flight = false;
+        let generation = self.connection_generation;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -151,21 +221,106 @@ impl Session {
 
             let connect_result = cx.background_spawn(connect_postgres(cfg)).await;
 
-            let _ = this.update(cx, |session, cx| {
-                match connect_result {
+            let connected = this.update(cx, |session, cx| {
+                let connected = match connect_result {
                     Ok(conn) => {
                         tracing::info!("session connected");
                         session.connection = Some(Arc::from(conn));
                         session.state = SessionState::Connected;
+                        true
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "session connect failed");
                         session.state = SessionState::Error(err.to_string());
+                        false
                     }
+                };
+                cx.notify();
+                connected
+            });
+
+            // Only a successful connect starts the probe loop: there is
+            // nothing to ping while `state` is `Connecting`/`Error`.
+            if matches!(connected, Ok(true)) {
+                let _ = this.update(cx, |session, cx| {
+                    session.spawn_liveness_probe_loop(generation, cx);
+                });
+            }
+        })
+    }
+
+    /// Start the recurring liveliness probe loop for the connection tied to
+    /// `generation`, on the gpui executor. The loop's own timer fires on a
+    /// fixed cadence of [`Session::probe_interval`](Config::liveness)
+    /// regardless of how long any individual probe takes (each probe runs
+    /// as its own task, dispatched by [`Session::spawn_probe_and_apply`]);
+    /// a tick that lands while a probe is still outstanding is skipped
+    /// rather than starting an overlapping one. The loop stops as soon as
+    /// `generation` no longer matches [`Session::connection_generation`] (a
+    /// fresh `connect` superseded it) or the session itself is dropped.
+    fn spawn_liveness_probe_loop(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let interval = self.probe_interval;
+        let timeout = self.probe_timeout;
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+
+                let tick = this.update(cx, |session, cx| {
+                    if session.connection_generation != generation {
+                        return ProbeTick::Stale;
+                    }
+                    let Some(connection) = session.connection.clone() else {
+                        return ProbeTick::Stale;
+                    };
+                    if session.probe_in_flight {
+                        return ProbeTick::Skipped;
+                    }
+                    session.probe_in_flight = true;
+                    Session::spawn_probe_and_apply(generation, connection, timeout, cx);
+                    ProbeTick::Started
+                });
+
+                match tick {
+                    Ok(ProbeTick::Started | ProbeTick::Skipped) => {}
+                    Ok(ProbeTick::Stale) | Err(_) => break,
                 }
+            }
+        })
+        .detach();
+    }
+
+    /// Run one probe against `connection` and fold its outcome into
+    /// `liveness`, as an independent task from the interval loop above so a
+    /// slow probe cannot delay that loop's next tick. Ignores the result
+    /// entirely (without touching `probe_in_flight`) if `generation` has
+    /// since been superseded: that flag belongs to whatever generation is
+    /// current now, not to this stale probe.
+    fn spawn_probe_and_apply(
+        generation: u64,
+        connection: Arc<dyn Connection>,
+        timeout: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let outcome = cx
+                .background_spawn(probe_connection(connection, timeout, executor))
+                .await;
+
+            let _ = this.update(cx, |session, cx| {
+                if session.connection_generation != generation {
+                    return;
+                }
+                session.probe_in_flight = false;
+                session.liveness = match outcome {
+                    Ok(()) => LivenessState::Healthy,
+                    Err(message) => LivenessState::Unreachable(message),
+                };
                 cx.notify();
             });
         })
+        .detach();
     }
 
     /// Run `sql` on the active connection, streaming its `QueryEvent`s into
@@ -328,6 +483,11 @@ impl Session {
             accumulating: result,
             query_started_at: None,
             query_generation: 0,
+            liveness: LivenessState::Unknown,
+            connection_generation: 0,
+            probe_in_flight: false,
+            probe_interval: Config::default().liveness.probe_interval(),
+            probe_timeout: Config::default().liveness.probe_timeout(),
         }
     }
 
@@ -353,6 +513,30 @@ impl Session {
         session.connection = Some(connection);
         session
     }
+
+    /// Start the liveliness probe loop against whatever `connection` a test
+    /// has already set, as if a real `connect()` had just succeeded. Bumps
+    /// `connection_generation` first, exactly as `connect()` does, so a
+    /// second call (simulating a reconnect) supersedes the first and any
+    /// probe still in flight for it.
+    pub(crate) fn start_liveness_probe_for_test(&mut self, cx: &mut Context<Self>) {
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.probe_in_flight = false;
+        let generation = self.connection_generation;
+        self.spawn_liveness_probe_loop(generation, cx);
+    }
+
+    /// The probe interval a test-constructed session was given, so tests
+    /// can advance a `TestAppContext`'s clock by exactly that much.
+    pub(crate) fn probe_interval_for_test(&self) -> Duration {
+        self.probe_interval
+    }
+
+    /// The probe timeout a test-constructed session was given, so tests can
+    /// advance a `TestAppContext`'s clock past it to force a probe timeout.
+    pub(crate) fn probe_timeout_for_test(&self) -> Duration {
+        self.probe_timeout
+    }
 }
 
 /// Connect to Postgres via [`PostgresDriver`]
@@ -368,6 +552,43 @@ async fn connect_postgres(cfg: ConnConfig) -> Result<Box<dyn Connection>, CoreEr
 #[tracing::instrument(name = "session_introspect", skip_all)]
 async fn introspect_connection(connection: Arc<dyn Connection>) -> Result<SchemaTree, CoreError> {
     connection.introspect().await
+}
+
+/// Ping `connection`, failing the probe if it does not complete within
+/// `timeout`. `timeout` races against `connection.ping()` on `executor`'s
+/// clock (real wall time in the running app, the deterministic test clock
+/// under `TestAppContext`) rather than a runtime timeout helper, since no
+/// tokio runtime is available here.
+#[tracing::instrument(name = "session_liveness_probe", skip_all)]
+async fn probe_connection(
+    connection: Arc<dyn Connection>,
+    timeout: Duration,
+    executor: BackgroundExecutor,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let ping = Box::pin(connection.ping());
+    let timed_out = executor.timer(timeout);
+
+    match futures::future::select(ping, timed_out).await {
+        Either::Left((Ok(()), _)) => {
+            tracing::debug!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "liveness probe succeeded"
+            );
+            Ok(())
+        }
+        Either::Left((Err(err), _)) => {
+            tracing::warn!(error = %err, "liveness probe failed");
+            Err(err.to_string())
+        }
+        Either::Right(((), _)) => {
+            tracing::warn!(timeout_ms = timeout.as_millis(), "liveness probe timed out");
+            Err(format!(
+                "liveness probe timed out after {}ms",
+                timeout.as_millis()
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +807,7 @@ mod tests {
 /// `TestAppContext`-driven `Session` tests that need no live database
 #[cfg(test)]
 mod gpui_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gpui::{AppContext as _, TestAppContext};
@@ -594,7 +816,7 @@ mod gpui_tests {
         RelationKind, SchemaNs, SchemaTree,
     };
 
-    use super::{Config, SchemaState, Session, SessionState};
+    use super::{Config, LivenessState, SchemaState, Session, SessionState};
 
     fn session_with_no_dsn() -> Session {
         Session::new(&Config::default())
@@ -713,20 +935,46 @@ mod gpui_tests {
     }
 
     /// A `Connection` double that records every `stream_query` call's SQL
-    /// text and sink instead of running anything
+    /// text and sink instead of running anything. `ping` answers with
+    /// whatever a test pushes through [`FakeConnection::ping_sender`], one
+    /// scripted outcome per call; a call with nothing pushed yet stays
+    /// pending, which is what lets tests observe a probe "in flight".
+    /// `ping_calls` counts every `ping()` invocation, letting a test prove
+    /// an overlapping tick was actually skipped (call count stays 1) rather
+    /// than merely inferring it from an unresolved outcome.
     struct FakeConnection {
         sinks: Arc<Mutex<Vec<BatchSink>>>,
         queries: Arc<Mutex<Vec<String>>>,
         introspect_outcome: FakeIntrospectOutcome,
+        ping_tx: flume::Sender<Result<(), CoreError>>,
+        ping_rx: flume::Receiver<Result<(), CoreError>>,
+        ping_calls: Arc<AtomicUsize>,
     }
 
     impl FakeConnection {
         fn new(sinks: Arc<Mutex<Vec<BatchSink>>>, queries: Arc<Mutex<Vec<String>>>) -> Self {
+            let (ping_tx, ping_rx) = flume::unbounded();
             Self {
                 sinks,
                 queries,
                 introspect_outcome: FakeIntrospectOutcome::Ready(SchemaTree::default()),
+                ping_tx,
+                ping_rx,
+                ping_calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        /// A sender that scripts this connection's next `ping()` calls, one
+        /// outcome per call, in order.
+        fn ping_sender(&self) -> flume::Sender<Result<(), CoreError>> {
+            self.ping_tx.clone()
+        }
+
+        /// A shared counter of every `ping()` call made on this connection,
+        /// so a test can assert exactly how many probes were actually
+        /// dispatched rather than just observing their (non-)outcome.
+        fn ping_call_counter(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.ping_calls)
         }
     }
 
@@ -750,6 +998,295 @@ mod gpui_tests {
                 }
             }
         }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            self.ping_calls.fetch_add(1, Ordering::SeqCst);
+            self.ping_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| Err(CoreError::Connection("fake connection closed".to_owned())))
+        }
+    }
+
+    #[gpui::test]
+    fn liveness_probe_does_not_run_before_a_connection_exists(cx: &mut TestAppContext) {
+        let session = cx.new(|_cx| session_with_no_dsn());
+
+        // No `connect()` (let alone a successful one) has ever happened, so
+        // no probe loop was ever started: advancing well past several probe
+        // intervals must not change `liveness`, and must not leave any task
+        // for `run_until_parked` to (unexpectedly) still be running.
+        let interval = session.read_with(cx, |session, _app| session.probe_interval_for_test());
+        cx.executor().advance_clock(interval * 5);
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Empty),
+                "expected SessionState::Empty, got {:?}",
+                session.state()
+            );
+            assert_eq!(
+                *session.liveness(),
+                LivenessState::Unknown,
+                "liveness must stay Unknown when no connection ever existed"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_probe_updates_liveness_without_touching_a_running_query(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks, queries);
+        let ping_sender = connection.ping_sender();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            // Simulate a query mid-flight: a probe tick landing now must
+            // not disturb this.
+            session.state = SessionState::Running;
+            session
+        });
+
+        let interval = session.update(cx, |session, cx| {
+            session.start_liveness_probe_for_test(cx);
+            session.probe_interval_for_test()
+        });
+
+        ping_sender
+            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .expect("send failed");
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Running),
+                "a probe result must never touch SessionState::Running, got {:?}",
+                session.state()
+            );
+            match session.liveness() {
+                LivenessState::Unreachable(message) => assert!(!message.is_empty()),
+                other => panic!("expected LivenessState::Unreachable, got {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_subsequent_successful_probe_reverts_liveness_to_healthy(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks, queries);
+        let ping_sender = connection.ping_sender();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session.state = SessionState::Connected;
+            session
+        });
+
+        let interval = session.update(cx, |session, cx| {
+            session.start_liveness_probe_for_test(cx);
+            session.probe_interval_for_test()
+        });
+
+        ping_sender
+            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .expect("send failed");
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _app| {
+            assert!(matches!(session.liveness(), LivenessState::Unreachable(_)));
+        });
+
+        ping_sender.send(Ok(())).expect("send failed");
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                *session.liveness(),
+                LivenessState::Healthy,
+                "a subsequent successful probe must revert liveness to Healthy automatically"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_overlapping_tick_is_skipped_while_a_probe_is_already_in_flight(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // Deliberately never send a ping response: the probe stays
+        // outstanding for the whole test.
+        let connection = FakeConnection::new(sinks, queries);
+        let ping_calls = connection.ping_call_counter();
+
+        // A timeout much longer than the interval so the probe's own
+        // timeout can't race ahead and resolve it before the second tick
+        // fires; the test needs the first probe to still be genuinely
+        // outstanding when the second interval elapses.
+        let mut cfg = Config::default();
+        cfg.liveness.probe_interval_ms = 10;
+        cfg.liveness.probe_timeout_ms = 10_000;
+
+        let session = cx.new(|_cx| {
+            let mut session = Session::new(&cfg);
+            session.connection = Some(Arc::new(connection));
+            session.state = SessionState::Connected;
+            session
+        });
+
+        let interval = session.update(cx, |session, cx| {
+            session.start_liveness_probe_for_test(cx);
+            session.probe_interval_for_test()
+        });
+
+        // First tick: starts the (never-answered) probe.
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+        assert_eq!(
+            ping_calls.load(Ordering::SeqCst),
+            1,
+            "the first tick must issue exactly one ping"
+        );
+
+        // A second interval elapses while that probe is still outstanding;
+        // this tick must be skipped, not start an overlapping probe. If the
+        // in-flight guard were broken, this would issue a second `ping()`
+        // even though `liveness` (which the never-answered fake can't move)
+        // would look identical either way.
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+
+        assert_eq!(
+            ping_calls.load(Ordering::SeqCst),
+            1,
+            "an overlapping tick must be skipped, not start a second ping while one is in flight"
+        );
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                *session.liveness(),
+                LivenessState::Unknown,
+                "no probe has ever completed, so liveness must still be Unknown"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_probe_that_never_answers_before_its_timeout_is_treated_as_a_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // Deliberately never send a ping response: the only way this probe
+        // can resolve is via the timeout path, not the ping-error path.
+        let connection = FakeConnection::new(sinks, queries);
+
+        // A generous interval and a short timeout so the probe's timer,
+        // not the loop's own next tick, is what resolves the probe.
+        let mut cfg = Config::default();
+        cfg.liveness.probe_interval_ms = 10_000;
+        cfg.liveness.probe_timeout_ms = 10;
+
+        let session = cx.new(|_cx| {
+            let mut session = Session::new(&cfg);
+            session.connection = Some(Arc::new(connection));
+            session.state = SessionState::Connected;
+            session
+        });
+
+        let (interval, timeout) = session.update(cx, |session, cx| {
+            session.start_liveness_probe_for_test(cx);
+            (
+                session.probe_interval_for_test(),
+                session.probe_timeout_for_test(),
+            )
+        });
+
+        // First tick starts the probe; it then must time out on its own
+        // before the (much longer) next interval would ever fire again.
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+        cx.executor().advance_clock(timeout);
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| match session.liveness() {
+            LivenessState::Unreachable(message) => {
+                assert!(
+                    message.contains("timed out"),
+                    "expected a timeout-specific message, got: {message}"
+                );
+            }
+            other => panic!("expected LivenessState::Unreachable, got {other:?}"),
+        });
+    }
+
+    #[gpui::test]
+    fn a_stale_probe_from_a_superseded_connection_is_ignored(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stale_connection = FakeConnection::new(sinks.clone(), queries.clone());
+        let stale_ping = stale_connection.ping_sender();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(stale_connection));
+            session.state = SessionState::Connected;
+            session
+        });
+
+        let interval = session.update(cx, |session, cx| {
+            session.start_liveness_probe_for_test(cx);
+            session.probe_interval_for_test()
+        });
+
+        // Fire the stale connection's first tick; its probe starts but
+        // never resolves yet (no response sent), simulating a probe still
+        // in flight at the moment a reconnect supersedes it below.
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+
+        // Simulate a reconnect: a fresh connection supersedes the stale
+        // one's generation, exactly as a real `connect()` would.
+        let fresh_sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let fresh_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fresh_connection = FakeConnection::new(fresh_sinks, fresh_queries);
+        let fresh_ping = fresh_connection.ping_sender();
+        session.update(cx, |session, cx| {
+            session.connection = Some(Arc::new(fresh_connection));
+            session.start_liveness_probe_for_test(cx);
+        });
+
+        // Now let the stale probe resolve successfully. Its generation no
+        // longer matches, so this must not overwrite `liveness`.
+        stale_ping.send(Ok(())).expect("send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                *session.liveness(),
+                LivenessState::Unknown,
+                "a stale probe's success must not be folded into liveness"
+            );
+        });
+
+        // The fresh connection's own first tick, however, must be honored.
+        fresh_ping
+            .send(Err(CoreError::Connection("fresh probe failed".to_owned())))
+            .expect("send failed");
+        cx.executor().advance_clock(interval);
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.liveness(), LivenessState::Unreachable(_)),
+                "the fresh connection's own probe result must still be honored, got {:?}",
+                session.liveness()
+            );
+        });
     }
 
     #[gpui::test]
@@ -1027,10 +1564,12 @@ mod gpui_tests {
 /// `cargo test` passes with no database present
 #[cfg(test)]
 mod live_tests {
-    use gpui::{AppContext as _, TestAppContext};
-    use zsql_core::Value;
+    use std::time::Duration;
 
-    use super::{Config, SchemaState, Session, SessionState};
+    use gpui::{AppContext as _, Entity, TestAppContext};
+    use zsql_core::{Driver as _, Value};
+
+    use super::{Config, LivenessState, SchemaState, Session, SessionState};
 
     fn live_database_url() -> Option<String> {
         let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
@@ -1038,6 +1577,35 @@ mod live_tests {
             return None;
         };
         Some(url)
+    }
+
+    /// Poll `session`'s liveness, advancing the deterministic test clock by
+    /// one probe `interval` between polls, until `matches_target` returns
+    /// true or `max_polls` is exhausted. Returns whether it matched.
+    ///
+    /// The probe's socket IO runs on a real OS thread outside the
+    /// `TestAppContext`'s deterministic dispatcher (this crate has no tokio
+    /// runtime to hand it a virtual clock), so each poll also sleeps a
+    /// short, real amount of wall-clock time before checking again -
+    /// negligible against `max_polls * interval`'s overall budget, but
+    /// enough for a same-host round trip to actually land.
+    fn wait_for_liveness(
+        cx: &mut TestAppContext,
+        session: &Entity<Session>,
+        interval: Duration,
+        max_polls: u32,
+        matches_target: impl Fn(&LivenessState) -> bool,
+    ) -> bool {
+        for _ in 0..max_polls {
+            let matched = session.read_with(cx, |session, _app| matches_target(session.liveness()));
+            if matched {
+                return true;
+            }
+            cx.executor().advance_clock(interval);
+            std::thread::sleep(Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        session.read_with(cx, |session, _app| matches_target(session.liveness()))
     }
 
     #[gpui::test]
@@ -1235,6 +1803,175 @@ mod live_tests {
                 session.result().rows.len(),
                 3,
                 "the seeded orders table has 3 rows"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn liveness_probe_detects_a_dropped_connection_and_recovers_when_configured(
+        cx: &mut TestAppContext,
+    ) {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        cx.executor().allow_parking();
+
+        // Tag this session's own connections with a unique `application_name`
+        // so the disconnect below can target exactly this test's backends,
+        // not every backend on the database - other live tests may be
+        // running against the same server concurrently.
+        let tagged_url = tag_dsn_with_application_name(&url, "zsql_test_liveness_disconnect");
+
+        let mut cfg = Config::default();
+        cfg.connection.default_url = Some(tagged_url);
+        // Fast enough that this test doesn't burn real wall-clock time
+        // waiting out several intervals, but still comfortably separated
+        // from the timeout below.
+        cfg.liveness.probe_interval_ms = 100;
+        cfg.liveness.probe_timeout_ms = 2_000;
+        let interval = cfg.liveness.probe_interval();
+
+        let session = cx.new(|_cx| Session::new(&cfg));
+        session.update(cx, Session::connect).await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "connect should succeed against a reachable database, got {:?}",
+                session.state()
+            );
+        });
+
+        let became_healthy = wait_for_liveness(cx, &session, interval, 50, |liveness| {
+            matches!(liveness, LivenessState::Healthy)
+        });
+        assert!(
+            became_healthy,
+            "the probe should report Healthy at least once before the connection is severed"
+        );
+
+        // Sever only this test's own tagged backends, simulating a genuine
+        // dropped connection out from under this session's pools without
+        // disturbing any other live test's connections to the same server.
+        // Goes through `zsql_postgres::PostgresDriver` and the `Connection`
+        // contract, like the rest of this test file, rather than naming
+        // `sqlx` directly in this crate.
+        terminate_backends_tagged(&url, "zsql_test_liveness_disconnect").await;
+
+        let became_unreachable = wait_for_liveness(cx, &session, interval, 50, |liveness| {
+            matches!(liveness, LivenessState::Unreachable(_))
+        });
+        assert!(
+            became_unreachable,
+            "liveness should flip to Unreachable within a bounded number of intervals \
+             after the connection is severed"
+        );
+
+        // No explicit reconnect: sqlx's pool opens a fresh connection the
+        // next time it needs one, so the very next successful probe should
+        // recover liveness on its own.
+        let recovered = wait_for_liveness(cx, &session, interval, 50, |liveness| {
+            matches!(liveness, LivenessState::Healthy)
+        });
+        assert!(
+            recovered,
+            "liveness should revert to Healthy automatically once the pool recovers, \
+             with no reconnect/restart from the app"
+        );
+    }
+
+    /// Append `?application_name=<tag>` to `url`, so every connection built
+    /// from the result is identifiable in `pg_stat_activity` by `tag` alone.
+    fn tag_dsn_with_application_name(url: &str, tag: &str) -> String {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}application_name={tag}")
+    }
+
+    /// Open a throwaway connection to `url` and terminate every backend
+    /// tagged with `application_name = tag` (see
+    /// [`tag_dsn_with_application_name`]), simulating a dropped connection
+    /// from outside the app. Scoped to `tag` rather than every backend on
+    /// the database, so this cannot disturb another live test running
+    /// concurrently against the same server. Runs entirely through
+    /// `zsql_postgres`/`zsql_core` so this test file never names `sqlx`
+    /// directly.
+    async fn terminate_backends_tagged(url: &str, tag: &str) {
+        let cfg = zsql_core::ConnConfig::from_dsn(url).expect("a valid test DSN");
+        let conn = zsql_postgres::PostgresDriver
+            .connect(&cfg)
+            .await
+            .expect("a separate verification connection must succeed");
+
+        // `tag` is always one of this file's own string literals, never
+        // externally supplied, so inlining it here carries no injection risk.
+        let sql = format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = '{tag}' AND pid <> pg_backend_pid()"
+        );
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+        loop {
+            match rx.recv_async().await {
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) | Err(_) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => panic!("terminating tagged backends failed: {err}"),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn a_liveness_probe_completes_and_a_slow_query_still_finishes_when_configured(
+        cx: &mut TestAppContext,
+    ) {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        cx.executor().allow_parking();
+
+        let mut cfg = Config::default();
+        cfg.connection.default_url = Some(url);
+        cfg.liveness.probe_interval_ms = 100;
+        cfg.liveness.probe_timeout_ms = 2_000;
+        let interval = cfg.liveness.probe_interval();
+
+        let session = cx.new(|_cx| Session::new(&cfg));
+        session.update(cx, Session::connect).await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(matches!(session.state(), SessionState::Connected));
+        });
+
+        // `pg_sleep` produces no output until it returns, so it is
+        // genuinely running server-side (not just queued) for its whole
+        // 2-second duration; let the probe tick while it's in flight.
+        let run_task = session.update(cx, |session, cx| {
+            session.run_query("SELECT pg_sleep(2)", cx)
+        });
+
+        let reached_healthy_while_running =
+            wait_for_liveness(cx, &session, interval, 50, |liveness| {
+                matches!(liveness, LivenessState::Healthy)
+            });
+        assert!(
+            reached_healthy_while_running,
+            "a probe must complete (using its own connection) while the slow query streams"
+        );
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Running),
+                "the slow query must still be in flight while the probe completed, got {:?}",
+                session.state()
+            );
+        });
+
+        run_task.await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "the slow query must still reach its normal terminal state, unaffected \
+                 by the probe that ran alongside it, got {:?}",
+                session.state()
             );
         });
     }

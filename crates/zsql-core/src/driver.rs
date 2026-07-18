@@ -81,4 +81,15 @@ pub trait Connection: Send + Sync {
     /// # Errors
     /// Returns an error if introspection fails.
     async fn introspect(&self) -> Result<SchemaTree, CoreError>;
+
+    /// Cheaply verify the connection is still alive (e.g. a trivial `SELECT
+    /// 1`-style round trip). Intended to be called on a bounded interval by
+    /// a liveness probe; implementations should use a connection/pool
+    /// distinct from the one [`Connection::stream_query`] draws from so a
+    /// slow query in flight cannot block or be blocked by a probe.
+    ///
+    /// # Errors
+    /// Returns an error if the connection is unreachable or the probe query
+    /// fails.
+    async fn ping(&self) -> Result<(), CoreError>;
 }

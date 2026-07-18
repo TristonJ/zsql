@@ -10,6 +10,11 @@ use gpui::{Pixels, px};
 pub const STATUS_CONNECTING: u32 = 0xd9_a2_5a;
 /// Status-bar "error" indicator: connecting or the last query failed.
 pub const STATUS_ERROR: u32 = 0xe2_6d_78;
+/// Status-bar "disconnected" indicator: the liveliness probe reports the
+/// connection unreachable. Deliberately its own constant (even though it
+/// currently shares `STATUS_ERROR`'s hue) so the two can diverge without
+/// hunting down every call site.
+pub const STATUS_DISCONNECTED: u32 = 0xe2_6d_78;
 
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);

@@ -1187,6 +1187,10 @@ mod tests {
         async fn introspect(&self) -> Result<SchemaTree, CoreError> {
             Ok(SchemaTree::default())
         }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            Ok(())
+        }
     }
 
     /// The entities under test plus the SQL text `FakeConnection` recorded.

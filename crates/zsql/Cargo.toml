@@ -26,6 +26,10 @@ toml = { workspace = true }
 dirs = { workspace = true }
 gpui = { workspace = true }
 flume = { workspace = true }
+# `Session`'s liveliness probe races `Connection::ping` against a timer via
+# `futures::future::select` (no tokio runtime is available to provide a
+# `tokio::time::timeout`).
+futures = { workspace = true }
 
 [dev-dependencies]
 # Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test

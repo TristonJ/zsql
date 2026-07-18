@@ -12,7 +12,7 @@ use zsql_ui::{colors, grid};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
-use crate::session::{Session, SessionState};
+use crate::session::{LivenessState, Session, SessionState};
 
 /// A virtualized results grid, driven by a `Session` entity.
 pub struct ResultsView {
@@ -402,7 +402,7 @@ impl ResultsView {
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
         let session = self.session.read(cx);
         let state = session.state();
-        let (dot_color, label) = status_indicator(state);
+        let (dot_color, label) = status_indicator(state, session.liveness());
 
         let mut bar = div()
             .flex()
@@ -467,8 +467,16 @@ impl Render for ResultsView {
     }
 }
 
-/// The bottom status bar's dot color and label for `state`
-fn status_indicator(state: &SessionState) -> (u32, &'static str) {
+/// The bottom status bar's dot color and label for `state`. A `liveness` of
+/// [`LivenessState::Unreachable`] overrides every state's normal indicator
+/// with a distinct "Disconnected" one, since the probe result is
+/// independent of (and can contradict) whatever `state` currently holds -
+/// for instance a query can still be `Running` against a connection the
+/// probe has just found unreachable.
+fn status_indicator(state: &SessionState, liveness: &LivenessState) -> (u32, &'static str) {
+    if matches!(liveness, LivenessState::Unreachable(_)) {
+        return (theme::STATUS_DISCONNECTED, "Disconnected");
+    }
     match state {
         SessionState::Empty => (colors::FAINT, "Not connected"),
         SessionState::Connecting => (theme::STATUS_CONNECTING, "Connecting…"),
@@ -547,7 +555,7 @@ mod tests {
     };
     use zsql_ui::colors;
 
-    use crate::session::Session;
+    use crate::session::{LivenessState, Session};
     use crate::ui::format::format_value;
     use crate::ui::theme;
 
@@ -640,28 +648,60 @@ mod tests {
     #[test]
     fn status_indicator_maps_each_state_to_its_dot_color_and_label() {
         assert_eq!(
-            status_indicator(&SessionState::Empty),
+            status_indicator(&SessionState::Empty, &LivenessState::Unknown),
             (colors::FAINT, "Not connected")
         );
         assert_eq!(
-            status_indicator(&SessionState::Connecting),
+            status_indicator(&SessionState::Connecting, &LivenessState::Unknown),
             (theme::STATUS_CONNECTING, "Connecting…")
         );
         assert_eq!(
-            status_indicator(&SessionState::Connected),
+            status_indicator(&SessionState::Connected, &LivenessState::Healthy),
             (colors::TEAL, "Connected")
         );
         assert_eq!(
-            status_indicator(&SessionState::Running),
+            status_indicator(&SessionState::Running, &LivenessState::Healthy),
             (colors::TEAL, "Running…")
         );
         assert_eq!(
-            status_indicator(&SessionState::Results(Duration::from_millis(1))),
+            status_indicator(
+                &SessionState::Results(Duration::from_millis(1)),
+                &LivenessState::Healthy
+            ),
             (colors::TEAL, "Connected")
         );
         assert_eq!(
-            status_indicator(&SessionState::Error("boom".to_owned())),
+            status_indicator(
+                &SessionState::Error("boom".to_owned()),
+                &LivenessState::Unknown
+            ),
             (theme::STATUS_ERROR, "Error")
+        );
+    }
+
+    #[test]
+    fn status_indicator_shows_disconnected_regardless_of_session_state_when_liveness_is_unreachable()
+     {
+        let unreachable = LivenessState::Unreachable("connection reset".to_owned());
+        for state in [
+            SessionState::Connected,
+            SessionState::Running,
+            SessionState::Results(Duration::from_millis(1)),
+        ] {
+            assert_eq!(
+                status_indicator(&state, &unreachable),
+                (theme::STATUS_DISCONNECTED, "Disconnected"),
+                "expected a Disconnected indicator regardless of state {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_indicator_treats_a_healthy_or_unknown_liveness_as_no_override() {
+        assert_eq!(
+            status_indicator(&SessionState::Connected, &LivenessState::Healthy),
+            status_indicator(&SessionState::Connected, &LivenessState::Unknown),
+            "Healthy and Unknown liveness must not change a state's own indicator"
         );
     }
 

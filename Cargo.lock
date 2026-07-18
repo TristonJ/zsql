@@ -7726,6 +7726,7 @@ dependencies = [
  "async-trait",
  "dirs 5.0.1",
  "flume 0.11.1",
+ "futures",
  "gpui",
  "serde",
  "toml 0.8.23",
