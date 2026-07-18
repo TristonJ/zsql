@@ -56,6 +56,10 @@ pub const SIDEBAR_INDENT_L1: f32 = 24.0;
 pub const SIDEBAR_INDENT_L2: f32 = 42.0;
 /// Vertical padding above/below the scrollable tree body.
 pub const SIDEBAR_TREE_PADDING_Y: f32 = 6.0;
+/// Size of a catalog/schema row's leading icon.
+pub const SIDEBAR_ROW_ICON_SIZE: Pixels = px(13.0);
+/// Size of a relation row's kind icon (table/view/matview/partitioned).
+pub const SIDEBAR_RELATION_ICON_SIZE: Pixels = px(12.0);
 
 /// Width of the sidebar tree's scrollbar track and thumb.
 pub const SIDEBAR_SCROLLBAR_WIDTH: Pixels = px(8.0);
@@ -107,3 +111,15 @@ pub const MODAL_ROW_URL_TEXT_SIZE: f32 = 10.5;
 pub const MODAL_ROW_CONNECTED_LABEL_TEXT_SIZE: f32 = 9.5;
 /// Vertical gap between a connection-list row's name line and its url line.
 pub const MODAL_ROW_INNER_GAP: Pixels = px(3.0);
+
+/// Size of the modal head's close icon.
+pub const MODAL_CLOSE_ICON_SIZE: Pixels = px(13.0);
+/// Size of a connection-list row's delete icon.
+pub const MODAL_DELETE_ICON_SIZE: Pixels = px(13.0);
+/// Size of the "Add connection" affordance's plus icon.
+pub const MODAL_ADD_ICON_SIZE: Pixels = px(12.0);
+
+/// `group()` name tying the modal close row's hitbox to its icon's
+/// `group_hover` tint, so hovering anywhere in the row -- not just the
+/// icon's own small hitbox -- lightens the close glyph.
+pub const MODAL_CLOSE_HOVER_GROUP: &str = "connection-modal-close-hover";

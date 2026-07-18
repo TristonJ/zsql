@@ -11,13 +11,14 @@ use gpui::{
 };
 use zsql_core::{RelationKind, SchemaTree};
 use zsql_ui::colors;
+use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollbar::{self, ScrollbarGeometry};
 // Imported by name rather than as `zsql_ui::tree::...`: this module already
 // uses `tree` as a local variable/parameter name for a `SchemaTree`, and
 // qualifying every call here would read as if it referred to that value.
 use zsql_ui::tree::{
     META_TEXT_SIZE, ROW_HEIGHT, ROW_TEXT_SIZE, disclosure_glyph, disclosure_spacer, row_count,
-    row_kind, row_label, row_meta, row_shell,
+    row_label, row_meta, row_shell,
 };
 
 use super::results::ResultsView;
@@ -487,6 +488,11 @@ impl SidebarView {
                         view.toggle_catalog(&name_owned, cx);
                     }))
                     .child(disclosure_glyph(*expanded))
+                    .child(icon(
+                        IconName::Database,
+                        theme::SIDEBAR_ROW_ICON_SIZE,
+                        colors::FAINT,
+                    ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
                         el.child(row_meta(format!("{schema_count} schemas")))
@@ -508,6 +514,11 @@ impl SidebarView {
                         view.toggle_schema(&catalog_owned, &name_owned, cx);
                     }))
                     .child(disclosure_glyph(*expanded))
+                    .child(icon(
+                        IconName::Schema,
+                        theme::SIDEBAR_ROW_ICON_SIZE,
+                        colors::FAINT,
+                    ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
                         el.child(row_meta(format!("{relation_count} rel")))
@@ -535,7 +546,11 @@ impl SidebarView {
                     }))
                     .child(disclosure_spacer())
                     .child(row_label(name.clone()))
-                    .child(row_kind(kind_label(*kind)))
+                    .child(icon(
+                        relation_icon_name(*kind),
+                        theme::SIDEBAR_RELATION_ICON_SIZE,
+                        relation_tint(*kind),
+                    ))
                     .child(row_count(format!("{column_count} cols")));
 
                 if selected {
@@ -579,13 +594,23 @@ fn sidebar_tree_content_height(row_count: usize) -> Pixels {
     ROW_HEIGHT * row_count as f32
 }
 
-/// Map a [`RelationKind`] to its ASCII text label.
-fn kind_label(kind: RelationKind) -> &'static str {
+/// Map a [`RelationKind`] to the icon its sidebar row badge renders.
+fn relation_icon_name(kind: RelationKind) -> IconName {
     match kind {
-        RelationKind::Table => "table",
-        RelationKind::View => "view",
-        RelationKind::MatView => "matview",
-        RelationKind::Partitioned => "partitioned",
+        RelationKind::Table => IconName::Table,
+        RelationKind::View => IconName::View,
+        RelationKind::MatView => IconName::MaterializedView,
+        RelationKind::Partitioned => IconName::PartitionedTable,
+    }
+}
+
+/// Map a [`RelationKind`] to the tint its sidebar row badge renders with.
+fn relation_tint(kind: RelationKind) -> u32 {
+    match kind {
+        RelationKind::Table => colors::TEAL,
+        RelationKind::View => colors::VIEW,
+        RelationKind::MatView => colors::MATVIEW,
+        RelationKind::Partitioned => colors::PARTITIONED,
     }
 }
 
@@ -639,9 +664,14 @@ mod tests {
     use std::collections::HashSet;
 
     use zsql_core::{Catalog, ColumnMeta, Relation, RelationKind, SchemaNs, SchemaTree};
+    use zsql_ui::colors;
+    use zsql_ui::icon::IconName;
     use zsql_ui::tree::ROW_HEIGHT;
 
-    use super::{SidebarRow, flatten_schema_tree, kind_label, sidebar_tree_content_height};
+    use super::{
+        SidebarRow, flatten_schema_tree, relation_icon_name, relation_tint,
+        sidebar_tree_content_height,
+    };
 
     fn sample_tree() -> SchemaTree {
         SchemaTree {
@@ -694,11 +724,33 @@ mod tests {
     }
 
     #[test]
-    fn kind_label_maps_every_relation_kind_to_ascii_text() {
-        assert_eq!(kind_label(RelationKind::Table), "table");
-        assert_eq!(kind_label(RelationKind::View), "view");
-        assert_eq!(kind_label(RelationKind::MatView), "matview");
-        assert_eq!(kind_label(RelationKind::Partitioned), "partitioned");
+    fn relation_icon_name_maps_every_relation_kind_to_a_distinct_icon() {
+        let icons = [
+            relation_icon_name(RelationKind::Table),
+            relation_icon_name(RelationKind::View),
+            relation_icon_name(RelationKind::MatView),
+            relation_icon_name(RelationKind::Partitioned),
+        ];
+        assert_eq!(icons[0], IconName::Table);
+        assert_eq!(icons[1], IconName::View);
+        assert_eq!(icons[2], IconName::MaterializedView);
+        assert_eq!(icons[3], IconName::PartitionedTable);
+        for (i, a) in icons.iter().enumerate() {
+            for b in &icons[i + 1..] {
+                assert_ne!(a, b, "every relation kind must map to a distinct icon");
+            }
+        }
+    }
+
+    #[test]
+    fn relation_tint_maps_every_relation_kind_to_a_named_color_constant() {
+        assert_eq!(relation_tint(RelationKind::Table), colors::TEAL);
+        assert_eq!(relation_tint(RelationKind::View), colors::VIEW);
+        assert_eq!(relation_tint(RelationKind::MatView), colors::MATVIEW);
+        assert_eq!(
+            relation_tint(RelationKind::Partitioned),
+            colors::PARTITIONED
+        );
     }
 
     #[test]

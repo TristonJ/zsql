@@ -16,6 +16,7 @@ use gpui::{
     relative, rgb, rgba, size,
 };
 use zsql_ui::colors;
+use zsql_ui::icon::{IconName, icon};
 
 use crate::theme;
 use crate::{Highlighter, PlainHighlighter, Position, Selection, StyleSpan, TextBuffer};
@@ -471,6 +472,11 @@ impl EditorView {
                     .on_click(cx.listener(|editor, _event: &ClickEvent, _window, cx| {
                         editor.run_current_query(cx);
                     }))
+                    .child(icon(
+                        IconName::Run,
+                        theme::RUN_BUTTON_ICON_SIZE,
+                        colors::INK,
+                    ))
                     .child(
                         div()
                             .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))

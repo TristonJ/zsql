@@ -43,60 +43,68 @@ fn main() -> anyhow::Result<()> {
     let saved_connections = connection_store.connections().to_vec();
     let resolved_dsn = cfg.resolve_url();
 
-    Application::new().run(move |cx: &mut App| {
-        zsql_editor::init(cx);
-        zsql_ui::text_field::init(cx);
+    Application::new()
+        .with_assets(zsql_ui::icon::IconAssetSource)
+        .run(move |cx: &mut App| {
+            zsql_editor::init(cx);
+            zsql_ui::text_field::init(cx);
 
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                let session = cx.new(|_cx| Session::new(&cfg));
+            let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let session = cx.new(|_cx| Session::new(&cfg));
 
-                let workspace_session = session.clone();
-                let workspace_layout = cfg.layout.clone();
-                let workspace = cx.new(|cx| {
-                    WorkspaceView::new(workspace_session, workspace_layout, connection_store, cx)
-                });
-                window.focus(&workspace.read(cx).editor_focus_handle(cx));
-
-                let startup_session = session.clone();
-                let startup_workspace = workspace.clone();
-                cx.spawn(async move |cx| {
-                    let connect_task = startup_session.update(cx, Session::connect)?;
-                    connect_task.await;
-
-                    let is_connected = startup_session.read_with(cx, |session, _app| {
-                        !matches!(
-                            session.state(),
-                            SessionState::Empty | SessionState::Error(_)
+                    let workspace_session = session.clone();
+                    let workspace_layout = cfg.layout.clone();
+                    let workspace = cx.new(|cx| {
+                        WorkspaceView::new(
+                            workspace_session,
+                            workspace_layout,
+                            connection_store,
+                            cx,
                         )
-                    })?;
+                    });
+                    window.focus(&workspace.read(cx).editor_focus_handle(cx));
 
-                    if is_connected {
-                        if let Some(dsn) = &resolved_dsn {
-                            let active = active_connection_for_url(dsn, &saved_connections);
-                            startup_workspace.update(cx, |workspace, cx| {
-                                workspace.set_active_connection(active, cx);
-                            })?;
+                    let startup_session = session.clone();
+                    let startup_workspace = workspace.clone();
+                    cx.spawn(async move |cx| {
+                        let connect_task = startup_session.update(cx, Session::connect)?;
+                        connect_task.await;
+
+                        let is_connected = startup_session.read_with(cx, |session, _app| {
+                            !matches!(
+                                session.state(),
+                                SessionState::Empty | SessionState::Error(_)
+                            )
+                        })?;
+
+                        if is_connected {
+                            if let Some(dsn) = &resolved_dsn {
+                                let active = active_connection_for_url(dsn, &saved_connections);
+                                startup_workspace.update(cx, |workspace, cx| {
+                                    workspace.set_active_connection(active, cx);
+                                })?;
+                            }
+                            let introspect_task =
+                                startup_session.update(cx, Session::introspect)?;
+                            introspect_task.await;
                         }
-                        let introspect_task = startup_session.update(cx, Session::introspect)?;
-                        introspect_task.await;
-                    }
 
-                    anyhow::Ok(())
-                })
-                .detach_and_log_err(cx);
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
 
-                workspace
-            },
-        )
-        .expect("failed to open window");
-        cx.activate(true);
-    });
+                    workspace
+                },
+            )
+            .expect("failed to open window");
+            cx.activate(true);
+        });
 
     Ok(())
 }
