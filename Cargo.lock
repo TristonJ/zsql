@@ -7730,12 +7730,14 @@ dependencies = [
  "futures",
  "gpui",
  "serde",
+ "thiserror 2.0.18",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "zsql-core",
  "zsql-editor",
  "zsql-postgres",
+ "zsql-sqlite",
  "zsql-ui",
 ]
 

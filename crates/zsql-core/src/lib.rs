@@ -4,11 +4,13 @@
 pub mod config;
 pub mod driver;
 pub mod error;
+pub mod registry;
 pub mod schema;
 pub mod value;
 
 pub use config::ConnConfig;
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
+pub use registry::select_driver;
 pub use schema::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

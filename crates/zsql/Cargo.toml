@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 zsql-core = { path = "../zsql-core" }
-# `Session` (session.rs) connects and runs queries through this: it is the
-# only place in this crate that names a Postgres/sqlx type, and even there
-# only behind `zsql_core::Connection`/`CoreError` — see `session.rs`'s module
-# doc comment.
+# `drivers.rs` registers both of these behind `zsql_core::Driver` and selects
+# between them purely via `zsql_core::select_driver`; neither crate's own
+# types (sqlx or otherwise) are named outside their own crates.
 zsql-postgres = { path = "../zsql-postgres" }
+zsql-sqlite = { path = "../zsql-sqlite" }
 zsql-ui = { path = "../zsql-ui" }
 zsql-editor = { path = "../zsql-editor" }
 anyhow = { workspace = true }
@@ -31,6 +31,8 @@ flume = { workspace = true }
 # `futures::future::select` (no tokio runtime is available to provide a
 # `tokio::time::timeout`).
 futures = { workspace = true }
+# `connections.rs`'s `ConnectionStoreError`.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test

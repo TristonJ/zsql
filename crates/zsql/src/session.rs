@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use futures::future::Either;
 use gpui::{BackgroundExecutor, Context, Task, prelude::*};
-use zsql_core::{ConnConfig, Connection, CoreError, Driver, QueryEvent, ResultSet, SchemaTree};
-use zsql_postgres::PostgresDriver;
+use zsql_core::{Connection, CoreError, QueryEvent, ResultSet, SchemaTree};
 
 use crate::config::Config;
+use crate::drivers;
 
 /// What the session (and the results grid it drives) currently displays.
 #[derive(Debug, Clone)]
@@ -183,7 +183,9 @@ impl Session {
         &self.accumulating
     }
 
-    /// Connect using the resolved DSN. If none is configured, sets
+    /// Connect using the resolved DSN (`DATABASE_URL`, or else
+    /// `Config::connection.default_url`) as a fallback/seed when no saved
+    /// connection has been explicitly chosen. If none is configured, sets
     /// [`SessionState::Empty`] and returns a completed task
     pub fn connect(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let Some(dsn) = self.dsn.clone() else {
@@ -191,7 +193,22 @@ impl Session {
             cx.notify();
             return Task::ready(());
         };
+        self.connect_url(dsn, cx)
+    }
 
+    /// Connect to an explicitly chosen URL (e.g. a saved connection picked
+    /// from the connection manager), replacing whatever connection is
+    /// currently active. The driver is resolved from `url`'s scheme via
+    /// [`drivers::connect`]; this crate never picks a driver directly.
+    pub fn connect_to(&mut self, url: impl Into<String>, cx: &mut Context<Self>) -> Task<()> {
+        self.connect_url(url.into(), cx)
+    }
+
+    /// Shared implementation behind [`Session::connect`] and
+    /// [`Session::connect_to`]: connect to `url` through
+    /// [`drivers::connect`], replacing the current connection and
+    /// (re)starting the liveliness probe loop on success.
+    fn connect_url(&mut self, url: String, cx: &mut Context<Self>) -> Task<()> {
         self.state = SessionState::Connecting;
         self.liveness = LivenessState::Unknown;
         // A fresh connect attempt invalidates any liveness probe loop tied
@@ -207,19 +224,7 @@ impl Session {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let cfg = match ConnConfig::from_dsn(&dsn) {
-                Ok(cfg) => cfg,
-                Err(err) => {
-                    let _ = this.update(cx, |session, cx| {
-                        tracing::warn!(error = %err, "session dsn rejected");
-                        session.state = SessionState::Error(err.to_string());
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-
-            let connect_result = cx.background_spawn(connect_postgres(cfg)).await;
+            let connect_result = cx.background_spawn(drivers::connect(url)).await;
 
             let connected = this.update(cx, |session, cx| {
                 let connected = match connect_result {
@@ -231,6 +236,12 @@ impl Session {
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "session connect failed");
+                        // Drop any previously-active connection: the generation
+                        // bump already invalidated its probe loop, and leaving it
+                        // in `self.connection` would let `run_query` silently
+                        // execute against the database this failed switch was
+                        // meant to replace.
+                        session.connection = None;
                         session.state = SessionState::Error(err.to_string());
                         false
                     }
@@ -537,15 +548,6 @@ impl Session {
     pub(crate) fn probe_timeout_for_test(&self) -> Duration {
         self.probe_timeout
     }
-}
-
-/// Connect to Postgres via [`PostgresDriver`]
-///
-/// # Errors
-/// Returns whatever [`PostgresDriver::connect`] returns on failure.
-#[tracing::instrument(name = "session_connect_postgres", skip_all)]
-async fn connect_postgres(cfg: ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
-    PostgresDriver.connect(&cfg).await
 }
 
 /// Introspect `connection`'s reachable schema.
@@ -925,6 +927,105 @@ mod gpui_tests {
                 );
             }
             other => panic!("expected SessionState::Error, got {other:?}"),
+        });
+    }
+
+    /// Proves a `SQLite` connection now works end-to-end through the same
+    /// selection-based connect path the app uses, where before this feature
+    /// `SQLite` could not be connected at all. Unconditional: an in-memory
+    /// database needs no external service.
+    #[gpui::test]
+    async fn connect_resolves_a_sqlite_url_and_actually_opens_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let mut cfg = Config::default();
+        cfg.connection.default_url = Some("sqlite::memory:".to_owned());
+        let session = cx.new(|_cx| Session::new(&cfg));
+
+        session.update(cx, Session::connect).await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected a sqlite connection to succeed, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// `Session::connect_to` (used by the connection manager to connect an
+    /// explicitly chosen saved connection) must dispatch through the exact
+    /// same selection-based path as `connect`, independent of whatever DSN
+    /// (if any) `Config` resolved at startup.
+    #[gpui::test]
+    async fn connect_to_opens_a_sqlite_url_regardless_of_the_configured_dsn(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        // No configured DSN at all: `connect_to` must still work on its own.
+        let session = cx.new(|_cx| Session::new(&Config::default()));
+
+        session
+            .update(cx, |session, cx| session.connect_to("sqlite::memory:", cx))
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected connect_to to open a sqlite connection, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// A failed connection switch must not leave the previous connection
+    /// queryable: `connect_to` clears the active connection on failure, so
+    /// `run_query` afterwards reports "not connected" instead of silently
+    /// executing against the database connected before the failed switch.
+    #[gpui::test]
+    async fn a_failed_connect_switch_clears_the_previous_connection(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let session = cx.new(|_cx| Session::new(&Config::default()));
+
+        session
+            .update(cx, |session, cx| session.connect_to("sqlite::memory:", cx))
+            .await;
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected the first connection to succeed, got {:?}",
+                session.state()
+            );
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.connect_to("cassandra://host/db", cx)
+            })
+            .await;
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected Error after a failed switch, got {:?}",
+                session.state()
+            );
+            assert!(
+                session.connection.is_none(),
+                "a failed connect switch must clear the previous live connection"
+            );
+        });
+
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 1", cx))
+            .await;
+        session.read_with(cx, |session, _app| match session.state() {
+            SessionState::Error(message) => assert!(
+                message.contains("not connected"),
+                "expected a not-connected error, got {message:?}"
+            ),
+            other => panic!("expected a not-connected error, got {other:?}"),
         });
     }
 
