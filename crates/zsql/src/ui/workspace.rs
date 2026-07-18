@@ -10,10 +10,12 @@ use gpui::{
 };
 use zsql_ui::colors;
 
+use super::connections::ConnectionManagerView;
 use super::editor_adapter;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use crate::config::LayoutConfig;
+use crate::connections::ConnectionStore;
 use crate::session::Session;
 
 /// Which pane boundary a divider drag is currently resizing, and the pane
@@ -36,6 +38,7 @@ enum DividerDrag {
 }
 
 pub struct WorkspaceView {
+    connections: Entity<ConnectionManagerView>,
     sidebar: Entity<SidebarView>,
     editor: Entity<EditorView>,
     results: Entity<ResultsView>,
@@ -52,16 +55,25 @@ pub struct WorkspaceView {
 }
 
 impl WorkspaceView {
-    /// Build a workspace over `session`, with pane sizes seeded from `layout`.
+    /// Build a workspace over `session`, with pane sizes seeded from `layout`
+    /// and `connection_store` backing the connection manager bar.
     #[must_use]
-    pub fn new(session: Entity<Session>, layout: LayoutConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<Session>,
+        layout: LayoutConfig,
+        connection_store: ConnectionStore,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), results.clone(), cx));
+        let connections =
+            cx.new(|cx| ConnectionManagerView::new(session.clone(), connection_store, cx));
         let editor = cx.new(|cx| editor_adapter::new_editor_view(session, results.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
 
         Self {
+            connections,
             sidebar,
             editor,
             results,
@@ -189,73 +201,85 @@ impl Render for WorkspaceView {
 
         div()
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .bg(rgb(colors::INK))
-            .on_mouse_move(cx.listener(Self::drag_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_drag))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_drag))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w(self.sidebar_width)
-                    .h_full()
-                    .child(self.sidebar.clone()),
-            )
-            .child(
-                div()
-                    .id("sidebar-divider")
-                    .flex_shrink_0()
-                    .w(divider_thickness)
-                    .h_full()
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .bg(rgb(colors::LINE))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::start_sidebar_drag)),
-            )
+            .child(self.connections.clone())
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(
-                        // Zero-size measuring probe: records this column's
-                        // painted height into `column_height` on every
-                        // layout pass, so a divider drag knows how much
-                        // vertical space the editor and results panes have
-                        // to split. Absolutely positioned so it never
-                        // participates in the column's own flex layout.
-                        canvas(
-                            move |bounds: Bounds<Pixels>, _window, _cx| {
-                                column_height.set(bounds.size.height);
-                            },
-                            |_bounds, (), _window, _cx| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
+                    .min_h_0()
+                    .on_mouse_move(cx.listener(Self::drag_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_drag))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_drag))
                     .child(
                         div()
                             .flex_shrink_0()
-                            .w_full()
-                            .h(self.editor_height)
-                            .child(self.editor.clone()),
+                            .w(self.sidebar_width)
+                            .h_full()
+                            .child(self.sidebar.clone()),
                     )
                     .child(
                         div()
-                            .id("editor-results-divider")
+                            .id("sidebar-divider")
                             .flex_shrink_0()
-                            .w_full()
-                            .h(divider_thickness)
-                            .cursor(CursorStyle::ResizeUpDown)
+                            .w(divider_thickness)
+                            .h_full()
+                            .cursor(CursorStyle::ResizeLeftRight)
                             .bg(rgb(colors::LINE))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(Self::start_editor_results_drag),
+                                cx.listener(Self::start_sidebar_drag),
                             ),
                     )
-                    .child(div().flex_1().min_h_0().child(self.results.clone())),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                // Zero-size measuring probe: records this
+                                // column's painted height into `column_height`
+                                // on every layout pass, so a divider drag knows
+                                // how much vertical space the editor and results
+                                // panes have to split. Absolutely positioned so
+                                // it never participates in the column's own flex
+                                // layout.
+                                canvas(
+                                    move |bounds: Bounds<Pixels>, _window, _cx| {
+                                        column_height.set(bounds.size.height);
+                                    },
+                                    |_bounds, (), _window, _cx| {},
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w_full()
+                                    .h(self.editor_height)
+                                    .child(self.editor.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("editor-results-divider")
+                                    .flex_shrink_0()
+                                    .w_full()
+                                    .h(divider_thickness)
+                                    .cursor(CursorStyle::ResizeUpDown)
+                                    .bg(rgb(colors::LINE))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::start_editor_results_drag),
+                                    ),
+                            )
+                            .child(div().flex_1().min_h_0().child(self.results.clone())),
+                    ),
             )
     }
 }
@@ -419,7 +443,19 @@ mod render_tests {
 
     use super::WorkspaceView;
     use crate::config::LayoutConfig;
+    use crate::connections::ConnectionStore;
     use crate::session::{SchemaState, Session};
+
+    /// An empty connection store backed by a path this test never writes
+    /// to: `WorkspaceView`'s render test only exercises rendering, not
+    /// persistence.
+    fn empty_store_for_test() -> ConnectionStore {
+        let path = std::env::temp_dir().join(format!(
+            "zsql-workspace-render-test-{}.toml",
+            std::process::id()
+        ));
+        ConnectionStore::load(&path).expect("loading a nonexistent path must succeed empty")
+    }
 
     fn sample_schema_session(cx: &mut gpui::TestAppContext) -> gpui::Entity<Session> {
         let tree = SchemaTree {
@@ -441,7 +477,9 @@ mod render_tests {
     #[gpui::test]
     fn renders_the_sidebar_editor_and_results_without_panicking(cx: &mut gpui::TestAppContext) {
         let session = sample_schema_session(cx);
-        cx.add_window_view(|_window, cx| WorkspaceView::new(session, LayoutConfig::default(), cx));
+        cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
     }
 
     #[gpui::test]
@@ -450,8 +488,9 @@ mod render_tests {
         let layout = LayoutConfig::default();
         let expected_sidebar_width = layout.sidebar_default_width;
         let expected_editor_height = layout.editor_default_height;
-        let (workspace, vcx) =
-            cx.add_window_view(|_window, cx| WorkspaceView::new(session, layout, cx));
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, layout, empty_store_for_test(), cx)
+        });
         workspace.read_with(vcx, |workspace, _cx| {
             assert_eq!(workspace.sidebar_width, expected_sidebar_width);
             assert_eq!(workspace.editor_height, expected_editor_height);

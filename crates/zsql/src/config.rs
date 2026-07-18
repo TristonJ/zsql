@@ -7,6 +7,15 @@ use std::time::Duration;
 use gpui::{Pixels, px};
 use serde::{Deserialize, Serialize};
 
+/// Directory name under the OS config dir that holds every zsql config/data
+/// file: `dirs::config_dir().join(APP_CONFIG_DIR_NAME)`.
+const APP_CONFIG_DIR_NAME: &str = "zsql";
+/// File name of the top-level app config, under `APP_CONFIG_DIR_NAME`.
+const CONFIG_FILE_NAME: &str = "config.toml";
+/// File name of the persisted connection store, under `APP_CONFIG_DIR_NAME`.
+/// See [`crate::connections::ConnectionStore`].
+const CONNECTIONS_FILE_NAME: &str = "connections.toml";
+
 /// Top-level application config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -148,7 +157,16 @@ impl Config {
     /// Standard config path (`$XDG_CONFIG_HOME/zsql/config.toml`), if resolvable.
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("zsql").join("config.toml"))
+        dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+    }
+
+    /// Path to the persisted connection store
+    /// (`$XDG_CONFIG_HOME/zsql/connections.toml`), if resolvable. Lives
+    /// alongside [`Config::default_path`], under the same app config
+    /// directory.
+    #[must_use]
+    pub fn connections_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(CONNECTIONS_FILE_NAME))
     }
 
     /// Load config from `path`, falling back to defaults if it does not exist.

@@ -1,12 +1,15 @@
 //! zsql -- a lightweight Postgres-first SQL editor (gpui).
 
 mod config;
+mod connections;
+mod drivers;
 mod observability;
 mod session;
 mod sql;
 mod ui;
 
 use config::Config;
+use connections::ConnectionStore;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use session::{Session, SessionState};
 use ui::workspace::WorkspaceView;
@@ -26,6 +29,11 @@ fn main() -> anyhow::Result<()> {
     let has_configured_url = cfg.resolve_url().is_some();
     tracing::info!(theme = %cfg.theme.name, has_configured_url, "zsql starting");
 
+    let connection_store = match Config::connections_path() {
+        Some(path) => ConnectionStore::load(&path)?,
+        None => ConnectionStore::in_memory(),
+    };
+
     Application::new().run(move |cx: &mut App| {
         zsql_editor::init(cx);
 
@@ -40,8 +48,9 @@ fn main() -> anyhow::Result<()> {
 
                 let workspace_session = session.clone();
                 let workspace_layout = cfg.layout.clone();
-                let workspace =
-                    cx.new(|cx| WorkspaceView::new(workspace_session, workspace_layout, cx));
+                let workspace = cx.new(|cx| {
+                    WorkspaceView::new(workspace_session, workspace_layout, connection_store, cx)
+                });
                 window.focus(&workspace.read(cx).editor_focus_handle(cx));
 
                 let startup_session = session.clone();
