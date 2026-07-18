@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 
 use gpui::{
-    ClickEvent, Context, Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Render, Stateful, UniformListScrollHandle, Window, div, point, prelude::*, px, rgb,
-    rgba, uniform_list,
+    ClickEvent, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, Stateful, UniformListScrollHandle, Window, div, point,
+    prelude::*, px, rgb, rgba, uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
 use zsql_ui::colors;
@@ -21,7 +21,7 @@ use zsql_ui::tree::{
     row_label, row_meta, row_shell,
 };
 
-use super::results::ResultsView;
+use super::tabs::TabModel;
 use super::theme;
 use crate::session::{SchemaState, Session};
 
@@ -55,7 +55,7 @@ enum SidebarRow {
 /// The schema sidebar view.
 pub struct SidebarView {
     session: Entity<Session>,
-    results: Entity<ResultsView>,
+    tabs: Entity<TabModel>,
     collapsed_catalogs: HashSet<String>,
     collapsed_schemas: HashSet<(String, String)>,
     /// The relation most recently clicked, for highlighting its row.
@@ -83,14 +83,10 @@ struct ThumbDrag {
 }
 
 impl SidebarView {
-    /// Build a sidebar over `session`, previewing clicked relations into
-    /// `results`.
+    /// Build a sidebar over `session`, previewing clicked relations by
+    /// opening (or reusing) a generated tab in `tabs`.
     #[must_use]
-    pub fn new(
-        session: Entity<Session>,
-        results: Entity<ResultsView>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(session: Entity<Session>, tabs: Entity<TabModel>, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |view: &mut Self, _session, cx| {
             if view.sync_rows_if_schema_changed(cx) {
                 cx.notify();
@@ -100,7 +96,7 @@ impl SidebarView {
 
         let mut view = Self {
             session,
-            results,
+            tabs,
             collapsed_catalogs: HashSet::new(),
             collapsed_schemas: HashSet::new(),
             selected_relation: None,
@@ -181,18 +177,30 @@ impl SidebarView {
     }
 
     /// Preview `schema.relation`: mark it selected (for row highlighting),
-    /// update the results grid's source label, and dispatch the preview
-    /// query via `Session::preview_relation`.
-    fn preview(&mut self, schema: &str, relation: &str, cx: &mut Context<Self>) {
+    /// open (or reuse) a generated tab for it -- running the preview query
+    /// through `Session` and updating the results grid's source label --
+    /// and move keyboard focus onto that tab's editor.
+    fn preview(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.selected_relation = Some((schema.to_owned(), relation.to_owned()));
 
-        let label = format!("{schema}.{relation}");
-        self.results
-            .update(cx, |results, cx| results.set_source_label(label, cx));
-
-        self.session.update(cx, |session, cx| {
-            session.preview_relation(schema, relation, cx).detach();
+        let preview_limit = self.session.read(cx).preview_limit();
+        self.tabs.update(cx, |tabs, cx| {
+            tabs.open_or_reuse_generated(schema, relation, preview_limit, cx);
         });
+        if let Some(handle) = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .map(|tab| tab.editor().focus_handle(cx))
+        {
+            window.focus(&handle);
+        }
 
         cx.notify();
     }
@@ -541,8 +549,8 @@ impl SidebarView {
                     .id(ix)
                     .cursor_pointer()
                     .hover(|this| this.bg(rgb(colors::RAISE)))
-                    .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
-                        view.preview(&schema_owned, &name_owned, cx);
+                    .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+                        view.preview(&schema_owned, &name_owned, window, cx);
                     }))
                     .child(disclosure_spacer())
                     .child(row_label(name.clone()))
@@ -881,6 +889,19 @@ mod render_tests {
     use super::SidebarView;
     use crate::session::{SchemaState, Session};
     use crate::ui::results::ResultsView;
+    use crate::ui::tabs::TabModel;
+
+    /// A `TabModel` over a fresh `ResultsView`, for tests that only care
+    /// about the sidebar's own state and do not inspect results/tabs
+    /// directly.
+    fn build_tabs(
+        session: gpui::Entity<Session>,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<TabModel> {
+        let session_for_results = session.clone();
+        let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
+        cx.new(|cx| TabModel::new(session, results, cx))
+    }
 
     fn sample_schema_tree() -> SchemaTree {
         SchemaTree {
@@ -927,11 +948,8 @@ mod render_tests {
 
     fn build(cx: &mut gpui::TestAppContext, schema: SchemaState) {
         let session = cx.new(|_cx| Session::new_for_schema_test(schema));
-        let session_for_results = session.clone();
-        cx.add_window_view(|_window, cx| {
-            let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-            SidebarView::new(session, results, cx)
-        });
+        let tabs = build_tabs(session.clone(), cx);
+        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
     }
 
     #[gpui::test]
@@ -970,11 +988,8 @@ mod render_tests {
     ) {
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tall_schema_tree(300))));
-        let session_for_results = session.clone();
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
-            let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-            SidebarView::new(session, results, cx)
-        });
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
         vcx.run_until_parked();
 
         sidebar.read_with(vcx, |view, _app| {
@@ -1001,12 +1016,10 @@ mod render_tests {
     fn an_unrelated_session_notify_does_not_reflatten_the_row_cache(cx: &mut gpui::TestAppContext) {
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
-        let session_for_results = session.clone();
         let session_for_view = session.clone();
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
-            let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-            SidebarView::new(session_for_view, results, cx)
-        });
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
 
         let (generation_after_build, row_count_after_build) = sidebar.update(vcx, |view, _cx| {
             (view.synced_schema_generation, view.rows.len())
@@ -1036,20 +1049,21 @@ mod render_tests {
     }
 
     #[gpui::test]
-    fn preview_selects_the_relation_and_sets_the_results_source_label(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn preview_selects_the_relation_and_opens_a_generated_tab(cx: &mut gpui::TestAppContext) {
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
-        let session_for_results = session.clone();
         let session_for_view = session.clone();
+        let session_for_results = session.clone();
         let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-        let results_for_view = results.clone();
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
-            SidebarView::new(session_for_view, results_for_view, cx)
-        });
+        let results_for_tabs = results.clone();
+        let tabs = cx.new(|cx| TabModel::new(session.clone(), results_for_tabs, cx));
+        let tabs_for_view = tabs.clone();
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));
 
-        sidebar.update(vcx, |view, cx| view.preview("public", "orders", cx));
+        sidebar.update_in(vcx, |view, window, cx| {
+            view.preview("public", "orders", window, cx);
+        });
         vcx.run_until_parked();
 
         sidebar.update(vcx, |view, _cx| {
@@ -1057,6 +1071,14 @@ mod render_tests {
                 view.selected_relation,
                 Some(("public".to_owned(), "orders".to_owned()))
             );
+        });
+        tabs.read_with(vcx, |tabs, _app| {
+            assert_eq!(
+                tabs.tabs().len(),
+                1,
+                "preview opens exactly one generated tab"
+            );
+            assert!(tabs.tabs()[0].is_generated());
         });
         results.update(vcx, |view, _cx| {
             assert_eq!(view.source_label_for_test(), "public.orders");
@@ -1067,12 +1089,10 @@ mod render_tests {
     fn toggling_a_catalog_or_schema_collapses_then_re_expands(cx: &mut gpui::TestAppContext) {
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
-        let session_for_results = session.clone();
         let session_for_view = session.clone();
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
-            let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-            SidebarView::new(session_for_view, results, cx)
-        });
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
 
         let expanded = sidebar.update(vcx, |view, _cx| view.rows.len());
         assert!(expanded > 1);

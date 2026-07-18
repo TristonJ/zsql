@@ -68,7 +68,9 @@ fn main() -> anyhow::Result<()> {
                             cx,
                         )
                     });
-                    window.focus(&workspace.read(cx).editor_focus_handle(cx));
+                    if let Some(handle) = workspace.read(cx).editor_focus_handle(cx) {
+                        window.focus(&handle);
+                    }
 
                     let startup_session = session.clone();
                     let startup_workspace = workspace.clone();

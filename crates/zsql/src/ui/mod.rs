@@ -6,5 +6,6 @@ pub mod footer;
 pub mod format;
 pub mod results;
 pub mod sidebar;
+pub mod tabs;
 pub mod theme;
 pub mod workspace;

@@ -4,21 +4,40 @@
 use std::ops::Range;
 
 use gpui::{
-    Context, Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    App, Context, Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Render, SharedString, UniformListScrollHandle, Window, div, point, prelude::*, px, rgb, rgba,
     uniform_list,
 };
-use zsql_core::ColumnMeta;
+use zsql_core::{ColumnMeta, ResultSet};
 use zsql_ui::{colors, grid, scrollbar};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
 use crate::session::{LivenessState, Session, SessionState};
 
+/// A tab's captured query outcome: the label, lifecycle state, and result
+/// set a [`ResultsView`] shows while that tab (rather than the live
+/// `Session`) is what it is displaying. Captured once a tab's own run
+/// reaches a terminal state, so switching back to that tab later restores
+/// exactly what it last produced instead of whatever a different tab most
+/// recently ran.
+#[derive(Debug, Clone)]
+pub struct ResultsSnapshot {
+    pub source_label: SharedString,
+    pub state: SessionState,
+    pub result: ResultSet,
+}
+
 /// A virtualized results grid, driven by a `Session` entity.
 pub struct ResultsView {
     session: Entity<Session>,
     source_label: SharedString,
+    /// `Some` while this view is frozen to a specific tab's captured
+    /// [`ResultsSnapshot`] instead of following `session` live -- e.g. the
+    /// active tab is not the one `session` is currently running a query
+    /// for. `None` (the default) means every render reads straight off
+    /// `session`.
+    frozen: Option<ResultsSnapshot>,
     column_widths: Vec<Pixels>,
     /// Per-column max formatted-text char count seen so far
     column_max_body_chars: Vec<usize>,
@@ -63,6 +82,7 @@ impl ResultsView {
         let mut view = Self {
             session,
             source_label: source_label.into(),
+            frozen: None,
             column_widths: Vec::new(),
             column_max_body_chars: Vec::new(),
             folded_row_count: 0,
@@ -87,12 +107,9 @@ impl ResultsView {
     /// `request_animation_frame` cannot do this - it only queues a callback
     /// without forcing a draw, so on an otherwise idle window it never fires.
     fn nudge_scrollbar_when_grid_unmeasured(&mut self, cx: &mut Context<Self>) {
-        let grid_shown = {
-            let session = self.session.read(cx);
-            matches!(session.state(), SessionState::Results(_))
-                || (matches!(session.state(), SessionState::Running)
-                    && !session.result().columns.is_empty())
-        };
+        let grid_shown = matches!(self.effective_state(cx), SessionState::Results(_))
+            || (matches!(self.effective_state(cx), SessionState::Running)
+                && !self.effective_result(cx).columns.is_empty());
         let viewport_unmeasured = self
             .row_scroll_handle
             .0
@@ -110,18 +127,73 @@ impl ResultsView {
         }
     }
 
-    /// Update the results header's source/relation label, e.g. after the
-    /// schema sidebar previews a different relation.
-    pub fn set_source_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.source_label = label.into();
+    /// Follow `session`'s state/result live under `source_label`, e.g. for
+    /// the tab that `session` is currently running a query for. Every
+    /// render reads straight off `session` until the next
+    /// [`ResultsView::show_snapshot`] or `show_live` call.
+    pub fn show_live(&mut self, source_label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.source_label = source_label.into();
+        self.frozen = None;
+        self.reset_dimension_cache();
+        self.sync_dimensions(cx);
         cx.notify();
+    }
+
+    /// Freeze the grid to `snapshot` instead of following `session` live,
+    /// e.g. when switching to a tab that is not the one `session` is
+    /// currently running a query for.
+    pub fn show_snapshot(&mut self, snapshot: ResultsSnapshot, cx: &mut Context<Self>) {
+        self.source_label = snapshot.source_label.clone();
+        self.frozen = Some(snapshot);
+        self.reset_dimension_cache();
+        self.sync_dimensions(cx);
+        cx.notify();
+    }
+
+    /// Clear the incrementally-folded column-width cache, e.g. right before
+    /// switching to a differently-shaped result set: the next
+    /// `sync_dimensions` call must recompute widths from that result set's
+    /// own columns/rows rather than folding onto stale per-column maxima
+    /// left over from whatever this view was showing before.
+    fn reset_dimension_cache(&mut self) {
+        self.column_widths = Vec::new();
+        self.column_max_body_chars = Vec::new();
+        self.folded_row_count = 0;
+        self.row_number_width = row_number_column_width(0);
+    }
+
+    /// The result set this view currently renders: `session`'s live result
+    /// while [`ResultsView::frozen`] is `None`, else the frozen snapshot's.
+    fn effective_result<'a>(&'a self, cx: &'a App) -> &'a ResultSet {
+        match &self.frozen {
+            Some(snapshot) => &snapshot.result,
+            None => self.session.read(cx).result(),
+        }
+    }
+
+    /// The lifecycle state this view currently renders: `session`'s live
+    /// state while [`ResultsView::frozen`] is `None`, else the frozen
+    /// snapshot's.
+    fn effective_state<'a>(&'a self, cx: &'a App) -> &'a SessionState {
+        match &self.frozen {
+            Some(snapshot) => &snapshot.state,
+            None => self.session.read(cx).state(),
+        }
     }
 
     /// Bring `column_widths`/`row_number_width` up to date with the
     /// session's current result set
     fn sync_dimensions(&mut self, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        let result = session.result();
+        // Matched directly on the `frozen` field (rather than through the
+        // `effective_result` method) so the borrow checker sees this as
+        // borrowing only `self.frozen`, leaving `self.column_widths` and
+        // the other fields assigned below free to borrow mutably in the
+        // same call -- routing through a `&self` method would borrow all
+        // of `self` and block those assignments.
+        let result: &ResultSet = match &self.frozen {
+            Some(snapshot) => &snapshot.result,
+            None => self.session.read(cx).result(),
+        };
 
         if result.columns.len() != self.column_max_body_chars.len() {
             self.column_max_body_chars = vec![0; result.columns.len()];
@@ -151,10 +223,9 @@ impl ResultsView {
 
     /// The results header bar: row count + source/relation label.
     fn render_bar(&self, cx: &Context<Self>) -> Div {
-        let session = self.session.read(cx);
-        let count_text = match session.state() {
+        let count_text = match self.effective_state(cx) {
             SessionState::Results(_) | SessionState::Running | SessionState::Limited { .. } => {
-                session.result().rows.len().to_string()
+                self.effective_result(cx).rows.len().to_string()
             }
             SessionState::Empty
             | SessionState::Connecting
@@ -205,9 +276,8 @@ impl ResultsView {
     /// The main content area: the virtualized grid when results are
     /// available, or a centered prompt/status message otherwise
     fn render_body(&mut self, cx: &mut Context<Self>) -> Div {
-        let session = self.session.read(cx);
-        let state = session.state().clone();
-        let has_columns = !session.result().columns.is_empty();
+        let state = self.effective_state(cx).clone();
+        let has_columns = !self.effective_result(cx).columns.is_empty();
 
         match state {
             // The rows streamed before truncation stay visible, exactly
@@ -272,7 +342,7 @@ impl ResultsView {
     /// The two-pane virtualized grid (pinned row numbers + horizontally
     /// scrolling data columns)
     fn render_grid(&mut self, cx: &mut Context<Self>) -> Div {
-        let row_count = self.session.read(cx).result().rows.len();
+        let row_count = self.effective_result(cx).rows.len();
         let row_number_width = self.row_number_width;
 
         div()
@@ -464,7 +534,7 @@ impl ResultsView {
             return;
         };
 
-        let row_count = self.session.read(cx).result().rows.len();
+        let row_count = self.effective_result(cx).rows.len();
         let content_extent = content_extent_for_row_count(row_count);
         let viewport_extent = f32::from(
             self.row_scroll_handle
@@ -535,8 +605,7 @@ impl ResultsView {
             .border_b_1()
             .border_color(rgb(colors::LINE));
 
-        let session = self.session.read(cx);
-        let columns: &[ColumnMeta] = &session.result().columns;
+        let columns: &[ColumnMeta] = &self.effective_result(cx).columns;
 
         for (column, width) in columns.iter().zip(self.column_widths.iter()) {
             row = row.child(
@@ -594,8 +663,7 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) -> Vec<Div> {
         let column_widths = &self.column_widths;
-        let session = self.session.read(cx);
-        let rows: &[zsql_core::Row] = &session.result().rows;
+        let rows: &[zsql_core::Row] = &self.effective_result(cx).rows;
 
         range
             .map(|ix| {
@@ -628,9 +696,14 @@ impl ResultsView {
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
-        let session = self.session.read(cx);
-        let state = session.state();
-        let (dot_color, label) = status_indicator(state, session.liveness());
+        // Liveness is the connection's real-time health, independent of
+        // which tab is displayed, so it is read straight off `session`
+        // rather than through `effective_state`: a dead connection must
+        // show as disconnected regardless of whether the active tab is
+        // frozen to an older, still-successful snapshot.
+        let liveness = self.session.read(cx).liveness().clone();
+        let state = self.effective_state(cx);
+        let (dot_color, label) = status_indicator(state, &liveness);
 
         let mut bar = div()
             .flex()
@@ -654,7 +727,8 @@ impl ResultsView {
                     .child(label),
             );
 
-        if let Some((rows_text, elapsed_text)) = status_metrics(state, session.result().rows.len())
+        if let Some((rows_text, elapsed_text)) =
+            status_metrics(state, self.effective_result(cx).rows.len())
         {
             bar = bar.child(rows_text).child(elapsed_text);
         }
@@ -674,11 +748,18 @@ impl ResultsView {
     }
 }
 
-/// Test-only accessor used by `ui::sidebar`'s render tests
+/// Test-only accessors used by `ui::sidebar`'s and `ui::tabs`'s tests
 #[cfg(test)]
 impl ResultsView {
     pub(crate) fn source_label_for_test(&self) -> &str {
         &self.source_label
+    }
+
+    /// Whether this view is currently frozen to a captured
+    /// [`ResultsSnapshot`] (see [`ResultsView::show_snapshot`]) rather than
+    /// following `session` live.
+    pub(crate) fn is_frozen_for_test(&self) -> bool {
+        self.frozen.is_some()
     }
 }
 

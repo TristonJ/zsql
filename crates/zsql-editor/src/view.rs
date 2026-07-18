@@ -34,6 +34,14 @@ pub const KEY_CONTEXT: &str = "SqlEditor";
 /// type.
 pub type QueryRunner = Box<dyn Fn(String, &mut Context<EditorView>)>;
 
+/// Invoked after a manual edit to the buffer's text -- typing, paste,
+/// backspace/delete, or an IME commit -- but not after cursor movement,
+/// selection changes alone, or a programmatic [`EditorView::set_text`]. Lets
+/// an embedding app react to the buffer's first real edit (e.g. converting
+/// an auto-generated tab into a normal one) without this crate knowing
+/// anything about tabs, relations, or sessions.
+pub type EditListener = Box<dyn Fn(&mut Context<EditorView>)>;
+
 actions!(
     zsql_editor,
     [
@@ -109,6 +117,12 @@ pub struct EditorView {
     highlighter: PlainHighlighter,
     focus_handle: FocusHandle,
     run_query: QueryRunner,
+    /// Invoked after every manual text edit; see [`EditListener`].
+    on_edit: Option<EditListener>,
+    /// Whether this editor renders as a compact, single-line strip -- no
+    /// toolbar, no line-number gutter -- instead of the full multi-line
+    /// pane.
+    compact: bool,
     /// The IME composition range, as flat character offsets into
     /// `buffer.text()`. `None` when there is no composition in progress.
     marked_range: Option<Range<usize>>,
@@ -138,12 +152,58 @@ impl EditorView {
             highlighter: PlainHighlighter,
             focus_handle: cx.focus_handle(),
             run_query,
+            on_edit: None,
+            compact: false,
             marked_range: None,
             is_selecting: false,
             last_lines: Vec::new(),
             last_bounds: None,
             scroll_handle: ScrollHandle::new(),
             last_autoscroll_cursor: None,
+        }
+    }
+
+    /// Replace the buffer's entire text, e.g. to seed a freshly-opened tab
+    /// with auto-generated SQL. Does not invoke the [`EditListener`]: this
+    /// is a programmatic write, not a manual edit.
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer = TextBuffer::from_text(text);
+        cx.notify();
+    }
+
+    /// The buffer's current text.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    /// Install the listener invoked after every manual text edit, replacing
+    /// any previously-installed listener.
+    pub fn set_on_edit(&mut self, listener: EditListener) {
+        self.on_edit = Some(listener);
+    }
+
+    /// Whether this editor currently renders in its compact, single-line
+    /// style (see [`EditorView::set_compact`]).
+    #[must_use]
+    pub fn is_compact(&self) -> bool {
+        self.compact
+    }
+
+    /// Switch between the compact, single-line strip style and the normal
+    /// full multi-line pane.
+    pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
+    }
+
+    /// Notify the view that the buffer's text just changed from a manual
+    /// edit -- as opposed to cursor movement, a selection change alone, or
+    /// [`EditorView::set_text`] -- and, if one is installed, run the
+    /// [`EditListener`].
+    fn notify_edit(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        if let Some(on_edit) = &self.on_edit {
+            on_edit(cx);
         }
     }
 
@@ -292,17 +352,17 @@ impl EditorView {
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
         self.buffer.backspace();
-        cx.notify();
+        self.notify_edit(cx);
     }
 
     fn delete_forward(&mut self, _: &DeleteForward, _window: &mut Window, cx: &mut Context<Self>) {
         self.buffer.delete_forward();
-        cx.notify();
+        self.notify_edit(cx);
     }
 
     fn newline(&mut self, _: &Newline, _window: &mut Window, cx: &mut Context<Self>) {
         self.buffer.insert_newline();
-        cx.notify();
+        self.notify_edit(cx);
     }
 
     // -- clipboard -----------------------------------------------------
@@ -317,14 +377,14 @@ impl EditorView {
         if self.buffer.has_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.selected_text()));
             self.buffer.backspace(); // deletes the active selection
-            cx.notify();
+            self.notify_edit(cx);
         }
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.buffer.insert_text(&text);
-            cx.notify();
+            self.notify_edit(cx);
         }
     }
 
@@ -536,6 +596,7 @@ impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let line_count = self.buffer.lines().len();
         let cursor_line = self.buffer.cursor().line;
+        let compact = self.compact;
 
         div()
             .id("sql-editor")
@@ -574,7 +635,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::run_query))
-            .child(Self::render_toolbar(cx))
+            .when(!compact, |el| el.child(Self::render_toolbar(cx)))
             .child(
                 div()
                     .id("sql-editor-code")
@@ -603,7 +664,9 @@ impl Render for EditorView {
                             .flex_row()
                             .flex_none()
                             .h(editor_content_height(line_count))
-                            .child(Self::render_gutter(line_count, cursor_line))
+                            .when(!compact, |el| {
+                                el.child(Self::render_gutter(line_count, cursor_line))
+                            })
                             .child(
                                 div()
                                     .id("sql-editor-text")
@@ -690,7 +753,7 @@ impl EntityInputHandler for EditorView {
         self.buffer.set_selection(start_pos, end_pos);
         self.buffer.insert_text(new_text);
         self.marked_range = None;
-        cx.notify();
+        self.notify_edit(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -730,7 +793,7 @@ impl EntityInputHandler for EditorView {
             self.buffer.set_selection(selection_start, selection_end);
         }
 
-        cx.notify();
+        self.notify_edit(cx);
     }
 
     fn bounds_for_range(
@@ -1134,6 +1197,15 @@ impl EditorView {
 
     pub fn set_text_for_test(&mut self, text: &str) {
         self.buffer = TextBuffer::from_text(text);
+    }
+
+    /// Insert `text` at the cursor as a manual edit -- i.e. this fires the
+    /// `EditListener` like real typed input would, unlike
+    /// [`EditorView::set_text_for_test`]. Lets a test simulate "the user
+    /// typed something" without a focused window's real input handler.
+    pub fn insert_text_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.insert_text(text);
+        self.notify_edit(cx);
     }
 
     /// The pixel point that hit-tests back to `position`, computed from the
@@ -1923,5 +1995,106 @@ mod tests {
         harness.editor.update(vcx, |view, _cx| {
             assert!(!view.is_selecting, "mouse-up should end the drag");
         });
+    }
+
+    // -- on_edit / set_text / compact ---------------------------------------
+
+    /// An `on_edit` listener double that counts how many times it fired.
+    fn counting_edit_listener() -> (crate::EditListener, Arc<Mutex<usize>>) {
+        let count = Arc::new(Mutex::new(0));
+        let counted = count.clone();
+        let listener: crate::EditListener = Box::new(move |_cx| {
+            *counted.lock().expect("edit count lock poisoned") += 1;
+        });
+        (listener, count)
+    }
+
+    #[gpui::test]
+    fn typing_fires_the_on_edit_listener(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness
+            .editor
+            .update(vcx, |view, _cx| view.set_on_edit(listener));
+
+        vcx.simulate_input("ab");
+
+        assert_eq!(*count.lock().expect("edit count lock poisoned"), 2);
+    }
+
+    #[gpui::test]
+    fn backspace_delete_newline_cut_and_paste_all_fire_the_on_edit_listener(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("ab");
+            view.set_on_edit(listener);
+            view.buffer.move_document_end();
+        });
+
+        vcx.dispatch_action(Backspace);
+        vcx.dispatch_action(DeleteForward);
+        vcx.dispatch_action(Newline);
+        vcx.dispatch_action(SelectAll);
+        vcx.dispatch_action(Cut);
+        vcx.dispatch_action(Paste);
+
+        assert_eq!(*count.lock().expect("edit count lock poisoned"), 5);
+    }
+
+    #[gpui::test]
+    fn cursor_movement_and_selection_alone_do_not_fire_the_on_edit_listener(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("select 1");
+            view.set_on_edit(listener);
+        });
+
+        vcx.dispatch_action(MoveRight);
+        vcx.dispatch_action(MoveLineEnd);
+        vcx.dispatch_action(MoveLineStart);
+        vcx.dispatch_action(SelectRight);
+        vcx.dispatch_action(SelectAll);
+
+        assert_eq!(*count.lock().expect("edit count lock poisoned"), 0);
+    }
+
+    #[gpui::test]
+    fn set_text_replaces_the_buffer_without_firing_the_on_edit_listener(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness.editor.update(vcx, |view, cx| {
+            view.set_on_edit(listener);
+            view.set_text("select * from orders", cx);
+        });
+
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.text(), "select * from orders");
+        });
+        assert_eq!(
+            *count.lock().expect("edit count lock poisoned"),
+            0,
+            "a programmatic set_text is not a manual edit"
+        );
+    }
+
+    #[gpui::test]
+    fn compact_mode_toggles_and_renders_without_a_toolbar_or_gutter(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            assert!(
+                !view.is_compact(),
+                "editors start in full, non-compact mode"
+            );
+            view.set_text_for_test("select * from orders limit 200");
+            view.set_compact(true);
+            assert!(view.is_compact());
+        });
+        vcx.run_until_parked();
     }
 }

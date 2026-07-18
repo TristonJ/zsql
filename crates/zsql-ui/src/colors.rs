@@ -20,6 +20,9 @@ pub const MUTED: u32 = 0x87_8e_9f;
 pub const FAINT: u32 = 0x59_60_6f;
 /// Accent color: row counts, active affordances.
 pub const TEAL: u32 = 0x33_c2_ac;
+/// Dimmer teal for a subtler accent than [`TEAL`] itself, e.g. a generated
+/// tab's compact strip's left border -- the mockup's `--teal-dim` token.
+pub const TEAL_DIM: u32 = 0x2b_85_79;
 /// Numeric cell text.
 pub const NUMBER: u32 = 0xcf_9b_e8;
 /// JSON/JSONB cell text.
@@ -43,7 +46,7 @@ pub const PARTITIONED: u32 = 0x8b_7f_d6;
 mod tests {
     use super::{
         BOOL, BYTES, FAINT, INK, JSON, LINE, LINE_SOFT, MATVIEW, MUTED, NUMBER, PANEL, PARTITIONED,
-        RAISE, TEAL, TEXT, UNKNOWN, VIEW,
+        RAISE, TEAL, TEAL_DIM, TEXT, UNKNOWN, VIEW,
     };
 
     #[test]
@@ -57,6 +60,7 @@ mod tests {
         assert_eq!(MUTED, 0x87_8e_9f);
         assert_eq!(FAINT, 0x59_60_6f);
         assert_eq!(TEAL, 0x33_c2_ac);
+        assert_eq!(TEAL_DIM, 0x2b_85_79);
         assert_eq!(NUMBER, 0xcf_9b_e8);
         assert_eq!(JSON, 0x9f_b4_d8);
         assert_eq!(UNKNOWN, 0xe2_6d_78);

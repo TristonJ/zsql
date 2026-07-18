@@ -10,5 +10,6 @@ pub mod colors;
 pub mod grid;
 pub mod icon;
 pub mod scrollbar;
+pub mod tabs;
 pub mod text_field;
 pub mod tree;

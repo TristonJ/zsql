@@ -1,96 +1,52 @@
-//! The seam between this binary's `Session`/`ResultsView` and the
-//! framework-independent `zsql_editor::EditorView`: builds the
-//! `zsql_editor::QueryRunner` closure the editor calls to run the current
-//! query. This is the only place in the binary that constructs an
-//! `EditorView`.
+//! The seam between this binary's app state and the framework-independent
+//! `zsql_editor::EditorView`. This is the only place in the binary that
+//! constructs an `EditorView`; `TabModel::build_editor` is its only
+//! production caller, passing a tab-scoped `QueryRunner` that dispatches
+//! back through itself (`TabModel::run_for_tab`) so each tab's run is
+//! tracked independently.
 
-use gpui::{Context, Entity};
+use gpui::Context;
 use zsql_editor::{EditorView, QueryRunner};
 
-use super::results::ResultsView;
-use crate::session::Session;
-
-/// Build an [`EditorView`] over `session`, running queries through it and
-/// updating `results`'s source label to reflect each run.
+/// Build an [`EditorView`] whose `RunQuery`/Run-button seam is `run_query`
+/// verbatim.
 #[must_use]
-pub fn new_editor_view(
-    session: Entity<Session>,
-    results: Entity<ResultsView>,
-    cx: &mut Context<EditorView>,
-) -> EditorView {
-    EditorView::new(query_runner(session, results), cx)
-}
-
-/// The `QueryRunner` seam passed to `EditorView::new`: runs `sql` through
-/// `session` and relabels `results` to `"query"`, in that order, on every
-/// invocation.
-fn query_runner(session: Entity<Session>, results: Entity<ResultsView>) -> QueryRunner {
-    Box::new(move |sql, cx| {
-        results.update(cx, |results, cx| results.set_source_label("query", cx));
-        session.update(cx, |session, cx| {
-            session.run_query(sql, cx).detach();
-        });
-    })
+pub fn new_tab_editor_view(run_query: QueryRunner, cx: &mut Context<EditorView>) -> EditorView {
+    EditorView::new(run_query, cx)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use gpui::{AppContext as _, Focusable as _, TestAppContext, VisualTestContext};
-    use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, SchemaTree};
-    use zsql_editor::RunQuery;
+    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
+    use zsql_editor::{QueryRunner, RunQuery};
 
-    use super::new_editor_view;
-    use crate::session::Session;
-    use crate::ui::results::ResultsView;
+    use super::new_tab_editor_view;
 
-    /// A `Connection` double that records every `stream_query` call's SQL
-    /// text instead of running anything.
-    struct FakeConnection {
-        queries: Arc<Mutex<Vec<String>>>,
+    /// A `QueryRunner` double that records every SQL string it was asked to
+    /// run, standing in for a tab's real `TabModel::run_for_tab` dispatch.
+    fn recording_query_runner() -> (QueryRunner, Arc<Mutex<Vec<String>>>) {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries = recorded.clone();
+        let runner: QueryRunner = Box::new(move |sql, _cx| {
+            queries.lock().expect("queries lock poisoned").push(sql);
+        });
+        (runner, recorded)
     }
 
-    #[async_trait]
-    impl Connection for FakeConnection {
-        fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
-            self.queries
-                .lock()
-                .expect("queries lock poisoned")
-                .push(sql);
-            let (cancel_tx, _cancel_rx) = flume::unbounded();
-            QueryHandle::new(cancel_tx)
-        }
-
-        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-            Ok(SchemaTree::default())
-        }
-
-        async fn ping(&self) -> Result<(), CoreError> {
-            Ok(())
-        }
-    }
-
-    /// Dispatching `RunQuery` through an adapter-wired `EditorView` must
-    /// still produce both of the adapter's side effects: the SQL reaches
-    /// `Session::run_query`, and `ResultsView`'s source label is set to
-    /// "query". The Run button's `on_click` handler calls the same shared
+    /// Dispatching `RunQuery` through an editor built by
+    /// [`new_tab_editor_view`] must invoke the exact `QueryRunner` closure
+    /// it was constructed with, with the buffer's current text. The Run
+    /// button's `on_click` handler calls the same shared
     /// `run_current_query` method the `RunQuery` action does, so exercising
     /// the action covers both entry points.
     #[gpui::test]
-    fn running_a_query_through_the_adapter_runs_it_and_labels_the_results(cx: &mut TestAppContext) {
-        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let connection: Arc<dyn Connection> = Arc::new(FakeConnection {
-            queries: queries.clone(),
-        });
-        let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-        let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+    fn running_a_query_invokes_the_editors_query_runner(cx: &mut TestAppContext) {
+        let (runner, queries) = recording_query_runner();
 
-        let session_for_editor = session.clone();
-        let results_for_editor = results.clone();
         let (editor, vcx): (_, &mut VisualTestContext) = cx.add_window_view(|window, cx| {
-            let view = new_editor_view(session_for_editor, results_for_editor, cx);
+            let view = new_tab_editor_view(runner, cx);
             window.focus(&view.focus_handle(cx));
             view
         });
@@ -104,9 +60,6 @@ mod tests {
             queries.lock().expect("queries lock poisoned").as_slice(),
             ["select * from orders"]
         );
-        results.update(vcx, |results, _cx| {
-            assert_eq!(results.source_label_for_test(), "query");
-        });
     }
 }
 
@@ -117,12 +70,11 @@ mod live_tests {
     use std::time::Duration;
 
     use gpui::{AppContext as _, Focusable as _, TestAppContext, Timer};
-    use zsql_editor::RunQuery;
+    use zsql_editor::{QueryRunner, RunQuery};
 
-    use super::new_editor_view;
+    use super::new_tab_editor_view;
     use crate::config::Config;
     use crate::session::{Session, SessionState};
-    use crate::ui::results::ResultsView;
 
     fn live_database_url() -> Option<String> {
         let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
@@ -156,11 +108,14 @@ mod live_tests {
             );
         });
 
-        let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
-        let session_for_editor = session.clone();
-        let results_for_editor = results.clone();
+        let session_for_runner = session.clone();
+        let run_query: QueryRunner = Box::new(move |sql, cx| {
+            session_for_runner.update(cx, |session, cx| {
+                session.run_query(sql, cx).detach();
+            });
+        });
         let (_editor, vcx) = cx.add_window_view(|window, cx| {
-            let mut view = new_editor_view(session_for_editor, results_for_editor, cx);
+            let mut view = new_tab_editor_view(run_query, cx);
             view.set_text_for_test("SELECT * FROM orders ORDER BY placed_at DESC");
             window.focus(&view.focus_handle(cx));
             view
