@@ -50,6 +50,11 @@ pub struct QueryConfig {
     pub preview_limit: u64,
     /// Server-side statement timeout in milliseconds (`0` disables it).
     pub statement_timeout_ms: u64,
+    /// Upper bound on rows accumulated for a single streamed query result.
+    /// Once a result reaches this many rows the query is cancelled and the
+    /// session reports a truncated result rather than continuing to grow
+    /// without bound.
+    pub max_result_rows: u64,
 }
 
 /// Connection defaults.
@@ -120,12 +125,18 @@ impl Default for ThemeConfig {
     }
 }
 
+/// Default [`QueryConfig::max_result_rows`]: large enough that an ordinary
+/// result set never comes close, but bounded so a runaway query cannot grow
+/// the in-memory result set (and the UI grid) without limit.
+const DEFAULT_MAX_RESULT_ROWS: u64 = 5_000_000;
+
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             batch_size: 500,
             preview_limit: 200,
             statement_timeout_ms: 30_000,
+            max_result_rows: DEFAULT_MAX_RESULT_ROWS,
         }
     }
 }
@@ -238,6 +249,33 @@ mod tests {
         assert_eq!(
             parsed.liveness.probe_interval_ms,
             Config::default().liveness.probe_interval_ms
+        );
+    }
+
+    #[test]
+    fn max_result_rows_defaults_to_five_million() {
+        assert_eq!(Config::default().query.max_result_rows, 5_000_000);
+    }
+
+    #[test]
+    fn query_config_max_result_rows_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.query.max_result_rows = 100;
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.query.max_result_rows, 100);
+    }
+
+    #[test]
+    fn query_section_is_optional_in_toml_and_falls_back_to_the_default_row_limit() {
+        let parsed: Config =
+            toml::from_str("[connection]\ndefault_url = \"postgres://localhost/db\"\n")
+                .expect("config without a [query] section must still parse");
+        assert_eq!(
+            parsed.query.max_result_rows,
+            Config::default().query.max_result_rows
         );
     }
 
