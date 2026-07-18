@@ -4,8 +4,6 @@
 
 use gpui::{Pixels, px};
 
-/// Height of the SQL editor pane above the results grid.
-pub const EDITOR_HEIGHT: Pixels = px(500.0);
 /// Height of the editor toolbar that holds the Run button.
 pub const EDITOR_TOOLBAR_HEIGHT: Pixels = px(38.0);
 /// Horizontal padding inside the editor toolbar.
