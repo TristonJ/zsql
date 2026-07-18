@@ -94,8 +94,6 @@ pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
 /// Background tint of a `Generated` tab's compact strip: teal at very low
 /// opacity (`0x33c2ac` at ~4.5% alpha).
 pub const GENERATED_STRIP_BG: u32 = 0x33_c2_ac_0b;
-/// Left accent border width of a `Generated` tab's compact strip.
-pub const GENERATED_STRIP_ACCENT_WIDTH: Pixels = px(2.0);
 /// Left accent border color of a `Generated` tab's compact strip: the
 /// mockup's `genstrip` left accent, `zsql_ui::colors::TEAL_DIM` (the tab
 /// bar's dashed active underline is the brighter `colors::TEAL` instead).

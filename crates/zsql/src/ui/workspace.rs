@@ -257,7 +257,6 @@ impl WorkspaceView {
         shell = match tab.kind() {
             TabKind::Generated { .. } => {
                 shell = shell
-                    .child(zsql_ui::grid::status_dot(colors::TEAL))
                     .child(
                         div()
                             .flex_shrink_0()
@@ -265,10 +264,9 @@ impl WorkspaceView {
                             .text_color(rgb(colors::TEAL))
                             .child("#"),
                     )
-                    .child(div().italic().child(tab.title().to_owned()))
-                    .child(zsql_ui::grid::type_tag("auto"));
+                    .child(div().italic().child(tab.title().to_owned()));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_dashed());
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid());
                 }
                 shell
             }
@@ -334,7 +332,6 @@ impl WorkspaceView {
             .w_full()
             .h(theme::GENERATED_STRIP_HEIGHT)
             .bg(gpui::rgba(theme::GENERATED_STRIP_BG))
-            .border_l(theme::GENERATED_STRIP_ACCENT_WIDTH)
             .border_color(rgb(theme::GENERATED_STRIP_ACCENT))
             .child(
                 div()
