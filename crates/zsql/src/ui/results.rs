@@ -5,9 +5,10 @@ use std::ops::Range;
 
 use gpui::{
     Context, Div, Entity, Pixels, Render, SharedString, UniformListScrollHandle, Window, div,
-    prelude::*, px, rgb, rgba, uniform_list,
+    prelude::*, px, rgb, uniform_list,
 };
 use zsql_core::ColumnMeta;
+use zsql_ui::{colors, grid};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
@@ -118,9 +119,9 @@ impl ResultsView {
             .gap_3()
             .h(theme::RESULTS_BAR_HEIGHT)
             .px_3()
-            .bg(rgb(theme::PANEL))
+            .bg(rgb(colors::PANEL))
             .border_b_1()
-            .border_color(rgb(theme::LINE_SOFT))
+            .border_color(rgb(colors::LINE_SOFT))
             .child(
                 div()
                     .flex()
@@ -131,13 +132,13 @@ impl ResultsView {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(colors::TEXT))
                             .child("Results"),
                     )
                     .child(
                         div()
                             .font_family("monospace")
-                            .text_color(rgb(theme::TEAL))
+                            .text_color(rgb(colors::TEAL))
                             .child(count_text),
                     ),
             )
@@ -145,7 +146,7 @@ impl ResultsView {
                 div()
                     .font_family("monospace")
                     .text_size(px(theme::RESULTS_META_TEXT_SIZE))
-                    .text_color(rgb(theme::FAINT))
+                    .text_color(rgb(colors::FAINT))
                     .child(self.source_label.clone()),
             )
     }
@@ -164,22 +165,22 @@ impl ResultsView {
             // grid immediately rather than waiting for `Done`
             SessionState::Running if has_columns => self.render_grid(cx),
             SessionState::Empty => Self::render_placeholder(
-                theme::FAINT,
+                colors::FAINT,
                 "No connection configured",
                 "Set DATABASE_URL or connection.default_url in your zsql config, then restart.",
             ),
             SessionState::Connecting => Self::render_placeholder(
-                theme::FAINT,
+                colors::FAINT,
                 "Connecting…",
                 "Establishing a connection to the configured database.",
             ),
             SessionState::Connected => Self::render_placeholder(
-                theme::FAINT,
+                colors::FAINT,
                 "Connected",
                 "Run a query to see results here.",
             ),
             SessionState::Running => Self::render_placeholder(
-                theme::FAINT,
+                colors::FAINT,
                 "Running query…",
                 "Streaming results from the database.",
             ),
@@ -210,7 +211,7 @@ impl ResultsView {
             .child(
                 div()
                     .text_size(px(theme::RESULTS_META_TEXT_SIZE))
-                    .text_color(rgb(theme::FAINT))
+                    .text_color(rgb(colors::FAINT))
                     .child(detail.to_owned()),
             )
     }
@@ -240,7 +241,7 @@ impl ResultsView {
                     .w(row_number_width)
                     .h_full()
                     .border_r_1()
-                    .border_color(rgb(theme::LINE_SOFT))
+                    .border_color(rgb(colors::LINE_SOFT))
                     .child(Self::render_row_number_header())
                     .child(
                         uniform_list(
@@ -287,11 +288,11 @@ impl ResultsView {
             .items_center()
             .justify_end()
             .h(theme::HEADER_ROW_HEIGHT)
-            .px(px(theme::CELL_PADDING_X))
-            .bg(rgb(theme::RAISE))
+            .px(px(grid::CELL_PADDING_X))
+            .bg(rgb(colors::RAISE))
             .border_b_1()
-            .border_color(rgb(theme::LINE))
-            .text_color(rgb(theme::FAINT))
+            .border_color(rgb(colors::LINE))
+            .text_color(rgb(colors::FAINT))
             .child("#")
     }
 
@@ -302,25 +303,25 @@ impl ResultsView {
             .flex_row()
             .flex_shrink_0()
             .h(theme::HEADER_ROW_HEIGHT)
-            .bg(rgb(theme::RAISE))
+            .bg(rgb(colors::RAISE))
             .border_b_1()
-            .border_color(rgb(theme::LINE));
+            .border_color(rgb(colors::LINE));
 
         let session = self.session.read(cx);
         let columns: &[ColumnMeta] = &session.result().columns;
 
         for (column, width) in columns.iter().zip(self.column_widths.iter()) {
             row = row.child(
-                header_cell_shell(*width)
+                grid::header_cell_shell(*width)
                     .flex_row()
                     .items_baseline()
                     .gap_2()
                     .child(
                         div()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(colors::TEXT))
                             .child(column.name.clone()),
                     )
-                    .child(type_tag(&column.type_name)),
+                    .child(grid::type_tag(&column.type_name)),
             );
         }
 
@@ -346,11 +347,11 @@ impl ResultsView {
                     .justify_end()
                     .w(width)
                     .h(theme::BODY_ROW_HEIGHT)
-                    .px(px(theme::CELL_PADDING_X))
-                    .bg(rgb(theme::PANEL))
+                    .px(px(grid::CELL_PADDING_X))
+                    .bg(rgb(colors::PANEL))
                     .border_b_1()
-                    .border_color(rgb(theme::LINE_SOFT))
-                    .text_color(rgb(theme::FAINT))
+                    .border_color(rgb(colors::LINE_SOFT))
+                    .text_color(rgb(colors::FAINT))
                     .child((ix + 1).to_string())
             })
             .collect()
@@ -376,14 +377,14 @@ impl ResultsView {
                     .items_center()
                     .h(theme::BODY_ROW_HEIGHT)
                     .border_b_1()
-                    .border_color(rgb(theme::LINE_SOFT));
+                    .border_color(rgb(colors::LINE_SOFT));
 
                 if let Some(row) = rows.get(ix) {
                     for (value, width) in row.0.iter().zip(column_widths.iter()) {
                         let formatted = format_value(value);
                         let is_null = formatted.kind == ValueKind::Null;
                         row_div = row_div.child(
-                            body_cell_shell(*width)
+                            grid::body_cell_shell(*width)
                                 .text_color(rgb(kind_color(formatted.kind)))
                                 .when(is_null, gpui::prelude::Styled::italic)
                                 .child(formatted.text),
@@ -411,17 +412,17 @@ impl ResultsView {
             .gap_4()
             .h(theme::STATUS_BAR_HEIGHT)
             .px_3()
-            .bg(rgb(theme::PANEL))
+            .bg(rgb(colors::PANEL))
             .border_t_1()
-            .border_color(rgb(theme::LINE))
+            .border_color(rgb(colors::LINE))
             .font_family("monospace")
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
-            .text_color(rgb(theme::MUTED))
-            .child(status_dot(dot_color))
+            .text_color(rgb(colors::MUTED))
+            .child(grid::status_dot(dot_color))
             .child(
                 div()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(colors::TEXT))
                     .child(label),
             );
 
@@ -459,60 +460,20 @@ impl Render for ResultsView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(theme::INK))
+            .bg(rgb(colors::INK))
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
     }
 }
 
-/// Shared chrome for a header cell
-fn header_cell_shell(width: Pixels) -> Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .w(width)
-        .h_full()
-        .px(px(theme::CELL_PADDING_X))
-        .truncate()
-        .border_r_1()
-        .border_color(rgb(theme::LINE_SOFT))
-}
-
-/// Shared chrome for a body cell
-fn body_cell_shell(width: Pixels) -> Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .w(width)
-        .h_full()
-        .px(px(theme::CELL_PADDING_X))
-        .truncate()
-        .border_r_1()
-        .border_color(rgb(theme::LINE_SOFT))
-}
-
-/// The small type-name badge shown next to a column's name in the header.
-fn type_tag(type_name: &str) -> Div {
-    div()
-        .text_size(px(theme::TYPE_TAG_TEXT_SIZE))
-        .text_color(rgb(theme::TEAL))
-        .px(px(theme::TYPE_TAG_PADDING_X))
-        .border_1()
-        .border_color(rgba(theme::TYPE_TAG_BORDER))
-        .rounded(px(theme::TYPE_TAG_RADIUS))
-        .child(type_name.to_owned())
-}
-
 /// The bottom status bar's dot color and label for `state`
 fn status_indicator(state: &SessionState) -> (u32, &'static str) {
     match state {
-        SessionState::Empty => (theme::FAINT, "Not connected"),
+        SessionState::Empty => (colors::FAINT, "Not connected"),
         SessionState::Connecting => (theme::STATUS_CONNECTING, "Connecting…"),
-        SessionState::Connected | SessionState::Results(_) => (theme::TEAL, "Connected"),
-        SessionState::Running => (theme::TEAL, "Running…"),
+        SessionState::Connected | SessionState::Results(_) => (colors::TEAL, "Connected"),
+        SessionState::Running => (colors::TEAL, "Running…"),
         SessionState::Error(_) => (theme::STATUS_ERROR, "Error"),
     }
 }
@@ -531,27 +492,17 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
     }
 }
 
-/// The small round indicator dot in the bottom status bar
-fn status_dot(color: u32) -> Div {
-    div()
-        .flex_shrink_0()
-        .w(px(theme::STATUS_DOT_SIZE))
-        .h(px(theme::STATUS_DOT_SIZE))
-        .rounded(px(theme::STATUS_DOT_SIZE / 2.0))
-        .bg(rgb(color))
-}
-
 /// The text color for a formatted cell's semantic kind.
 fn kind_color(kind: ValueKind) -> u32 {
     match kind {
-        ValueKind::Null => theme::FAINT,
-        ValueKind::Bool => theme::BOOL,
-        ValueKind::Number => theme::NUMBER,
-        ValueKind::Text => theme::TEXT,
-        ValueKind::Json => theme::JSON,
-        ValueKind::Timestamp => theme::MUTED,
-        ValueKind::Bytes => theme::BYTES,
-        ValueKind::Unknown => theme::UNKNOWN,
+        ValueKind::Null => colors::FAINT,
+        ValueKind::Bool => colors::BOOL,
+        ValueKind::Number => colors::NUMBER,
+        ValueKind::Text => colors::TEXT,
+        ValueKind::Json => colors::JSON,
+        ValueKind::Timestamp => colors::MUTED,
+        ValueKind::Bytes => colors::BYTES,
+        ValueKind::Unknown => colors::UNKNOWN,
     }
 }
 
@@ -563,11 +514,11 @@ fn kind_color(kind: ValueKind) -> u32 {
 #[allow(clippy::cast_precision_loss)]
 fn column_width_from_parts(column: &ColumnMeta, max_body_chars: usize) -> Pixels {
     let header_chars = column.name.chars().count() + column.type_name.chars().count();
-    let header_width = theme::CELL_PADDING_X * 2.0
+    let header_width = grid::CELL_PADDING_X * 2.0
         + header_chars as f32 * theme::CELL_CHAR_WIDTH
         + theme::TYPE_TAG_EXTRA_WIDTH;
 
-    let body_width = theme::CELL_PADDING_X * 2.0 + max_body_chars as f32 * theme::CELL_CHAR_WIDTH;
+    let body_width = grid::CELL_PADDING_X * 2.0 + max_body_chars as f32 * theme::CELL_CHAR_WIDTH;
 
     px(header_width
         .max(body_width)
@@ -579,7 +530,7 @@ fn column_width_from_parts(column: &ColumnMeta, max_body_chars: usize) -> Pixels
 #[allow(clippy::cast_precision_loss)]
 fn row_number_column_width(row_count: usize) -> Pixels {
     let digits = row_count.to_string().chars().count().max(1);
-    let width = theme::CELL_PADDING_X * 2.0 + digits as f32 * theme::CELL_CHAR_WIDTH;
+    let width = grid::CELL_PADDING_X * 2.0 + digits as f32 * theme::CELL_CHAR_WIDTH;
     px(width.max(theme::ROW_NUMBER_MIN_WIDTH))
 }
 
@@ -594,6 +545,8 @@ mod tests {
         SessionState, column_width_from_parts, row_number_column_width, status_indicator,
         status_metrics,
     };
+    use zsql_ui::colors;
+
     use crate::session::Session;
     use crate::ui::format::format_value;
     use crate::ui::theme;
@@ -661,9 +614,26 @@ mod tests {
     }
 
     #[test]
+    // `.max()` returns `ROW_NUMBER_MIN_WIDTH` verbatim when it wins (no
+    // further arithmetic on it), so an exact comparison here is intentional.
+    #[allow(clippy::float_cmp)]
+    fn row_number_width_clamps_to_the_minimum_for_small_row_counts() {
+        // Both counts have few enough digits that the computed width sits
+        // below `ROW_NUMBER_MIN_WIDTH`, so both clamp to the same floor.
+        let single_digit = row_number_column_width(9);
+        let seven_digit = row_number_column_width(1_000_000);
+        assert_eq!(f32::from(single_digit), super::theme::ROW_NUMBER_MIN_WIDTH);
+        assert_eq!(f32::from(seven_digit), super::theme::ROW_NUMBER_MIN_WIDTH);
+    }
+
+    #[test]
     fn row_number_width_grows_with_digit_count() {
         let small = row_number_column_width(9);
-        let large = row_number_column_width(1_000_000);
+        // 100_000_000 is the smallest 9-digit row count; nine digits is the
+        // first digit count whose computed width clears `ROW_NUMBER_MIN_WIDTH`'s
+        // floor, so this is the smallest row count that actually demonstrates
+        // growth over `small`.
+        let large = row_number_column_width(100_000_000);
         assert!(f32::from(large) > f32::from(small));
     }
 
@@ -671,7 +641,7 @@ mod tests {
     fn status_indicator_maps_each_state_to_its_dot_color_and_label() {
         assert_eq!(
             status_indicator(&SessionState::Empty),
-            (theme::FAINT, "Not connected")
+            (colors::FAINT, "Not connected")
         );
         assert_eq!(
             status_indicator(&SessionState::Connecting),
@@ -679,15 +649,15 @@ mod tests {
         );
         assert_eq!(
             status_indicator(&SessionState::Connected),
-            (theme::TEAL, "Connected")
+            (colors::TEAL, "Connected")
         );
         assert_eq!(
             status_indicator(&SessionState::Running),
-            (theme::TEAL, "Running…")
+            (colors::TEAL, "Running…")
         );
         assert_eq!(
             status_indicator(&SessionState::Results(Duration::from_millis(1))),
-            (theme::TEAL, "Connected")
+            (colors::TEAL, "Connected")
         );
         assert_eq!(
             status_indicator(&SessionState::Error("boom".to_owned())),

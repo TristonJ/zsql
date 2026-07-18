@@ -17,6 +17,7 @@ zsql-core = { path = "../zsql-core" }
 # only behind `zsql_core::Connection`/`CoreError` — see `session.rs`'s module
 # doc comment.
 zsql-postgres = { path = "../zsql-postgres" }
+zsql-ui = { path = "../zsql-ui" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -7733,6 +7733,7 @@ dependencies = [
  "tracing-subscriber",
  "zsql-core",
  "zsql-postgres",
+ "zsql-ui",
 ]
 
 [[package]]
@@ -7756,6 +7757,13 @@ dependencies = [
  "sqlx",
  "tracing",
  "zsql-core",
+]
+
+[[package]]
+name = "zsql-ui"
+version = "0.0.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]

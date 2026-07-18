@@ -1,6 +1,7 @@
 //! The root workspace view
 
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, Window, div, prelude::*, rgb};
+use zsql_ui::colors;
 
 use super::editor::EditorView;
 use super::results::ResultsView;
@@ -41,14 +42,14 @@ impl Render for WorkspaceView {
             .flex()
             .flex_row()
             .size_full()
-            .bg(rgb(theme::INK))
+            .bg(rgb(colors::INK))
             .child(
                 div()
                     .flex_shrink_0()
                     .w(theme::SIDEBAR_WIDTH)
                     .h_full()
                     .border_r_1()
-                    .border_color(rgb(theme::LINE))
+                    .border_color(rgb(colors::LINE))
                     .child(self.sidebar.clone()),
             )
             .child(

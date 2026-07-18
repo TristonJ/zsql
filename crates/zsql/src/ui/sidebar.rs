@@ -5,10 +5,18 @@
 use std::collections::HashSet;
 
 use gpui::{
-    ClickEvent, Context, Div, Entity, Render, SharedString, Stateful, Window, div, prelude::*, px,
-    rgb, rgba, uniform_list,
+    ClickEvent, Context, Div, Entity, Render, Stateful, Window, div, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
+use zsql_ui::colors;
+// Imported by name rather than as `zsql_ui::tree::...`: this module already
+// uses `tree` as a local variable/parameter name for a `SchemaTree`, and
+// qualifying every call here would read as if it referred to that value.
+use zsql_ui::tree::{
+    META_TEXT_SIZE, ROW_TEXT_SIZE, disclosure_glyph, disclosure_spacer, row_count, row_kind,
+    row_label, row_meta, row_shell,
+};
 
 use super::results::ResultsView;
 use super::theme;
@@ -154,11 +162,11 @@ impl SidebarView {
             .h(theme::SIDEBAR_HEADER_HEIGHT)
             .px_3()
             .border_b_1()
-            .border_color(rgb(theme::LINE_SOFT))
+            .border_color(rgb(colors::LINE_SOFT))
             .child(
                 div()
                     .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                    .text_color(rgb(theme::FAINT))
+                    .text_color(rgb(colors::FAINT))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("SCHEMA"),
             )
@@ -171,12 +179,12 @@ impl SidebarView {
             let session = self.session.read(cx);
             match session.schema() {
                 SchemaState::NotLoaded => Some((
-                    theme::FAINT,
+                    colors::FAINT,
                     "No schema",
                     "Connect to a database to browse its schema.".to_owned(),
                 )),
                 SchemaState::Loading => Some((
-                    theme::FAINT,
+                    colors::FAINT,
                     "Loading schema...",
                     "Fetching catalogs, schemas, and relations.".to_owned(),
                 )),
@@ -184,7 +192,7 @@ impl SidebarView {
                     Some((theme::STATUS_ERROR, "Schema unavailable", message.clone()))
                 }
                 SchemaState::Ready(tree) if tree.catalogs.is_empty() => Some((
-                    theme::FAINT,
+                    colors::FAINT,
                     "No catalogs",
                     "The connected database reported no catalogs.".to_owned(),
                 )),
@@ -215,15 +223,15 @@ impl SidebarView {
             .text_center()
             .child(
                 div()
-                    .text_size(px(theme::SIDEBAR_ROW_TEXT_SIZE))
+                    .text_size(px(ROW_TEXT_SIZE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(rgb(title_color))
                     .child(title.to_owned()),
             )
             .child(
                 div()
-                    .text_size(px(theme::SIDEBAR_META_TEXT_SIZE))
-                    .text_color(rgb(theme::FAINT))
+                    .text_size(px(META_TEXT_SIZE))
+                    .text_color(rgb(colors::FAINT))
                     .child(detail.to_owned()),
             )
     }
@@ -264,7 +272,7 @@ impl SidebarView {
                 row_shell(theme::SIDEBAR_INDENT_L0)
                     .id(ix)
                     .cursor_pointer()
-                    .hover(|this| this.bg(rgb(theme::RAISE)))
+                    .hover(|this| this.bg(rgb(colors::RAISE)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_catalog(&name_owned, cx);
                     }))
@@ -285,7 +293,7 @@ impl SidebarView {
                 row_shell(theme::SIDEBAR_INDENT_L1)
                     .id(ix)
                     .cursor_pointer()
-                    .hover(|this| this.bg(rgb(theme::RAISE)))
+                    .hover(|this| this.bg(rgb(colors::RAISE)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_schema(&catalog_owned, &name_owned, cx);
                     }))
@@ -311,7 +319,7 @@ impl SidebarView {
                 let mut shell = row_shell(theme::SIDEBAR_INDENT_L2)
                     .id(ix)
                     .cursor_pointer()
-                    .hover(|this| this.bg(rgb(theme::RAISE)))
+                    .hover(|this| this.bg(rgb(colors::RAISE)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.preview(&schema_owned, &name_owned, cx);
                     }))
@@ -324,7 +332,7 @@ impl SidebarView {
                     shell = shell
                         .bg(rgba(theme::SIDEBAR_SELECTED_BG))
                         .border_l_2()
-                        .border_color(rgb(theme::TEAL));
+                        .border_color(rgb(colors::TEAL));
                 }
                 shell
             }
@@ -338,81 +346,10 @@ impl Render for SidebarView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(theme::PANEL))
+            .bg(rgb(colors::PANEL))
             .child(Self::render_header())
             .child(self.render_body(cx))
     }
-}
-
-/// Shared chrome for a tree row: height, indent, gap, monospace text.
-fn row_shell(indent: f32) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SIDEBAR_ROW_GAP))
-        .h(theme::SIDEBAR_ROW_HEIGHT)
-        .pl(px(indent))
-        .pr_3()
-        .flex_shrink_0()
-        .w_full()
-        .font_family("monospace")
-        .text_size(px(theme::SIDEBAR_ROW_TEXT_SIZE))
-        .text_color(rgb(theme::TEXT))
-}
-
-/// The ASCII disclosure glyph: `v` expanded, `>` collapsed.
-fn disclosure_glyph(expanded: bool) -> Div {
-    div()
-        .flex_shrink_0()
-        .w(px(theme::SIDEBAR_DISCLOSURE_WIDTH))
-        .text_color(rgb(theme::FAINT))
-        .child(if expanded { "v" } else { ">" })
-}
-
-/// Blank space the width of a disclosure glyph
-fn disclosure_spacer() -> Div {
-    div().flex_shrink_0().w(px(theme::SIDEBAR_DISCLOSURE_WIDTH))
-}
-
-/// A row's primary label
-fn row_label(text: impl Into<SharedString>) -> Div {
-    div().flex_1().min_w_0().truncate().child(text.into())
-}
-
-/// A row's trailing affordance (a relation/column count)
-fn row_meta(text: impl Into<SharedString>) -> Div {
-    div()
-        .flex_shrink_0()
-        .ml_auto()
-        .pl_2()
-        .text_size(px(theme::SIDEBAR_META_TEXT_SIZE))
-        .text_color(rgb(theme::FAINT))
-        .font_family("monospace")
-        .child(text.into())
-}
-
-/// A relation row's kind label (table/view/matview/partitioned)
-fn row_kind(text: impl Into<SharedString>) -> Div {
-    div()
-        .flex_shrink_0()
-        .ml_auto()
-        .pl_2()
-        .text_size(px(theme::SIDEBAR_KIND_TEXT_SIZE))
-        .text_color(rgb(theme::FAINT))
-        .font_family("monospace")
-        .child(text.into())
-}
-
-/// A relation row's column count, following [`row_kind`] in normal flow
-fn row_count(text: impl Into<SharedString>) -> Div {
-    div()
-        .flex_shrink_0()
-        .pl_2()
-        .text_size(px(theme::SIDEBAR_META_TEXT_SIZE))
-        .text_color(rgb(theme::FAINT))
-        .font_family("monospace")
-        .child(text.into())
 }
 
 /// Map a [`RelationKind`] to its ASCII text label.

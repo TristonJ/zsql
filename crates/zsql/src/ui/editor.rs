@@ -14,6 +14,7 @@ use gpui::{
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
     relative, rgb, rgba, size,
 };
+use zsql_ui::colors;
 
 use super::results::ResultsView;
 use super::theme;
@@ -445,13 +446,13 @@ impl EditorView {
             .justify_between()
             .h(theme::EDITOR_TOOLBAR_HEIGHT)
             .px(px(theme::EDITOR_TOOLBAR_PADDING_X))
-            .bg(rgb(theme::PANEL))
+            .bg(rgb(colors::PANEL))
             .border_b_1()
-            .border_color(rgb(theme::LINE))
+            .border_color(rgb(colors::LINE))
             .child(
                 div()
                     .text_size(px(theme::EDITOR_TOOLBAR_LABEL_TEXT_SIZE))
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(rgb(colors::MUTED))
                     .child("SQL"),
             )
             .child(
@@ -464,8 +465,8 @@ impl EditorView {
                     .h(theme::RUN_BUTTON_HEIGHT)
                     .px(px(theme::RUN_BUTTON_PADDING_X))
                     .rounded(px(theme::RUN_BUTTON_RADIUS))
-                    .bg(rgb(theme::TEAL))
-                    .text_color(rgb(theme::INK))
+                    .bg(rgb(colors::TEAL))
+                    .text_color(rgb(colors::INK))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme::RUN_BUTTON_HOVER_BG)))
                     .on_click(cx.listener(|editor, _event: &ClickEvent, _window, cx| {
@@ -496,8 +497,8 @@ impl EditorView {
             .w(theme::EDITOR_GUTTER_WIDTH)
             .py(px(theme::EDITOR_PADDING_Y))
             .border_r_1()
-            .border_color(rgb(theme::LINE_SOFT))
-            .bg(rgb(theme::INK));
+            .border_color(rgb(colors::LINE_SOFT))
+            .bg(rgb(colors::INK));
 
         for line_index in 0..line_count {
             let is_current = line_index == cursor_line;
@@ -509,9 +510,9 @@ impl EditorView {
                     .h(px(theme::EDITOR_LINE_HEIGHT))
                     .px(px(theme::EDITOR_GUTTER_PADDING_X))
                     .text_color(rgb(if is_current {
-                        theme::MUTED
+                        colors::MUTED
                     } else {
-                        theme::FAINT
+                        colors::FAINT
                     }))
                     .child((line_index + 1).to_string()),
             );
@@ -540,9 +541,9 @@ impl Render for EditorView {
             .flex_col()
             .flex_shrink_0()
             .h(theme::EDITOR_HEIGHT)
-            .bg(rgb(theme::INK))
+            .bg(rgb(colors::INK))
             .border_b_1()
-            .border_color(rgb(theme::LINE))
+            .border_color(rgb(colors::LINE))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
@@ -579,7 +580,7 @@ impl Render for EditorView {
                     .track_scroll(&self.scroll_handle)
                     .font_family("monospace")
                     .text_size(px(theme::EDITOR_TEXT_SIZE))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(colors::TEXT))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -891,7 +892,7 @@ impl Element for EditorContentElement {
                         point(bounds.left() + x, top),
                         size(theme::EDITOR_CURSOR_WIDTH, line_height),
                     ),
-                    rgb(theme::TEAL),
+                    rgb(colors::TEAL),
                 ))
             })
             .flatten();
