@@ -1,0 +1,26 @@
+[package]
+name = "zsql-sqlite"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+zsql-core = { path = "../zsql-core" }
+# Own feature list, deliberately narrower than the workspace-shared `sqlx`
+# entry (which pulls in postgres + tls-rustls + chrono/uuid/json/bigdecimal
+# for zsql-postgres): SQLite is file-based with no network/TLS surface, and
+# its storage classes decode with plain i64/f64/String/Vec<u8>, so none of
+# those extra type-mapping features are exercised here.
+sqlx = { version = "0.9", default-features = false, features = [
+    "sqlite",
+    "runtime-smol",
+] }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+async-global-executor = { workspace = true }
+
+[lints]
+workspace = true

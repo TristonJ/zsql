@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/zsql-core", "crates/zsql-postgres", "crates/zsql-ui", "crates/zsql"]
+members = [
+    "crates/zsql-core",
+    "crates/zsql-postgres",
+    "crates/zsql-sqlite",
+    "crates/zsql-ui",
+    "crates/zsql",
+]
 
 [workspace.package]
 edition = "2024"

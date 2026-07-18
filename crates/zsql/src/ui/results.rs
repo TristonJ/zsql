@@ -636,6 +636,9 @@ mod tests {
 
     #[test]
     fn row_number_width_grows_with_digit_count() {
+        // `row_number_column_width` clamps to `ROW_NUMBER_MIN_WIDTH`, so the
+        // "large" side needs enough digits to actually clear that floor
+        // (1_000_000 alone still clamps to the minimum).
         let small = row_number_column_width(9);
         // 100_000_000 is the smallest 9-digit row count; nine digits is the
         // first digit count whose computed width clears `ROW_NUMBER_MIN_WIDTH`'s

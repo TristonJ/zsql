@@ -3180,6 +3180,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -7751,6 +7752,19 @@ name = "zsql-postgres"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-global-executor",
+ "async-trait",
+ "flume 0.11.1",
+ "futures",
+ "sqlx",
+ "tracing",
+ "zsql-core",
+]
+
+[[package]]
+name = "zsql-sqlite"
+version = "0.0.0"
+dependencies = [
  "async-global-executor",
  "async-trait",
  "flume 0.11.1",
