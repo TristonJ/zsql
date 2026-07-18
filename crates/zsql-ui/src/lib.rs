@@ -9,4 +9,5 @@
 pub mod colors;
 pub mod grid;
 pub mod scrollbar;
+pub mod text_field;
 pub mod tree;
