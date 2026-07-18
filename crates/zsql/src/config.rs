@@ -107,7 +107,7 @@ impl Default for LayoutConfig {
             editor_default_height: px(500.0),
             editor_min_height: px(120.0),
             results_min_height: px(120.0),
-            divider_thickness: px(6.0),
+            divider_thickness: px(4.0),
         }
     }
 }
