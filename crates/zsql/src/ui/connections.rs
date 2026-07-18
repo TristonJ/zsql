@@ -12,8 +12,8 @@
 //! (a [`TextFieldEvent::Submit`]) submits the add form.
 
 use gpui::{
-    ClickEvent, Context, Div, Entity, FocusHandle, KeyDownEvent, Render, Stateful, Task, Window,
-    div, prelude::*, px, rgb, rgba,
+    ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, Render, Stateful, Task,
+    Window, div, prelude::*, px, rgb, rgba,
 };
 use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
 use zsql_ui::{colors, grid};
@@ -537,6 +537,10 @@ impl Render for ConnectionManagerView {
             .items_center()
             .justify_center()
             .bg(rgba(theme::MODAL_BACKDROP))
+            // Block mouse events from reaching the workspace behind the modal
+            // (notably the SQL editor): without this, a click on a field falls
+            // through to the editor's own mouse-down, which steals focus back.
+            .occlude()
             .track_focus(&self.modal_focus)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                 view.handle_modal_key_down(event, cx);
@@ -670,8 +674,10 @@ impl ConnectionManagerView {
                             .border_color(rgb(colors::TEAL))
                             .text_color(rgb(colors::TEXT))
                             .child("+ Add connection")
-                            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                            .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
                                 view.show_add_form(cx);
+                                let handle = view.name_field.read(cx).focus_handle(cx);
+                                window.focus(&handle);
                             })),
                     ),
             )
