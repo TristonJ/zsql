@@ -39,7 +39,9 @@ fn main() -> anyhow::Result<()> {
                 let session = cx.new(|_cx| Session::new(&cfg));
 
                 let workspace_session = session.clone();
-                let workspace = cx.new(|cx| WorkspaceView::new(workspace_session, cx));
+                let workspace_layout = cfg.layout.clone();
+                let workspace =
+                    cx.new(|cx| WorkspaceView::new(workspace_session, workspace_layout, cx));
                 window.focus(&workspace.read(cx).editor_focus_handle(cx));
 
                 let startup_session = session.clone();

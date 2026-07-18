@@ -40,8 +40,6 @@ pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 /// Narrowest the leading row-number column is allowed to shrink to.
 pub const ROW_NUMBER_MIN_WIDTH: f32 = 80.0;
 
-/// Fixed width of the schema sidebar.
-pub const SIDEBAR_WIDTH: Pixels = px(300.0);
 /// Height of the sidebar's "SCHEMA" header bar.
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(34.0);
 /// Left padding for a catalog row (tree depth 0).

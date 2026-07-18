@@ -538,11 +538,12 @@ impl Render for EditorView {
             .cursor(CursorStyle::IBeam)
             .flex()
             .flex_col()
-            .flex_shrink_0()
-            .h(theme::EDITOR_HEIGHT)
+            // Height comes from the parent workspace column: that wrapper
+            // gives this pane an explicit, resizable pixel height (see
+            // `workspace.rs`), and `h_full()` fills exactly that rather than
+            // this view hardcoding its own fixed size.
+            .h_full()
             .bg(rgb(colors::INK))
-            .border_b_1()
-            .border_color(rgb(colors::LINE))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
