@@ -141,6 +141,7 @@ mod live_tests {
             return;
         };
         cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(url);

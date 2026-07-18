@@ -62,6 +62,7 @@ mod tests {
 
     #[test]
     fn connect_opens_a_sqlite_in_memory_database_through_selection() {
+        let _guard = crate::test_support::serialize_real_io();
         let conn = block_on(connect("sqlite::memory:".to_owned()))
             .expect("sqlite connect through selection should succeed");
         drop(conn);
@@ -99,6 +100,7 @@ mod tests {
             eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
             return;
         };
+        let _guard = crate::test_support::serialize_real_io();
 
         let conn =
             block_on(connect(url)).expect("postgres connect through selection should succeed");

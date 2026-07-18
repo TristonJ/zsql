@@ -131,6 +131,30 @@ impl ConnectionStore {
         Ok(())
     }
 
+    /// Remove the connection at `index` and persist the updated list
+    /// immediately. Mirrors [`Self::add`]'s rollback-on-save-failure
+    /// discipline: on a write failure the removed entry is reinserted at its
+    /// original position and an `Err` is returned, so a failed remove can
+    /// never leave the on-disk store out of sync with what's in memory. An
+    /// out-of-range `index` is a no-op that returns `Ok(())`, mirroring how
+    /// the connection manager already treats an out-of-range connect index.
+    ///
+    /// # Errors
+    /// Returns [`ConnectionStoreError`] if the store cannot be written.
+    #[tracing::instrument(name = "connection_store_remove", skip_all, fields(index))]
+    pub fn remove(&mut self, index: usize) -> Result<(), ConnectionStoreError> {
+        if index >= self.connections.len() {
+            tracing::warn!(index, "remove requested for an out-of-range index");
+            return Ok(());
+        }
+        let removed = self.connections.remove(index);
+        if let Err(err) = self.save() {
+            self.connections.insert(index, removed);
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Write the current list to `path`, creating its parent directory if
     /// needed, then set owner-only permissions on the resulting file.
     #[tracing::instrument(name = "connection_store_save", skip_all)]
@@ -330,6 +354,96 @@ mod tests {
         // Restore permissions so the temp dir can be cleaned up.
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
             .expect("teardown: restore base dir permissions");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn removing_a_connection_then_reloading_from_disk_reflects_the_removal() {
+        let temp = TempStorePath::new("remove");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        let first = StoredConnection {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        };
+        let second = StoredConnection {
+            name: "second".to_owned(),
+            url: "sqlite:///tmp/b.db".to_owned(),
+        };
+        store.add(first.clone()).expect("add first");
+        store.add(second.clone()).expect("add second");
+
+        store.remove(0).expect("remove must succeed");
+        assert_eq!(
+            store.connections(),
+            std::slice::from_ref(&second),
+            "removing index 0 must leave only the second connection in memory"
+        );
+
+        let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+        assert_eq!(
+            reloaded.connections(),
+            &[second],
+            "the removal must be persisted to disk"
+        );
+    }
+
+    #[test]
+    fn removing_an_out_of_range_index_is_a_no_op() {
+        let temp = TempStorePath::new("remove-out-of-range");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+        store.add(sample()).expect("add must succeed");
+
+        store
+            .remove(5)
+            .expect("an out-of-range remove must not error");
+
+        assert_eq!(
+            store.connections(),
+            &[sample()],
+            "an out-of-range remove must not change the list"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_on_remove_restores_the_entry_in_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "zsql-connections-test-remove-unwritable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("setup: create base dir");
+
+        let path = base.join("connections.toml");
+        let mut store = ConnectionStore::load(&path).expect("initial load must succeed");
+        store
+            .add(sample())
+            .expect("add must succeed: dir is writable at this point");
+
+        // Now make the saved file itself read-only, so the directory stays
+        // writable (creation would still succeed) but overwriting the
+        // existing file's contents on the remove's save fails.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("setup: make store file read-only");
+
+        let result = store.remove(0);
+        assert!(
+            result.is_err(),
+            "remove must fail when the store file cannot be overwritten"
+        );
+        assert_eq!(
+            store.connections(),
+            &[sample()],
+            "a failed save must restore the removed entry in memory: {:?}",
+            store.connections()
+        );
+
+        // Restore permissions so the temp dir can be cleaned up.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("teardown: restore file permissions");
         let _ = std::fs::remove_dir_all(&base);
     }
 
