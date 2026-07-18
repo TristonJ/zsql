@@ -35,12 +35,6 @@ mod tests {
         (runner, recorded)
     }
 
-    /// Dispatching `RunQuery` through an editor built by
-    /// [`new_tab_editor_view`] must invoke the exact `QueryRunner` closure
-    /// it was constructed with, with the buffer's current text. The Run
-    /// button's `on_click` handler calls the same shared
-    /// `run_current_query` method the `RunQuery` action does, so exercising
-    /// the action covers both entry points.
     #[gpui::test]
     fn running_a_query_invokes_the_editors_query_runner(cx: &mut TestAppContext) {
         let (runner, queries) = recording_query_runner();

@@ -468,6 +468,7 @@ mod tests {
     use gpui::{AppContext as _, Entity, SharedString, TestAppContext};
     use zsql_core::{
         BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, SchemaTree,
+        RowCount
     };
 
     use super::{TabKind, TabModel, generated_tab_sql};
@@ -493,6 +494,10 @@ mod tests {
         async fn ping(&self) -> Result<(), CoreError> {
             Ok(())
         }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError>;
+            Ok(RowCount::Exact(0))
+        }
     }
 
     /// A `Connection` double that hands back every `stream_query` call's
@@ -517,6 +522,10 @@ mod tests {
 
         async fn ping(&self) -> Result<(), CoreError> {
             Ok(())
+        }
+
+        async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError>;
+          Ok(RowCount::Exact(0))
         }
     }
 

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::config::ConnConfig;
 use crate::error::CoreError;
+use crate::row_count::RowCount;
 use crate::schema::SchemaTree;
 use crate::value::{ColumnMeta, RowBatch};
 
@@ -92,4 +93,14 @@ pub trait Connection: Send + Sync {
     /// Returns an error if the connection is unreachable or the probe query
     /// fails.
     async fn ping(&self) -> Result<(), CoreError>;
+
+    /// The total row count for `relation` in `schema`. Whether the result is
+    /// [`RowCount::Exact`] or [`RowCount::Estimated`] is entirely up to the
+    /// implementation: a driver with a cheap planner statistic available
+    /// should prefer it over an exact `COUNT(*)`.
+    ///
+    /// # Errors
+    /// Returns an error if the count cannot be determined (e.g. the relation
+    /// does not exist, or the underlying query fails).
+    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError>;
 }

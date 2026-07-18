@@ -8,7 +8,7 @@ use gpui::{
     Render, SharedString, UniformListScrollHandle, Window, div, point, prelude::*, px, rgb, rgba,
     uniform_list,
 };
-use zsql_core::{ColumnMeta, ResultSet};
+use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::{colors, grid, scrollbar};
 
 use super::format::{ValueKind, format_value};
@@ -696,12 +696,13 @@ impl ResultsView {
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
+        let session = self.session.read(cx);
         // Liveness is the connection's real-time health, independent of
         // which tab is displayed, so it is read straight off `session`
         // rather than through `effective_state`: a dead connection must
         // show as disconnected regardless of whether the active tab is
         // frozen to an older, still-successful snapshot.
-        let liveness = self.session.read(cx).liveness().clone();
+        let liveness = session.liveness().clone();
         let state = self.effective_state(cx);
         let (dot_color, label) = status_indicator(state, &liveness);
 
@@ -731,6 +732,10 @@ impl ResultsView {
             status_metrics(state, self.effective_result(cx).rows.len())
         {
             bar = bar.child(rows_text).child(elapsed_text);
+        }
+
+        if let Some(total_row_count_text) = format_total_row_count(session.row_count()) {
+            bar = bar.child(total_row_count_text);
         }
 
         if let SessionState::Error(message) = state {
@@ -829,6 +834,53 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
     }
 }
 
+/// Groups digits every three places when rendering a total row count in the
+/// status bar.
+const THOUSANDS_SEPARATOR: char = ',';
+
+/// Appended after the number when a total row count is a planner estimate
+/// rather than an exact count, so the distinction reads clearly even without
+/// color.
+const ESTIMATED_ROW_COUNT_SUFFIX: &str = " (estimated)";
+
+/// Labels the whole-relation total so it never reads as the streamed-rows
+/// metric beside it. That metric renders as `"200 rows"` (capped at the
+/// preview limit), so the total drops the bare `"rows"` word for `"total"`
+/// and the two can no longer be confused.
+const TOTAL_ROW_COUNT_LABEL: &str = " total";
+
+/// The previewed relation's total row count, for the status bar: e.g.
+/// `"1,234 total"` for an exact count, or `"~1,234,567 total (estimated)"`
+/// when the driver could only provide a planner estimate. `None` when no
+/// count has been fetched (no preview yet, still fetching, or the fetch
+/// failed), so the caller can omit the segment entirely.
+fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
+    let row_count = row_count?;
+    let grouped = group_thousands(row_count.value());
+    Some(if row_count.is_estimated() {
+        format!(
+            "{}{grouped}{TOTAL_ROW_COUNT_LABEL}{ESTIMATED_ROW_COUNT_SUFFIX}",
+            zsql_core::ESTIMATE_MARKER
+        )
+    } else {
+        format!("{grouped}{TOTAL_ROW_COUNT_LABEL}")
+    })
+}
+
+/// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
+/// the right, e.g. `1234567` -> `"1,234,567"`.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(THOUSANDS_SEPARATOR);
+        }
+        grouped.push(ch);
+    }
+    grouped.chars().rev().collect()
+}
+
 /// The text color for a formatted cell's semantic kind.
 fn kind_color(kind: ValueKind) -> u32 {
     match kind {
@@ -876,11 +928,11 @@ mod tests {
     use std::time::Duration;
 
     use gpui::AppContext as _;
-    use zsql_core::{ColumnMeta, ResultSet, Row, Value};
+    use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
-        SessionState, column_width_from_parts, row_number_column_width, status_indicator,
-        status_metrics,
+        SessionState, column_width_from_parts, format_total_row_count, row_number_column_width,
+        status_indicator, status_metrics,
     };
     use zsql_ui::colors;
 
@@ -1092,6 +1144,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_total_row_count_renders_nothing_when_absent() {
+        assert_eq!(format_total_row_count(None), None);
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_exact_count_with_thousands_separators() {
+        assert_eq!(
+            format_total_row_count(Some(RowCount::Exact(1_234))),
+            Some("1,234 total".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_estimated_count_marked_distinctly() {
+        assert_eq!(
+            format_total_row_count(Some(RowCount::Estimated(1_234_567))),
+            Some("~1,234,567 total (estimated)".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_labels_the_total_distinctly_from_the_streamed_rows_metric() {
+        // The streamed-rows metric reads "N rows"; the total must not, or the
+        // two segments are indistinguishable in the status bar.
+        let exact = format_total_row_count(Some(RowCount::Exact(1_234))).unwrap();
+        let estimated = format_total_row_count(Some(RowCount::Estimated(1_234))).unwrap();
+        assert!(!exact.ends_with(" rows"));
+        assert!(exact.contains("total"));
+        assert!(estimated.contains("total"));
+    }
+
+    #[test]
+    fn format_total_row_count_handles_small_counts_with_no_separator_needed() {
+        assert_eq!(
+            format_total_row_count(Some(RowCount::Exact(7))),
+            Some("7 total".to_owned())
+        );
+        assert_eq!(
+            format_total_row_count(Some(RowCount::Exact(0))),
+            Some("0 total".to_owned())
+        );
+    }
+
     #[gpui::test]
     fn renders_one_frame_without_panicking(cx: &mut gpui::TestAppContext) {
         let mut result = sample_result();
@@ -1123,6 +1219,23 @@ mod tests {
         let state = SessionState::Results(Duration::from_millis(8));
         let session = cx.new(|_cx| Session::new_for_render_test(state, result));
         cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+    }
+
+    #[gpui::test]
+    fn renders_with_every_row_count_variant_without_panicking(cx: &mut gpui::TestAppContext) {
+        for row_count in [
+            None,
+            Some(RowCount::Exact(1_234)),
+            Some(RowCount::Estimated(1_234_567)),
+        ] {
+            let state = SessionState::Results(Duration::from_millis(8));
+            let session = cx.new(|_cx| {
+                let mut session = Session::new_for_render_test(state, sample_result());
+                session.set_row_count_for_test(row_count);
+                session
+            });
+            cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+        }
     }
 
     #[gpui::test]

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::Either;
 use gpui::{BackgroundExecutor, Context, Task, prelude::*};
-use zsql_core::{Connection, CoreError, QueryEvent, ResultSet, SchemaTree};
+use zsql_core::{Connection, CoreError, QueryEvent, ResultSet, RowCount, SchemaTree};
 
 use crate::config::Config;
 use crate::drivers;
@@ -86,6 +86,12 @@ pub struct Session {
     active_query: Option<zsql_core::QueryHandle>,
     /// Columns/rows accumulated so far for the query currently streaming
     accumulating: ResultSet,
+    /// The most recently previewed relation's total row count, once its
+    /// background fetch (started by [`Session::preview_relation`]) has
+    /// completed. Cleared at the start of every [`Session::run_query`] call
+    /// (preview or not), and populated only by `preview_relation`'s own
+    /// fetch -- a query typed into the editor never touches this.
+    row_count: Option<RowCount>,
     /// When the currently-streaming query started
     query_started_at: Option<Instant>,
     /// Incremented every `run_query` call. Each query's consumer loop
@@ -145,6 +151,7 @@ impl Session {
             max_result_rows: cfg.query.max_result_rows,
             active_query: None,
             accumulating: ResultSet::default(),
+            row_count: None,
             query_started_at: None,
             query_generation: 0,
             liveness: LivenessState::Unknown,
@@ -208,6 +215,15 @@ impl Session {
     #[must_use]
     pub fn result(&self) -> &ResultSet {
         &self.accumulating
+    }
+
+    /// The most recently previewed relation's total row count, if its
+    /// background fetch has completed. `None` before it completes, if it
+    /// failed, or if the current result came from [`Session::run_query`]
+    /// rather than [`Session::preview_relation`].
+    #[must_use]
+    pub fn row_count(&self) -> Option<RowCount> {
+        self.row_count
     }
 
     /// Connect using the resolved DSN (`DATABASE_URL`, or else
@@ -373,6 +389,7 @@ impl Session {
 
         tracing::debug!(sql = %sql, "session running query");
         self.accumulating = ResultSet::default();
+        self.row_count = None;
         self.state = SessionState::Running;
         self.query_started_at = Some(Instant::now());
         self.query_generation += 1;
@@ -453,7 +470,18 @@ impl Session {
     }
 
     /// Preview a relation's rows: `SELECT * FROM "<schema>"."<relation>"
-    /// LIMIT <configured preview limit>`
+    /// LIMIT <configured preview limit>`, and separately fetch the
+    /// relation's total row count via [`Connection::count_rows`].
+    ///
+    /// The count fetch runs as its own task, started here alongside (not
+    /// sequenced before) the streaming preview `run_query` kicks off, so a
+    /// slow count can never delay the first streamed rows painting. This is
+    /// the only path that ever calls `count_rows`: SQL typed into the editor
+    /// and run via a plain [`Session::run_query`] call never triggers a
+    /// count fetch. A count failure is logged and leaves
+    /// [`Session::row_count`] at `None`; it never moves `state` to
+    /// [`SessionState::Error`] or otherwise disturbs the already-streaming
+    /// preview.
     pub fn preview_relation(
         &mut self,
         schema: &str,
@@ -461,7 +489,39 @@ impl Session {
         cx: &mut Context<Self>,
     ) -> Task<()> {
         let sql = crate::sql::preview_sql(schema, relation, self.preview_limit);
-        self.run_query(sql, cx)
+        let preview_task = self.run_query(sql, cx);
+
+        if let Some(connection) = self.connection.clone() {
+            let generation = self.query_generation;
+            let schema = schema.to_owned();
+            let relation = relation.to_owned();
+            cx.spawn(async move |this, cx| {
+                let outcome = cx
+                    .background_spawn(count_relation_rows(connection, schema, relation))
+                    .await;
+
+                let _ = this.update(cx, |session, cx| {
+                    if session.query_generation != generation {
+                        // A newer query has superseded this preview; a
+                        // late-arriving count no longer belongs to what is
+                        // currently displayed.
+                        return;
+                    }
+                    match outcome {
+                        Ok(row_count) => {
+                            session.row_count = Some(row_count);
+                            cx.notify();
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "session row count fetch failed");
+                        }
+                    }
+                });
+            })
+            .detach();
+        }
+
+        preview_task
     }
 
     /// Fold one `QueryEvent` (or a terminal error) into `state`/`accumulating`.
@@ -589,6 +649,7 @@ impl Session {
             max_result_rows: Config::default().query.max_result_rows,
             active_query: None,
             accumulating: result,
+            row_count: None,
             query_started_at: None,
             query_generation: 0,
             liveness: LivenessState::Unknown,
@@ -603,6 +664,13 @@ impl Session {
     /// batch (or a fresh result)
     pub(crate) fn set_result_for_test(&mut self, result: ResultSet) {
         self.accumulating = result;
+    }
+
+    /// Set the exposed row count directly, simulating a completed (or
+    /// absent) [`Session::preview_relation`] count fetch without going
+    /// through a real `Connection`.
+    pub(crate) fn set_row_count_for_test(&mut self, row_count: Option<RowCount>) {
+        self.row_count = row_count;
     }
 
     /// Build a session already holding `schema` as its introspected schema
@@ -651,6 +719,16 @@ impl Session {
 #[tracing::instrument(name = "session_introspect", skip_all)]
 async fn introspect_connection(connection: Arc<dyn Connection>) -> Result<SchemaTree, CoreError> {
     connection.introspect().await
+}
+
+/// Fetch `schema.relation`'s total row count via `connection`.
+#[tracing::instrument(name = "session_count_rows", skip(connection))]
+async fn count_relation_rows(
+    connection: Arc<dyn Connection>,
+    schema: String,
+    relation: String,
+) -> Result<RowCount, CoreError> {
+    connection.count_rows(&schema, &relation).await
 }
 
 /// Ping `connection`, failing the probe if it does not complete within
@@ -1014,7 +1092,7 @@ mod gpui_tests {
     use gpui::{AppContext as _, TestAppContext};
     use zsql_core::{
         BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
-        RelationKind, Row, RowBatch, SchemaNs, SchemaTree, Value,
+        RelationKind, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
     };
 
     use super::{Config, LivenessState, SchemaState, Session, SessionState};
@@ -1253,6 +1331,9 @@ mod gpui_tests {
         ping_tx: flume::Sender<Result<(), CoreError>>,
         ping_rx: flume::Receiver<Result<(), CoreError>>,
         ping_calls: Arc<AtomicUsize>,
+        count_calls: Arc<AtomicUsize>,
+        count_outcome: Arc<Mutex<Result<RowCount, String>>>,
+        count_gate: Arc<Mutex<Option<flume::Receiver<()>>>>,
     }
 
     impl FakeConnection {
@@ -1265,6 +1346,9 @@ mod gpui_tests {
                 ping_tx,
                 ping_rx,
                 ping_calls: Arc::new(AtomicUsize::new(0)),
+                count_calls: Arc::new(AtomicUsize::new(0)),
+                count_outcome: Arc::new(Mutex::new(Ok(RowCount::Exact(0)))),
+                count_gate: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1279,6 +1363,31 @@ mod gpui_tests {
         /// dispatched rather than just observing their (non-)outcome.
         fn ping_call_counter(&self) -> Arc<AtomicUsize> {
             Arc::clone(&self.ping_calls)
+        }
+
+        /// A shared counter of every `count_rows()` call made on this
+        /// connection, so a test can assert whether (and how often) a count
+        /// was actually fetched.
+        fn count_call_counter(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.count_calls)
+        }
+
+        /// Script the outcome of every future `count_rows()` call on this
+        /// connection.
+        fn set_count_outcome(&self, outcome: Result<RowCount, String>) {
+            *self
+                .count_outcome
+                .lock()
+                .expect("count_outcome lock poisoned") = outcome;
+        }
+
+        /// Install a gate that holds every future `count_rows()` call pending
+        /// until the returned sender fires, so a test can keep a count in
+        /// flight while a newer query supersedes the preview that started it.
+        fn gate_count(&self) -> flume::Sender<()> {
+            let (tx, rx) = flume::unbounded();
+            *self.count_gate.lock().expect("count_gate lock poisoned") = Some(rx);
+            tx
         }
     }
 
@@ -1309,6 +1418,23 @@ mod gpui_tests {
                 .recv_async()
                 .await
                 .unwrap_or_else(|_| Err(CoreError::Connection("fake connection closed".to_owned())))
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            self.count_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self
+                .count_gate
+                .lock()
+                .expect("count_gate lock poisoned")
+                .clone();
+            if let Some(gate) = gate {
+                let _ = gate.recv_async().await;
+            }
+            self.count_outcome
+                .lock()
+                .expect("count_outcome lock poisoned")
+                .clone()
+                .map_err(CoreError::Query)
         }
     }
 
@@ -1988,6 +2114,239 @@ mod gpui_tests {
         assert_eq!(
             recorded.as_slice(),
             ["SELECT * FROM \"public\".\"orders\" LIMIT 50"],
+        );
+    }
+
+    #[gpui::test]
+    fn run_query_does_not_fetch_a_row_count(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks.clone(), queries);
+        let count_calls = connection.count_call_counter();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 1", cx))
+            .detach();
+        cx.run_until_parked();
+
+        let sink = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            sinks[0].clone()
+        };
+        sink.send(Ok(QueryEvent::Done { affected: None }))
+            .expect("sink send failed");
+        cx.run_until_parked();
+
+        assert_eq!(
+            count_calls.load(Ordering::SeqCst),
+            0,
+            "run_query must never call count_rows -- only preview_relation does"
+        );
+        session.read_with(cx, |session, _app| {
+            assert_eq!(session.row_count(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn preview_relation_fetches_and_exposes_the_row_count(cx: &mut TestAppContext) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks, queries);
+        connection.set_count_outcome(Ok(RowCount::Exact(42)));
+        let count_calls = connection.count_call_counter();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("public", "orders", cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        assert_eq!(
+            count_calls.load(Ordering::SeqCst),
+            1,
+            "preview_relation must fetch the row count exactly once"
+        );
+        session.read_with(cx, |session, _app| {
+            assert_eq!(session.row_count(), Some(RowCount::Exact(42)));
+        });
+    }
+
+    #[gpui::test]
+    fn a_failing_row_count_fetch_leaves_row_count_none_without_touching_session_state(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks.clone(), queries);
+        connection.set_count_outcome(Err("boom".to_owned()));
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("public", "orders", cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        let sink = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            sinks[0].clone()
+        };
+        sink.send(Ok(QueryEvent::Columns(vec![ColumnMeta {
+            name: "id".to_owned(),
+            type_name: "int8".to_owned(),
+            nullable: false,
+        }])))
+        .expect("sink send failed");
+        sink.send(Ok(QueryEvent::Done { affected: None }))
+            .expect("sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "a failing row count fetch must not disturb the streaming preview's state, got {:?}",
+                session.state()
+            );
+            assert_eq!(
+                session.row_count(),
+                None,
+                "a failing row count fetch must leave row_count at None"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_superseded_previews_late_count_does_not_overwrite_the_current_row_count(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks, queries);
+        connection.set_count_outcome(Ok(RowCount::Exact(42)));
+        // Hold the count in flight so it can only land after a newer query
+        // has bumped the generation out from under it.
+        let release_count = connection.gate_count();
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("public", "orders", cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        // A newer query supersedes the preview while its count is still gated.
+        // `run_query` never fetches a count, so no second count is in flight.
+        session
+            .update(cx, |session, cx| {
+                session.run_query("SELECT 1".to_owned(), cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        release_count.send(()).expect("count gate send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                session.row_count(),
+                None,
+                "a late count from a superseded preview must not overwrite the current result"
+            );
+        });
+    }
+
+    /// Proves the fetch-and-expose wiring end to end against a real (if
+    /// in-memory) `SQLite` connection, without requiring postgres/docker:
+    /// previewing a relation must result in `Session::row_count` reporting
+    /// the seeded table's actual row count.
+    #[gpui::test]
+    async fn preview_relation_against_a_real_connection_exposes_the_seeded_row_count(
+        cx: &mut TestAppContext,
+    ) {
+        use zsql_core::Driver as _;
+
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let cfg = zsql_core::ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let conn = zsql_sqlite::SqliteDriver
+            .connect(&cfg)
+            .await
+            .expect("sqlite connect should succeed");
+        let conn: Arc<dyn Connection> = Arc::from(conn);
+
+        let (setup_tx, setup_rx) = flume::unbounded();
+        let _setup = conn.stream_query(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY); \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES"
+                .to_owned(),
+            setup_tx,
+        );
+        while setup_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok()
+        {}
+
+        let session = cx.new(|_cx| {
+            let mut session = session_with_no_dsn();
+            session.connection = Some(conn);
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("main", "items", cx)
+            })
+            .await;
+
+        // The count fetch runs as its own detached task, on a real OS
+        // thread outside the `TestAppContext`'s deterministic dispatcher
+        // (this crate has no tokio runtime to hand it a virtual clock), so
+        // `run_until_parked` alone can return before it actually finishes -
+        // the same real-IO timing this crate's liveness-probe tests already
+        // document and poll around. Poll with a bounded number of short
+        // real sleeps instead of asserting immediately.
+        let mut row_count = None;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            row_count = session.read_with(cx, |session, _app| session.row_count());
+            if row_count.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            row_count,
+            Some(RowCount::Exact(3)),
+            "expected the row count to match the 3 seeded rows, got {row_count:?}"
         );
     }
 }

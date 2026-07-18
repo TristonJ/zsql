@@ -10,7 +10,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RowBatch,
-    SchemaTree,
+    RowCount, SchemaTree, quote_ident,
 };
 
 use crate::error::{map_connect_error, map_query_error};
@@ -39,6 +39,15 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// client, and keeping it off the query pool entirely is the point (see the
 /// doc comment on [`PostgresDriver::build_side_pool`]).
 const CANCEL_POOL_CONNECTIONS: u32 = 2;
+
+/// Below this, `pg_class.reltuples` cannot be trusted as a row-count
+/// estimate. Modern Postgres (this driver has been verified against 18)
+/// reports `reltuples = -1` as an explicit sentinel for a relation that has
+/// never been `ANALYZE`d (whether or not it holds any rows), and this
+/// `reltuples >= threshold` check is what actually catches that sentinel and
+/// routes `count_rows` to the exact `COUNT(*)` fallback -- it is not dead
+/// defensive code guarding against a case Postgres cannot produce.
+const RELTUPLES_UNRELIABLE_THRESHOLD: f32 = 0.0;
 
 /// Bounded size of the dedicated pool [`PgConnection::ping`] draws from.
 /// Separate from both `MAX_POOL_CONNECTIONS` and `CANCEL_POOL_CONNECTIONS` so
@@ -223,6 +232,98 @@ impl Connection for PgConnection {
         liveness_check(&self.probe_pool).await?;
         Ok(())
     }
+
+    #[tracing::instrument(name = "pg_count_rows", skip(self), fields(pool_size = self.pool.size()))]
+    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
+        if let Some(reltuples) = fetch_reltuples(&self.pool, schema, relation).await? {
+            if reltuples_is_reliable(reltuples) {
+                tracing::debug!(reltuples, "using planner row-count estimate");
+                return Ok(RowCount::Estimated(reltuples_to_row_count(reltuples)));
+            }
+            tracing::debug!(
+                reltuples,
+                "planner estimate unreliable (relation never analyzed); \
+                 falling back to an exact count"
+            );
+        } else {
+            tracing::debug!("no pg_class row found; falling back to an exact count");
+        }
+        let exact = exact_row_count(&self.pool, schema, relation).await?;
+        Ok(RowCount::Exact(exact))
+    }
+}
+
+/// Look up `pg_class.reltuples` for `schema.relation`, bind-parameterized
+/// (never string-interpolated) against `pg_namespace`/`pg_class`. Returns
+/// `None` if no matching catalog row exists (e.g. the relation was dropped,
+/// or the caller passed a name that doesn't exist).
+async fn fetch_reltuples(
+    pool: &PgPool,
+    schema: &str,
+    relation: &str,
+) -> Result<Option<f32>, CoreError> {
+    let row = sqlx::query(
+        "SELECT c.reltuples \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2",
+    )
+    .bind(schema)
+    .bind(relation)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_query_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let reltuples: f32 = row.try_get("reltuples").map_err(map_query_error)?;
+    Ok(Some(reltuples))
+}
+
+/// Whether `reltuples` is trustworthy enough to report as a
+/// [`RowCount::Estimated`]. Postgres uses a negative `reltuples` as an
+/// explicit sentinel for "this relation has never been `ANALYZE`d" (verified
+/// against Postgres 18: a freshly created, unanalyzed table reports
+/// `reltuples = -1` regardless of how many rows it actually holds); once
+/// `ANALYZE` has run at least once, `reltuples` is a nonnegative planner
+/// estimate, including `0` for a genuinely empty analyzed table, which is
+/// reliable and reported as-is.
+fn reltuples_is_reliable(reltuples: f32) -> bool {
+    reltuples >= RELTUPLES_UNRELIABLE_THRESHOLD
+}
+
+/// Convert a nonnegative `pg_class.reltuples` estimate to a row count.
+/// `reltuples_is_reliable` guarantees `reltuples >= 0.0` before this is
+/// called, so the cast never loses sign, and Postgres's own `reltuples` is
+/// itself only ever an approximation, so rounding-to-nearest is at least as
+/// precise as the estimate it comes from.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn reltuples_to_row_count(reltuples: f32) -> u64 {
+    reltuples.round() as u64
+}
+
+/// Build `SELECT COUNT(*) FROM <quoted schema>.<quoted relation>`, quoting
+/// both identifiers so an adversarial schema/relation name cannot break out
+/// of the identifier position.
+fn exact_count_sql(schema: &str, relation: &str) -> String {
+    format!(
+        "SELECT COUNT(*) FROM {}.{}",
+        quote_ident(schema),
+        quote_ident(relation)
+    )
+}
+
+/// Run an exact `SELECT COUNT(*)` against `schema.relation`.
+async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<u64, CoreError> {
+    let sql = exact_count_sql(schema, relation);
+    // `sql` is built entirely from `quote_ident`-escaped identifiers via
+    // `exact_count_sql`, never from unescaped runtime text.
+    let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+        .fetch_one(pool)
+        .await
+        .map_err(map_query_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// Stream a query's results into `sink`. `sql` may hold several statements;
@@ -1270,6 +1371,227 @@ mod tests {
             "the pg_sleep backend should have been server-side cancelled \
              well within the 30s sleep, but is still active after 10s"
         );
+    }
+
+    #[test]
+    fn exact_count_sql_quotes_both_identifiers() {
+        assert_eq!(
+            super::exact_count_sql("public", "orders"),
+            "SELECT COUNT(*) FROM \"public\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
+        let sql = super::exact_count_sql("public", "orders\"; DROP TABLE users; --");
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"public\".\"orders\"\"; DROP TABLE users; --\""
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
+        let sql = super::exact_count_sql("public\"; DROP TABLE users; --", "orders");
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"public\"\"; DROP TABLE users; --\".\"orders\""
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn reltuples_is_reliable_rejects_the_never_analyzed_sentinel() {
+        // Postgres reports reltuples == -1 for a relation that has never
+        // been ANALYZE'd, regardless of how many rows it actually holds.
+        assert!(!super::reltuples_is_reliable(-1.0));
+    }
+
+    #[test]
+    fn reltuples_is_reliable_accepts_a_positive_estimate() {
+        assert!(super::reltuples_is_reliable(1234.0));
+    }
+
+    #[test]
+    fn reltuples_is_reliable_accepts_a_genuinely_empty_analyzed_table() {
+        // Once ANALYZE has run, reltuples == 0 means "zero rows", a
+        // trustworthy estimate rather than an unanalyzed placeholder (the
+        // placeholder is the negative sentinel above, not zero).
+        assert!(super::reltuples_is_reliable(0.0));
+    }
+
+    #[test]
+    fn reltuples_to_row_count_rounds_to_the_nearest_integer() {
+        assert_eq!(super::reltuples_to_row_count(1234.4), 1234);
+        assert_eq!(super::reltuples_to_row_count(1234.6), 1235);
+        assert_eq!(super::reltuples_to_row_count(0.0), 0);
+    }
+
+    /// Runs `ANALYZE` on a freshly seeded table, then asserts `count_rows`
+    /// reports a `RowCount::Estimated` within a generous tolerance of the
+    /// table's true row count. Postgres's own planner statistics come from a
+    /// sample, not a full scan, so a wide (20%) relative tolerance is used
+    /// even though a table this small is typically counted exactly by
+    /// `ANALYZE`.
+    #[test]
+    fn count_rows_returns_an_estimated_count_within_tolerance_after_analyze_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let table = "zsql_test_count_rows_estimated";
+        let seeded_rows: i64 = 500;
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(&*conn, &format!("CREATE TABLE {table} (n integer)"));
+        run_ddl(
+            &*conn,
+            &format!("INSERT INTO {table} SELECT * FROM generate_series(1, {seeded_rows})"),
+        );
+        run_ddl(&*conn, &format!("ANALYZE {table}"));
+
+        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        tracing::info!(
+            ?row_count,
+            "count_rows_returns_an_estimated_count_within_tolerance_after_analyze_when_configured executed against the live database"
+        );
+
+        match row_count {
+            zsql_core::RowCount::Estimated(estimate) => {
+                let diff = (i64::try_from(estimate).unwrap() - seeded_rows).abs();
+                let tolerance = seeded_rows / 5; // 20%
+                assert!(
+                    diff <= tolerance,
+                    "estimate {estimate} too far from the true count {seeded_rows} \
+                     (tolerance {tolerance})"
+                );
+            }
+            zsql_core::RowCount::Exact(n) => {
+                panic!("expected an Estimated count after ANALYZE, got Exact({n})")
+            }
+        }
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    /// A freshly created, never-`ANALYZE`d table reports `reltuples = -1` in
+    /// `pg_class` (Postgres's own sentinel for "never analyzed") regardless
+    /// of how many rows it actually holds, so `count_rows` must fall back to
+    /// an exact `COUNT(*)` rather than trusting that sentinel as an
+    /// estimate.
+    #[test]
+    fn count_rows_falls_back_to_exact_for_an_unanalyzed_table_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let table = "zsql_test_count_rows_unanalyzed";
+        let seeded_rows = 7;
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(&*conn, &format!("CREATE TABLE {table} (n integer)"));
+        run_ddl(
+            &*conn,
+            &format!("INSERT INTO {table} SELECT * FROM generate_series(1, {seeded_rows})"),
+        );
+        // Deliberately no ANALYZE here: this is the whole point of the test.
+
+        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        tracing::info!(
+            ?row_count,
+            "count_rows_falls_back_to_exact_for_an_unanalyzed_table_when_configured executed against the live database"
+        );
+
+        assert_eq!(
+            row_count,
+            zsql_core::RowCount::Exact(seeded_rows),
+            "an unanalyzed table must fall back to an exact count"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    /// A genuinely empty table that HAS been `ANALYZE`d reports
+    /// `reltuples = 0`, distinct from the `-1` never-analyzed sentinel
+    /// exercised above, and must be trusted as `Estimated(0)` rather than
+    /// falling back to an exact count.
+    #[test]
+    fn count_rows_returns_an_estimated_zero_for_an_analyzed_empty_table_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let table = "zsql_test_count_rows_analyzed_empty";
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(&*conn, &format!("CREATE TABLE {table} (n integer)"));
+        run_ddl(&*conn, &format!("ANALYZE {table}"));
+
+        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        tracing::info!(
+            ?row_count,
+            "count_rows_returns_an_estimated_zero_for_an_analyzed_empty_table_when_configured executed against the live database"
+        );
+
+        assert_eq!(
+            row_count,
+            zsql_core::RowCount::Estimated(0),
+            "an analyzed, genuinely empty table must report a trustworthy Estimated(0), \
+             not fall back to an exact count"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    /// A relation with no matching `pg_class` row at all (never created, or
+    /// already dropped) makes `fetch_reltuples` return `None`, which must
+    /// still fall through to the exact-count path rather than panicking or
+    /// silently reporting a zero count; the exact `COUNT(*)` against a
+    /// nonexistent relation then fails, and that failure must surface as a
+    /// `CoreError`, not be swallowed.
+    #[test]
+    fn count_rows_errors_for_a_relation_absent_from_pg_class_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let result = block_on(conn.count_rows("public", "zsql_test_relation_that_does_not_exist"));
+        tracing::info!(
+            ?result,
+            "count_rows_errors_for_a_relation_absent_from_pg_class_when_configured executed against the live database"
+        );
+
+        match result {
+            Err(zsql_core::CoreError::Query(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Query, got {other:?}"),
+            Ok(row_count) => {
+                panic!("counting a nonexistent relation must fail, got {row_count:?}")
+            }
+        }
+    }
+
+    /// Run `sql` (typically DDL/DML setup) to completion against `conn`,
+    /// panicking on any error and discarding whatever events it produces.
+    fn run_ddl(conn: &dyn zsql_core::Connection, sql: &str) {
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql.to_owned(), tx);
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => panic!("ddl setup failed: {err:?}"),
+                Err(err) => panic!("ddl setup did not complete: {err:?}"),
+            }
+        }
     }
 
     /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
