@@ -467,8 +467,7 @@ mod tests {
     use async_trait::async_trait;
     use gpui::{AppContext as _, Entity, SharedString, TestAppContext};
     use zsql_core::{
-        BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, SchemaTree,
-        RowCount
+        BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RowCount, SchemaTree,
     };
 
     use super::{TabKind, TabModel, generated_tab_sql};
@@ -495,7 +494,7 @@ mod tests {
             Ok(())
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError>;
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
     }
@@ -524,8 +523,8 @@ mod tests {
             Ok(())
         }
 
-        async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError>;
-          Ok(RowCount::Exact(0))
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            Ok(RowCount::Exact(0))
         }
     }
 
