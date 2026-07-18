@@ -153,7 +153,7 @@ impl ResultsView {
     fn render_bar(&self, cx: &Context<Self>) -> Div {
         let session = self.session.read(cx);
         let count_text = match session.state() {
-            SessionState::Results(_) | SessionState::Running => {
+            SessionState::Results(_) | SessionState::Running | SessionState::Limited { .. } => {
                 session.result().rows.len().to_string()
             }
             SessionState::Empty
@@ -210,7 +210,9 @@ impl ResultsView {
         let has_columns = !session.result().columns.is_empty();
 
         match state {
-            SessionState::Results(_) => self.render_grid(cx),
+            // The rows streamed before truncation stay visible, exactly
+            // like a normal completed result.
+            SessionState::Results(_) | SessionState::Limited { .. } => self.render_grid(cx),
             // Once the streaming query's `Columns` event has arrived there
             // is a real (if partial) result set to paint, so switch to the
             // grid immediately rather than waiting for `Done`
@@ -724,6 +726,7 @@ fn status_indicator(state: &SessionState, liveness: &LivenessState) -> (u32, &'s
         SessionState::Connecting => (theme::STATUS_CONNECTING, "Connecting…"),
         SessionState::Connected | SessionState::Results(_) => (colors::TEAL, "Connected"),
         SessionState::Running => (colors::TEAL, "Running…"),
+        SessionState::Limited { .. } => (theme::STATUS_LIMITED, "Limited"),
         SessionState::Error(_) => (theme::STATUS_ERROR, "Error"),
     }
 }
@@ -732,13 +735,16 @@ fn status_indicator(state: &SessionState, liveness: &LivenessState) -> (u32, &'s
 /// `row_count`. `None` for any state with no completed query to
 /// report timing/row-count for
 fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, String)> {
-    if let SessionState::Results(elapsed) = state {
-        Some((
+    match state {
+        SessionState::Results(elapsed) => Some((
             format!("{row_count} rows"),
             format!("{} ms", elapsed.as_millis()),
-        ))
-    } else {
-        None
+        )),
+        SessionState::Limited { elapsed, rows } => Some((
+            format!("Result limited to {rows} rows"),
+            format!("{} ms", elapsed.as_millis()),
+        )),
+        _ => None,
     }
 }
 
@@ -922,6 +928,24 @@ mod tests {
             ),
             (theme::STATUS_ERROR, "Error")
         );
+        let limited = status_indicator(
+            &SessionState::Limited {
+                elapsed: Duration::from_millis(1),
+                rows: 100,
+            },
+            &LivenessState::Healthy,
+        );
+        assert_eq!(limited, (theme::STATUS_LIMITED, "Limited"));
+        assert_ne!(
+            limited,
+            (colors::TEAL, "Connected"),
+            "Limited must not be indistinguishable from a normal completed result"
+        );
+        assert_ne!(
+            limited,
+            (theme::STATUS_ERROR, "Error"),
+            "Limited must not be indistinguishable from a query error"
+        );
     }
 
     #[test]
@@ -971,6 +995,20 @@ mod tests {
                 "expected no fabricated rows/ms text for {state:?}"
             );
         }
+    }
+
+    #[test]
+    fn status_metrics_reads_as_truncated_for_a_limited_result() {
+        let state = SessionState::Limited {
+            elapsed: Duration::from_millis(7),
+            rows: 100,
+        };
+        assert_eq!(
+            status_metrics(&state, 5_000),
+            Some(("Result limited to 100 rows".to_owned(), "7 ms".to_owned())),
+            "the row count shown must come from the capped Limited state, not the raw \
+             (ignored) row_count argument"
+        );
     }
 
     #[gpui::test]
@@ -1027,6 +1065,22 @@ mod tests {
         let mut result = sample_result();
         result.rows.truncate(1);
         let session = cx.new(|_cx| Session::new_for_render_test(SessionState::Running, result));
+
+        cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+    }
+
+    /// The rows streamed before a query was cancelled at the configured
+    /// limit must stay visible: `Limited` renders the grid, not a
+    /// placeholder, exactly like a normal completed result.
+    #[gpui::test]
+    fn renders_the_grid_for_a_limited_result_keeping_rows_visible(cx: &mut gpui::TestAppContext) {
+        let mut result = sample_result();
+        result.rows.truncate(1);
+        let state = SessionState::Limited {
+            elapsed: Duration::from_millis(5),
+            rows: 1,
+        };
+        let session = cx.new(|_cx| Session::new_for_render_test(state, result));
 
         cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
     }

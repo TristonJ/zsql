@@ -16,6 +16,11 @@ pub const STATUS_ERROR: u32 = 0xe2_6d_78;
 /// currently shares `STATUS_ERROR`'s hue) so the two can diverge without
 /// hunting down every call site.
 pub const STATUS_DISCONNECTED: u32 = 0xe2_6d_78;
+/// Status-bar "limited" indicator: the last query was cancelled after its
+/// result reached the configured row limit. Its own amber, distinct from
+/// `STATUS_CONNECTING`'s, so a truncated result cannot be mistaken for a
+/// connection attempt in flight.
+pub const STATUS_LIMITED: u32 = 0xe8_a1_3a;
 
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);

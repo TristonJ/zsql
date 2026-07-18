@@ -25,6 +25,10 @@ pub enum SessionState {
     Running,
     /// The most recent query completed successfully
     Results(Duration),
+    /// The most recent query was cancelled after its accumulated row count
+    /// reached the configured limit (`Config.query.max_result_rows`). The
+    /// rows streamed up to that point remain in [`Session::result`]
+    Limited { elapsed: Duration, rows: u64 },
     /// Connecting or running a query failed. The message is safe to show
     /// directly in the UI
     Error(String),
@@ -74,6 +78,10 @@ pub struct Session {
     schema_generation: u64,
     /// `LIMIT` applied to [`Session::preview_relation`]'s generated query
     preview_limit: u64,
+    /// Upper bound on rows accumulated for the query currently streaming,
+    /// from [`Config::query`]. Reaching this many rows cancels the query and
+    /// moves `state` to [`SessionState::Limited`]; see [`Session::apply_query_event`].
+    max_result_rows: u64,
     /// Cancellation handle for whichever query is currently streaming.
     active_query: Option<zsql_core::QueryHandle>,
     /// Columns/rows accumulated so far for the query currently streaming
@@ -134,6 +142,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: cfg.query.preview_limit,
+            max_result_rows: cfg.query.max_result_rows,
             active_query: None,
             accumulating: ResultSet::default(),
             query_started_at: None,
@@ -383,7 +392,9 @@ impl Session {
                     cx.notify();
                     matches!(
                         session.state,
-                        SessionState::Results(..) | SessionState::Error(_)
+                        SessionState::Results(..)
+                            | SessionState::Error(_)
+                            | SessionState::Limited { .. }
                     )
                 });
                 match reached_terminal_state {
@@ -447,7 +458,16 @@ impl Session {
     }
 
     /// Fold one `QueryEvent` (or a terminal error) into `state`/`accumulating`.
+    ///
+    /// Once `state` has moved to [`SessionState::Limited`] for the query
+    /// currently streaming, every further event is a no-op: the flume
+    /// channel can still hold `Batch`/`Columns`/`Done` events queued before
+    /// the cancel took effect, and those must not resurrect rows or state
+    /// the truncation already settled.
     fn apply_query_event(&mut self, event: Result<QueryEvent, CoreError>) {
+        if matches!(self.state, SessionState::Limited { .. }) {
+            return;
+        }
         match event {
             Ok(QueryEvent::Columns(columns)) => {
                 // Each Columns event begins a fresh result set. A run of
@@ -461,8 +481,7 @@ impl Session {
                 self.state = SessionState::Running;
             }
             Ok(QueryEvent::Batch(batch)) => {
-                self.accumulating.rows.extend(batch.rows);
-                self.state = SessionState::Running;
+                self.append_batch_capped(batch);
             }
             Ok(QueryEvent::Done { affected }) => {
                 self.accumulating.affected = affected;
@@ -486,6 +505,65 @@ impl Session {
             }
         }
     }
+
+    /// Append `batch`'s rows to `accumulating`, capping at exactly
+    /// `max_result_rows`. A batch can straddle the limit (batches hold up to
+    /// the driver's own batch size, which may be far larger than a small
+    /// configured limit), so only as many rows as still fit are appended -
+    /// never the whole batch followed by a truncation of the vector, which
+    /// would momentarily overshoot the limit.
+    ///
+    /// The moment the cap is reached, the query is cancelled through the
+    /// existing [`zsql_core::QueryHandle`] cancellation path (the same one
+    /// that drives cooperative-drop and server-side `pg_cancel_backend`
+    /// cancellation) and `state` moves to [`SessionState::Limited`].
+    fn append_batch_capped(&mut self, batch: zsql_core::RowBatch) {
+        let limit = self.max_result_rows;
+        let accumulated = row_count(&self.accumulating);
+        let remaining = limit.saturating_sub(accumulated);
+        let take = usize::try_from(remaining).unwrap_or(usize::MAX);
+        self.accumulating
+            .rows
+            .extend(batch.rows.into_iter().take(take));
+        self.state = SessionState::Running;
+
+        let accumulated = row_count(&self.accumulating);
+        if !row_limit_reached(accumulated, limit) {
+            return;
+        }
+
+        let elapsed = self
+            .query_started_at
+            .take()
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        tracing::warn!(
+            limit,
+            rows = accumulated,
+            elapsed_ms = elapsed.as_millis(),
+            "session query result truncated at the configured row limit"
+        );
+        self.state = SessionState::Limited {
+            elapsed,
+            rows: accumulated,
+        };
+        if let Some(handle) = self.active_query.take() {
+            handle.cancel();
+        }
+    }
+}
+
+/// `accumulating.rows.len()` as a `u64`, for comparison against the
+/// configured row limit (also `u64`).
+fn row_count(accumulating: &ResultSet) -> u64 {
+    u64::try_from(accumulating.rows.len()).unwrap_or(u64::MAX)
+}
+
+/// Whether an accumulated row count of `accumulated` rows has reached or
+/// exceeded `limit`. Pure and cheap (a single comparison) so it can run once
+/// per streamed batch without touching the executor or blocking anything
+/// else in flight, such as the liveness probe or an unrelated query.
+fn row_limit_reached(accumulated: u64, limit: u64) -> bool {
+    accumulated >= limit
 }
 
 /// Test-only constructors used by the UI views' render and action tests.
@@ -501,6 +579,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: Config::default().query.preview_limit,
+            max_result_rows: Config::default().query.max_result_rows,
             active_query: None,
             accumulating: result,
             query_started_at: None,
@@ -815,6 +894,108 @@ mod tests {
             other => panic!("expected SessionState::Error, got {other:?}"),
         }
     }
+
+    #[test]
+    fn row_limit_reached_compares_accumulated_against_the_limit() {
+        assert!(
+            !super::row_limit_reached(4, 5),
+            "an accumulated count below the limit must not be reached"
+        );
+        assert!(
+            super::row_limit_reached(5, 5),
+            "an accumulated count exactly at the limit must count as reached"
+        );
+        assert!(
+            super::row_limit_reached(6, 5),
+            "an accumulated count above the limit must count as reached"
+        );
+    }
+
+    #[test]
+    fn a_batch_crossing_the_limit_is_capped_exactly_and_cancels_the_query() {
+        let mut cfg = Config::default();
+        cfg.query.max_result_rows = 5;
+        let mut session = Session::new(&cfg);
+        session.state = SessionState::Running;
+
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        session.active_query = Some(zsql_core::QueryHandle::new(cancel_tx));
+
+        session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
+            name: "n".to_owned(),
+            type_name: "int8".to_owned(),
+            nullable: false,
+        }])));
+
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: (0..3).map(|n| Row(vec![Value::Int(n)])).collect(),
+        })));
+        assert!(
+            matches!(session.state(), SessionState::Running),
+            "still under the limit, so the query must keep running"
+        );
+        assert_eq!(session.result().rows.len(), 3);
+
+        // This batch alone (5 rows) would push the total to 8, well past the
+        // limit of 5: only 2 of its rows may be appended.
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: (3..8).map(|n| Row(vec![Value::Int(n)])).collect(),
+        })));
+
+        assert_eq!(
+            session.result().rows.len(),
+            5,
+            "rows must be capped at exactly the configured limit, never overshot"
+        );
+        match session.state() {
+            SessionState::Limited { rows, .. } => assert_eq!(*rows, 5),
+            other => panic!("expected SessionState::Limited, got {other:?}"),
+        }
+        assert!(
+            session.active_query.is_none(),
+            "active_query must be cleared once the limit is reached, as on Done/Error"
+        );
+        assert!(
+            cancel_rx.try_recv().is_ok(),
+            "the existing QueryHandle cancellation path must have been invoked"
+        );
+
+        // Events already queued for this generation when cancellation fired
+        // must be ignored, not resurrect rows or flip state away from Limited.
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: vec![Row(vec![Value::Int(99)])],
+        })));
+        assert_eq!(
+            session.result().rows.len(),
+            5,
+            "a late batch after truncation must not grow the capped result"
+        );
+        session.apply_query_event(Ok(QueryEvent::Done { affected: None }));
+        assert!(
+            matches!(session.state(), SessionState::Limited { .. }),
+            "a late Done after truncation must not flip state away from Limited"
+        );
+    }
+
+    #[test]
+    fn a_batch_landing_exactly_on_the_limit_truncates_without_overshoot() {
+        let mut cfg = Config::default();
+        cfg.query.max_result_rows = 4;
+        let mut session = Session::new(&cfg);
+        session.state = SessionState::Running;
+
+        session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
+            name: "n".to_owned(),
+            type_name: "int8".to_owned(),
+            nullable: false,
+        }])));
+        session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
+            rows: (0..4).map(|n| Row(vec![Value::Int(n)])).collect(),
+        })));
+
+        assert_eq!(session.result().rows.len(), 4);
+        assert!(matches!(session.state(), SessionState::Limited { .. }));
+    }
 }
 
 /// `TestAppContext`-driven `Session` tests that need no live database
@@ -826,7 +1007,7 @@ mod gpui_tests {
     use gpui::{AppContext as _, TestAppContext};
     use zsql_core::{
         BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
-        RelationKind, SchemaNs, SchemaTree,
+        RelationKind, Row, RowBatch, SchemaNs, SchemaTree, Value,
     };
 
     use super::{Config, LivenessState, SchemaState, Session, SessionState};
@@ -1481,6 +1662,94 @@ mod gpui_tests {
     }
 
     #[gpui::test]
+    fn a_superseded_querys_over_limit_batch_does_not_truncate_the_current_query(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeConnection::new(sinks.clone(), queries);
+
+        let mut cfg = Config::default();
+        cfg.query.max_result_rows = 3;
+        let session = cx.new(|_cx| {
+            let mut session = Session::new(&cfg);
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 1", cx))
+            .detach();
+        cx.run_until_parked();
+
+        // Supersede the first query before it ever reaches a terminal state.
+        session
+            .update(cx, |session, cx| session.run_query("SELECT 2", cx))
+            .detach();
+        cx.run_until_parked();
+
+        let (first_sink, second_sink) = {
+            let sinks = sinks.lock().expect("sinks lock poisoned");
+            assert_eq!(sinks.len(), 2, "expected exactly two stream_query calls");
+            (sinks[0].clone(), sinks[1].clone())
+        };
+
+        // The superseded first query's batch alone would blow past the
+        // limit of 3, but it must never be folded into the current
+        // (second) query's state: the generation guard in `run_query`'s
+        // consumer loop must reject it before `apply_query_event` even
+        // sees it.
+        first_sink
+            .send(Ok(QueryEvent::Columns(vec![ColumnMeta {
+                name: "stale".to_owned(),
+                type_name: "int8".to_owned(),
+                nullable: false,
+            }])))
+            .expect("first sink send failed");
+        first_sink
+            .send(Ok(QueryEvent::Batch(RowBatch {
+                rows: (0..10).map(|n| Row(vec![Value::Int(n)])).collect(),
+            })))
+            .expect("first sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                !matches!(session.state(), SessionState::Limited { .. }),
+                "a stale over-limit batch from a superseded query must not truncate \
+                 the current query, got {:?}",
+                session.state()
+            );
+        });
+
+        second_sink
+            .send(Ok(QueryEvent::Columns(vec![ColumnMeta {
+                name: "fresh".to_owned(),
+                type_name: "int8".to_owned(),
+                nullable: false,
+            }])))
+            .expect("second sink send failed");
+        second_sink
+            .send(Ok(QueryEvent::Batch(RowBatch {
+                rows: vec![Row(vec![Value::Int(1)])],
+            })))
+            .expect("second sink send failed");
+        second_sink
+            .send(Ok(QueryEvent::Done { affected: None }))
+            .expect("second sink send failed");
+        cx.run_until_parked();
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Results(_)),
+                "the current query must complete normally, got {:?}",
+                session.state()
+            );
+            assert_eq!(session.result().rows.len(), 1);
+        });
+    }
+
+    #[gpui::test]
     fn a_query_error_leaves_the_underlying_connection_in_place(cx: &mut TestAppContext) {
         let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
         let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1824,6 +2093,65 @@ mod live_tests {
                 .collect();
             total_cents.sort_unstable();
             assert_eq!(total_cents, vec![250, 1299, 4900]);
+        });
+    }
+
+    /// A query producing far more rows than the configured
+    /// `max_result_rows` must be cancelled the moment the limit is reached:
+    /// the session's `run_query` task itself stops awaiting further events
+    /// as soon as `state` becomes `Limited` (its terminal-state check now
+    /// includes it), so `run_task.await` below returns promptly instead of
+    /// waiting for `generate_series` to actually finish producing 100,000
+    /// rows.
+    #[gpui::test]
+    async fn a_runaway_result_is_cancelled_and_capped_at_the_configured_limit_when_configured(
+        cx: &mut TestAppContext,
+    ) {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let mut cfg = Config::default();
+        cfg.connection.default_url = Some(url);
+        cfg.query.max_result_rows = 100;
+
+        let session = cx.new(|_cx| Session::new(&cfg));
+        session.update(cx, Session::connect).await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "connect should succeed against a reachable database, got {:?}",
+                session.state()
+            );
+        });
+
+        let run_task = session.update(cx, |session, cx| {
+            session.run_query("SELECT * FROM generate_series(1, 100000)", cx)
+        });
+        run_task.await;
+
+        session.read_with(cx, |session, _app| {
+            match session.state() {
+                SessionState::Limited { rows, .. } => {
+                    assert_eq!(
+                        *rows, 100,
+                        "the truncated state must report exactly the configured limit"
+                    );
+                }
+                other => panic!(
+                    "expected SessionState::Limited after exceeding the configured limit, \
+                     got {other:?} (the query must not stream all 100,000 rows nor stay \
+                     Running indefinitely)"
+                ),
+            }
+            assert_eq!(
+                session.result().rows.len(),
+                100,
+                "accumulated rows must be capped at exactly the configured limit"
+            );
         });
     }
 
