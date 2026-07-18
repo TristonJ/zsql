@@ -5,17 +5,17 @@
 //! driver-selection connect path ([`crate::drivers::connect`] via
 //! [`crate::session::Session::connect_to`]).
 //!
-//! Name/URL entry here is plain append/backspace key capture
-//! (`handle_key_down` folding into `set_name_input`/`set_url_input`) rather
-//! than a full cursor/IME text-editing widget like `ui::editor::EditorView`:
-//! no selection, no cursor movement, no clipboard. A richer input is a
-//! UI-only concern layered on top of the state transitions this module
-//! already makes independently testable.
+//! Name/URL entry uses the reusable [`zsql_ui::text_field::TextFieldState`]
+//! widget: a bordered field with a teal focus ring, blinking caret, muted
+//! placeholder, selection, clipboard, and IME. Each field is its own entity;
+//! this view reads their values when adding, and an `Enter` in either field
+//! (a [`TextFieldEvent::Submit`]) submits the add form.
 
 use gpui::{
-    ClickEvent, Context, Div, Entity, FocusHandle, KeyDownEvent, Keystroke, Render, Stateful, Task,
-    Window, div, prelude::*, px, rgb, rgba,
+    ClickEvent, Context, Div, Entity, FocusHandle, KeyDownEvent, Render, Stateful, Task, Window,
+    div, prelude::*, px, rgb, rgba,
 };
+use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
 use zsql_ui::{colors, grid};
 
 use super::theme;
@@ -128,13 +128,6 @@ pub fn host_label(url: &str) -> String {
     }
 }
 
-/// Which of the add form's two fields a key event targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputField {
-    Name,
-    Url,
-}
-
 /// One persisted connection as shown in the manager, with its auto-detected
 /// driver id (or the detection failure's message, surfaced inline rather
 /// than hidden) derived fresh from the URL every time the row list is built
@@ -155,10 +148,11 @@ pub struct ConnectionManagerView {
     session: Entity<Session>,
     store: ConnectionStore,
     rows: Vec<ConnectionRow>,
-    name_input: String,
-    url_input: String,
-    name_focus: FocusHandle,
-    url_focus: FocusHandle,
+    /// The add form's name field: a reusable interactive text input.
+    name_field: Entity<TextFieldState>,
+    /// The add form's URL field. Observed so the detected-driver preview
+    /// recomputes as the user types.
+    url_field: Entity<TextFieldState>,
     /// Focus target for the modal overlay itself, so an `Escape` keystroke
     /// reaches [`Self::handle_modal_key_down`] once the caller that opens
     /// the modal focuses it (see `ui::footer::ConnectionFooterView`).
@@ -180,14 +174,29 @@ impl ConnectionManagerView {
     #[must_use]
     pub fn new(session: Entity<Session>, store: ConnectionStore, cx: &mut Context<Self>) -> Self {
         let rows = build_rows(store.connections());
+        let name_field = cx.new(|cx| TextFieldState::new("name", None, cx));
+        let url_field =
+            cx.new(|cx| TextFieldState::new("postgres://... or sqlite://...", None, cx));
+
+        // Enter in either field submits the add form.
+        cx.subscribe(&name_field, |view, _field, _event: &TextFieldEvent, cx| {
+            let _ = view.add_connection(cx);
+        })
+        .detach();
+        cx.subscribe(&url_field, |view, _field, _event: &TextFieldEvent, cx| {
+            let _ = view.add_connection(cx);
+        })
+        .detach();
+        // Recompute the detected-driver preview as the URL is edited.
+        cx.observe(&url_field, |_view, _field, cx| cx.notify())
+            .detach();
+
         Self {
             session,
             store,
             rows,
-            name_input: String::new(),
-            url_input: String::new(),
-            name_focus: cx.focus_handle(),
-            url_focus: cx.focus_handle(),
+            name_field,
+            url_field,
             modal_focus: cx.focus_handle(),
             open: false,
             view: ManagerView::List,
@@ -251,8 +260,8 @@ impl ConnectionManagerView {
     }
 
     /// `Escape` closes the modal; every other key is ignored here (the
-    /// name/url inputs handle their own keys separately via
-    /// [`Self::handle_key_down`]).
+    /// name/url [`TextFieldState`] fields handle their own keys, and an
+    /// `Enter` in either submits the add form via their `Submit` event).
     pub fn handle_modal_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
             self.close(cx);
@@ -263,8 +272,7 @@ impl ConnectionManagerView {
     /// pending input/status left over from a previous visit to the form.
     pub fn show_add_form(&mut self, cx: &mut Context<Self>) {
         self.view = ManagerView::AddForm;
-        self.name_input.clear();
-        self.url_input.clear();
+        self.clear_inputs(cx);
         self.status = None;
         cx.notify();
     }
@@ -273,10 +281,25 @@ impl ConnectionManagerView {
     /// whatever was typed without saving anything.
     pub fn cancel_add(&mut self, cx: &mut Context<Self>) {
         self.view = ManagerView::List;
-        self.name_input.clear();
-        self.url_input.clear();
+        self.clear_inputs(cx);
         self.status = None;
         cx.notify();
+    }
+
+    /// Empty both add-form fields.
+    fn clear_inputs(&mut self, cx: &mut Context<Self>) {
+        self.name_field
+            .update(cx, |field, cx| field.set_value("", cx));
+        self.url_field
+            .update(cx, |field, cx| field.set_value("", cx));
+    }
+
+    /// The add form's current name and URL values, read from the fields.
+    fn input_values(&self, cx: &Context<Self>) -> (String, String) {
+        (
+            self.name_field.read(cx).value().to_string(),
+            self.url_field.read(cx).value().to_string(),
+        )
     }
 
     /// Replace the tracked active connection, e.g. after a successful
@@ -288,21 +311,26 @@ impl ConnectionManagerView {
         cx.notify();
     }
 
-    /// Replace the pending "name" field of the add form.
-    pub fn set_name_input(&mut self, name: impl Into<String>) {
-        self.name_input = name.into();
+    /// Set the name field's content. Test helper: users type into the field
+    /// directly, so this is only needed to drive the field from tests.
+    #[cfg(test)]
+    fn set_name_input(&mut self, name: impl AsRef<str>, cx: &mut Context<Self>) {
+        self.name_field
+            .update(cx, |field, cx| field.set_value(name, cx));
     }
 
-    /// Replace the pending "url" field of the add form.
-    pub fn set_url_input(&mut self, url: impl Into<String>) {
-        self.url_input = url.into();
+    /// Set the URL field's content. Test helper (see [`Self::set_name_input`]).
+    #[cfg(test)]
+    fn set_url_input(&mut self, url: impl AsRef<str>, cx: &mut Context<Self>) {
+        self.url_field
+            .update(cx, |field, cx| field.set_value(url, cx));
     }
 
-    /// The add form's current driver tag preview, computed from
-    /// `url_input` exactly as [`ConnectionRow::driver_id`] would be once
+    /// The add form's current driver tag preview, computed from the URL
+    /// field's content exactly as [`ConnectionRow::driver_id`] would be once
     /// saved.
-    pub fn pending_driver_id(&self) -> Result<&'static str, String> {
-        detect_driver_id(&self.url_input)
+    pub fn pending_driver_id(&self, cx: &Context<Self>) -> Result<&'static str, String> {
+        detect_driver_id(&self.url_field.read(cx).value())
     }
 
     /// Save a new connection from the current name/url inputs, persist it,
@@ -318,22 +346,22 @@ impl ConnectionManagerView {
     /// rather than this `Result`, since they never reach the store.
     #[tracing::instrument(name = "connection_manager_add", skip_all)]
     pub fn add_connection(&mut self, cx: &mut Context<Self>) -> Result<(), ConnectionStoreError> {
-        if let Err(message) = validate_new_connection(&self.name_input, &self.url_input) {
+        let (name, url) = self.input_values(cx);
+        if let Err(message) = validate_new_connection(&name, &url) {
             tracing::warn!(reason = %message, "rejected invalid connection input");
             self.status = Some(message);
             cx.notify();
             return Ok(());
         }
         let connection = StoredConnection {
-            name: self.name_input.clone(),
-            url: self.url_input.clone(),
+            name: name.clone(),
+            url,
         };
         match self.store.add(connection) {
             Ok(()) => {
-                tracing::info!(name = %self.name_input, "connection saved");
+                tracing::info!(name = %name, "connection saved");
                 self.rows = build_rows(self.store.connections());
-                self.name_input.clear();
-                self.url_input.clear();
+                self.clear_inputs(cx);
                 self.status = Some("Connection saved.".to_owned());
                 self.view = ManagerView::List;
                 cx.notify();
@@ -456,39 +484,6 @@ impl ConnectionManagerView {
             });
         })
     }
-
-    /// Fold a raw keystroke into `field`'s pending input: backspace pops the
-    /// last character, an unmodified printable key appends its `key_char`.
-    /// Anything else (arrow keys, cmd/ctrl combinations, ...) is ignored --
-    /// this is deliberately not a full text-editing widget, see the module
-    /// doc comment.
-    fn handle_key_down(&mut self, field: InputField, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let mut target = self.field_value(field).to_owned();
-        if !apply_keystroke(&mut target, &event.keystroke) {
-            return;
-        }
-        match field {
-            InputField::Name => self.set_name_input(target),
-            InputField::Url => self.set_url_input(target),
-        }
-        cx.notify();
-    }
-}
-
-/// Apply one keystroke to `target`, returning whether it changed anything.
-fn apply_keystroke(target: &mut String, keystroke: &Keystroke) -> bool {
-    if keystroke.key == "backspace" {
-        return target.pop().is_some();
-    }
-    let no_editing_modifier =
-        !keystroke.modifiers.control && !keystroke.modifiers.alt && !keystroke.modifiers.platform;
-    match (no_editing_modifier, &keystroke.key_char) {
-        (true, Some(key_char)) => {
-            target.push_str(key_char);
-            true
-        }
-        _ => false,
-    }
 }
 
 /// Reject a would-be [`StoredConnection`] before it ever reaches
@@ -575,55 +570,6 @@ impl Render for ConnectionManagerView {
 }
 
 impl ConnectionManagerView {
-    /// A single click-to-focus, type-to-append field bound to `field`.
-    fn render_input(
-        &self,
-        field: InputField,
-        placeholder: &'static str,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let (value, focus_handle) = match field {
-            InputField::Name => (self.name_input.clone(), self.name_focus.clone()),
-            InputField::Url => (self.url_input.clone(), self.url_focus.clone()),
-        };
-        let label = if value.is_empty() {
-            placeholder.to_owned()
-        } else {
-            value
-        };
-        let text_color = if self.field_value(field).is_empty() {
-            colors::FAINT
-        } else {
-            colors::INK
-        };
-
-        div()
-            .id(match field {
-                InputField::Name => "connection-name-input",
-                InputField::Url => "connection-url-input",
-            })
-            .track_focus(&focus_handle)
-            .on_click(cx.listener(move |_view, _event: &ClickEvent, window, _cx| {
-                window.focus(&focus_handle);
-            }))
-            .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _window, cx| {
-                view.handle_key_down(field, event, cx);
-            }))
-            .min_w(px(180.0))
-            .px_2()
-            .py_1()
-            .bg(rgb(colors::RAISE))
-            .text_color(rgb(text_color))
-            .child(label)
-    }
-
-    fn field_value(&self, field: InputField) -> &str {
-        match field {
-            InputField::Name => &self.name_input,
-            InputField::Url => &self.url_input,
-        }
-    }
-
     /// The modal's title bar: a back arrow on the add form, the panel
     /// title, a saved-count subtitle on the list, and a close (`x`) button.
     fn render_modal_head(&self, cx: &Context<Self>) -> Div {
@@ -833,9 +779,10 @@ impl ConnectionManagerView {
     /// The "new connection" form panel: name/url fields, a detected-driver
     /// preview, and Cancel/Add actions.
     fn render_modal_add_form(&self, cx: &Context<Self>) -> Div {
-        let driver_preview = match self.pending_driver_id() {
+        let url_is_empty = self.url_field.read(cx).value().is_empty();
+        let driver_preview = match self.pending_driver_id(cx) {
             Ok(id) => id.to_owned(),
-            Err(_) if self.url_input.is_empty() => String::new(),
+            Err(_) if url_is_empty => String::new(),
             Err(_) => "unrecognized".to_owned(),
         };
 
@@ -844,13 +791,13 @@ impl ConnectionManagerView {
             .flex_col()
             .gap_3()
             .p_4()
-            .child(self.render_input(InputField::Name, "name", cx))
+            .child(self.name_field.clone())
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(self.render_input(InputField::Url, "postgres://... or sqlite://...", cx))
+                    .child(self.url_field.clone())
                     .when(!driver_preview.is_empty(), |el| {
                         el.child(
                             div()
@@ -920,7 +867,7 @@ mod tests {
 
     use super::{
         ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, StoredConnection,
-        active_connection_for_url, apply_keystroke, footer_display, host_label,
+        active_connection_for_url, footer_display, host_label,
     };
     use crate::session::{Session, SessionState};
 
@@ -1028,8 +975,8 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("local sqlite");
-            view.set_url_input("sqlite::memory:");
+            view.set_name_input("local sqlite", cx);
+            view.set_url_input("sqlite::memory:", cx);
             let result = view.add_connection(cx);
             assert!(
                 result.is_err(),
@@ -1056,8 +1003,8 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("new db");
-            view.set_url_input("sqlite::memory:");
+            view.set_name_input("new db", cx);
+            view.set_url_input("sqlite::memory:", cx);
             view.add_connection(cx).expect("add must succeed");
         });
 
@@ -1081,11 +1028,11 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("x");
-            view.set_url_input("sqlite::memory:");
+            view.set_name_input("x", cx);
+            view.set_url_input("sqlite::memory:", cx);
             view.add_connection(cx).expect("add must succeed");
-            assert_eq!(view.name_input, "");
-            assert_eq!(view.url_input, "");
+            assert!(view.name_field.read(cx).value().is_empty());
+            assert!(view.url_field.read(cx).value().is_empty());
         });
     }
 
@@ -1096,12 +1043,12 @@ mod tests {
         let session = cx.new(|_cx| session_with_no_dsn());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
-        manager.update(cx, |view, _cx| {
-            view.set_url_input("postgresql://host/db");
-            assert_eq!(view.pending_driver_id(), Ok("postgres"));
+        manager.update(cx, |view, cx| {
+            view.set_url_input("postgresql://host/db", cx);
+            assert_eq!(view.pending_driver_id(cx), Ok("postgres"));
 
-            view.set_url_input("nope://host");
-            assert!(view.pending_driver_id().is_err());
+            view.set_url_input("nope://host", cx);
+            assert!(view.pending_driver_id(cx).is_err());
         });
     }
 
@@ -1194,14 +1141,15 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("");
-            view.set_url_input("sqlite::memory:");
+            view.set_name_input("", cx);
+            view.set_url_input("sqlite::memory:", cx);
             view.add_connection(cx)
                 .expect("validation rejection is Ok(())");
 
             assert!(view.connections().is_empty());
             assert_eq!(
-                view.url_input, "sqlite::memory:",
+                view.url_field.read(cx).value().to_string(),
+                "sqlite::memory:",
                 "inputs must be preserved"
             );
             assert!(view.status().is_some_and(|s| s.contains("name")));
@@ -1218,13 +1166,17 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("new db");
-            view.set_url_input("");
+            view.set_name_input("new db", cx);
+            view.set_url_input("", cx);
             view.add_connection(cx)
                 .expect("validation rejection is Ok(())");
 
             assert!(view.connections().is_empty());
-            assert_eq!(view.name_input, "new db", "inputs must be preserved");
+            assert_eq!(
+                view.name_field.read(cx).value().to_string(),
+                "new db",
+                "inputs must be preserved"
+            );
             assert!(view.status().is_some_and(|s| s.contains("URL")));
         });
     }
@@ -1239,109 +1191,18 @@ mod tests {
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
-            view.set_name_input("mystery");
-            view.set_url_input("cassandra://host/db");
+            view.set_name_input("mystery", cx);
+            view.set_url_input("cassandra://host/db", cx);
             view.add_connection(cx)
                 .expect("validation rejection is Ok(())");
 
             assert!(view.connections().is_empty());
-            assert_eq!(view.name_input, "mystery", "inputs must be preserved");
+            assert_eq!(
+                view.name_field.read(cx).value().to_string(),
+                "mystery",
+                "inputs must be preserved"
+            );
         });
-    }
-
-    #[test]
-    fn apply_keystroke_backspace_pops_the_last_character() {
-        let mut target = "hello".to_owned();
-        let keystroke = Keystroke {
-            key: "backspace".to_owned(),
-            key_char: None,
-            modifiers: Modifiers::default(),
-        };
-        assert!(apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "hell");
-    }
-
-    #[test]
-    fn apply_keystroke_backspace_on_an_empty_string_returns_false() {
-        let mut target = String::new();
-        let keystroke = Keystroke {
-            key: "backspace".to_owned(),
-            key_char: None,
-            modifiers: Modifiers::default(),
-        };
-        assert!(!apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "");
-    }
-
-    #[test]
-    fn apply_keystroke_appends_an_unmodified_printable_keys_char() {
-        let mut target = "ab".to_owned();
-        let keystroke = Keystroke {
-            key: "c".to_owned(),
-            key_char: Some("c".to_owned()),
-            modifiers: Modifiers::default(),
-        };
-        assert!(apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "abc");
-    }
-
-    #[test]
-    fn apply_keystroke_rejects_a_control_chord_without_mutating_the_target() {
-        let mut target = "ab".to_owned();
-        let keystroke = Keystroke {
-            key: "c".to_owned(),
-            key_char: Some("c".to_owned()),
-            modifiers: Modifiers {
-                control: true,
-                ..Modifiers::default()
-            },
-        };
-        assert!(!apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "ab");
-    }
-
-    #[test]
-    fn apply_keystroke_rejects_a_platform_chord_without_mutating_the_target() {
-        let mut target = "ab".to_owned();
-        let keystroke = Keystroke {
-            key: "v".to_owned(),
-            key_char: Some("v".to_owned()),
-            modifiers: Modifiers {
-                platform: true,
-                ..Modifiers::default()
-            },
-        };
-        assert!(!apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "ab");
-    }
-
-    #[test]
-    fn apply_keystroke_rejects_an_alt_chord_without_mutating_the_target() {
-        let mut target = "ab".to_owned();
-        let keystroke = Keystroke {
-            key: "c".to_owned(),
-            key_char: Some("c".to_owned()),
-            modifiers: Modifiers {
-                alt: true,
-                ..Modifiers::default()
-            },
-        };
-        assert!(!apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "ab");
-    }
-
-    #[test]
-    fn apply_keystroke_ignores_a_key_with_no_key_char_and_no_modifiers() {
-        // e.g. an arrow key: not backspace, and there is no printable
-        // character to append.
-        let mut target = "ab".to_owned();
-        let keystroke = Keystroke {
-            key: "left".to_owned(),
-            key_char: None,
-            modifiers: Modifiers::default(),
-        };
-        assert!(!apply_keystroke(&mut target, &keystroke));
-        assert_eq!(target, "ab");
     }
 
     // ---- host_label / active_connection_for_url -------------------------
@@ -1535,14 +1396,20 @@ mod tests {
             view.show_add_form(cx);
             assert_eq!(view.current_view(), ManagerView::AddForm);
 
-            view.set_name_input("staging");
-            view.set_url_input("postgres://host/db");
+            view.set_name_input("staging", cx);
+            view.set_url_input("postgres://host/db", cx);
             view.cancel_add(cx);
 
             assert_eq!(view.current_view(), ManagerView::List);
             assert!(view.connections().is_empty());
-            assert_eq!(view.name_input, "", "cancel must clear the pending name");
-            assert_eq!(view.url_input, "", "cancel must clear the pending url");
+            assert!(
+                view.name_field.read(cx).value().is_empty(),
+                "cancel must clear the pending name"
+            );
+            assert!(
+                view.url_field.read(cx).value().is_empty(),
+                "cancel must clear the pending url"
+            );
         });
 
         // Nothing was ever persisted to disk.
@@ -1560,8 +1427,8 @@ mod tests {
         manager.update(cx, |view, cx| {
             view.open(cx);
             view.show_add_form(cx);
-            view.set_name_input("staging");
-            view.set_url_input("postgres://host/db");
+            view.set_name_input("staging", cx);
+            view.set_url_input("postgres://host/db", cx);
             view.add_connection(cx).expect("add must succeed");
 
             assert_eq!(view.current_view(), ManagerView::List);
