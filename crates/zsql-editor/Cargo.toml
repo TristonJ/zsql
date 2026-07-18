@@ -1,0 +1,30 @@
+[package]
+name = "zsql-editor"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gpui = { workspace = true }
+zsql-ui = { path = "../zsql-ui" }
+tracing = { workspace = true }
+
+[features]
+# Exposes `EditorView`'s test-only accessors (`set_text_for_test` and
+# friends) outside this crate's own `#[cfg(test)]` build, so a consumer
+# crate's own tests (the `zsql` binary's adapter/live tests) can drive an
+# `EditorView` without reaching into private fields. Enabled only as a
+# dev-dependency feature, matching gpui's own `test-support` pattern, so it
+# never reaches a shipped build.
+test-support = []
+
+[dev-dependencies]
+# Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test
+# harness) for `EditorView`'s behavior tests. Unified with the `gpui`
+# dependency above via Cargo's resolver, so this only takes effect for
+# test/bench builds.
+gpui = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

@@ -1,9 +1,10 @@
 //! The root workspace view
 
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, Window, div, prelude::*, rgb};
+use zsql_editor::EditorView;
 use zsql_ui::colors;
 
-use super::editor::EditorView;
+use super::editor_adapter;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use super::theme;
@@ -21,7 +22,7 @@ impl WorkspaceView {
     pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), results.clone(), cx));
-        let editor = cx.new(|cx| EditorView::new(session, results.clone(), cx));
+        let editor = cx.new(|cx| editor_adapter::new_editor_view(session, results.clone(), cx));
         Self {
             sidebar,
             editor,

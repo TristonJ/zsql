@@ -1,7 +1,6 @@
 //! zsql -- a lightweight Postgres-first SQL editor (gpui).
 
 mod config;
-mod editor;
 mod observability;
 mod session;
 mod sql;
@@ -28,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(theme = %cfg.theme.name, has_configured_url, "zsql starting");
 
     Application::new().run(move |cx: &mut App| {
-        ui::editor::init(cx);
+        zsql_editor::init(cx);
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
