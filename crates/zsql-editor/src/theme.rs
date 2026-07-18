@@ -18,6 +18,8 @@ pub const RUN_BUTTON_PADDING_X: f32 = 11.0;
 pub const RUN_BUTTON_RADIUS: f32 = 5.0;
 /// Text size of the Run button's label.
 pub const RUN_BUTTON_TEXT_SIZE: f32 = 11.5;
+/// Size of the Run button's play icon.
+pub const RUN_BUTTON_ICON_SIZE: Pixels = px(12.0);
 /// Text size of the Run button's keyboard-shortcut hint.
 pub const RUN_BUTTON_HINT_TEXT_SIZE: f32 = 10.0;
 /// Run button background when hovered: a lighter teal than the resting accent.

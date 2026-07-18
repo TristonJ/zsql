@@ -31,12 +31,19 @@ pub const UNKNOWN: u32 = 0xe2_6d_78;
 pub const BOOL: u32 = 0xd9_a2_5a;
 /// Raw-bytes cell text.
 pub const BYTES: u32 = 0x2b_85_79;
+/// View relation-kind tint: a cool blue.
+pub const VIEW: u32 = 0x4d_9c_e0;
+/// Materialized-view relation-kind tint: a warm amber, distinct from
+/// [`BOOL`]'s.
+pub const MATVIEW: u32 = 0xe8_b1_3a;
+/// Partitioned-table relation-kind tint: a violet.
+pub const PARTITIONED: u32 = 0x8b_7f_d6;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOL, BYTES, FAINT, INK, JSON, LINE, LINE_SOFT, MUTED, NUMBER, PANEL, RAISE, TEAL, TEXT,
-        UNKNOWN,
+        BOOL, BYTES, FAINT, INK, JSON, LINE, LINE_SOFT, MATVIEW, MUTED, NUMBER, PANEL, PARTITIONED,
+        RAISE, TEAL, TEXT, UNKNOWN, VIEW,
     };
 
     #[test]
@@ -55,5 +62,19 @@ mod tests {
         assert_eq!(UNKNOWN, 0xe2_6d_78);
         assert_eq!(BOOL, 0xd9_a2_5a);
         assert_eq!(BYTES, 0x2b_85_79);
+        assert_eq!(VIEW, 0x4d_9c_e0);
+        assert_eq!(MATVIEW, 0xe8_b1_3a);
+        assert_eq!(PARTITIONED, 0x8b_7f_d6);
+    }
+
+    #[test]
+    fn relation_kind_tints_are_pairwise_distinct() {
+        let tints = [TEAL, VIEW, MATVIEW, PARTITIONED];
+        for (i, a) in tints.iter().enumerate() {
+            for b in &tints[i + 1..] {
+                assert_ne!(a, b, "relation-kind tints must not collide");
+            }
+        }
+        assert_ne!(MATVIEW, BOOL, "matview must not reuse BOOL's amber");
     }
 }

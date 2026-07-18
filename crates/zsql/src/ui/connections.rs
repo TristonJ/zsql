@@ -15,6 +15,7 @@ use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, Render, Stateful, Task,
     Window, div, prelude::*, px, rgb, rgba,
 };
+use zsql_ui::icon::{IconName, icon};
 use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
 use zsql_ui::{colors, grid};
 
@@ -625,11 +626,15 @@ impl ConnectionManagerView {
         head.child(
             div()
                 .id("connection-modal-close")
+                .group(theme::MODAL_CLOSE_HOVER_GROUP)
                 .ml_auto()
                 .cursor_pointer()
-                .text_color(rgb(colors::FAINT))
-                .hover(|el| el.text_color(rgb(colors::TEXT)))
-                .child("x")
+                .child(
+                    icon(IconName::Close, theme::MODAL_CLOSE_ICON_SIZE, colors::FAINT)
+                        .group_hover(theme::MODAL_CLOSE_HOVER_GROUP, |style| {
+                            style.text_color(rgb(colors::TEXT))
+                        }),
+                )
                 .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                     view.close(cx);
                 })),
@@ -666,6 +671,10 @@ impl ConnectionManagerView {
                     .child(
                         div()
                             .id("add-connection-button")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
                             .cursor_pointer()
                             .px_3()
                             .py_1()
@@ -673,7 +682,12 @@ impl ConnectionManagerView {
                             .border_1()
                             .border_color(rgb(colors::TEAL))
                             .text_color(rgb(colors::TEXT))
-                            .child("+ Add connection")
+                            .child(icon(
+                                IconName::Add,
+                                theme::MODAL_ADD_ICON_SIZE,
+                                colors::TEXT,
+                            ))
+                            .child("Add connection")
                             .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
                                 view.show_add_form(cx);
                                 let handle = view.name_field.read(cx).focus_handle(cx);
@@ -760,21 +774,30 @@ impl ConnectionManagerView {
                     ),
             )
             .child(grid::type_tag(&driver_label))
-            .child(
+            .child({
+                let hover_group = format!("delete-connection-button-hover-{index}");
                 div()
                     .id(("delete-connection-button", index))
+                    .group(hover_group.clone())
                     .cursor_pointer()
                     .px_1()
-                    .text_color(rgb(colors::FAINT))
-                    .hover(|el| el.text_color(rgb(theme::STATUS_ERROR)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         // Swallowed here so deleting a row never also
                         // dispatches that row's own connect-on-click above.
                         cx.stop_propagation();
                         let _ = view.delete_index(index, cx);
                     }))
-                    .child("del"),
-            );
+                    .child(
+                        icon(
+                            IconName::Delete,
+                            theme::MODAL_DELETE_ICON_SIZE,
+                            colors::FAINT,
+                        )
+                        .group_hover(hover_group, |style| {
+                            style.text_color(rgb(theme::STATUS_ERROR))
+                        }),
+                    )
+            });
 
         if is_active {
             item = item.bg(rgba(theme::MODAL_ROW_ACTIVE_BG));

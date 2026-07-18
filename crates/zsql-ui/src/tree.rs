@@ -6,6 +6,7 @@
 use gpui::{Div, SharedString, div, prelude::*, px, rgb};
 
 use crate::colors;
+use crate::icon::{IconName, icon};
 
 /// Height of each row in a tree view.
 pub const ROW_HEIGHT: gpui::Pixels = px(26.0);
@@ -41,14 +42,27 @@ pub fn row_shell(indent: f32) -> Div {
         .text_color(rgb(colors::TEXT))
 }
 
-/// The ASCII disclosure glyph: `v` expanded, `>` collapsed.
+/// The icon a disclosure row shows for `expanded`: chevron-down when
+/// expanded, chevron-right when collapsed.
+#[must_use]
+fn disclosure_icon_name(expanded: bool) -> IconName {
+    if expanded {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    }
+}
+
+/// The tree disclosure glyph: a chevron-down icon expanded, chevron-right
+/// collapsed, tinted [`colors::FAINT`] and sized to fill its
+/// [`DISCLOSURE_WIDTH`] slot.
 #[must_use]
 pub fn disclosure_glyph(expanded: bool) -> Div {
-    div()
-        .flex_shrink_0()
-        .w(px(DISCLOSURE_WIDTH))
-        .text_color(rgb(colors::FAINT))
-        .child(if expanded { "v" } else { ">" })
+    div().flex_shrink_0().w(px(DISCLOSURE_WIDTH)).child(icon(
+        disclosure_icon_name(expanded),
+        px(DISCLOSURE_WIDTH),
+        colors::FAINT,
+    ))
 }
 
 /// Blank space the width of a disclosure glyph, for a row that cannot be
@@ -105,8 +119,10 @@ pub fn row_count(text: impl Into<SharedString>) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        disclosure_glyph, disclosure_spacer, row_count, row_kind, row_label, row_meta, row_shell,
+        disclosure_glyph, disclosure_icon_name, disclosure_spacer, row_count, row_kind, row_label,
+        row_meta, row_shell,
     };
+    use crate::icon::IconName;
 
     #[test]
     fn row_shell_and_disclosure_helpers_build_for_any_indent_or_state() {
@@ -114,6 +130,12 @@ mod tests {
         let _expanded = disclosure_glyph(true);
         let _collapsed = disclosure_glyph(false);
         let _spacer = disclosure_spacer();
+    }
+
+    #[test]
+    fn disclosure_icon_name_maps_both_states_to_distinct_chevrons() {
+        assert_eq!(disclosure_icon_name(true), IconName::ChevronDown);
+        assert_eq!(disclosure_icon_name(false), IconName::ChevronRight);
     }
 
     #[test]
