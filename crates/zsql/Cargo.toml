@@ -18,6 +18,7 @@ zsql-core = { path = "../zsql-core" }
 # doc comment.
 zsql-postgres = { path = "../zsql-postgres" }
 zsql-ui = { path = "../zsql-ui" }
+zsql-editor = { path = "../zsql-editor" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -40,6 +41,9 @@ gpui = { workspace = true, features = ["test-support"] }
 # Only used by `session.rs`'s test-only `FakeConnection`, to implement
 # `zsql_core::Connection` without pulling in a real driver.
 async-trait = { workspace = true }
+# Exposes `EditorView`'s test-only accessors so the adapter/live tests can
+# drive an editor entity directly, without reaching into its private fields.
+zsql-editor = { path = "../zsql-editor", features = ["test-support"] }
 
 [lints]
 workspace = true

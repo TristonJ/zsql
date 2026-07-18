@@ -1,8 +1,9 @@
-//! The SQL editor pane: a `gpui` view over `crate::editor::TextBuffer`. Wires
-//! OS keyboard/IME input into the buffer via `EntityInputHandler`, paints the
+//! The SQL editor pane: a `gpui` view over [`crate::TextBuffer`]. Wires OS
+//! keyboard/IME input into the buffer via `EntityInputHandler`, paints the
 //! buffer's lines with a line-number gutter, a blinking-free cursor, and a
-//! selection highlight, and runs the buffer's query text through `Session`
-//! on cmd/ctrl-enter or the toolbar's Run button.
+//! selection highlight, and runs the buffer's query text through the
+//! caller-supplied [`QueryRunner`] seam on cmd/ctrl-enter or the toolbar's
+//! Run button.
 
 use std::ops::Range;
 
@@ -16,14 +17,21 @@ use gpui::{
 };
 use zsql_ui::colors;
 
-use super::results::ResultsView;
-use super::theme;
-use crate::editor::{Highlighter, PlainHighlighter, Position, Selection, StyleSpan, TextBuffer};
-use crate::session::Session;
+use crate::theme;
+use crate::{Highlighter, PlainHighlighter, Position, Selection, StyleSpan, TextBuffer};
 
 /// The key context the editor's own key bindings are scoped to, so they only
 /// fire while the editor pane is focused.
 pub const KEY_CONTEXT: &str = "SqlEditor";
+
+/// Runs the SQL text an [`EditorView`] is asked to run: the selection if
+/// there is one, otherwise the whole buffer. Invoked with the entity's own
+/// `Context` so the closure can drive whatever app state the embedding
+/// binary owns (running the query through a session, relabeling a results
+/// view) via the same `cx.update` machinery `EditorView` itself uses. This
+/// is the seam that keeps this crate free of any app, driver, or session
+/// type.
+pub type QueryRunner = Box<dyn Fn(String, &mut Context<EditorView>)>;
 
 actions!(
     zsql_editor,
@@ -99,8 +107,7 @@ pub struct EditorView {
     buffer: TextBuffer,
     highlighter: PlainHighlighter,
     focus_handle: FocusHandle,
-    session: Entity<Session>,
-    results: Entity<ResultsView>,
+    run_query: QueryRunner,
     /// The IME composition range, as flat character offsets into
     /// `buffer.text()`. `None` when there is no composition in progress.
     marked_range: Option<Range<usize>>,
@@ -120,20 +127,16 @@ pub struct EditorView {
 }
 
 impl EditorView {
-    /// Build an editor over `session`, running queries through it and
-    /// updating `results`'s source label to reflect each run.
+    /// Build an editor over an empty buffer. Running the current query (the
+    /// selection if there is one, else the whole buffer) is delegated to
+    /// `run_query`.
     #[must_use]
-    pub fn new(
-        session: Entity<Session>,
-        results: Entity<ResultsView>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(run_query: QueryRunner, cx: &mut Context<Self>) -> Self {
         Self {
             buffer: TextBuffer::new(),
             highlighter: PlainHighlighter,
             focus_handle: cx.focus_handle(),
-            session,
-            results,
+            run_query,
             marked_range: None,
             is_selecting: false,
             last_lines: Vec::new(),
@@ -331,9 +334,9 @@ impl EditorView {
     }
 
     /// Run the buffer's query text (the selection if there is one,
-    /// otherwise the whole document) through `Session`, and label the
-    /// results grid to reflect the run. A blank query is a no-op. Shared by
-    /// the `RunQuery` action and the toolbar's Run button.
+    /// otherwise the whole document) through the `run_query` seam. A blank
+    /// query is a no-op. Shared by the `RunQuery` action and the toolbar's
+    /// Run button.
     fn run_current_query(&mut self, cx: &mut Context<Self>) {
         let sql = self.buffer.query_text();
         if sql.trim().is_empty() {
@@ -341,11 +344,7 @@ impl EditorView {
         }
 
         tracing::info!(chars = sql.chars().count(), "editor running query");
-        self.results
-            .update(cx, |results, cx| results.set_source_label("query", cx));
-        self.session.update(cx, |session, cx| {
-            session.run_query(sql, cx).detach();
-        });
+        (self.run_query)(sql, cx);
     }
 
     // -- mouse -----------------------------------------------------------
@@ -1090,8 +1089,8 @@ fn build_runs(
 // `EntityInputHandler` deals in UTF-16 code unit offsets into "the text" the
 // OS was told about, which here is the whole document (`buffer.text()`).
 // `TextBuffer` itself only knows char offsets, so these free functions
-// bridge the two at the gpui boundary -- they stay out of `crate::editor` so
-// that module has no reason to know what an OS text input API counts in.
+// bridge the two at the gpui boundary -- they stay out of the buffer module
+// so it has no reason to know what an OS text input API counts in.
 
 fn char_offset_from_utf16(text: &str, offset_utf16: usize) -> usize {
     let mut utf16_count = 0;
@@ -1116,14 +1115,17 @@ fn char_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
     char_offset_to_utf16(text, range.start)..char_offset_to_utf16(text, range.end)
 }
 
-/// Test-only accessors used by this module's own tests
-#[cfg(test)]
+/// Test-only accessors used by this module's own tests, and by consumer
+/// crates' tests that drive an [`EditorView`] end to end (see the
+/// `test-support` feature).
+#[cfg(any(test, feature = "test-support"))]
 impl EditorView {
-    pub(crate) fn buffer_for_test(&self) -> &TextBuffer {
+    #[must_use]
+    pub fn buffer_for_test(&self) -> &TextBuffer {
         &self.buffer
     }
 
-    pub(crate) fn set_text_for_test(&mut self, text: &str) {
+    pub fn set_text_for_test(&mut self, text: &str) {
         self.buffer = TextBuffer::from_text(text);
     }
 
@@ -1131,7 +1133,13 @@ impl EditorView {
     /// most recent paint's shaped lines and bounds. Lets mouse-handling
     /// tests drive `on_mouse_down`/`on_mouse_move` with real, paint-derived
     /// coordinates instead of guessed pixel offsets.
-    pub(crate) fn point_for_position_for_test(&self, position: Position) -> Point<Pixels> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if no paint has run yet, or if `position.line` is past the
+    /// last painted line.
+    #[must_use]
+    pub fn point_for_position_for_test(&self, position: Position) -> Point<Pixels> {
         let bounds = self
             .last_bounds
             .expect("a paint must run before computing a point for a position");
@@ -1151,81 +1159,48 @@ impl EditorView {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
     use gpui::{
-        AppContext as _, Entity, EntityInputHandler, Modifiers, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, TestAppContext, VisualTestContext,
+        Entity, EntityInputHandler, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, TestAppContext, VisualTestContext,
     };
-    use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, SchemaTree};
 
     use super::{
         Backspace, Copy, Cut, DeleteForward, EditorView, MoveDocumentEnd, MoveDocumentStart,
         MoveDown, MoveLeft, MoveLineEnd, MoveLineStart, MoveRight, MoveUp, Newline, Paste,
-        Position, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown,
-        SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp,
+        Position, QueryRunner, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart,
+        SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp,
     };
-    use crate::session::Session;
-    use crate::ui::results::ResultsView;
 
-    /// A `Connection` double that records every `stream_query` call's SQL
-    /// text instead of running anything.
-    struct FakeConnection {
-        queries: Arc<Mutex<Vec<String>>>,
+    /// A `QueryRunner` double that records every SQL string it was asked to
+    /// run instead of running anything, in place of a real session/database.
+    fn recording_query_runner() -> (QueryRunner, Arc<Mutex<Vec<String>>>) {
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = queries.clone();
+        let runner: QueryRunner = Box::new(move |sql, _cx| {
+            recorded.lock().expect("queries lock poisoned").push(sql);
+        });
+        (runner, queries)
     }
 
-    #[async_trait]
-    impl Connection for FakeConnection {
-        fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
-            self.queries
-                .lock()
-                .expect("queries lock poisoned")
-                .push(sql);
-            let (cancel_tx, _cancel_rx) = flume::unbounded();
-            QueryHandle::new(cancel_tx)
-        }
-
-        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-            Ok(SchemaTree::default())
-        }
-
-        async fn ping(&self) -> Result<(), CoreError> {
-            Ok(())
-        }
-    }
-
-    /// The entities under test plus the SQL text `FakeConnection` recorded.
+    /// The entity under test plus the SQL text its `QueryRunner` recorded.
     struct Harness {
         editor: Entity<EditorView>,
-        results: Entity<ResultsView>,
         queries: Arc<Mutex<Vec<String>>>,
     }
 
     /// Build an [`EditorView`] as a window's root view, focused, wired to a
-    /// `Session` over a `FakeConnection` so `RunQuery` can be asserted
-    /// against without a real database.
+    /// recording `QueryRunner` so `RunQuery` can be asserted against without
+    /// a real session or database.
     fn build_harness(cx: &mut TestAppContext) -> (Harness, &mut VisualTestContext) {
-        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let connection: Arc<dyn Connection> = Arc::new(FakeConnection {
-            queries: queries.clone(),
-        });
-        let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-        let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-        let results_for_editor = results.clone();
+        let (runner, queries) = recording_query_runner();
 
         let (editor, vcx) = cx.add_window_view(|window, cx| {
-            let view = EditorView::new(session, results_for_editor, cx);
+            let view = EditorView::new(runner, cx);
             window.focus(&view.focus_handle);
             view
         });
 
-        (
-            Harness {
-                editor,
-                results,
-                queries,
-            },
-            vcx,
-        )
+        (Harness { editor, queries }, vcx)
     }
 
     // -- viewport / paint coverage -----------------------------------------
@@ -1251,8 +1226,8 @@ mod tests {
                 "the pane has a measured height after paint"
             );
             let scroll = -view.scroll_handle.offset().y;
-            let line_height = gpui::px(crate::ui::theme::EDITOR_LINE_HEIGHT);
-            let cursor_top = gpui::px(crate::ui::theme::EDITOR_PADDING_Y)
+            let line_height = gpui::px(crate::theme::EDITOR_LINE_HEIGHT);
+            let cursor_top = gpui::px(crate::theme::EDITOR_PADDING_Y)
                 + line_height * view.buffer_for_test().cursor().line as f32;
             assert!(
                 cursor_top >= scroll
@@ -1747,9 +1722,7 @@ mod tests {
     // -- run query ---------------------------------------------------------
 
     #[gpui::test]
-    fn run_query_with_no_selection_runs_the_whole_buffer_and_labels_the_results(
-        cx: &mut TestAppContext,
-    ) {
+    fn run_query_with_no_selection_runs_the_whole_buffer(cx: &mut TestAppContext) {
         let (harness, vcx) = build_harness(cx);
         harness.editor.update(vcx, |view, _cx| {
             view.set_text_for_test("select * from orders");
@@ -1765,9 +1738,6 @@ mod tests {
                 .as_slice(),
             ["select * from orders"]
         );
-        harness.results.update(vcx, |results, _cx| {
-            assert_eq!(results.source_label_for_test(), "query");
-        });
     }
 
     #[gpui::test]
@@ -1945,117 +1915,6 @@ mod tests {
         });
         harness.editor.update(vcx, |view, _cx| {
             assert!(!view.is_selecting, "mouse-up should end the drag");
-        });
-    }
-}
-
-/// Live-database end-to-end tests, gated on `ZSQL_TEST_DATABASE_URL` so
-/// `cargo test` passes with no database present
-#[cfg(test)]
-mod live_tests {
-    use std::time::Duration;
-
-    use gpui::{AppContext as _, TestAppContext, Timer};
-
-    use super::{EditorView, RunQuery};
-    use crate::config::Config;
-    use crate::session::{Session, SessionState};
-    use crate::ui::results::ResultsView;
-
-    fn live_database_url() -> Option<String> {
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
-            return None;
-        };
-        Some(url)
-    }
-
-    /// Types a query into a focused [`EditorView`], dispatches `RunQuery`,
-    /// and drives the session all the way to a live `Results` state --
-    /// the type-and-run loop end to end.
-    #[gpui::test]
-    async fn dispatching_run_query_reaches_live_results_when_configured(cx: &mut TestAppContext) {
-        let Some(url) = live_database_url() else {
-            return;
-        };
-        cx.executor().allow_parking();
-
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(url);
-
-        let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
-        session.read_with(cx, |session, _app| {
-            assert!(
-                matches!(session.state(), SessionState::Connected),
-                "connect should succeed against a reachable database, got {:?}",
-                session.state()
-            );
-        });
-
-        let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
-        let session_for_editor = session.clone();
-        let (_editor, vcx) = cx.add_window_view(|window, cx| {
-            let mut view = EditorView::new(session_for_editor, results, cx);
-            view.set_text_for_test("SELECT * FROM orders ORDER BY placed_at DESC");
-            window.focus(&view.focus_handle);
-            view
-        });
-
-        // `dispatch_action` already runs gpui's deterministic dispatcher
-        // until nothing is immediately ready, but the query itself streams
-        // over a real socket on a background OS thread (see
-        // `zsql-postgres`'s driver), so a single pass is not enough: the
-        // loop below alternates a real (not virtual-clock) sleep -- giving
-        // that thread genuine wall-clock time to make progress and wake the
-        // consumer task gpui's dispatcher scheduled -- with another
-        // deterministic drain, until the session reaches a terminal state.
-        vcx.dispatch_action(RunQuery);
-
-        let mut reached_terminal_state = session.read_with(vcx, |session, _app| {
-            matches!(
-                session.state(),
-                SessionState::Results(_) | SessionState::Error(_)
-            )
-        });
-        for _ in 0..200 {
-            if reached_terminal_state {
-                break;
-            }
-            Timer::after(Duration::from_millis(10)).await;
-            vcx.run_until_parked();
-            reached_terminal_state = session.read_with(vcx, |session, _app| {
-                matches!(
-                    session.state(),
-                    SessionState::Results(_) | SessionState::Error(_)
-                )
-            });
-        }
-        assert!(
-            reached_terminal_state,
-            "session did not reach a terminal state after dispatching RunQuery"
-        );
-
-        session.read_with(vcx, |session, _app| {
-            assert!(
-                matches!(session.state(), SessionState::Results(_)),
-                "expected SessionState::Results, got {:?}",
-                session.state()
-            );
-            let result = session.result();
-            let column_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-            assert_eq!(
-                column_names,
-                vec![
-                    "id",
-                    "user_id",
-                    "total_cents",
-                    "status",
-                    "metadata",
-                    "placed_at"
-                ]
-            );
-            assert_eq!(result.rows.len(), 3, "the seeded orders table has 3 rows");
         });
     }
 }

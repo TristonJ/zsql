@@ -506,7 +506,7 @@ impl Session {
     }
 
     /// Build a session already connected to `connection`, idle, with no
-    /// result set. Used by `ui::editor`'s tests to assert `RunQuery`
+    /// result set. Used by `ui::editor_adapter`'s tests to assert `RunQuery`
     /// dispatches the expected SQL through `Session::run_query`.
     pub(crate) fn new_for_query_test(connection: Arc<dyn Connection>) -> Self {
         let mut session = Self::new_for_render_test(SessionState::Connected, ResultSet::default());
