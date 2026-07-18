@@ -1,8 +1,9 @@
 //! App-specific spacing/size tokens for the workspace's panes, matching the
 //! locked visual spec. Centralized here so no view hardcodes a raw pixel
-//! literal inline. The base color palette and small reusable grid/tree
-//! builders live in the `zsql-ui` crate instead -- see `zsql_ui::colors`,
-//! `zsql_ui::grid`, and `zsql_ui::tree`.
+//! literal inline. The base color palette and small reusable grid/tree/
+//! scrollbar builders live in the `zsql-ui` crate instead -- see
+//! `zsql_ui::colors`, `zsql_ui::grid`, `zsql_ui::tree`, and
+//! `zsql_ui::scrollbar`.
 
 use gpui::{Pixels, px};
 
