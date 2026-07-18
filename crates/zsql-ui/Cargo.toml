@@ -7,6 +7,17 @@ publish = false
 
 [dependencies]
 gpui = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test
+# harness) for `TextField`'s behavior tests. Unified with the `gpui`
+# dependency above via Cargo's resolver, so this only takes effect for
+# test/bench builds.
+gpui = { workspace = true, features = ["test-support"] }
+
+[[example]]
+name = "text_field_demo"
 
 [lints]
 workspace = true

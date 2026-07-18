@@ -7791,6 +7791,7 @@ name = "zsql-ui"
 version = "0.0.0"
 dependencies = [
  "gpui",
+ "tracing",
 ]
 
 [[package]]
