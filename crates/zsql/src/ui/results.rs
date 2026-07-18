@@ -4,11 +4,12 @@
 use std::ops::Range;
 
 use gpui::{
-    Context, Div, Entity, Pixels, Render, SharedString, UniformListScrollHandle, Window, div,
-    prelude::*, px, rgb, uniform_list,
+    Context, Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, SharedString, UniformListScrollHandle, Window, div, point, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
 use zsql_core::ColumnMeta;
-use zsql_ui::{colors, grid};
+use zsql_ui::{colors, grid, scrollbar};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
@@ -28,6 +29,19 @@ pub struct ResultsView {
     /// Shared vertical scroll state between the row-number pane's list and
     /// the data pane's list, so the two stay in lockstep
     row_scroll_handle: UniformListScrollHandle,
+    /// Set while the user is dragging the vertical scrollbar's thumb, so
+    /// mouse-move events know to translate pointer movement into a new
+    /// scroll offset instead of being ignored.
+    vscrollbar_drag: Option<VscrollbarDrag>,
+}
+
+/// The pointer position and scroll offset captured when a vertical
+/// scrollbar thumb-drag starts, used to translate subsequent pointer
+/// movement into a new scroll offset.
+#[derive(Debug, Clone, Copy)]
+struct VscrollbarDrag {
+    pointer_start_y: Pixels,
+    offset_start_y: Pixels,
 }
 
 impl ResultsView {
@@ -54,6 +68,7 @@ impl ResultsView {
             folded_row_count: 0,
             row_number_width: row_number_column_width(0),
             row_scroll_handle: UniformListScrollHandle::new(),
+            vscrollbar_drag: None,
         };
         view.sync_dimensions(cx);
         view
@@ -256,28 +271,199 @@ impl ResultsView {
                     ),
             )
             .child(
+                // The scrollbar is a sibling of the horizontally scrolling
+                // "results-h-scroll" pane below, not a descendant of it:
+                // gpui translates every descendant of a scroll container by
+                // its scroll offset during prepaint (including absolutely
+                // positioned ones), so nesting the scrollbar inside the
+                // overflow_x_scroll pane would drag it left off the
+                // viewport's right edge whenever the grid is scrolled right.
+                // This outer div carries the `.relative()` anchor instead,
+                // so the scrollbar's `.absolute()` positioning is relative
+                // to a container unaffected by horizontal scrolling.
                 div()
-                    .id("results-h-scroll")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_w_full()
                     .min_h_0()
                     .h_full()
-                    .overflow_x_scroll()
-                    .child(self.render_column_headers(cx))
                     .child(
-                        uniform_list(
-                            "results-grid",
-                            row_count,
-                            cx.processor(|this, range, window, cx| {
-                                this.render_data_row_cells(range, window, cx)
-                            }),
-                        )
-                        .flex_1()
-                        .track_scroll(self.row_scroll_handle.clone()),
-                    ),
+                        div()
+                            .id("results-h-scroll")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_full()
+                            .min_h_0()
+                            .h_full()
+                            .overflow_x_scroll()
+                            .child(self.render_column_headers(cx))
+                            .child(
+                                uniform_list(
+                                    "results-grid",
+                                    row_count,
+                                    cx.processor(|this, range, window, cx| {
+                                        this.render_data_row_cells(range, window, cx)
+                                    }),
+                                )
+                                .flex_1()
+                                .track_scroll(self.row_scroll_handle.clone()),
+                            ),
+                    )
+                    .children(self.render_vertical_scrollbar(row_count, cx)),
             )
+    }
+
+    /// The vertical scrollbar's current geometry, read fresh from
+    /// `row_scroll_handle`'s live offset and bounds (never cached), so it
+    /// stays in sync with wheel scrolling, keyboard scrolling, and rows
+    /// streaming in across renders.
+    fn vertical_scrollbar_geometry(&self, row_count: usize) -> scrollbar::ScrollbarGeometry {
+        let (viewport_extent, scroll_offset) = {
+            let state = self.row_scroll_handle.0.borrow();
+            (
+                f32::from(state.base_handle.bounds().size.height),
+                f32::from(-state.base_handle.offset().y),
+            )
+        };
+        scrollbar::ScrollbarGeometry::compute(
+            content_extent_for_row_count(row_count),
+            viewport_extent,
+            scroll_offset,
+            viewport_extent,
+            scrollbar::MIN_THUMB_LENGTH,
+        )
+    }
+
+    /// A thin track + draggable thumb overlaid on the right edge of the
+    /// data pane, or `None` once `row_count` rows already fit inside the
+    /// viewport and there is nothing to scroll.
+    fn render_vertical_scrollbar(&self, row_count: usize, cx: &Context<Self>) -> Option<Div> {
+        let geometry = self.vertical_scrollbar_geometry(row_count);
+        if !geometry.visible {
+            return None;
+        }
+
+        let track_length = f32::from(
+            self.row_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .height,
+        );
+        let thumb_top = geometry.thumb_offset(track_length);
+
+        Some(
+            div()
+                .absolute()
+                .top(theme::HEADER_ROW_HEIGHT)
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .w(px(scrollbar::TRACK_WIDTH))
+                .bg(rgba(scrollbar::TRACK_COLOR))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(0.0))
+                        .w(px(scrollbar::TRACK_WIDTH))
+                        .h(px(geometry.thumb_length))
+                        .rounded(px(scrollbar::TRACK_WIDTH / 2.0))
+                        .bg(rgba(scrollbar::THUMB_COLOR))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_vscrollbar_mouse_down),
+                        ),
+                ),
+        )
+    }
+
+    /// Start a vertical scrollbar thumb-drag, capturing the pointer's
+    /// starting position and the grid's current scroll offset.
+    fn on_vscrollbar_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset_start_y = self.row_scroll_handle.0.borrow().base_handle.offset().y;
+        self.vscrollbar_drag = Some(VscrollbarDrag {
+            pointer_start_y: event.position.y,
+            offset_start_y,
+        });
+        cx.notify();
+    }
+
+    /// While a thumb-drag is in progress, translate pointer movement into a
+    /// new grid scroll offset via [`scrollbar::ScrollbarGeometry::scroll_offset_for_drag`].
+    /// A no-op when no drag is in progress, or when the left button is no
+    /// longer held: if the button was released outside the window mid-drag,
+    /// neither `on_mouse_up` nor `on_mouse_up_out` fires, so this handler
+    /// must independently notice the button is gone and end the drag itself
+    /// rather than leaving the thumb stuck to a button-less pointer.
+    fn on_vscrollbar_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            if self.vscrollbar_drag.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(drag) = self.vscrollbar_drag else {
+            return;
+        };
+
+        let row_count = self.session.read(cx).result().rows.len();
+        let content_extent = content_extent_for_row_count(row_count);
+        let viewport_extent = f32::from(
+            self.row_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .height,
+        );
+        let pointer_delta = f32::from(event.position.y - drag.pointer_start_y);
+        let new_offset_y = scrollbar::ScrollbarGeometry::scroll_offset_for_drag(
+            f32::from(-drag.offset_start_y),
+            pointer_delta,
+            content_extent,
+            viewport_extent,
+            viewport_extent,
+            scrollbar::MIN_THUMB_LENGTH,
+        );
+
+        let current_offset_x = self.row_scroll_handle.0.borrow().base_handle.offset().x;
+        self.row_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(current_offset_x, px(-new_offset_y)));
+        cx.notify();
+    }
+
+    /// End a vertical scrollbar thumb-drag, on both a mouse-up over the
+    /// thumb and a mouse-up anywhere else in the window (the pointer often
+    /// leaves the thumb's small hit region mid-drag).
+    fn on_vscrollbar_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.vscrollbar_drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The sticky header cell for the pinned row-number pane
@@ -461,10 +647,25 @@ impl Render for ResultsView {
             .flex_col()
             .size_full()
             .bg(rgb(colors::INK))
+            // Attached here, above the grid, so a vertical scrollbar
+            // thumb-drag keeps tracking the pointer even once it leaves the
+            // thumb's own small hit region.
+            .on_mouse_move(cx.listener(Self::on_vscrollbar_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_vscrollbar_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_vscrollbar_mouse_up))
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
     }
+}
+
+/// Total pixel height of `row_count` body rows, i.e. the vertical
+/// scrollbar's content extent.
+// Row counts here are always far below `f32`'s exact-integer range, so this
+// conversion cannot lose meaningful precision.
+#[allow(clippy::cast_precision_loss)]
+fn content_extent_for_row_count(row_count: usize) -> f32 {
+    row_count as f32 * f32::from(theme::BODY_ROW_HEIGHT)
 }
 
 /// The bottom status bar's dot color and label for `state`. A `liveness` of
