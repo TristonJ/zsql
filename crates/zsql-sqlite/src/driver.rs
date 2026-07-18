@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RowBatch,
-    SchemaTree,
+    RowCount, SchemaTree, quote_ident,
 };
 
 use crate::error::{map_connect_error, map_query_error};
@@ -148,6 +148,35 @@ impl Connection for SqliteConnectionImpl {
     async fn ping(&self) -> Result<(), CoreError> {
         liveness_check(&self.pool).await.map(|_| ())
     }
+
+    /// `SQLite` has no analogue of Postgres's `pg_class.reltuples`: it keeps
+    /// no running per-table row-count statistic, and `ANALYZE`'s own
+    /// `sqlite_stat1`/`sqlite_stat4` tables estimate index selectivity, not
+    /// a table's total row count, and only exist at all once `ANALYZE` has
+    /// been run. There is therefore no cheap estimate to prefer here; this
+    /// always executes an exact `COUNT(*)` and reports [`RowCount::Exact`].
+    #[tracing::instrument(name = "sqlite_count_rows", skip(self), fields(pool_size = self.pool.size()))]
+    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
+        let sql = count_sql(schema, relation);
+        // `sql` is built entirely from `quote_ident`-escaped identifiers via
+        // `count_sql`, never from unescaped runtime text.
+        let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(RowCount::Exact(u64::try_from(count).unwrap_or(0)))
+    }
+}
+
+/// Build `SELECT COUNT(*) FROM <quoted schema>.<quoted relation>`, quoting
+/// both identifiers so an adversarial schema/relation name cannot break out
+/// of the identifier position.
+fn count_sql(schema: &str, relation: &str) -> String {
+    format!(
+        "SELECT COUNT(*) FROM {}.{}",
+        quote_ident(schema),
+        quote_ident(relation)
+    )
 }
 
 /// Stream a query's results into `sink`. `sql` may hold several statements;
@@ -577,6 +606,79 @@ mod tests {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => panic!("ddl setup failed: {err:?}"),
                 Err(err) => panic!("ddl setup did not complete: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn count_sql_quotes_both_identifiers() {
+        assert_eq!(
+            super::count_sql("main", "items"),
+            "SELECT COUNT(*) FROM \"main\".\"items\""
+        );
+    }
+
+    #[test]
+    fn count_sql_is_safe_against_an_injection_shaped_relation_name() {
+        let sql = super::count_sql("main", "items\"; DROP TABLE users; --");
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"main\".\"items\"\"; DROP TABLE users; --\""
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn count_rows_returns_the_exact_seeded_row_count() {
+        let db = TempDbPath::new("count-rows");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        run_ddl(
+            &*conn,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY); \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES; \
+             INSERT INTO items DEFAULT VALUES",
+        );
+
+        let row_count =
+            block_on(conn.count_rows("main", "items")).expect("count_rows should succeed");
+        assert_eq!(row_count, zsql_core::RowCount::Exact(5));
+    }
+
+    #[test]
+    fn count_rows_returns_exact_zero_for_an_empty_table() {
+        let db = TempDbPath::new("count-rows-empty");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        run_ddl(&*conn, "CREATE TABLE empty_items(id INTEGER PRIMARY KEY)");
+
+        let row_count =
+            block_on(conn.count_rows("main", "empty_items")).expect("count_rows should succeed");
+        assert_eq!(row_count, zsql_core::RowCount::Exact(0));
+    }
+
+    #[test]
+    fn count_rows_errors_for_a_relation_that_does_not_exist() {
+        let db = TempDbPath::new("count-rows-missing-relation");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let result = block_on(conn.count_rows("main", "zsql_test_relation_that_does_not_exist"));
+        match result {
+            Err(zsql_core::CoreError::Query(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Query, got {other:?}"),
+            Ok(row_count) => {
+                panic!("counting a nonexistent relation must fail, got {row_count:?}")
             }
         }
     }

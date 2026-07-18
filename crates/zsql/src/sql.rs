@@ -3,19 +3,12 @@
 //! arbitrary interpolated strings
 
 /// Double-quote `ident` for use in generated SQL, escaping any embedded
-/// double quote by doubling it
+/// double quote by doubling it. Delegates to `zsql_core::quote_ident`, the
+/// single implementation every driver and the UI share, rather than keeping
+/// a second copy of the escaping logic in the binary crate.
 #[must_use]
 pub fn quote_ident(ident: &str) -> String {
-    let mut out = String::with_capacity(ident.len() + 2);
-    out.push('"');
-    for ch in ident.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
+    zsql_core::quote_ident(ident)
 }
 
 /// Build the click-to-preview query for a relation:
