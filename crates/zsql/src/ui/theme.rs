@@ -61,6 +61,8 @@ pub const SIDEBAR_SCROLLBAR_RADIUS: f32 = 4.0;
 pub const SIDEBAR_SCROLLBAR_THUMB: u32 = 0x59_60_6f_66;
 /// Hovered fill of the sidebar scrollbar thumb.
 pub const SIDEBAR_SCROLLBAR_THUMB_HOVER: u32 = 0x59_60_6f_99;
+/// Distance between the sidebar scrollbar track and the tree's right edge.
+pub const SIDEBAR_SCROLLBAR_GAP: Pixels = px(4.0);
 
 /// Text size of the "SCHEMA" header label.
 pub const SIDEBAR_HEADER_TEXT_SIZE: f32 = 10.5;

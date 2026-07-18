@@ -74,6 +74,42 @@ impl ResultsView {
         view
     }
 
+    /// The vertical scrollbar's visibility and size are computed from the
+    /// scroll viewport's laid-out height, which reads back as zero during the
+    /// render that first lays the grid out (a scroll container's bounds are
+    /// only known after that render). The grid itself only appears once a
+    /// query returns rows, so the first grid frame always starts unmeasured.
+    /// When that state is detected - the grid is shown but its viewport has
+    /// not been measured yet - schedule exactly one re-render so the scrollbar
+    /// appears on the next frame instead of staying hidden until unrelated
+    /// input forces a repaint. This settles immediately: once the viewport is
+    /// measured (non-zero) the condition is false, so no further nudges fire.
+    /// `request_animation_frame` cannot do this - it only queues a callback
+    /// without forcing a draw, so on an otherwise idle window it never fires.
+    fn nudge_scrollbar_when_grid_unmeasured(&mut self, cx: &mut Context<Self>) {
+        let grid_shown = {
+            let session = self.session.read(cx);
+            matches!(session.state(), SessionState::Results(_))
+                || (matches!(session.state(), SessionState::Running)
+                    && !session.result().columns.is_empty())
+        };
+        let viewport_unmeasured = self
+            .row_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height
+            == Pixels::ZERO;
+        if grid_shown && viewport_unmeasured {
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
+    }
+
     /// Update the results header's source/relation label, e.g. after the
     /// schema sidebar previews a different relation.
     pub fn set_source_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -280,13 +316,17 @@ impl ResultsView {
                 // viewport's right edge whenever the grid is scrolled right.
                 // This outer div carries the `.relative()` anchor instead,
                 // so the scrollbar's `.absolute()` positioning is relative
-                // to a container unaffected by horizontal scrolling.
+                // to a container unaffected by horizontal scrolling. It must
+                // NOT set `min_w_full`: as a `flex_1` child sharing this
+                // flex-row with the fixed-width row-number pane, a 100%
+                // min-width would force it wider than the row and push its
+                // right edge (where the scrollbar is pinned) off-screen. The
+                // inner pane below fills the width instead.
                 div()
                     .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w_full()
                     .min_h_0()
                     .h_full()
                     .child(
@@ -642,6 +682,7 @@ impl ResultsView {
 
 impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.nudge_scrollbar_when_grid_unmeasured(cx);
         div()
             .flex()
             .flex_col()
@@ -988,6 +1029,42 @@ mod tests {
         let session = cx.new(|_cx| Session::new_for_render_test(SessionState::Running, result));
 
         cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+    }
+
+    /// A result set with enough rows to overflow any reasonable viewport must
+    /// show its vertical scrollbar without user interaction. This guards the
+    /// first-frame regression where the scrollbar stayed hidden because the
+    /// scroll viewport's bounds are zero during the first render and nothing
+    /// forced the follow-up re-render once they became known.
+    #[gpui::test]
+    fn vertical_scrollbar_is_shown_after_the_first_frame_when_rows_overflow(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut result = sample_result();
+        let template = result.rows[0].clone();
+        result.rows = (0..400).map(|_| template.clone()).collect();
+        let row_count = result.rows.len();
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                SessionState::Results(std::time::Duration::from_millis(1)),
+                result,
+            )
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+        vcx.run_until_parked();
+
+        view.update(vcx, |v, cx| {
+            let geometry = v.vertical_scrollbar_geometry(row_count);
+            assert!(
+                geometry.visible,
+                "the scrollbar geometry must be visible for 400 overflowing rows"
+            );
+            assert!(
+                v.render_vertical_scrollbar(row_count, cx).is_some(),
+                "the scrollbar overlay must be rendered once the viewport is laid out"
+            );
+        });
     }
 
     #[gpui::test]
