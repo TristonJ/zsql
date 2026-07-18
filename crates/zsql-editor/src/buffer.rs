@@ -95,12 +95,8 @@ impl TextBuffer {
         }
     }
 
-    // Only ever constructed by tests today: nothing in the shipped app loads
-    // a buffer from existing text yet (the editor always starts empty). Kept
-    // `pub` under `cfg(test)`/`test-support` rather than deleted, since it
-    // is the natural constructor a future "open a saved query" feature will
-    // want, and `EditorView::set_text_for_test` (test-support) needs it too.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Build a buffer preloaded with `text`, e.g. for a tab seeded with
+    /// auto-generated SQL. The cursor starts at the document's beginning.
     #[must_use]
     pub fn from_text(text: &str) -> Self {
         let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();

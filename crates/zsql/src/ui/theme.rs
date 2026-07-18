@@ -6,6 +6,7 @@
 //! `zsql_ui::scrollbar`.
 
 use gpui::{Pixels, px};
+use zsql_ui::colors;
 
 /// Status-bar "connecting" indicator: a connection attempt is in flight.
 pub const STATUS_CONNECTING: u32 = 0xd9_a2_5a;
@@ -86,6 +87,29 @@ pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
 pub const RESULTS_META_TEXT_SIZE: f32 = 11.0;
 /// Text size of the bottom connection/status bar.
 pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
+
+/// Height of a `Generated` tab's compact SQL strip, tall enough for one line
+/// of monospace text plus the editor's own vertical padding.
+pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
+/// Background tint of a `Generated` tab's compact strip: teal at very low
+/// opacity (`0x33c2ac` at ~4.5% alpha).
+pub const GENERATED_STRIP_BG: u32 = 0x33_c2_ac_0b;
+/// Left accent border width of a `Generated` tab's compact strip.
+pub const GENERATED_STRIP_ACCENT_WIDTH: Pixels = px(2.0);
+/// Left accent border color of a `Generated` tab's compact strip: the
+/// mockup's `genstrip` left accent, `zsql_ui::colors::TEAL_DIM` (the tab
+/// bar's dashed active underline is the brighter `colors::TEAL` instead).
+pub const GENERATED_STRIP_ACCENT: u32 = colors::TEAL_DIM;
+/// Horizontal padding around the generated strip's trailing "generated" tag
+/// and hint text.
+pub const GENERATED_STRIP_TRAILING_PADDING_X: f32 = 14.0;
+/// Horizontal gap between the generated strip's trailing tag and hint text.
+pub const GENERATED_STRIP_TRAILING_GAP: f32 = 10.0;
+/// Text size of the generated strip's trailing hint ("edit to convert to a
+/// script").
+pub const GENERATED_HINT_TEXT_SIZE: f32 = 11.0;
+/// Text size of a tab's leading table-icon glyph.
+pub const TAB_ICON_TEXT_SIZE: f32 = 11.0;
 
 /// Width of the centered connection-manager modal panel.
 pub const MODAL_WIDTH: Pixels = px(468.0);

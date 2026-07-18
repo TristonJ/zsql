@@ -191,6 +191,13 @@ impl Session {
         self.schema_generation
     }
 
+    /// The `LIMIT` [`Session::preview_relation`] applies to a relation
+    /// preview, from [`Config::query`]'s `preview_limit`.
+    #[must_use]
+    pub fn preview_limit(&self) -> u64 {
+        self.preview_limit
+    }
+
     /// Replace `schema` and bump [`Session::schema_generation`]
     fn set_schema(&mut self, schema: SchemaState) {
         self.schema = schema;
