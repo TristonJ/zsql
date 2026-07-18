@@ -33,7 +33,7 @@ pub fn row_shell(indent: f32) -> Div {
         .gap(px(ROW_GAP))
         .h(ROW_HEIGHT)
         .pl(px(indent))
-        .pr_3()
+        .pr_6()
         .flex_shrink_0()
         .w_full()
         .font_family("monospace")

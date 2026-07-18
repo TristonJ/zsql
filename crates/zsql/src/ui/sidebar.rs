@@ -70,13 +70,6 @@ pub struct SidebarView {
     /// State of an in-progress scrollbar thumb drag; `None` when the thumb
     /// is not being dragged.
     thumb_drag: Option<ThumbDrag>,
-    /// Whether a follow-up frame has already been requested to catch the
-    /// tree viewport's first real paint (see `render_tree`). Cleared once a
-    /// non-zero viewport is observed, so a viewport that later collapses
-    /// back to zero (e.g. the window shrinks past the sidebar's minimum) can
-    /// request one more follow-up frame rather than spinning on every
-    /// zero-height frame in between.
-    requested_initial_tree_frame: bool,
 }
 
 /// A scrollbar thumb drag's starting point: the mouse position and the
@@ -114,10 +107,33 @@ impl SidebarView {
             synced_schema_generation: 0,
             tree_scroll_handle: UniformListScrollHandle::new(),
             thumb_drag: None,
-            requested_initial_tree_frame: false,
         };
         view.sync_rows(cx);
         view
+    }
+
+    /// The tree scrollbar's size is computed from the scroll viewport's
+    /// laid-out height, which reads back as zero during the render that first
+    /// lays the tree out (a scroll container's bounds are only known after
+    /// that render). The tree only appears once the schema loads, so its first
+    /// frame always starts unmeasured. When that state is detected - the tree
+    /// is shown but its viewport has not been measured yet - schedule exactly
+    /// one re-render so the scrollbar appears on the next frame instead of
+    /// staying hidden until a wheel/keyboard scroll forces a repaint. This
+    /// settles immediately: once the viewport is measured the condition is
+    /// false. `request_animation_frame` cannot do this - it only queues a
+    /// callback without forcing a draw, so on an idle window it never fires.
+    fn nudge_scrollbar_when_tree_unmeasured(&mut self, cx: &mut Context<Self>) {
+        let tree_shown = matches!(
+            self.session.read(cx).schema(),
+            SchemaState::Ready(tree) if !tree.catalogs.is_empty()
+        );
+        if tree_shown && self.tree_viewport_height() == Pixels::ZERO {
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
     }
 
     /// Rebuild `rows` from the session's current schema state and this
@@ -360,46 +376,29 @@ impl SidebarView {
             )
     }
 
+    /// The tree scrollbar's geometry, computed from the flattened row count's
+    /// content height, the scroll viewport's laid-out height, and the current
+    /// scroll offset. Read fresh each render so it stays in sync with wheel
+    /// and keyboard scrolling and with rows appearing as the schema loads.
+    fn tree_scrollbar_geometry(&self) -> ScrollbarGeometry {
+        let viewport_height = f32::from(self.tree_viewport_height());
+        ScrollbarGeometry::compute(
+            f32::from(sidebar_tree_content_height(self.rows.len())),
+            viewport_height,
+            f32::from(self.tree_scroll_offset()),
+            viewport_height,
+            scrollbar::MIN_THUMB_LENGTH,
+        )
+    }
+
     /// The virtualized tree body: only rows scrolled into view are built.
     /// Wraps the `uniform_list` in a `relative` viewport div so the
     /// scrollbar overlay can be pinned to its right edge without shifting
     /// the tree rows' layout.
-    fn render_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_tree(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let row_count = self.rows.len();
-        let content_height = sidebar_tree_content_height(row_count);
         let viewport_height = self.tree_viewport_height();
-
-        // The scroll handle's bounds reflect the previous frame's paint, so
-        // on the tree's first-ever render (or after it was replaced by a
-        // placeholder and reappears) `viewport_height` is still zero and the
-        // scrollbar computes as hidden even though this frame's paint will
-        // establish real bounds. Requesting a follow-up frame here re-runs
-        // this render once those bounds are available, so an overflowing
-        // tree shows its scrollbar without waiting for a wheel/keyboard
-        // scroll to trigger the next repaint.
-        //
-        // Requested at most once per zero-height stretch: a persistently
-        // zero-height viewport (e.g. the window shrunk so the sidebar body
-        // has no room) would otherwise re-request every frame forever, since
-        // the requested frame's render finds the viewport still zero and
-        // would ask for another. `requested_initial_tree_frame` re-arms only
-        // once a real, non-zero viewport is observed.
-        if viewport_height == Pixels::ZERO && row_count > 0 {
-            if !self.requested_initial_tree_frame {
-                self.requested_initial_tree_frame = true;
-                window.request_animation_frame();
-            }
-        } else if viewport_height != Pixels::ZERO {
-            self.requested_initial_tree_frame = false;
-        }
-
-        let geometry = ScrollbarGeometry::compute(
-            f32::from(content_height),
-            f32::from(viewport_height),
-            f32::from(self.tree_scroll_offset()),
-            f32::from(viewport_height),
-            scrollbar::MIN_THUMB_LENGTH,
-        );
+        let geometry = self.tree_scrollbar_geometry();
 
         div()
             .id("sidebar-tree")
@@ -454,7 +453,7 @@ impl SidebarView {
             .id("sidebar-scrollbar-track")
             .absolute()
             .top_0()
-            .right_0()
+            .right(theme::SIDEBAR_SCROLLBAR_GAP)
             .bottom_0()
             .w(theme::SIDEBAR_SCROLLBAR_WIDTH)
             .child(
@@ -553,6 +552,7 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.nudge_scrollbar_when_tree_unmeasured(cx);
         div()
             .flex()
             .flex_col()
@@ -885,6 +885,52 @@ mod render_tests {
     #[gpui::test]
     fn renders_a_populated_schema_tree_without_panicking(cx: &mut gpui::TestAppContext) {
         build(cx, SchemaState::Ready(sample_schema_tree()));
+    }
+
+    /// A schema with one catalog, one schema, and `table_count` tables.
+    fn tall_schema_tree(table_count: usize) -> SchemaTree {
+        let tables = (0..table_count)
+            .map(|i| Relation {
+                name: format!("t{i}"),
+                kind: RelationKind::Table,
+                columns: vec![],
+            })
+            .collect();
+        SchemaTree {
+            catalogs: vec![Catalog {
+                name: "zsql".to_owned(),
+                schemas: vec![SchemaNs {
+                    name: "public".to_owned(),
+                    tables,
+                }],
+            }],
+        }
+    }
+
+    /// A tree taller than any reasonable sidebar viewport must show its
+    /// scrollbar after the first frame. This guards the regression where the
+    /// scrollbar stayed hidden because the scroll viewport's bounds are zero
+    /// during the first render and nothing forced the follow-up re-render once
+    /// they became known.
+    #[gpui::test]
+    fn tree_scrollbar_is_shown_after_the_first_frame_when_rows_overflow(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tall_schema_tree(300))));
+        let session_for_results = session.clone();
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
+            let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
+            SidebarView::new(session, results, cx)
+        });
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.tree_scrollbar_geometry().visible,
+                "the tree scrollbar must be visible when 300 rows overflow the sidebar viewport"
+            );
+        });
     }
 
     #[gpui::test]
