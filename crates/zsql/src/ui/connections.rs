@@ -23,6 +23,7 @@ use super::theme;
 use crate::connections::{ConnectionStore, ConnectionStoreError, StoredConnection};
 use crate::drivers;
 use crate::session::{Session, SessionState};
+use crate::tab_session::ConnectionKey;
 
 /// Which panel the connection-manager modal currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +236,26 @@ impl ConnectionManagerView {
     #[must_use]
     pub fn active(&self) -> Option<&ActiveConnection> {
         self.active.as_ref()
+    }
+
+    /// The stable tab-session key for whichever connection is currently
+    /// tracked as active, if any: [`ConnectionKey::Saved`] when its
+    /// name/url match a persisted [`StoredConnection`], else
+    /// [`ConnectionKey::Unsaved`] for a `DATABASE_URL`/`Config`-fallback
+    /// connection with no saved entry behind it.
+    #[must_use]
+    pub fn active_tab_session_key(&self) -> Option<ConnectionKey> {
+        let active = self.active.as_ref()?;
+        let is_saved = self
+            .store
+            .connections()
+            .iter()
+            .any(|connection| connection.name == active.name && connection.url == active.url);
+        Some(if is_saved {
+            ConnectionKey::Saved(active.name.clone())
+        } else {
+            ConnectionKey::Unsaved
+        })
     }
 
     /// The modal overlay's own focus handle, so a caller that opens the
@@ -1548,6 +1569,80 @@ mod tests {
                 view.active()
             );
             assert!(view.connections().is_empty());
+        });
+    }
+
+    // ---- active_tab_session_key ---------------------------------------------
+
+    #[gpui::test]
+    fn active_tab_session_key_is_none_when_no_connection_is_tracked(cx: &mut TestAppContext) {
+        let temp = TempStorePath::new("key-none");
+        let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+        let session = cx.new(|_cx| session_with_no_dsn());
+        let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
+
+        manager.read_with(cx, |view, _app| {
+            assert_eq!(view.active_tab_session_key(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn active_tab_session_key_is_saved_for_a_connection_matching_a_stored_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let temp = TempStorePath::new("key-saved");
+        let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+        store
+            .add(StoredConnection {
+                name: "local pg".to_owned(),
+                url: "postgres://localhost/app".to_owned(),
+            })
+            .expect("add must succeed");
+        let session = cx.new(|_cx| session_with_no_dsn());
+        let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
+
+        manager.update(cx, |view, cx| {
+            view.set_active(
+                Some(ActiveConnection {
+                    name: "local pg".to_owned(),
+                    url: "postgres://localhost/app".to_owned(),
+                }),
+                cx,
+            );
+        });
+
+        manager.read_with(cx, |view, _app| {
+            assert_eq!(
+                view.active_tab_session_key(),
+                Some(super::ConnectionKey::Saved("local pg".to_owned()))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn active_tab_session_key_is_unsaved_for_a_fallback_connection_with_no_stored_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let temp = TempStorePath::new("key-unsaved");
+        let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+        let session = cx.new(|_cx| session_with_no_dsn());
+        let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
+
+        manager.update(cx, |view, cx| {
+            view.set_active(
+                Some(ActiveConnection {
+                    name: "localhost:5432".to_owned(),
+                    url: "postgres://localhost:5432/app".to_owned(),
+                }),
+                cx,
+            );
+        });
+
+        manager.read_with(cx, |view, _app| {
+            assert_eq!(
+                view.active_tab_session_key(),
+                Some(super::ConnectionKey::Unsaved)
+            );
         });
     }
 

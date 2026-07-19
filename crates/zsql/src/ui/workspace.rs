@@ -1,12 +1,14 @@
 //! The root workspace view
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Window, canvas, div, prelude::*,
-    px, rgb, rgba,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, canvas, div,
+    prelude::*, px, rgb, rgba,
 };
 use zsql_ui::colors;
 use zsql_ui::icon::{IconName, icon};
@@ -20,6 +22,7 @@ use super::theme;
 use crate::config::LayoutConfig;
 use crate::connections::ConnectionStore;
 use crate::session::Session;
+use crate::tab_session::{self, ConnectionKey, TabSessionSnapshot};
 
 /// Which pane boundary a divider drag is currently resizing, and the pane
 /// size/pointer position it started from. Tracking the drag's origin (not
@@ -56,16 +59,50 @@ pub struct WorkspaceView {
     /// know how much vertical space the editor and results panes have to
     /// share.
     column_height: Rc<Cell<Pixels>>,
+    /// Where tab-session snapshots are persisted
+    /// (`Config::tab_sessions_path`), if a config directory could be
+    /// resolved at all. `None` disables tab-session persistence entirely
+    /// rather than failing to start.
+    tab_sessions_path: Option<PathBuf>,
+    /// The tab-session key `tabs` currently holds state for, so a save
+    /// triggered by a tab change knows which key to write under, and a
+    /// connection switch knows which key's tabs it is replacing. `None`
+    /// while no connection has ever been tracked as active.
+    active_tab_session_key: Option<ConnectionKey>,
+    /// The active connection last seen by [`Self::handle_active_connection_changed`],
+    /// so that handler can tell an actual switch apart from an unrelated
+    /// change on `connections` (e.g. the modal opening).
+    last_active_connection: Option<ActiveConnection>,
+    /// Set just before [`Self::handle_active_connection_changed`] reloads
+    /// `tabs` from a snapshot, and consumed by the very next `tabs`
+    /// notification (that reload's own `cx.notify()`) instead of triggering
+    /// another save under the key that was just loaded. Without this, that
+    /// redundant save would race the outgoing connection's own save (both
+    /// dispatched onto the background executor around the same moment) for
+    /// no benefit -- the freshly loaded tabs already match what is (or is
+    /// not) on disk for that key.
+    suppress_next_tab_save: bool,
+    /// Every key's most recently dispatched-for-save snapshot, updated
+    /// synchronously in [`Self::dispatch_tab_session_save`] before that
+    /// save's write is handed to the background executor. Consulted first in
+    /// [`Self::handle_active_connection_changed`] so switching back to a key
+    /// whose write is still in flight sees this session's own latest tabs
+    /// rather than racing the background write for whatever is currently on
+    /// disk.
+    session_cache: HashMap<ConnectionKey, TabSessionSnapshot>,
 }
 
 impl WorkspaceView {
-    /// Build a workspace over `session`, with pane sizes seeded from `layout`
-    /// and `connection_store` backing the connection-manager modal.
+    /// Build a workspace over `session`, with pane sizes seeded from
+    /// `layout`, `connection_store` backing the connection-manager modal,
+    /// and `tab_sessions_path` (typically [`crate::config::Config::tab_sessions_path`])
+    /// as where per-connection tab sessions are read from and saved to.
     #[must_use]
     pub fn new(
         session: Entity<Session>,
         layout: LayoutConfig,
         connection_store: ConnectionStore,
+        tab_sessions_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
@@ -73,7 +110,10 @@ impl WorkspaceView {
         // Every workspace opens with one empty script tab so the editor
         // pane is never blank; `TabModel::new` itself stays tab-less so its
         // own constructor never has to call back into an entity that has
-        // not finished being built yet.
+        // not finished being built yet. A connection tracked as active by
+        // the time this workspace is built (never true today, since
+        // `connection_store` carries no notion of "last connected") would
+        // otherwise leave this default tab in place until the next switch.
         tabs.update(cx, |tabs, cx| {
             tabs.new_script_tab(cx);
         });
@@ -87,14 +127,31 @@ impl WorkspaceView {
         // Opening/closing the modal (or switching its list/add-form panel)
         // lives entirely inside `connections`' own state; this workspace
         // must still re-render to mount or unmount that entity as the modal
-        // overlay child below.
-        cx.observe(&connections, |_this, _connections, cx| cx.notify())
-            .detach();
+        // overlay child below. A change to which connection is tracked as
+        // active additionally swaps the tab session (see
+        // `Self::handle_active_connection_changed`).
+        cx.observe(&connections, |this, connections, cx| {
+            let new_active = connections.read(cx).active().cloned();
+            if new_active != this.last_active_connection {
+                this.handle_active_connection_changed(cx);
+            }
+            cx.notify();
+        })
+        .detach();
         // Opening, reusing, converting, closing, or switching a tab lives
         // entirely inside `tabs`' own state; this workspace must still
         // re-render the tab bar and the active tab's body whenever any of
-        // that changes.
-        cx.observe(&tabs, |_this, _tabs, cx| cx.notify()).detach();
+        // that changes, and persist the active connection's tab session so
+        // the change survives a reconnect or restart.
+        cx.observe(&tabs, |this, _tabs, cx| {
+            if std::mem::take(&mut this.suppress_next_tab_save) {
+                cx.notify();
+                return;
+            }
+            this.save_active_tab_session(cx);
+            cx.notify();
+        })
+        .detach();
 
         Self {
             connections,
@@ -107,6 +164,11 @@ impl WorkspaceView {
             editor_height,
             drag: None,
             column_height: Rc::new(Cell::new(Pixels::ZERO)),
+            tab_sessions_path,
+            active_tab_session_key: None,
+            last_active_connection: None,
+            suppress_next_tab_save: false,
+            session_cache: HashMap::new(),
         }
     }
 
@@ -141,6 +203,110 @@ impl WorkspaceView {
     pub fn set_active_connection(&mut self, active: ActiveConnection, cx: &mut Context<Self>) {
         self.connections
             .update(cx, |view, cx| view.set_active(Some(active), cx));
+    }
+
+    /// React to `connections`' tracked active connection having changed
+    /// (including to or from `None`, e.g. a disconnect or a deleted active
+    /// row): persist the outgoing connection's tabs under its own key, then
+    /// load the newly active connection's snapshot (or the default single
+    /// script tab if it has none) into `tabs`, fully replacing whatever was
+    /// open rather than merging with it.
+    fn handle_active_connection_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_active_tab_session(cx);
+
+        let (new_key, new_active) = {
+            let connections = self.connections.read(cx);
+            (
+                connections.active_tab_session_key(),
+                connections.active().cloned(),
+            )
+        };
+        self.active_tab_session_key.clone_from(&new_key);
+        self.last_active_connection = new_active;
+
+        // A key this session has already dispatched a save for always wins
+        // over disk: `dispatch_tab_session_save` records it here
+        // synchronously, before handing the actual write to the background
+        // executor, so this in-memory copy can never be older than whatever
+        // is (or, for a write still in flight, will shortly be) on disk for
+        // that key. Consulting disk instead in that case could observe the
+        // pre-write file if the background write has not run yet -- e.g. a
+        // quick switch back to a connection right after switching away from
+        // it -- and wrongly show its default tabs.
+        let snapshot = match &new_key {
+            Some(key) if self.session_cache.contains_key(key) => {
+                self.session_cache.get(key).cloned()
+            }
+            // Read synchronously rather than via a background executor: this
+            // runs before the tab strip for the newly active connection is
+            // ever shown, and the store is a small, local JSON file, so the
+            // blocking read finishes long before it would be worth the
+            // complexity of loading in the background and re-applying the
+            // result once it completed a frame or more later (which would
+            // show the wrong tabs briefly).
+            Some(key) => match &self.tab_sessions_path {
+                Some(path) => match tab_session::load_snapshot(path, key) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to load tab session; falling back to the default tab"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            },
+            None => None,
+        };
+
+        self.suppress_next_tab_save = true;
+        self.tabs.update(cx, |tabs, cx| {
+            tabs.load_for_connection(snapshot.as_ref(), cx);
+        });
+    }
+
+    /// Dispatch (but do not await) a background save of the active
+    /// connection's current tab session, if one is tracked and a
+    /// tab-session path could be resolved. A no-op otherwise: there is
+    /// nothing meaningful to key the save under.
+    fn save_active_tab_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(task) = self.dispatch_tab_session_save(cx) {
+            task.detach();
+        }
+    }
+
+    /// Flush the active connection's tab session to disk, returning the
+    /// background [`Task`] the caller must await before the app actually
+    /// exits. Used from `main.rs`'s `App::on_app_quit` hook so a change made
+    /// just before quitting is not lost to a fire-and-forget write racing
+    /// process exit.
+    pub fn flush_tab_session_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.dispatch_tab_session_save(cx)
+            .unwrap_or_else(|| Task::ready(()))
+    }
+
+    /// Build the active connection's current snapshot, record it as this
+    /// key's latest known state (see `session_cache`), and spawn its write
+    /// to disk on a background executor -- never on this (render/update)
+    /// thread -- returning the spawned [`Task`] so a caller that must
+    /// observe completion (app quit) can await it, while a caller that only
+    /// wants to fire-and-forget (a tab change) can detach it.
+    fn dispatch_tab_session_save(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
+        let key = self.active_tab_session_key.clone()?;
+        let path = self.tab_sessions_path.clone()?;
+        let snapshot = self.tabs.read(cx).snapshot(cx);
+        tracing::info!(
+            key = ?key,
+            tab_count = snapshot.tabs.len(),
+            "dispatching tab session save"
+        );
+        self.session_cache.insert(key.clone(), snapshot.clone());
+        Some(cx.background_spawn(async move {
+            if let Err(err) = tab_session::save_snapshot(&path, &key, &snapshot) {
+                tracing::warn!(error = %err, "failed to save tab session");
+            }
+        }))
     }
 
     fn start_sidebar_drag(
@@ -777,8 +943,10 @@ mod render_tests {
 
     use super::WorkspaceView;
     use crate::config::LayoutConfig;
-    use crate::connections::ConnectionStore;
+    use crate::connections::{ConnectionStore, StoredConnection};
     use crate::session::{SchemaState, Session};
+    use crate::tab_session::{self, ConnectionKey};
+    use crate::ui::connections::ActiveConnection;
 
     /// An empty connection store backed by a path this test never writes
     /// to: `WorkspaceView`'s render test only exercises rendering, not
@@ -789,6 +957,59 @@ mod render_tests {
             std::process::id()
         ));
         ConnectionStore::load(&path).expect("loading a nonexistent path must succeed empty")
+    }
+
+    /// A connection store's temp file path, plus a tab-session store's own
+    /// temp path, both owned exclusively by one test and removed on drop.
+    struct PersistenceTestPaths {
+        connections: std::path::PathBuf,
+        tab_sessions: std::path::PathBuf,
+    }
+
+    impl PersistenceTestPaths {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            Self {
+                connections: std::env::temp_dir().join(format!(
+                    "zsql-workspace-persistence-test-{label}-{pid}-{n}-connections.toml"
+                )),
+                tab_sessions: std::env::temp_dir().join(format!(
+                    "zsql-workspace-persistence-test-{label}-{pid}-{n}-tab-sessions.json"
+                )),
+            }
+        }
+    }
+
+    impl Drop for PersistenceTestPaths {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.connections);
+            let _ = std::fs::remove_file(&self.tab_sessions);
+        }
+    }
+
+    /// A connection store, persisted to `path`, holding two saved
+    /// connections ("conn-a" and "conn-b") so `active_tab_session_key`
+    /// resolves each to a stable [`ConnectionKey::Saved`] rather than the
+    /// [`ConnectionKey::Unsaved`] fallback.
+    fn store_with_two_saved_connections(path: &std::path::Path) -> ConnectionStore {
+        let mut store =
+            ConnectionStore::load(path).expect("loading a nonexistent path must succeed empty");
+        store
+            .add(StoredConnection {
+                name: "conn-a".to_owned(),
+                url: "postgres://localhost/a".to_owned(),
+            })
+            .expect("add conn-a must succeed");
+        store
+            .add(StoredConnection {
+                name: "conn-b".to_owned(),
+                url: "postgres://localhost/b".to_owned(),
+            })
+            .expect("add conn-b must succeed");
+        store
     }
 
     fn sample_schema_session(cx: &mut gpui::TestAppContext) -> gpui::Entity<Session> {
@@ -812,7 +1033,13 @@ mod render_tests {
     fn renders_the_sidebar_editor_and_results_without_panicking(cx: &mut gpui::TestAppContext) {
         let session = sample_schema_session(cx);
         cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
     }
 
@@ -823,7 +1050,13 @@ mod render_tests {
     fn renders_an_active_schema_tab_without_panicking(cx: &mut gpui::TestAppContext) {
         let session = sample_schema_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         workspace.update(vcx, |workspace, cx| {
@@ -856,7 +1089,13 @@ mod render_tests {
     ) {
         let session = sample_schema_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         let generated_id = workspace.update(vcx, |workspace, cx| {
@@ -904,7 +1143,13 @@ mod render_tests {
     ) {
         let session = sample_schema_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         let (converted_id, editor) = workspace.update(vcx, |workspace, cx| {
@@ -952,12 +1197,307 @@ mod render_tests {
         let expected_sidebar_width = layout.sidebar_default_width;
         let expected_editor_height = layout.editor_default_height;
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, layout, empty_store_for_test(), cx)
+            WorkspaceView::new(session, layout, empty_store_for_test(), None, cx)
         });
         workspace.read_with(vcx, |workspace, _cx| {
             assert_eq!(workspace.sidebar_width, expected_sidebar_width);
             assert_eq!(workspace.editor_height, expected_editor_height);
         });
+    }
+
+    /// Exercises the full connect-switch wiring, not just the pure
+    /// `TabModel`/`tab_session` logic: connecting to "conn-a", mutating its
+    /// tabs, then switching to "conn-b" must flush "conn-a"'s tabs to disk
+    /// under its own key before "conn-b"'s (snapshot-less, default) tabs
+    /// replace what `TabModel` shows -- the two saves this triggers must not
+    /// race each other or corrupt the store.
+    #[gpui::test]
+    fn switching_the_active_connection_persists_the_outgoing_tabs_and_shows_the_incoming_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = sample_schema_session(cx);
+        let paths = PersistenceTestPaths::new("switch");
+        let store = store_with_two_saved_connections(&paths.connections);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                store,
+                Some(paths.tab_sessions.clone()),
+                cx,
+            )
+        });
+
+        let conn_a = ActiveConnection {
+            name: "conn-a".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let conn_b = ActiveConnection {
+            name: "conn-b".to_owned(),
+            url: "postgres://localhost/b".to_owned(),
+        };
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(conn_a, cx);
+        });
+        vcx.run_until_parked();
+
+        // Mutate connection A's tabs beyond the default single empty
+        // script, so its persisted snapshot is distinguishable from B's.
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.new_script_tab(cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(conn_b, cx);
+        });
+        vcx.run_until_parked();
+
+        let saved_a = tab_session::load_snapshot(
+            &paths.tab_sessions,
+            &ConnectionKey::Saved("conn-a".to_owned()),
+        )
+        .expect("load must succeed")
+        .expect("conn-a's tabs must have been persisted before switching away from it");
+        assert_eq!(
+            saved_a.tabs.len(),
+            2,
+            "the persisted snapshot must reflect conn-a's mutated tab set"
+        );
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert_eq!(
+                tabs.tabs().len(),
+                1,
+                "conn-b has no snapshot yet, so it must show the default single tab, \
+                 not conn-a's leftover tabs"
+            );
+            assert!(!tabs.tabs()[0].dirty());
+        });
+    }
+
+    /// A key this session has already loaded/saved must never lose to a
+    /// disk read that happens to observe an older state than what this
+    /// process already knows -- e.g. a background write still in flight
+    /// when the user reconnects to a connection they only just switched
+    /// away from. Forces disk out of sync with the in-memory cache directly
+    /// (standing in for a write that has not landed yet) and asserts the
+    /// switch back to "conn-a" still shows this session's own latest tabs.
+    #[gpui::test]
+    fn switching_back_to_a_cached_connection_ignores_a_stale_disk_snapshot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = sample_schema_session(cx);
+        let paths = PersistenceTestPaths::new("cache-wins");
+        let store = store_with_two_saved_connections(&paths.connections);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                store,
+                Some(paths.tab_sessions.clone()),
+                cx,
+            )
+        });
+
+        let conn_a = ActiveConnection {
+            name: "conn-a".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let conn_b = ActiveConnection {
+            name: "conn-b".to_owned(),
+            url: "postgres://localhost/b".to_owned(),
+        };
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(conn_a, cx);
+        });
+        vcx.run_until_parked();
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.new_script_tab(cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(conn_b, cx);
+        });
+        vcx.run_until_parked();
+
+        // Disk now disagrees with what this session already knows for
+        // "conn-a" -- standing in for a background write dispatched earlier
+        // that has not actually landed yet by the time the user reconnects.
+        tab_session::save_snapshot(
+            &paths.tab_sessions,
+            &ConnectionKey::Saved("conn-a".to_owned()),
+            &tab_session::TabSessionSnapshot::default(),
+        )
+        .expect("overwrite must succeed");
+
+        let conn_a_again = ActiveConnection {
+            name: "conn-a".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(conn_a_again, cx);
+        });
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert_eq!(
+                tabs.tabs().len(),
+                2,
+                "this session's own cached tabs for conn-a must win over the \
+                 stale snapshot forced onto disk"
+            );
+        });
+    }
+
+    /// The app-restart path: a fresh workspace (empty in-memory cache) that
+    /// connects to a saved connection whose tabs are already on disk must
+    /// read that snapshot back from the file and rebuild the tab model from
+    /// it -- order, kind, title, buffer text, and active tab all exactly as
+    /// persisted. Exercises the cache-miss disk-read branch end to end, which
+    /// the cache-wins and switch tests never reach.
+    #[gpui::test]
+    fn connecting_to_a_saved_connection_restores_its_tabs_from_disk(cx: &mut gpui::TestAppContext) {
+        let session = sample_schema_session(cx);
+        let paths = PersistenceTestPaths::new("restore-from-disk");
+        let store = store_with_two_saved_connections(&paths.connections);
+
+        // Seed conn-a's tab session on disk before the workspace exists, as
+        // if written by a previous run of the app.
+        let seeded = tab_session::TabSessionSnapshot {
+            tabs: vec![
+                tab_session::TabEntrySnapshot {
+                    kind: tab_session::TabEntryKind::Script,
+                    title: "query-1.sql".to_owned(),
+                    buffer_text: "select 1;".to_owned(),
+                },
+                tab_session::TabEntrySnapshot {
+                    kind: tab_session::TabEntryKind::Generated {
+                        schema: "public".to_owned(),
+                        relation: "orders".to_owned(),
+                        edited: false,
+                    },
+                    title: "orders".to_owned(),
+                    buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200".to_owned(),
+                },
+            ],
+            active_index: Some(1),
+        };
+        tab_session::save_snapshot(
+            &paths.tab_sessions,
+            &ConnectionKey::Saved("conn-a".to_owned()),
+            &seeded,
+        )
+        .expect("seeding conn-a's snapshot on disk must succeed");
+
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                store,
+                Some(paths.tab_sessions.clone()),
+                cx,
+            )
+        });
+
+        // First-ever connect to conn-a: the in-memory cache has no entry, so
+        // this must fall through to the on-disk snapshot.
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(
+                ActiveConnection {
+                    name: "conn-a".to_owned(),
+                    url: "postgres://localhost/a".to_owned(),
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert_eq!(tabs.tabs().len(), 2, "both persisted tabs must be restored");
+
+            let script = &tabs.tabs()[0];
+            assert!(!script.is_generated());
+            assert_eq!(script.title(), "query-1.sql");
+            assert_eq!(script.editor().read(cx).text(), "select 1;");
+
+            let generated = &tabs.tabs()[1];
+            assert!(generated.is_generated());
+            assert_eq!(generated.title(), "orders");
+            assert_eq!(
+                generated.editor().read(cx).text(),
+                "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+            );
+
+            assert_eq!(
+                tabs.active_id(),
+                Some(generated.id()),
+                "the persisted active tab (index 1) must be the active one after restore"
+            );
+        });
+    }
+
+    /// `flush_tab_session_on_quit` returns a `Task` the caller must await
+    /// before the app actually exits; this proves awaiting it actually
+    /// finishes the write rather than the caller racing process exit
+    /// against a fire-and-forget save.
+    #[gpui::test]
+    async fn flush_tab_session_on_quit_persists_the_active_connections_current_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = sample_schema_session(cx);
+        let paths = PersistenceTestPaths::new("quit-flush");
+        let store = store_with_two_saved_connections(&paths.connections);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                store,
+                Some(paths.tab_sessions.clone()),
+                cx,
+            )
+        });
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(
+                ActiveConnection {
+                    name: "conn-a".to_owned(),
+                    url: "postgres://localhost/a".to_owned(),
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace.tabs.read(cx).tabs()[0].editor().clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.insert_text_for_test("select 42;", cx);
+        });
+        vcx.run_until_parked();
+
+        let flush = workspace.update(vcx, WorkspaceView::flush_tab_session_on_quit);
+        flush.await;
+
+        let saved = tab_session::load_snapshot(
+            &paths.tab_sessions,
+            &ConnectionKey::Saved("conn-a".to_owned()),
+        )
+        .expect("load must succeed")
+        .expect("flush_tab_session_on_quit must have written conn-a's tabs");
+        assert_eq!(saved.tabs.len(), 1);
+        assert_eq!(saved.tabs[0].buffer_text, "select 42;");
     }
 }
 
@@ -1042,7 +1582,13 @@ mod header_tests {
     fn header_run_button_dispatches_run_for_the_active_script_tab(cx: &mut TestAppContext) {
         let (session, queries) = recording_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         let editor = workspace.read_with(vcx, |workspace, cx| {
@@ -1072,7 +1618,13 @@ mod header_tests {
     fn header_run_button_dispatches_run_for_the_active_generated_tab(cx: &mut TestAppContext) {
         let (session, queries) = recording_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         workspace.update(vcx, |workspace, cx| {
@@ -1101,7 +1653,13 @@ mod header_tests {
     ) {
         let (session, _queries) = recording_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
         // A fresh workspace's active tab is a Script tab: this first frame
         // already exercises the header above a Script tab's full editor.
@@ -1131,7 +1689,13 @@ mod header_tests {
     fn header_run_button_is_a_no_op_when_all_tabs_are_closed(cx: &mut TestAppContext) {
         let (session, queries) = recording_session(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                empty_store_for_test(),
+                None,
+                cx,
+            )
         });
 
         // Close the default script tab, leaving no active tab

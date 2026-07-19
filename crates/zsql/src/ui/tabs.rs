@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{AppContext as _, Context, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
 use zsql_core::RelationKind;
 use zsql_editor::{EditorView, QueryRunner};
 
@@ -20,6 +20,7 @@ use super::results::{ResultsSnapshot, ResultsView};
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
 use crate::sql::preview_sql;
+use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 
 /// Identifies one open tab, stable for its lifetime and never reused within
 /// a single `TabModel`.
@@ -46,6 +47,29 @@ pub enum TabKind {
 #[must_use]
 pub fn generated_tab_sql(schema: &str, relation: &str, preview_limit: u64) -> String {
     preview_sql(schema, relation, preview_limit)
+}
+
+/// Leading text of every title [`TabModel::new_script_tab`] mints, before
+/// the number.
+const SCRIPT_TITLE_PREFIX: &str = "query-";
+/// Trailing text of every title [`TabModel::new_script_tab`] mints, after
+/// the number.
+const SCRIPT_TITLE_SUFFIX: &str = ".sql";
+
+/// The title [`TabModel::new_script_tab`] gives its `n`th script tab.
+fn script_title(n: u64) -> String {
+    format!("{SCRIPT_TITLE_PREFIX}{n}{SCRIPT_TITLE_SUFFIX}")
+}
+
+/// The number a title matching [`script_title`]'s pattern was minted with,
+/// or `None` for any other title (a `Generated` tab's relation name, or a
+/// script tab renamed by the user, once renaming exists).
+fn parse_script_number(title: &str) -> Option<u64> {
+    title
+        .strip_prefix(SCRIPT_TITLE_PREFIX)?
+        .strip_suffix(SCRIPT_TITLE_SUFFIX)?
+        .parse()
+        .ok()
 }
 
 /// One open editor tab: its kind, display title, own independent editor
@@ -157,6 +181,9 @@ pub struct TabModel {
     next_id: TabId,
     /// Numbers successive `query-N.sql` titles for tabs opened via
     /// [`TabModel::new_script_tab`], starting at 1 and never reused.
+    /// [`TabModel::restore_tabs`] advances this past the highest number
+    /// among the titles it restores, so a tab opened right after a restore
+    /// can never collide with a restored title.
     next_script_number: u64,
     /// The tab whose run `session` is currently tracking live (streaming or
     /// just completed): [`TabModel::set_active`] shows `results` live for
@@ -421,7 +448,7 @@ impl TabModel {
     pub fn new_script_tab(&mut self, cx: &mut Context<Self>) -> TabId {
         let id = self.allocate_id();
         let editor = Self::build_editor(id, cx);
-        let title = format!("query-{}.sql", self.next_script_number);
+        let title = script_title(self.next_script_number);
         self.next_script_number += 1;
 
         tracing::info!(tab_id = id, title = %title, "opened new script tab");
@@ -571,6 +598,152 @@ impl TabModel {
 
         cx.notify();
     }
+
+    /// This model's entire tab state as a persistable, window-independent
+    /// snapshot: every tab's kind/title/buffer text, in order, plus which
+    /// one is active.
+    #[must_use]
+    pub fn snapshot(&self, cx: &App) -> TabSessionSnapshot {
+        let tabs = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let kind = match &tab.kind {
+                    TabKind::Script => TabEntryKind::Script,
+                    // `tab.dirty` is always `false` here: `mark_edited`
+                    // converts a `Generated` tab to `TabKind::Script` in the
+                    // same call that would otherwise set it, so a live tab
+                    // can never be both still-`Generated` and dirty. The
+                    // field exists so the persisted shape has somewhere to
+                    // carry that conversion if the live behavior ever
+                    // changes, and so `restore_tabs` has a single rule
+                    // (check `edited`) instead of two.
+                    TabKind::Generated { schema, relation } => TabEntryKind::Generated {
+                        schema: schema.clone(),
+                        relation: relation.clone(),
+                        edited: tab.dirty,
+                    },
+                    // A schema tab is a read-only view re-openable from the
+                    // sidebar at any time and carries no editable buffer, so
+                    // it is intentionally not persisted.
+                    TabKind::Schema { .. } => return None,
+                };
+                Some(TabEntrySnapshot {
+                    kind,
+                    title: tab.title.clone(),
+                    buffer_text: tab.editor.read(cx).text(),
+                })
+            })
+            .collect();
+        // Index into the persisted (non-schema) tabs, so it lines up with
+        // what `restore_tabs` rebuilds; an active schema tab leaves no active
+        // index and restore falls back to the first tab.
+        let active_index = self.active.and_then(|id| {
+            self.tabs
+                .iter()
+                .filter(|tab| !matches!(tab.kind, TabKind::Schema { .. }))
+                .position(|tab| tab.id == id)
+        });
+        TabSessionSnapshot { tabs, active_index }
+    }
+
+    /// Replace every open tab with `snapshot`'s tabs (or, if `snapshot` is
+    /// `None` or holds no tabs, the same single-empty-script default a
+    /// brand new workspace opens with), for a connection that was just
+    /// (re)connected. Never merges with whatever tabs were already open --
+    /// switching the connection a tab set belongs to always swaps the whole
+    /// set rather than folding one into the other.
+    pub fn load_for_connection(
+        &mut self,
+        snapshot: Option<&TabSessionSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tabs.clear();
+        self.generated_by_relation.clear();
+        self.active = None;
+        self.live_owner = None;
+
+        match snapshot {
+            Some(snapshot) if !snapshot.tabs.is_empty() => self.restore_tabs(snapshot, cx),
+            _ => {
+                // No restored titles to stay clear of, so a connection with
+                // no snapshot always starts back at the same "query-1.sql"
+                // a brand new workspace opens with, rather than carrying
+                // over whatever number a previous connection's tabs left
+                // behind.
+                self.next_script_number = 1;
+                self.new_script_tab(cx);
+            }
+        }
+
+        tracing::info!(
+            tab_count = self.tabs.len(),
+            "tab session loaded for connection"
+        );
+        self.sync_results_to_active(cx);
+        cx.notify();
+    }
+
+    /// Rebuild `self.tabs` from `snapshot`'s entries: same order, kind,
+    /// title, and buffer text. A `Generated` entry whose persisted `edited`
+    /// flag is set restores as [`TabKind::Script`] instead, consistent with
+    /// the live conversion [`TabModel::mark_edited`] performs on a
+    /// generated tab's first edit.
+    ///
+    /// Never triggers a query: [`EditorView::set_text`] does not invoke the
+    /// on-edit listener, so restoring a buffer's text neither marks a
+    /// restored tab dirty nor dispatches anything through `session`.
+    fn restore_tabs(&mut self, snapshot: &TabSessionSnapshot, cx: &mut Context<Self>) {
+        self.next_script_number = snapshot
+            .tabs
+            .iter()
+            .filter_map(|entry| parse_script_number(&entry.title))
+            .max()
+            .map_or(1, |highest| highest + 1);
+
+        for entry in &snapshot.tabs {
+            let id = self.allocate_id();
+            let editor = Self::build_editor(id, cx);
+            editor.update(cx, |editor, cx| editor.set_text(&entry.buffer_text, cx));
+
+            let (kind, dirty) = match &entry.kind {
+                TabEntryKind::Script => (TabKind::Script, false),
+                TabEntryKind::Generated { edited: true, .. } => (TabKind::Script, true),
+                TabEntryKind::Generated {
+                    schema,
+                    relation,
+                    edited: false,
+                } => (
+                    TabKind::Generated {
+                        schema: schema.clone(),
+                        relation: relation.clone(),
+                    },
+                    false,
+                ),
+            };
+            if let TabKind::Generated { schema, relation } = &kind {
+                self.generated_by_relation
+                    .insert((schema.clone(), relation.clone()), id);
+                editor.update(cx, |editor, _cx| editor.set_compact(true));
+            }
+
+            self.tabs.push(Tab {
+                id,
+                kind,
+                title: entry.title.clone(),
+                editor,
+                dirty,
+                last_run: None,
+                schema_view: None,
+            });
+        }
+
+        self.active = snapshot
+            .active_index
+            .and_then(|index| self.tabs.get(index))
+            .or_else(|| self.tabs.first())
+            .map(Tab::id);
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +758,7 @@ mod tests {
 
     use super::{TabKind, TabModel, generated_tab_sql};
     use crate::session::Session;
+    use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
     use crate::ui::results::ResultsView;
 
     /// A `Connection` double that records nothing and never resolves a
@@ -1327,6 +1501,374 @@ mod tests {
                 Some(SharedString::from("public.users")),
                 "the actual live owner's run must still be captured onto its own tab"
             );
+        });
+    }
+
+    // ---- tab session snapshot / restore ------------------------------------
+
+    fn two_tab_snapshot() -> TabSessionSnapshot {
+        TabSessionSnapshot {
+            tabs: vec![
+                TabEntrySnapshot {
+                    kind: TabEntryKind::Generated {
+                        schema: "public".to_owned(),
+                        relation: "orders".to_owned(),
+                        edited: false,
+                    },
+                    title: "orders".to_owned(),
+                    buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200".to_owned(),
+                },
+                TabEntrySnapshot {
+                    kind: TabEntryKind::Script,
+                    title: "query-1.sql".to_owned(),
+                    buffer_text: "select 1;\n".to_owned(),
+                },
+            ],
+            active_index: Some(1),
+        }
+    }
+
+    #[gpui::test]
+    fn snapshot_captures_every_tabs_kind_title_buffer_and_the_active_index(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", 200, cx);
+        });
+        let script_id = model.update(cx, TabModel::new_script_tab);
+        let editor = model.read_with(cx, |model, _app| {
+            model
+                .tabs()
+                .iter()
+                .find(|tab| tab.id() == script_id)
+                .unwrap()
+                .editor()
+                .clone()
+        });
+        editor.update(cx, |editor, cx| {
+            editor.insert_text_for_test("select 1;", cx);
+        });
+
+        let snapshot = model.read_with(cx, TabModel::snapshot);
+
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(
+            snapshot.tabs[0].kind,
+            TabEntryKind::Generated {
+                schema: "public".to_owned(),
+                relation: "orders".to_owned(),
+                edited: false,
+            }
+        );
+        assert_eq!(
+            snapshot.tabs[0].buffer_text,
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+        assert_eq!(snapshot.tabs[0].title, "orders");
+        assert_eq!(snapshot.tabs[1].kind, TabEntryKind::Script);
+        assert_eq!(snapshot.tabs[1].buffer_text, "select 1;");
+        assert_eq!(snapshot.tabs[1].title, "query-1.sql");
+        assert_eq!(
+            snapshot.active_index,
+            Some(1),
+            "the active tab is the script tab, at index 1"
+        );
+    }
+
+    #[gpui::test]
+    fn restoring_a_snapshot_rebuilds_the_expected_tabs_order_and_active_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        let snapshot = two_tab_snapshot();
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            assert_eq!(model.tabs().len(), 2);
+            assert_eq!(
+                model.tabs()[0].kind(),
+                &TabKind::Generated {
+                    schema: "public".to_owned(),
+                    relation: "orders".to_owned(),
+                }
+            );
+            assert_eq!(model.tabs()[0].title(), "orders");
+            assert_eq!(
+                model.tabs()[0].editor().read(app).text(),
+                "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+            );
+            assert!(!model.tabs()[0].dirty());
+
+            assert_eq!(model.tabs()[1].kind(), &TabKind::Script);
+            assert_eq!(model.tabs()[1].title(), "query-1.sql");
+            assert_eq!(model.tabs()[1].editor().read(app).text(), "select 1;\n");
+
+            assert_eq!(
+                model.active_id(),
+                Some(model.tabs()[1].id()),
+                "the active tab must be the one at the snapshot's active_index"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn restoring_a_snapshot_with_no_active_index_activates_the_first_tab(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        let mut snapshot = two_tab_snapshot();
+        snapshot.active_index = None;
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.active_id(), Some(model.tabs()[0].id()));
+        });
+    }
+
+    #[gpui::test]
+    fn restoring_a_snapshot_with_an_out_of_range_active_index_activates_the_first_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        let mut snapshot = two_tab_snapshot();
+        snapshot.active_index = Some(99);
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.active_id(), Some(model.tabs()[0].id()));
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_tab_after_restoring_query_1_sql_gets_a_distinct_title(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        let snapshot = TabSessionSnapshot {
+            tabs: vec![TabEntrySnapshot {
+                kind: TabEntryKind::Script,
+                title: "query-1.sql".to_owned(),
+                buffer_text: String::new(),
+            }],
+            active_index: Some(0),
+        };
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+        let new_id = model.update(cx, TabModel::new_script_tab);
+
+        model.read_with(cx, |model, _app| {
+            let new_tab = model.tabs().iter().find(|tab| tab.id() == new_id).unwrap();
+            assert_ne!(
+                new_tab.title(),
+                "query-1.sql",
+                "a new tab must not collide with a restored title"
+            );
+            assert_eq!(new_tab.title(), "query-2.sql");
+        });
+    }
+
+    #[gpui::test]
+    fn connecting_with_no_snapshot_resets_script_numbering_to_one(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        let snapshot = TabSessionSnapshot {
+            tabs: vec![TabEntrySnapshot {
+                kind: TabEntryKind::Script,
+                title: "query-5.sql".to_owned(),
+                buffer_text: String::new(),
+            }],
+            active_index: Some(0),
+        };
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(None, cx);
+        });
+
+        model.read_with(cx, |model, _app| {
+            assert_eq!(
+                model.tabs()[0].title(),
+                "query-1.sql",
+                "a snapshot-less connection must not carry over a prior connection's \
+                 script numbering"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_restored_unedited_generated_tab_stays_eligible_for_reuse(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&two_tab_snapshot()), cx);
+        });
+        let restored_id = model.read_with(cx, |model, _app| model.tabs()[0].id());
+
+        let reused_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", 200, cx)
+        });
+
+        assert_eq!(
+            restored_id, reused_id,
+            "a restored, never-edited generated tab must still be reused rather \
+             than duplicated"
+        );
+    }
+
+    /// `TabModel::snapshot` can never actually produce a `Generated` entry
+    /// with `edited: true` -- `mark_edited` converts a tab to
+    /// `TabKind::Script` in the same call that would otherwise dirty it, so
+    /// a live tab is never simultaneously `Generated` and dirty. This test
+    /// constructs that combination by hand to pin `restore_tabs`'s defensive
+    /// handling of it, in case a future change to the persisted shape (or a
+    /// hand-edited store file) ever produces it.
+    #[gpui::test]
+    fn a_restored_generated_tab_marked_edited_comes_back_as_a_script(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        let snapshot = TabSessionSnapshot {
+            tabs: vec![TabEntrySnapshot {
+                kind: TabEntryKind::Generated {
+                    schema: "public".to_owned(),
+                    relation: "orders".to_owned(),
+                    edited: true,
+                },
+                title: "orders".to_owned(),
+                buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200 -- edited".to_owned(),
+            }],
+            active_index: Some(0),
+        };
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot), cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            let tab = &model.tabs()[0];
+            assert_eq!(
+                tab.kind(),
+                &TabKind::Script,
+                "an edited generated entry must restore as a script"
+            );
+            assert!(tab.dirty());
+            assert_eq!(
+                tab.editor().read(app).text(),
+                "SELECT * FROM \"public\".\"orders\" LIMIT 200 -- edited"
+            );
+        });
+
+        // A restored, edited tab's relation must not have been registered
+        // for live reuse: reopening it must create a fresh generated tab.
+        let new_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", 200, cx)
+        });
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.tabs().len(), 2);
+            assert_ne!(new_id, model.tabs()[0].id());
+        });
+    }
+
+    #[gpui::test]
+    fn restoring_a_snapshot_never_dispatches_a_query(cx: &mut TestAppContext) {
+        let (model, results) = build_model_with_results(cx);
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&two_tab_snapshot()), cx);
+        });
+        cx.run_until_parked();
+
+        results.read_with(cx, |results, _app| {
+            assert!(
+                results.is_frozen_for_test(),
+                "restoring tabs must never leave the results view tracking a live \
+                 session run"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn connecting_with_no_snapshot_yields_the_default_single_empty_script_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(None, cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            assert_eq!(model.tabs().len(), 1);
+            let tab = &model.tabs()[0];
+            assert_eq!(tab.kind(), &TabKind::Script);
+            assert_eq!(tab.editor().read(app).text(), "");
+            assert_eq!(model.active_id(), Some(tab.id()));
+        });
+    }
+
+    #[gpui::test]
+    fn switching_to_a_connection_with_no_snapshot_after_one_with_tabs_replaces_them(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&two_tab_snapshot()), cx);
+        });
+        model.read_with(cx, |model, _app| assert_eq!(model.tabs().len(), 2));
+
+        model.update(cx, |model, cx| {
+            model.load_for_connection(None, cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            assert_eq!(
+                model.tabs().len(),
+                1,
+                "switching connections must replace, not merge with, the prior tab set"
+            );
+            assert_eq!(model.tabs()[0].kind(), &TabKind::Script);
+            assert_eq!(model.tabs()[0].editor().read(app).text(), "");
+        });
+    }
+
+    #[gpui::test]
+    fn switching_between_two_connections_snapshots_swaps_the_whole_tab_set(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        let snapshot_a = two_tab_snapshot();
+        let snapshot_b = TabSessionSnapshot {
+            tabs: vec![TabEntrySnapshot {
+                kind: TabEntryKind::Script,
+                title: "b-query.sql".to_owned(),
+                buffer_text: "select 'b';".to_owned(),
+            }],
+            active_index: Some(0),
+        };
+
+        // Connect to A, then mutate its tabs beyond what the snapshot held.
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot_a), cx);
+            model.new_script_tab(cx);
+        });
+        model.read_with(cx, |model, _app| assert_eq!(model.tabs().len(), 3));
+
+        // Switch to B: the mutated A tab set must not leak through.
+        model.update(cx, |model, cx| {
+            model.load_for_connection(Some(&snapshot_b), cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            assert_eq!(model.tabs().len(), 1, "B's tab set must fully replace A's");
+            assert_eq!(model.tabs()[0].title(), "b-query.sql");
+            assert_eq!(model.tabs()[0].editor().read(app).text(), "select 'b';");
+            assert_eq!(model.active_id(), Some(model.tabs()[0].id()));
         });
     }
 }
