@@ -350,13 +350,43 @@ fn table_shell() -> gpui::Div {
 }
 
 /// A header row of `labels`, each cell sized to its matching entry in
-/// `widths`.
+/// `widths`. The trailing cell drops its vertical separator so the table's
+/// own border carries the right edge.
 fn header_row<const N: usize>(widths: [gpui::Pixels; N], labels: [&str; N]) -> impl IntoElement {
-    let mut row = div().flex().flex_row().bg(rgb(colors::RAISE));
-    for (width, label) in widths.into_iter().zip(labels) {
-        row = row.child(grid::header_cell_shell(width).child(label.to_owned()));
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .bg(rgb(colors::RAISE))
+        .border_b_1()
+        .border_color(rgb(colors::LINE));
+    let last = N.saturating_sub(1);
+    for (index, (width, label)) in widths.into_iter().zip(labels).enumerate() {
+        let mut cell = grid::header_cell_shell(width)
+            .text_size(px(theme::SCHEMA_TABLE_HEADER_TEXT_SIZE))
+            .text_color(rgb(colors::MUTED))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(label.to_owned());
+        if index == last {
+            cell = cell.border_r_0();
+        }
+        row = row.child(cell);
     }
     row
+}
+
+/// The Type cell: the teal type tag shown in full, never clipped mid-glyph
+/// even for a long Postgres type name.
+fn type_cell(width: gpui::Pixels, type_name: &str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .w(width)
+        .h_full()
+        .px(px(grid::CELL_PADDING_X))
+        .border_r_1()
+        .border_color(rgb(colors::LINE_SOFT))
+        .child(grid::type_tag(type_name).flex_shrink_0())
 }
 
 /// One row of the Columns table: the left key-rail tick, then Column/Type/
@@ -393,12 +423,16 @@ fn render_column_row(
                         .child(column.name.clone()),
                 ),
         )
-        .child(grid::body_cell_shell(type_w).child(grid::type_tag(&column.type_name)))
+        .child(type_cell(type_w, &column.type_name))
         .child(grid::body_cell_shell(null_w).child(null_label(column.nullable)))
         .child(
             grid::body_cell_shell(default_w).child(render_default_cell(column.default.as_deref())),
         )
-        .child(grid::body_cell_shell(keys_w).child(render_keys_cell(column, constraints)))
+        .child(
+            grid::body_cell_shell(keys_w)
+                .border_r_0()
+                .child(render_keys_cell(column, constraints)),
+        )
 }
 
 /// The Null cell's text and color for `nullable`.
@@ -519,7 +553,7 @@ fn render_index_row(index: &IndexInfo, widths: [gpui::Pixels; 4]) -> impl IntoEl
                 .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
         }))
         .child(
-            grid::body_cell_shell(def_w).child(
+            grid::body_cell_shell(def_w).border_r_0().child(
                 div()
                     .text_color(rgb(colors::MUTED))
                     .child(index.definition.clone()),
@@ -549,7 +583,7 @@ fn render_constraint_row(
         )
         .child(grid::body_cell_shell(kind_w).child(key_badge(kind_label, kind_color, colors::LINE)))
         .child(
-            grid::body_cell_shell(def_w).child(
+            grid::body_cell_shell(def_w).border_r_0().child(
                 div()
                     .text_color(rgb(colors::MUTED))
                     .child(constraint.definition.clone()),

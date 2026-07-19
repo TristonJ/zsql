@@ -85,13 +85,16 @@ struct ThumbDrag {
 }
 
 /// A relation row's open right-click context menu: which relation it
-/// targets and where (in window coordinates) to anchor the menu.
+/// targets, the flattened index of its triggering row (so the menu can
+/// anchor to that row's right edge), and the triggering click position used
+/// as a fallback anchor before the tree viewport has been measured.
 #[derive(Debug, Clone)]
 struct ContextMenuState {
     schema: String,
     relation: String,
     kind: RelationKind,
-    position: Point<Pixels>,
+    row_index: usize,
+    fallback_position: Point<Pixels>,
 }
 
 impl SidebarView {
@@ -234,23 +237,42 @@ impl SidebarView {
         cx.notify();
     }
 
-    /// Open the right-click context menu for `schema.relation`, anchored at
-    /// `position` (window coordinates, from the triggering mouse event).
+    /// Open the right-click context menu for `schema.relation`, anchored to
+    /// the right edge of its `row_index` row. `fallback_position` (window
+    /// coordinates, from the triggering mouse event) anchors the menu until
+    /// the tree viewport has been measured.
     fn open_context_menu(
         &mut self,
         schema: String,
         relation: String,
         kind: RelationKind,
-        position: Point<Pixels>,
+        row_index: usize,
+        fallback_position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.context_menu = Some(ContextMenuState {
             schema,
             relation,
             kind,
-            position,
+            row_index,
+            fallback_position,
         });
         cx.notify();
+    }
+
+    /// Where to anchor the context menu for the relation row at `row_index`:
+    /// the top of that row at the tree viewport's right edge, in window
+    /// coordinates. `None` before the tree viewport has been measured, when
+    /// the row's on-screen position cannot yet be derived.
+    #[allow(clippy::cast_precision_loss)]
+    fn relation_row_anchor(&self, row_index: usize) -> Option<Point<Pixels>> {
+        let bounds = self.tree_scroll_handle.0.borrow().base_handle.bounds();
+        if bounds.size.height == Pixels::ZERO {
+            return None;
+        }
+        let right_edge_x = bounds.origin.x + bounds.size.width;
+        let row_top_y = bounds.origin.y + ROW_HEIGHT * row_index as f32 - self.tree_scroll_offset();
+        Some(point(right_edge_x, row_top_y))
     }
 
     /// Close the open context menu, if any.
@@ -651,6 +673,7 @@ impl SidebarView {
                         schema_for_menu.clone(),
                         name_for_menu.clone(),
                         kind,
+                        ix,
                         event.position,
                         cx,
                     );
@@ -677,13 +700,19 @@ impl SidebarView {
 
 impl SidebarView {
     /// The right-click context menu overlay: `Preview Data`, `View Schema`,
-    /// a separator, then `Copy Name`/`Copy Qualified Name`, anchored at the
-    /// triggering click's position. Renders nothing when no menu is open.
+    /// a separator, then `Copy Name`/`Copy Qualified Name`, anchored to the
+    /// right edge of its triggering relation row. A full-window backdrop
+    /// behind it absorbs off-menu clicks so closing the menu never doubles
+    /// as activating whatever sits beneath it. Renders nothing when no menu
+    /// is open.
     fn render_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let menu = self.context_menu.clone()?;
         let schema = menu.schema.clone();
         let relation = menu.relation.clone();
         let kind = menu.kind;
+        let anchor = self
+            .relation_row_anchor(menu.row_index)
+            .unwrap_or(menu.fallback_position);
 
         let preview_schema = schema.clone();
         let preview_relation = relation.clone();
@@ -692,15 +721,13 @@ impl SidebarView {
 
         let content = div()
             .id("sidebar-context-menu")
+            .occlude()
             .w(theme::CONTEXT_MENU_WIDTH)
             .p(theme::CONTEXT_MENU_PADDING)
             .bg(rgb(colors::RAISE))
             .border_1()
             .border_color(rgb(colors::LINE))
             .rounded(px(theme::CONTEXT_MENU_RADIUS))
-            .on_mouse_down_out(cx.listener(|view, _event, _window, cx| {
-                view.close_context_menu(cx);
-            }))
             .child(context_menu_item(
                 cx,
                 "Preview Data",
@@ -729,16 +756,25 @@ impl SidebarView {
                 },
             ));
 
-        Some(
-            deferred(
-                anchored()
-                    .position(menu.position)
-                    .snap_to_window()
-                    .child(content),
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_context_menu(cx);
+                }),
             )
-            .with_priority(1)
-            .into_any_element(),
-        )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_context_menu(cx);
+                }),
+            )
+            .child(anchored().position(anchor).snap_to_window().child(content));
+
+        Some(deferred(backdrop).with_priority(1).into_any_element())
     }
 }
 
@@ -1335,6 +1371,7 @@ mod render_tests {
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
+                0,
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
@@ -1363,6 +1400,7 @@ mod render_tests {
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
+                0,
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
@@ -1396,6 +1434,7 @@ mod render_tests {
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
+                0,
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
@@ -1432,6 +1471,7 @@ mod render_tests {
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
+                0,
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
@@ -1444,6 +1484,37 @@ mod render_tests {
 
         sidebar.read_with(vcx, |view, _app| {
             assert!(view.context_menu.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_anchors_to_the_triggering_rows_right_edge(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+        vcx.run_until_parked();
+
+        // Once the tree viewport is measured, a row anchor is derived from
+        // the row's laid-out geometry (its top at the viewport's right edge),
+        // and successive rows anchor lower than their predecessors.
+        sidebar.read_with(vcx, |view, _app| {
+            let first = view
+                .relation_row_anchor(0)
+                .expect("a measured tree yields a row anchor");
+            let second = view
+                .relation_row_anchor(1)
+                .expect("a measured tree yields a row anchor");
+            assert!(
+                second.y > first.y,
+                "a later row must anchor below an earlier one"
+            );
+            assert_eq!(
+                first.x, second.x,
+                "every row anchors at the same right-edge x"
+            );
         });
     }
 

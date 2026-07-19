@@ -1008,6 +1008,14 @@ mod header_tests {
         async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
+        }
     }
 
     /// An empty connection store backed by a path this test never writes to.

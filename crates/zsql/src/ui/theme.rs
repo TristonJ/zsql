@@ -228,6 +228,8 @@ pub const SCHEMA_SECTION_COUNT_PILL_RADIUS: f32 = 20.0;
 pub const SCHEMA_SECTION_COUNT_PILL_PADDING_X: Pixels = px(7.0);
 /// Corner radius of one of the schema view's tables.
 pub const SCHEMA_TABLE_RADIUS: f32 = 8.0;
+/// Text size of a schema table's column-header labels.
+pub const SCHEMA_TABLE_HEADER_TEXT_SIZE: f32 = 10.5;
 
 /// Width of a column row's left key-rail tick.
 pub const SCHEMA_RAIL_WIDTH: Pixels = px(3.0);
@@ -271,9 +273,11 @@ pub const SCHEMA_DEFAULT_NONE_PLACEHOLDER: &str = "-";
 pub const SCHEMA_INDEX_UNIQUE_LABEL: &str = "unique";
 
 /// Fixed pixel widths of the Columns table's cells, in display order
-/// (Column, Type, Null, Default, Keys).
+/// (Column, Type, Null, Default, Keys). The Type column is wide enough to
+/// show a full Postgres type name (e.g. `character varying(255)` or
+/// `timestamp with time zone`) without clipping its type tag.
 pub const SCHEMA_COLUMNS_WIDTHS: [Pixels; 5] =
-    [px(190.0), px(100.0), px(90.0), px(220.0), px(220.0)];
+    [px(190.0), px(210.0), px(90.0), px(220.0), px(220.0)];
 /// Fixed pixel widths of the Indexes table's cells, in display order (Name,
 /// Method, Unique, Definition).
 pub const SCHEMA_INDEXES_WIDTHS: [Pixels; 4] = [px(220.0), px(100.0), px(80.0), px(360.0)];

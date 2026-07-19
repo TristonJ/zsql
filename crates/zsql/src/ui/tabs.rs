@@ -326,6 +326,8 @@ impl TabModel {
             TabKind::Script => self
                 .session
                 .update(cx, |session, cx| session.run_query(sql, cx)),
+            // A schema tab is read-only and has no query to run.
+            TabKind::Schema { .. } => return,
         };
         self.dispatch_run(id, label, task, cx);
     }
