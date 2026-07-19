@@ -5,7 +5,6 @@ mod connections;
 mod drivers;
 mod observability;
 mod session;
-mod sql;
 mod tab_session;
 #[cfg(test)]
 mod test_support;

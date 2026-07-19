@@ -205,9 +205,8 @@ impl SidebarView {
     ) {
         self.selected_relation = Some((schema.to_owned(), relation.to_owned()));
 
-        let preview_limit = self.session.read(cx).preview_limit();
         self.tabs.update(cx, |tabs, cx| {
-            tabs.open_or_reuse_generated(schema, relation, preview_limit, cx);
+            tabs.open_or_reuse_generated(schema, relation, cx);
         });
         if let Some(handle) = self
             .tabs

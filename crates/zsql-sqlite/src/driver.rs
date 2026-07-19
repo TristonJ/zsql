@@ -400,6 +400,30 @@ mod tests {
     }
 
     #[test]
+    fn preview_query_matches_the_shared_default_limit_form() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        assert_eq!(
+            conn.preview_query("public", "orders", 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
     fn close_shuts_down_the_underlying_pool() {
         // `close` is reachable only on the concrete type (see its doc
         // comment), so this builds one directly instead of going through

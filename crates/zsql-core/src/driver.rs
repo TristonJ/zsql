@@ -117,4 +117,62 @@ pub trait Connection: Send + Sync {
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError>;
+
+    /// The click-to-preview query for `relation` in `schema`, capped at
+    /// `limit` rows, in this dialect's syntax. Synchronous and read-only:
+    /// building the text touches neither the connection nor the network, so
+    /// callers may call it freely (e.g. to show what a query will run before
+    /// running it).
+    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
+        crate::sql::default_preview_query(schema, relation, limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BatchSink, Connection, QueryHandle};
+    use crate::error::CoreError;
+    use crate::row_count::RowCount;
+    use crate::schema::SchemaTree;
+    use crate::schema_detail::RelationSchema;
+
+    /// A connection double that overrides nothing, so it takes the trait's
+    /// default [`Connection::preview_query`] body verbatim.
+    struct DefaultOnlyConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for DefaultOnlyConnection {
+        fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<RelationSchema, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    #[test]
+    fn a_connection_with_no_override_falls_back_to_the_shared_default() {
+        let connection = DefaultOnlyConnection;
+        assert_eq!(
+            connection.preview_query("public", "orders", 200),
+            crate::sql::default_preview_query("public", "orders", 200)
+        );
+    }
 }

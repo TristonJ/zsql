@@ -1,21 +1,26 @@
 //! Registers this binary's concrete [`Driver`] implementations and resolves
 //! a connection URL to one of them via [`zsql_core::select_driver`].
 //!
-//! This is the only module in the `zsql` binary that names both
-//! `zsql-postgres` and `zsql-sqlite`; everything downstream (`session.rs`,
-//! the connection-manager UI) goes through [`connect`] and never picks a
-//! driver directly.
+//! This is the only module in the `zsql` binary that names
+//! `zsql-postgres`, `zsql-sqlite`, and `zsql-mssql`; everything downstream
+//! (`session.rs`, the connection-manager UI) goes through [`connect`] and
+//! never picks a driver directly.
 
 use std::sync::Arc;
 
 use zsql_core::{Connection, CoreError, Driver};
+use zsql_mssql::MssqlDriver;
 use zsql_postgres::PostgresDriver;
 use zsql_sqlite::SqliteDriver;
 
 /// Build the list of drivers this binary registers.
 #[must_use]
 pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
-    vec![Arc::new(PostgresDriver), Arc::new(SqliteDriver)]
+    vec![
+        Arc::new(PostgresDriver),
+        Arc::new(SqliteDriver),
+        Arc::new(MssqlDriver),
+    ]
 }
 
 /// Resolve `url`'s scheme to a registered driver and connect through it.
@@ -57,6 +62,10 @@ mod tests {
         assert!(
             ids.contains(&"sqlite"),
             "expected a registered sqlite driver: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"mssql"),
+            "expected a registered mssql driver: {ids:?}"
         );
     }
 

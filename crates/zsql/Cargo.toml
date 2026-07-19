@@ -17,6 +17,7 @@ zsql-core = { path = "../zsql-core" }
 # types (sqlx or otherwise) are named outside their own crates.
 zsql-postgres = { path = "../zsql-postgres" }
 zsql-sqlite = { path = "../zsql-sqlite" }
+zsql-mssql = { path = "../zsql-mssql" }
 zsql-ui = { path = "../zsql-ui" }
 zsql-editor = { path = "../zsql-editor" }
 anyhow = { workspace = true }

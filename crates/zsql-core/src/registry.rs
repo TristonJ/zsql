@@ -20,6 +20,7 @@ fn driver_id_for_scheme(scheme: &str) -> Option<&'static str> {
     match scheme {
         "postgres" | "postgresql" => Some("postgres"),
         "sqlite" | "file" => Some("sqlite"),
+        "mssql" | "sqlserver" => Some("mssql"),
         _ => None,
     }
 }
@@ -93,6 +94,7 @@ mod tests {
         vec![
             Arc::new(FakeDriver("postgres")),
             Arc::new(FakeDriver("sqlite")),
+            Arc::new(FakeDriver("mssql")),
         ]
     }
 
@@ -115,6 +117,15 @@ mod tests {
         ] {
             let driver = select_driver(&drivers, url).expect("scheme should resolve");
             assert_eq!(driver.id(), "sqlite");
+        }
+    }
+
+    #[test]
+    fn mssql_and_sqlserver_schemes_select_the_mssql_driver() {
+        let drivers = registry();
+        for url in ["mssql://user@host/db", "sqlserver://user@host/db"] {
+            let driver = select_driver(&drivers, url).expect("scheme should resolve");
+            assert_eq!(driver.id(), "mssql");
         }
     }
 

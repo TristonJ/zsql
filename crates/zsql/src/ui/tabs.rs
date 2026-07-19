@@ -4,10 +4,9 @@
 //! reopen until its buffer is manually edited), `Script` (a normal,
 //! freely-editable buffer), or `Schema` (a read-only structural view of a
 //! relation, never editable). Opening a generated tab, reusing one, and
-//! converting one to a script all drive `Session`/`ResultsView` and reuse
-//! `crate::sql::preview_sql`, which is why this lives in the binary's `ui`
-//! module rather than in `zsql-editor` (framework-agnostic) or `zsql-core`
-//! (driver-agnostic).
+//! converting one to a script all drive `Session`/`ResultsView`, which is
+//! why this lives in the binary's `ui` module rather than in `zsql-editor`
+//! (framework-agnostic) or `zsql-core` (driver-agnostic).
 
 use std::collections::HashMap;
 
@@ -19,7 +18,6 @@ use super::editor_adapter;
 use super::results::{ResultsSnapshot, ResultsView};
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
-use crate::sql::preview_sql;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 
 /// Identifies one open tab, stable for its lifetime and never reused within
@@ -39,14 +37,6 @@ pub enum TabKind {
     /// and constraints (see [`TabModel::open_or_reuse_schema`]). Never
     /// editable and never converts to `Script`.
     Schema { schema: String, relation: String },
-}
-
-/// The SQL text a `Generated` tab shows for `schema.relation`: exactly the
-/// text `Session::preview_relation` executes, so what a generated tab
-/// displays always matches what actually ran.
-#[must_use]
-pub fn generated_tab_sql(schema: &str, relation: &str, preview_limit: u64) -> String {
-    preview_sql(schema, relation, preview_limit)
 }
 
 /// Leading text of every title [`TabModel::new_script_tab`] mints, before
@@ -390,17 +380,16 @@ impl TabModel {
     }
 
     /// Open a `Generated` tab for `schema.relation` and make it active,
-    /// executing the same preview SQL text `Session::preview_relation`
-    /// itself builds from `preview_limit`. Reuses the relation's existing
-    /// live (never-edited) generated tab instead of creating a duplicate, if
-    /// one exists -- re-focusing it with whatever it last showed rather than
-    /// re-running the query, since a live generated tab's buffer (and thus
-    /// its SQL) cannot have changed since that run.
+    /// showing exactly the SQL text `Session::preview_relation` itself
+    /// executes for it. Reuses the relation's existing live (never-edited)
+    /// generated tab instead of creating a duplicate, if one exists --
+    /// re-focusing it with whatever it last showed rather than re-running
+    /// the query, since a live generated tab's buffer (and thus its SQL)
+    /// cannot have changed since that run.
     pub fn open_or_reuse_generated(
         &mut self,
         schema: &str,
         relation: &str,
-        preview_limit: u64,
         cx: &mut Context<Self>,
     ) -> TabId {
         let key = (schema.to_owned(), relation.to_owned());
@@ -412,7 +401,10 @@ impl TabModel {
 
         let id = self.allocate_id();
         let editor = Self::build_editor(id, cx);
-        let sql = generated_tab_sql(schema, relation, preview_limit);
+        // Read the exact text `preview_relation` (dispatched below) is about
+        // to execute, so the buffer a user sees can never drift from what
+        // actually runs.
+        let sql = self.session.read(cx).preview_sql(schema, relation);
         editor.update(cx, |editor, cx| {
             editor.set_text(&sql, cx);
             editor.set_compact(true);
@@ -756,7 +748,7 @@ mod tests {
         BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RowCount, SchemaTree,
     };
 
-    use super::{TabKind, TabModel, generated_tab_sql};
+    use super::{TabKind, TabModel};
     use crate::session::Session;
     use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
     use crate::ui::results::ResultsView;
@@ -861,7 +853,7 @@ mod tests {
 
         // Opening a generated preview tab fetches the relation's total row count.
         let id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 100, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         cx.run_until_parked();
         session.read_with(cx, |session, _cx| {
@@ -901,19 +893,107 @@ mod tests {
         (model, results)
     }
 
-    #[test]
-    fn generated_tab_sql_matches_preview_sql_unchanged() {
-        assert_eq!(
-            generated_tab_sql("public", "orders", 200),
-            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
-        );
+    #[gpui::test]
+    fn a_generated_tab_displays_the_shared_default_preview_form(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", cx);
+        });
+
+        model.read_with(cx, |model, app| {
+            assert_eq!(
+                model.tabs()[0].editor().read(app).text(),
+                "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+            );
+        });
+    }
+
+    /// A `Connection` double whose `preview_query` returns a form no dialect
+    /// this codebase ships actually emits, so a test asserting a generated
+    /// tab's displayed text against it can only pass if that text was truly
+    /// built from `Connection::preview_query` rather than a hardcoded
+    /// `LIMIT` string.
+    struct DialectRecordingConnection {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Connection for DialectRecordingConnection {
+        fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
+            self.queries
+                .lock()
+                .expect("queries lock poisoned")
+                .push(sql);
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            Ok(SchemaTree::default())
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            Ok(RowCount::Exact(0))
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
+        }
+
+        fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
+            format!("SELECT TOP ({limit}) * FROM [{schema}].[{relation}]")
+        }
+    }
+
+    /// The core of this fix: a generated tab's displayed buffer and the SQL
+    /// `Session::preview_relation` actually executes are built from the same
+    /// call, so they can never diverge -- including for a dialect (modeled
+    /// here by a connection whose `preview_query` looks nothing like the
+    /// default `LIMIT` form) where the two used to differ.
+    #[gpui::test]
+    fn a_generated_tabs_displayed_sql_matches_what_preview_relation_executes(
+        cx: &mut TestAppContext,
+    ) {
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection: Arc<dyn Connection> = Arc::new(DialectRecordingConnection {
+            queries: queries.clone(),
+        });
+        let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+        let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+        let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
+
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("dbo", "orders", cx);
+        });
+        cx.run_until_parked();
+
+        let displayed = model.read_with(cx, |model, app| {
+            model.active_tab().unwrap().editor().read(app).text()
+        });
+        let executed = queries
+            .lock()
+            .expect("queries lock poisoned")
+            .first()
+            .cloned()
+            .expect("opening a generated tab must dispatch exactly one query");
+
+        assert_eq!(displayed, executed);
+        assert_eq!(displayed, "SELECT TOP (200) * FROM [dbo].[orders]");
     }
 
     #[gpui::test]
     fn opening_a_relation_creates_one_generated_tab_and_activates_it(cx: &mut TestAppContext) {
         let model = build_model(cx);
         model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx);
+            model.open_or_reuse_generated("public", "orders", cx);
         });
 
         model.read_with(cx, |model, _app| {
@@ -936,7 +1016,7 @@ mod tests {
     fn reopening_the_same_relation_reuses_the_tab_instead_of_duplicating(cx: &mut TestAppContext) {
         let model = build_model(cx);
         let first_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         // Focus a different tab first so reopening has to actively
@@ -945,7 +1025,7 @@ mod tests {
             model.new_script_tab(cx);
         });
         let second_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         assert_eq!(first_id, second_id);
@@ -963,10 +1043,10 @@ mod tests {
     fn opening_two_different_relations_creates_two_generated_tabs(cx: &mut TestAppContext) {
         let model = build_model(cx);
         let orders_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let users_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "users", 200, cx)
+            model.open_or_reuse_generated("public", "users", cx)
         });
 
         assert_ne!(orders_id, users_id);
@@ -980,7 +1060,7 @@ mod tests {
     fn editing_a_generated_tab_converts_it_to_a_script_permanently(cx: &mut TestAppContext) {
         let model = build_model(cx);
         let id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
 
@@ -1001,13 +1081,13 @@ mod tests {
     ) {
         let model = build_model(cx);
         let first_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let first_editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
         first_editor.update(cx, |editor, cx| editor.insert_text_for_test("x", cx));
 
         let second_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         assert_ne!(first_id, second_id, "a converted tab must not be reused");
@@ -1045,7 +1125,7 @@ mod tests {
     ) {
         let model = build_model(cx);
         let id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
         let original_sql = editor.read_with(cx, |editor, _app| editor.text());
@@ -1142,12 +1222,12 @@ mod tests {
     fn closing_a_live_generated_tab_frees_its_relation_for_reuse(cx: &mut TestAppContext) {
         let model = build_model(cx);
         let first_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         model.update(cx, |model, cx| model.close_tab(first_id, cx));
         let second_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         assert_ne!(
@@ -1216,7 +1296,7 @@ mod tests {
     ) {
         let model = build_model(cx);
         let generated_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let schema_id = model.update(cx, |model, cx| {
             model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
@@ -1273,7 +1353,7 @@ mod tests {
     ) {
         let model = build_model(cx);
         let generated_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         let script_id = model.update(cx, TabModel::new_script_tab);
         let script_editor = model.read_with(cx, |model, _app| {
@@ -1337,7 +1417,7 @@ mod tests {
     ) {
         let (model, results) = build_model_with_results(cx);
         let id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         results.read_with(cx, |results, _app| {
@@ -1364,7 +1444,7 @@ mod tests {
     fn switching_to_a_tab_that_has_never_run_shows_an_empty_placeholder(cx: &mut TestAppContext) {
         let (model, results) = build_model_with_results(cx);
         model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         cx.run_until_parked();
 
@@ -1389,7 +1469,7 @@ mod tests {
     ) {
         let (model, results) = build_model_with_results(cx);
         let orders_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         cx.run_until_parked();
 
@@ -1406,7 +1486,7 @@ mod tests {
         });
 
         let reopened_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         assert_eq!(
@@ -1435,14 +1515,14 @@ mod tests {
         let (model, sinks) = build_model_with_recording_connection(cx);
 
         let orders_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         cx.run_until_parked();
 
         // Opening a second relation's generated tab dispatches its own run
         // before "orders"'s has reached a terminal state, superseding it.
         let users_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "users", 200, cx)
+            model.open_or_reuse_generated("public", "users", cx)
         });
         cx.run_until_parked();
 
@@ -1534,7 +1614,7 @@ mod tests {
     ) {
         let model = build_model(cx);
         model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx);
+            model.open_or_reuse_generated("public", "orders", cx);
         });
         let script_id = model.update(cx, TabModel::new_script_tab);
         let editor = model.read_with(cx, |model, _app| {
@@ -1713,7 +1793,7 @@ mod tests {
         let restored_id = model.read_with(cx, |model, _app| model.tabs()[0].id());
 
         let reused_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
 
         assert_eq!(
@@ -1767,7 +1847,7 @@ mod tests {
         // A restored, edited tab's relation must not have been registered
         // for live reuse: reopening it must create a fresh generated tab.
         let new_id = model.update(cx, |model, cx| {
-            model.open_or_reuse_generated("public", "orders", 200, cx)
+            model.open_or_reuse_generated("public", "orders", cx)
         });
         model.read_with(cx, |model, _app| {
             assert_eq!(model.tabs().len(), 2);

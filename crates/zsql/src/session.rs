@@ -78,7 +78,7 @@ pub struct Session {
     schema: SchemaState,
     /// Bumped every time `schema` is reassigned (see [`Session::set_schema`]).
     schema_generation: u64,
-    /// `LIMIT` applied to [`Session::preview_relation`]'s generated query
+    /// Row limit applied to [`Session::preview_relation`]'s generated query.
     preview_limit: u64,
     /// Upper bound on rows accumulated for the query currently streaming,
     /// from [`Config::query`]. Reaching this many rows cancels the query and
@@ -200,11 +200,24 @@ impl Session {
         self.schema_generation
     }
 
-    /// The `LIMIT` [`Session::preview_relation`] applies to a relation
-    /// preview, from [`Config::query`]'s `preview_limit`.
+    /// The click-to-preview SQL for `schema.relation`, in the active
+    /// connection's dialect and capped at the configured preview row limit
+    /// (from [`Config::query`]'s `preview_limit`). When there is no active
+    /// connection (before the first successful connect, or after a connection
+    /// switch fails), falls back to [`zsql_core::default_preview_query`], so
+    /// a caller that wants to show (but not yet run) a preview never has to
+    /// special-case the disconnected state.
+    ///
+    /// This is the single source of the preview query's text: both
+    /// [`Session::preview_relation`] (what actually executes) and the
+    /// generated tab's displayed buffer are built from it, so the two can
+    /// never diverge.
     #[must_use]
-    pub fn preview_limit(&self) -> u64 {
-        self.preview_limit
+    pub fn preview_sql(&self, schema: &str, relation: &str) -> String {
+        self.connection.as_ref().map_or_else(
+            || zsql_core::default_preview_query(schema, relation, self.preview_limit),
+            |connection| connection.preview_query(schema, relation, self.preview_limit),
+        )
     }
 
     /// Replace `schema` and bump [`Session::schema_generation`]
@@ -471,9 +484,10 @@ impl Session {
         })
     }
 
-    /// Preview a relation's rows: `SELECT * FROM "<schema>"."<relation>"
-    /// LIMIT <configured preview limit>`, and separately fetch the
-    /// relation's total row count via [`Connection::count_rows`].
+    /// Preview a relation's rows via [`Session::preview_sql`] (capped at the
+    /// configured preview limit, in the active connection's dialect), and
+    /// separately fetch the relation's total row count via
+    /// [`Connection::count_rows`].
     ///
     /// The count fetch runs as its own task, started here alongside (not
     /// sequenced before) the streaming preview `run_query` kicks off, so a
@@ -490,7 +504,7 @@ impl Session {
         relation: &str,
         cx: &mut Context<Self>,
     ) -> Task<()> {
-        let sql = crate::sql::preview_sql(schema, relation, self.preview_limit);
+        let sql = self.preview_sql(schema, relation);
         let preview_task = self.run_query(sql, cx);
 
         if let Some(connection) = self.connection.clone() {
@@ -848,6 +862,15 @@ mod tests {
     fn new_session_with_no_dsn_starts_empty() {
         let session = session_with_no_dsn();
         assert!(matches!(session.state(), SessionState::Empty));
+    }
+
+    #[test]
+    fn preview_sql_with_no_connection_falls_back_to_the_shared_default_form() {
+        let session = session_with_no_dsn();
+        assert_eq!(
+            session.preview_sql("public", "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
     }
 
     #[test]
@@ -1510,6 +1533,79 @@ mod gpui_tests {
         ) -> Result<zsql_core::RelationSchema, CoreError> {
             Ok(zsql_core::RelationSchema::default())
         }
+    }
+
+    /// A `Connection` double whose `preview_query` returns a form no dialect
+    /// this codebase ships actually emits, so a test asserting on it can only
+    /// pass if `Session` really dispatches through `Connection::preview_query`
+    /// rather than a hardcoded string of its own.
+    struct DialectStubConnection {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for DialectStubConnection {
+        fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
+            self.queries
+                .lock()
+                .expect("queries lock poisoned")
+                .push(sql);
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            Ok(SchemaTree::default())
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            Ok(RowCount::Exact(0))
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
+        }
+
+        fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
+            format!("SELECT TOP ({limit}) * FROM [{schema}].[{relation}]")
+        }
+    }
+
+    #[gpui::test]
+    fn preview_relation_executes_the_active_connections_own_dialect(cx: &mut TestAppContext) {
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection = DialectStubConnection {
+            queries: queries.clone(),
+        };
+
+        let session = cx.new(|_cx| {
+            let mut session = Session::new(&Config::default());
+            session.connection = Some(Arc::new(connection));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| {
+                session.preview_relation("dbo", "orders", cx)
+            })
+            .detach();
+        cx.run_until_parked();
+
+        let recorded = queries.lock().expect("queries lock poisoned");
+        assert_eq!(
+            recorded.as_slice(),
+            ["SELECT TOP (200) * FROM [dbo].[orders]"],
+            "preview_relation must execute whatever the active connection's own \
+             preview_query builds, not a hardcoded LIMIT form"
+        );
     }
 
     #[gpui::test]

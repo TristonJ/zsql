@@ -21,5 +21,5 @@ pub use schema_detail::{
     ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, IndexInfo, KeyBadge,
     RelationSchema,
 };
-pub use sql::quote_ident;
+pub use sql::{default_preview_query, quote_ident};
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

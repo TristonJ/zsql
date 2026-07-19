@@ -1100,7 +1100,7 @@ mod render_tests {
 
         let generated_id = workspace.update(vcx, |workspace, cx| {
             workspace.tabs.update(cx, |tabs, cx| {
-                let generated_id = tabs.open_or_reuse_generated("public", "orders", 200, cx);
+                let generated_id = tabs.open_or_reuse_generated("public", "orders", cx);
                 tabs.new_script_tab(cx);
                 generated_id
             })
@@ -1154,7 +1154,7 @@ mod render_tests {
 
         let (converted_id, editor) = workspace.update(vcx, |workspace, cx| {
             workspace.tabs.update(cx, |tabs, cx| {
-                let id = tabs.open_or_reuse_generated("public", "orders", 200, cx);
+                let id = tabs.open_or_reuse_generated("public", "orders", cx);
                 let editor = tabs
                     .tabs()
                     .iter()
@@ -1517,7 +1517,6 @@ mod header_tests {
     use crate::config::LayoutConfig;
     use crate::connections::ConnectionStore;
     use crate::session::Session;
-    use crate::ui::tabs::generated_tab_sql;
 
     /// A `Connection` double that records every SQL string `stream_query` is
     /// called with, in place of a real session/database, so a test can
@@ -1629,7 +1628,7 @@ mod header_tests {
 
         workspace.update(vcx, |workspace, cx| {
             workspace.tabs.update(cx, |tabs, cx| {
-                tabs.open_or_reuse_generated("public", "orders", 200, cx);
+                tabs.open_or_reuse_generated("public", "orders", cx);
             });
         });
         vcx.run_until_parked();
@@ -1642,7 +1641,7 @@ mod header_tests {
 
         assert_eq!(
             queries.lock().expect("queries lock poisoned").as_slice(),
-            [generated_tab_sql("public", "orders", 200)],
+            ["SELECT * FROM \"public\".\"orders\" LIMIT 200"],
             "the header's Run button must dispatch the active generated tab's SQL"
         );
     }
@@ -1667,7 +1666,7 @@ mod header_tests {
 
         workspace.update(vcx, |workspace, cx| {
             workspace.tabs.update(cx, |tabs, cx| {
-                tabs.open_or_reuse_generated("public", "orders", 200, cx);
+                tabs.open_or_reuse_generated("public", "orders", cx);
             });
         });
         vcx.run_until_parked();
