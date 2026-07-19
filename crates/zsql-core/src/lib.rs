@@ -7,6 +7,7 @@ pub mod error;
 pub mod registry;
 pub mod row_count;
 pub mod schema;
+pub mod schema_detail;
 pub mod sql;
 pub mod value;
 
@@ -16,5 +17,9 @@ pub use error::CoreError;
 pub use registry::select_driver;
 pub use row_count::{ESTIMATE_MARKER, RowCount};
 pub use schema::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
+pub use schema_detail::{
+    ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, IndexInfo, KeyBadge,
+    RelationSchema,
+};
 pub use sql::quote_ident;
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

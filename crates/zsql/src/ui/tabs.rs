@@ -1,8 +1,9 @@
 //! The editor tab model: an ordered set of tabs, each owning its own
 //! `zsql_editor::EditorView` buffer independently of any other tab's. A tab
-//! is either `Generated` (auto-preview SQL for a clicked relation, reused on
-//! reopen until its buffer is manually edited) or `Script` (a normal,
-//! freely-editable buffer). Opening a generated tab, reusing one, and
+//! is `Generated` (auto-preview SQL for a clicked relation, reused on
+//! reopen until its buffer is manually edited), `Script` (a normal,
+//! freely-editable buffer), or `Schema` (a read-only structural view of a
+//! relation, never editable). Opening a generated tab, reusing one, and
 //! converting one to a script all drive `Session`/`ResultsView` and reuse
 //! `crate::sql::preview_sql`, which is why this lives in the binary's `ui`
 //! module rather than in `zsql-editor` (framework-agnostic) or `zsql-core`
@@ -11,10 +12,12 @@
 use std::collections::HashMap;
 
 use gpui::{AppContext as _, Context, Entity, SharedString, Task};
+use zsql_core::RelationKind;
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
 use super::results::{ResultsSnapshot, ResultsView};
+use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
 use crate::sql::preview_sql;
 
@@ -31,6 +34,10 @@ pub enum TabKind {
     Generated { schema: String, relation: String },
     /// A normal, freely-editable script buffer.
     Script,
+    /// A read-only structural view of `schema.relation`'s columns, indexes,
+    /// and constraints (see [`TabModel::open_or_reuse_schema`]). Never
+    /// editable and never converts to `Script`.
+    Schema { schema: String, relation: String },
 }
 
 /// The SQL text a `Generated` tab shows for `schema.relation`: exactly the
@@ -64,6 +71,9 @@ pub struct Tab {
     /// each tab's own last results rather than whichever tab ran most
     /// recently. `None` for a tab that has never run.
     last_run: Option<ResultsSnapshot>,
+    /// The read-only schema view for a `Schema` tab; `None` for every other
+    /// kind.
+    schema_view: Option<Entity<SchemaTabView>>,
 }
 
 impl Tab {
@@ -96,6 +106,18 @@ impl Tab {
     pub fn is_generated(&self) -> bool {
         matches!(self.kind, TabKind::Generated { .. })
     }
+
+    #[must_use]
+    pub fn is_schema(&self) -> bool {
+        matches!(self.kind, TabKind::Schema { .. })
+    }
+
+    /// This tab's schema view, for a `Schema` tab. `None` for every other
+    /// kind.
+    #[must_use]
+    pub fn schema_view(&self) -> Option<&Entity<SchemaTabView>> {
+        self.schema_view.as_ref()
+    }
 }
 
 /// Test-only accessor for asserting on a tab's captured run.
@@ -111,7 +133,9 @@ impl Tab {
 /// shares (matching `editor_adapter`'s label for a plain, ungenerated run).
 fn display_label(tab: &Tab) -> String {
     match &tab.kind {
-        TabKind::Generated { schema, relation } => format!("{schema}.{relation}"),
+        TabKind::Generated { schema, relation } | TabKind::Schema { schema, relation } => {
+            format!("{schema}.{relation}")
+        }
         TabKind::Script => "query".to_owned(),
     }
 }
@@ -126,6 +150,10 @@ pub struct TabModel {
     /// later click on the same relation always opens a fresh tab instead of
     /// re-focusing stale, already-edited state.
     generated_by_relation: HashMap<(String, String), TabId>,
+    /// Maps a relation to its already-open `Schema` tab. An entry is
+    /// removed only when that tab closes: a `Schema` tab has no edit path,
+    /// so (unlike `generated_by_relation`) nothing else ever invalidates it.
+    schema_by_relation: HashMap<(String, String), TabId>,
     next_id: TabId,
     /// Numbers successive `query-N.sql` titles for tabs opened via
     /// [`TabModel::new_script_tab`], starting at 1 and never reused.
@@ -156,6 +184,7 @@ impl TabModel {
             tabs: Vec::new(),
             active: None,
             generated_by_relation: HashMap::new(),
+            schema_by_relation: HashMap::new(),
             next_id: 0,
             next_script_number: 1,
             live_owner: None,
@@ -227,7 +256,11 @@ impl TabModel {
     /// Point `results` at the active tab's own state: live if it is the
     /// tab `session` is currently running a query for, else its captured
     /// `last_run` snapshot, else an empty "never run" placeholder. A no-op
-    /// when no tab is active (every tab has been closed).
+    /// when no tab is active (every tab has been closed) or the active tab
+    /// is a `Schema` tab: a schema tab renders its own view in place of the
+    /// shared results grid entirely (see `ui::workspace`), so `results`
+    /// is simply left showing whatever it last held, restored correctly the
+    /// next time a non-`Schema` tab becomes active.
     fn sync_results_to_active(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active else {
             return;
@@ -235,6 +268,9 @@ impl TabModel {
         let Some(tab) = self.tab(id) else {
             return;
         };
+        if tab.is_schema() {
+            return;
+        }
         let label = SharedString::from(display_label(tab));
 
         if self.live_owner == Some(id) {
@@ -363,6 +399,7 @@ impl TabModel {
             editor,
             dirty: false,
             last_run: None,
+            schema_view: None,
         });
         self.generated_by_relation.insert(key, id);
         self.active = Some(id);
@@ -393,6 +430,7 @@ impl TabModel {
             editor,
             dirty: false,
             last_run: None,
+            schema_view: None,
         });
         self.active = Some(id);
         self.sync_results_to_active(cx);
@@ -400,20 +438,81 @@ impl TabModel {
         id
     }
 
+    /// Open (or, if `schema.relation` already has one open, reuse/activate)
+    /// a read-only `Schema` tab for `schema.relation` and make it active.
+    /// `kind` is the relation's [`RelationKind`], shown in the tab's header
+    /// kind pill. The tab dispatches its own `describe_relation` (and
+    /// row-count) fetches independently of `session`'s shared
+    /// query-lifecycle state -- see [`SchemaTabView::new`].
+    pub fn open_or_reuse_schema(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        kind: RelationKind,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let key = (schema.to_owned(), relation.to_owned());
+        if let Some(&id) = self.schema_by_relation.get(&key) {
+            tracing::info!(tab_id = id, schema, relation, "reusing open schema tab");
+            self.set_active(id, cx);
+            return id;
+        }
+
+        let id = self.allocate_id();
+        // A schema tab has no editable buffer: this editor is built for
+        // uniformity with every other tab kind (e.g. `Tab::editor` stays
+        // infallible) but is never rendered or focused for a `Schema` tab,
+        // so its `RunQuery`/edit wiring is simply never triggered.
+        let editor = Self::build_editor(id, cx);
+        let session = self.session.clone();
+        let schema_view = cx.new(|cx| {
+            SchemaTabView::new(&session, schema.to_owned(), relation.to_owned(), kind, cx)
+        });
+
+        self.tabs.push(Tab {
+            id,
+            kind: TabKind::Schema {
+                schema: schema.to_owned(),
+                relation: relation.to_owned(),
+            },
+            title: relation.to_owned(),
+            editor,
+            dirty: false,
+            last_run: None,
+            schema_view: Some(schema_view),
+        });
+        self.schema_by_relation.insert(key, id);
+        self.active = Some(id);
+        self.sync_results_to_active(cx);
+
+        tracing::info!(tab_id = id, schema, relation, "opened schema tab");
+        cx.notify();
+        id
+    }
+
     /// Close `id`, dropping its editor. Updates the active tab to a
     /// neighboring tab if `id` was active (or clears it if `id` was the last
-    /// tab), and, if `id` was a live generated tab, removes it from the
-    /// relation reuse map.
+    /// tab), and, if `id` was a live generated tab or an open schema tab,
+    /// removes it from the corresponding relation reuse map.
     pub fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
         let closed = self.tabs.remove(index);
-        if let TabKind::Generated { schema, relation } = &closed.kind {
-            let key = (schema.clone(), relation.clone());
-            if self.generated_by_relation.get(&key) == Some(&id) {
-                self.generated_by_relation.remove(&key);
+        match &closed.kind {
+            TabKind::Generated { schema, relation } => {
+                let key = (schema.clone(), relation.clone());
+                if self.generated_by_relation.get(&key) == Some(&id) {
+                    self.generated_by_relation.remove(&key);
+                }
             }
+            TabKind::Schema { schema, relation } => {
+                let key = (schema.clone(), relation.clone());
+                if self.schema_by_relation.get(&key) == Some(&id) {
+                    self.schema_by_relation.remove(&key);
+                }
+            }
+            TabKind::Script => {}
         }
         if self.live_owner == Some(id) {
             self.live_owner = None;
@@ -509,6 +608,14 @@ mod tests {
         async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
+        }
     }
 
     /// A `Connection` double that hands back every `stream_query` call's
@@ -537,6 +644,14 @@ mod tests {
 
         async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
         }
     }
 
@@ -865,6 +980,114 @@ mod tests {
         );
         model.read_with(cx, |model, _app| {
             assert_eq!(model.tabs().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn opening_a_relation_schema_creates_one_schema_tab_and_activates_it(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx);
+        });
+
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.tabs().len(), 1);
+            let tab = &model.tabs()[0];
+            assert_eq!(
+                tab.kind(),
+                &TabKind::Schema {
+                    schema: "public".to_owned(),
+                    relation: "orders".to_owned()
+                }
+            );
+            assert_eq!(tab.title(), "orders");
+            assert!(!tab.dirty(), "a schema tab is never dirty");
+            assert!(tab.schema_view().is_some());
+            assert_eq!(model.active_id(), Some(tab.id()));
+        });
+    }
+
+    #[gpui::test]
+    fn reopening_the_same_relation_schema_reuses_the_tab_instead_of_duplicating(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        let first_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+        });
+
+        model.update(cx, |model, cx| {
+            model.new_script_tab(cx);
+        });
+        let second_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+        });
+
+        assert_eq!(first_id, second_id);
+        model.read_with(cx, |model, _app| {
+            assert_eq!(
+                model.tabs().len(),
+                2,
+                "reopening must not create a duplicate schema tab"
+            );
+            assert_eq!(model.active_id(), Some(first_id));
+        });
+    }
+
+    #[gpui::test]
+    fn opening_a_relation_schema_and_a_relation_preview_creates_two_distinct_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model(cx);
+        let generated_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", 200, cx)
+        });
+        let schema_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+        });
+
+        assert_ne!(generated_id, schema_id);
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.tabs().len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn closing_an_open_schema_tab_frees_its_relation_for_reuse(cx: &mut TestAppContext) {
+        let model = build_model(cx);
+        let first_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+        });
+
+        model.update(cx, |model, cx| model.close_tab(first_id, cx));
+        let second_id = model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+        });
+
+        assert_ne!(
+            first_id, second_id,
+            "the relation's schema-tab map entry must have been freed by closing its tab"
+        );
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.tabs().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn opening_a_second_schema_tab_while_the_first_describe_is_in_flight_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        let model = build_model_with_recording_connection(cx).0;
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx);
+        });
+        model.update(cx, |model, cx| {
+            model.open_or_reuse_schema("public", "users", zsql_core::RelationKind::Table, cx);
+        });
+        cx.run_until_parked();
+
+        model.read_with(cx, |model, _app| {
+            assert_eq!(model.tabs().len(), 2);
         });
     }
 

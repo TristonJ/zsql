@@ -111,12 +111,15 @@ impl WorkspaceView {
     }
 
     /// The active tab's editor focus handle, so the app can focus it on
-    /// startup. `None` only when every tab has been closed.
+    /// startup or after a tab switch. `None` when every tab has been closed,
+    /// or when the active tab is a read-only Schema tab, whose editor is
+    /// never rendered and so must not receive keyboard focus.
     #[must_use]
     pub fn editor_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
         self.tabs
             .read(cx)
             .active_tab()
+            .filter(|tab| !tab.is_schema())
             .map(|tab| tab.editor().focus_handle(cx))
     }
 
@@ -301,6 +304,19 @@ impl WorkspaceView {
                 }
                 shell
             }
+            TabKind::Schema { .. } => {
+                shell = shell
+                    .child(icon(
+                        IconName::Table,
+                        px(theme::TAB_ICON_TEXT_SIZE),
+                        colors::TEAL,
+                    ))
+                    .child(div().child(tab.title().to_owned()));
+                if active {
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid());
+                }
+                shell
+            }
         };
 
         shell
@@ -387,7 +403,8 @@ impl WorkspaceView {
     /// The active tab's editor body: a compact, teal-tinted strip for a
     /// live `Generated` tab, or the full-height editor pane for a `Script`
     /// tab (including a converted-from-generated one). Renders nothing when
-    /// every tab has been closed.
+    /// every tab has been closed. Never called for an active `Schema` tab --
+    /// see [`Self::render_main_pane`].
     fn render_active_body(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let Some(active) = self.tabs.read(cx).active_tab() else {
             return div().flex_shrink_0().into_any_element();
@@ -403,6 +420,50 @@ impl WorkspaceView {
                 .child(active.editor().clone())
                 .into_any_element()
         }
+    }
+
+    /// Everything below the tab bar: for an active `Schema` tab, its
+    /// read-only structural view alone, filling all remaining space (no
+    /// editor pane, divider, or shared results grid); for every other
+    /// active tab (or none), the normal editor body, the resizable
+    /// editor/results divider, and the shared results grid.
+    fn render_main_pane(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+        if let Some(active) = self.tabs.read(cx).active_tab()
+            && let Some(schema_view) = active.schema_view()
+        {
+            // A schema tab is read-only and carries its own header meta strip,
+            // so the shared editor header (with its Run button) is deliberately
+            // omitted; the schema view fills the whole pane below the tab bar.
+            return vec![
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(schema_view.clone())
+                    .into_any_element(),
+            ];
+        }
+
+        vec![
+            Self::render_header(cx).into_any_element(),
+            self.render_active_body(cx),
+            div()
+                .id("editor-results-divider")
+                .flex_shrink_0()
+                .w_full()
+                .h(self.layout.divider_thickness)
+                .cursor(CursorStyle::ResizeUpDown)
+                .bg(rgb(colors::LINE))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::start_editor_results_drag),
+                )
+                .into_any_element(),
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(self.results.clone())
+                .into_any_element(),
+        ]
     }
 
     /// The compact, single-line SQL strip a live `Generated` tab renders
@@ -550,22 +611,7 @@ impl Render for WorkspaceView {
                                 .inset_0(),
                             )
                             .child(self.render_tab_bar(cx))
-                            .child(Self::render_header(cx))
-                            .child(self.render_active_body(cx))
-                            .child(
-                                div()
-                                    .id("editor-results-divider")
-                                    .flex_shrink_0()
-                                    .w_full()
-                                    .h(divider_thickness)
-                                    .cursor(CursorStyle::ResizeUpDown)
-                                    .bg(rgb(colors::LINE))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(Self::start_editor_results_drag),
-                                    ),
-                            )
-                            .child(div().flex_1().min_h_0().child(self.results.clone())),
+                            .children(self.render_main_pane(cx)),
                     ),
             )
             .when(modal_open, |el| el.child(self.connections.clone()))
@@ -767,6 +813,37 @@ mod render_tests {
         let session = sample_schema_session(cx);
         cx.add_window_view(|_window, cx| {
             WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+    }
+
+    /// Renders an active `Schema` tab: its own read-only structural view
+    /// fills the pane in place of the editor, divider, and shared results
+    /// grid.
+    #[gpui::test]
+    fn renders_an_active_schema_tab_without_panicking(cx: &mut gpui::TestAppContext) {
+        let session = sample_schema_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.open_or_reuse_schema("public", "orders", RelationKind::Table, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            let active = tabs.active_tab().expect("a schema tab is active");
+            assert!(active.is_schema());
+            assert!(active.schema_view().is_some());
+            // A schema tab's editor is never rendered, so it must not be
+            // offered up for keyboard focus.
+            assert!(
+                workspace.editor_focus_handle(cx).is_none(),
+                "a read-only schema tab must not expose an editor focus handle"
+            );
         });
     }
 

@@ -9,8 +9,8 @@ use futures::StreamExt as _;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RowBatch,
-    RowCount, SchemaTree, quote_ident,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
+    RowBatch, RowCount, SchemaTree, quote_ident,
 };
 
 use crate::error::{map_connect_error, map_query_error};
@@ -250,6 +250,19 @@ impl Connection for PgConnection {
         }
         let exact = exact_row_count(&self.pool, schema, relation).await?;
         Ok(RowCount::Exact(exact))
+    }
+
+    #[tracing::instrument(
+        name = "pg_describe_relation",
+        skip(self),
+        fields(pool_size = self.pool.size())
+    )]
+    async fn describe_relation(
+        &self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<RelationSchema, CoreError> {
+        crate::describe::describe_relation(&self.pool, schema, relation).await
     }
 }
 
@@ -1575,6 +1588,184 @@ mod tests {
             Err(other) => panic!("expected CoreError::Query, got {other:?}"),
             Ok(row_count) => {
                 panic!("counting a nonexistent relation must fail, got {row_count:?}")
+            }
+        }
+    }
+
+    /// Table names [`seed_describe_relation_tables`] creates: a referenced
+    /// parent table and the described child table.
+    const DESCRIBE_RELATION_PARENTS_TABLE: &str = "zsql_test_describe_parents";
+    const DESCRIBE_RELATION_CHILDREN_TABLE: &str = "zsql_test_describe_children";
+
+    /// Seeds a self-contained pair of tables (a referenced parents table and
+    /// the described children table) with a primary key, a foreign key, a
+    /// named non-PK unique index, and a check constraint. Ad hoc DDL run
+    /// through `conn` rather than `dev/seed.sql`, so a test using this owns
+    /// and cleans up its own tables independently of the shared dev seed.
+    fn seed_describe_relation_tables(conn: &dyn zsql_core::Connection) {
+        let parents = DESCRIBE_RELATION_PARENTS_TABLE;
+        let children = DESCRIBE_RELATION_CHILDREN_TABLE;
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {children}"));
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {parents}"));
+        run_ddl(
+            conn,
+            &format!("CREATE TABLE {parents} (id bigserial PRIMARY KEY)"),
+        );
+        run_ddl(
+            conn,
+            &format!(
+                "CREATE TABLE {children} (\
+                     id bigserial PRIMARY KEY, \
+                     parent_id bigint NOT NULL REFERENCES {parents} (id), \
+                     code text NOT NULL, \
+                     total integer NOT NULL DEFAULT 0, \
+                     label text NOT NULL DEFAULT 'pending', \
+                     CONSTRAINT zsql_test_describe_children_total_check CHECK (total >= 0)\
+                 )"
+            ),
+        );
+        run_ddl(
+            conn,
+            &format!(
+                "CREATE UNIQUE INDEX zsql_test_describe_children_code_idx ON {children} (code)"
+            ),
+        );
+    }
+
+    /// Drops the tables [`seed_describe_relation_tables`] created.
+    fn drop_describe_relation_tables(conn: &dyn zsql_core::Connection) {
+        run_ddl(
+            conn,
+            &format!("DROP TABLE {DESCRIBE_RELATION_CHILDREN_TABLE}"),
+        );
+        run_ddl(
+            conn,
+            &format!("DROP TABLE {DESCRIBE_RELATION_PARENTS_TABLE}"),
+        );
+    }
+
+    #[test]
+    fn describe_relation_reports_columns_indexes_and_constraints_when_configured() {
+        let Some(url) = live_database_url() else {
+            return;
+        };
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let parents = DESCRIBE_RELATION_PARENTS_TABLE;
+        let children = DESCRIBE_RELATION_CHILDREN_TABLE;
+        seed_describe_relation_tables(&*conn);
+
+        let detail = block_on(conn.describe_relation("public", children))
+            .expect("describe_relation must succeed against the live database");
+        tracing::info!(
+            columns = detail.columns.len(),
+            indexes = detail.indexes.len(),
+            constraints = detail.constraints.len(),
+            "describe_relation_reports_columns_indexes_and_constraints_when_configured \
+             executed against the live database"
+        );
+
+        let id = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .expect("id column is present");
+        assert!(id.is_primary_key, "id must be flagged as the primary key");
+        assert!(!id.nullable);
+
+        let parent_id = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "parent_id")
+            .expect("parent_id column is present");
+        let fk = parent_id
+            .foreign_key
+            .as_ref()
+            .expect("parent_id must carry a foreign key");
+        assert_eq!(fk.schema, "public");
+        assert_eq!(fk.table, parents);
+        assert_eq!(fk.columns, vec!["id".to_owned()]);
+
+        let code = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "code")
+            .expect("code column is present");
+        assert!(
+            code.is_unique,
+            "code must be flagged unique via its single-column unique index"
+        );
+
+        let total = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "total")
+            .expect("total column is present");
+        assert_eq!(total.default.as_deref(), Some("0"));
+
+        let label = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "label")
+            .expect("label column is present");
+        assert_eq!(label.default.as_deref(), Some("'pending'::text"));
+
+        let code_index = detail
+            .indexes
+            .iter()
+            .find(|idx| idx.name == "zsql_test_describe_children_code_idx")
+            .expect("the named unique index is present");
+        assert_eq!(code_index.method, "btree");
+        assert!(code_index.unique);
+
+        let check = detail
+            .constraints
+            .iter()
+            .find(|c| c.name == "zsql_test_describe_children_total_check")
+            .expect("the check constraint is present");
+        assert_eq!(check.kind, zsql_core::ConstraintKind::Check);
+        assert!(check.definition.contains("total"));
+
+        let fk_constraint = detail
+            .constraints
+            .iter()
+            .find(|c| c.kind == zsql_core::ConstraintKind::ForeignKey)
+            .expect("the foreign key constraint is present");
+        assert!(fk_constraint.definition.contains(parents));
+
+        let pk_constraint = detail
+            .constraints
+            .iter()
+            .find(|c| c.kind == zsql_core::ConstraintKind::PrimaryKey)
+            .expect("the primary key constraint is present");
+        assert!(pk_constraint.definition.contains("id"));
+
+        drop_describe_relation_tables(&*conn);
+    }
+
+    #[test]
+    fn describe_relation_errors_for_a_relation_that_does_not_exist_when_configured() {
+        let Some(conn) = live_connection() else {
+            return;
+        };
+
+        let result = block_on(
+            conn.describe_relation("public", "zsql_test_relation_that_does_not_exist_either"),
+        );
+        tracing::info!(
+            ?result,
+            "describe_relation_errors_for_a_relation_that_does_not_exist_when_configured \
+             executed against the live database"
+        );
+
+        match result {
+            Err(zsql_core::CoreError::Introspection(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
+            Ok(detail) => {
+                panic!("describing a nonexistent relation must fail, got {detail:?}")
             }
         }
     }

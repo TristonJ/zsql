@@ -170,3 +170,113 @@ pub const MODAL_ADD_ICON_SIZE: Pixels = px(12.0);
 /// `group_hover` tint, so hovering anywhere in the row -- not just the
 /// icon's own small hitbox -- lightens the close glyph.
 pub const MODAL_CLOSE_HOVER_GROUP: &str = "connection-modal-close-hover";
+
+// ---- schema tab / view -----------------------------------------------
+
+/// Width of a right-click context menu.
+pub const CONTEXT_MENU_WIDTH: Pixels = px(210.0);
+/// Padding around a context menu's items.
+pub const CONTEXT_MENU_PADDING: Pixels = px(5.0);
+/// Corner radius of a context menu.
+pub const CONTEXT_MENU_RADIUS: f32 = 8.0;
+/// Height of one context menu item.
+pub const CONTEXT_MENU_ITEM_HEIGHT: Pixels = px(28.0);
+/// Horizontal padding inside a context menu item.
+pub const CONTEXT_MENU_ITEM_PADDING_X: Pixels = px(9.0);
+/// Corner radius of a context menu item.
+pub const CONTEXT_MENU_ITEM_RADIUS: f32 = 5.0;
+/// Text size of a context menu item's label.
+pub const CONTEXT_MENU_ITEM_TEXT_SIZE: f32 = 12.0;
+/// Height of a context menu's separator line.
+pub const CONTEXT_MENU_SEPARATOR_HEIGHT: Pixels = px(1.0);
+/// Vertical margin around a context menu separator.
+pub const CONTEXT_MENU_SEPARATOR_MARGIN_Y: Pixels = px(5.0);
+
+/// Padding around the schema tab's header meta strip.
+pub const SCHEMA_HEAD_PADDING_X: Pixels = px(16.0);
+/// Top padding of the schema tab's header meta strip.
+pub const SCHEMA_HEAD_PADDING_TOP: Pixels = px(13.0);
+/// Bottom padding of the schema tab's header meta strip.
+pub const SCHEMA_HEAD_PADDING_BOTTOM: Pixels = px(12.0);
+/// Text size of the schema tab's structure icon and qualified-name title.
+pub const SCHEMA_TITLE_TEXT_SIZE: f32 = 15.0;
+/// Text size of the schema tab's kind pill (e.g. "TABLE").
+pub const SCHEMA_KIND_PILL_TEXT_SIZE: f32 = 9.5;
+/// Border color of the schema tab's kind pill: teal at ~30% alpha.
+pub const SCHEMA_KIND_PILL_BORDER: u32 = 0x33_c2_ac_4d;
+/// Corner radius of the schema tab's kind pill.
+pub const SCHEMA_KIND_PILL_RADIUS: f32 = 4.0;
+/// Horizontal padding inside the schema tab's kind pill.
+pub const SCHEMA_KIND_PILL_PADDING_X: Pixels = px(6.0);
+/// Text size of the schema tab's header stat counts.
+pub const SCHEMA_STATS_TEXT_SIZE: f32 = 11.0;
+/// Horizontal gap between the schema tab's header stat counts.
+pub const SCHEMA_STATS_GAP: Pixels = px(18.0);
+
+/// Padding around the schema tab's scrollable body.
+pub const SCHEMA_SCROLL_PADDING: Pixels = px(16.0);
+/// Vertical gap between the schema tab's Columns/Indexes/Constraints
+/// sections.
+pub const SCHEMA_SECTION_GAP: Pixels = px(20.0);
+/// Text size of a section label (e.g. "Columns").
+pub const SCHEMA_SECTION_LABEL_TEXT_SIZE: f32 = 10.5;
+/// Bottom margin under a section label, above its table.
+pub const SCHEMA_SECTION_LABEL_MARGIN_BOTTOM: Pixels = px(8.0);
+/// Corner radius of a section label's trailing count pill.
+pub const SCHEMA_SECTION_COUNT_PILL_RADIUS: f32 = 20.0;
+/// Horizontal padding inside a section label's trailing count pill.
+pub const SCHEMA_SECTION_COUNT_PILL_PADDING_X: Pixels = px(7.0);
+/// Corner radius of one of the schema view's tables.
+pub const SCHEMA_TABLE_RADIUS: f32 = 8.0;
+
+/// Width of a column row's left key-rail tick.
+pub const SCHEMA_RAIL_WIDTH: Pixels = px(3.0);
+/// Text size of a Keys-cell badge or link chip.
+pub const SCHEMA_BADGE_TEXT_SIZE: f32 = 9.5;
+/// Horizontal padding inside a Keys-cell badge or link chip.
+pub const SCHEMA_BADGE_PADDING_X: Pixels = px(6.0);
+/// Corner radius of a Keys-cell badge or link chip.
+pub const SCHEMA_BADGE_RADIUS: f32 = 4.0;
+/// Border color of the primary-key badge: teal at ~32% alpha.
+pub const SCHEMA_BADGE_PK_BORDER: u32 = 0x33_c2_ac_52;
+/// Border color of the unique badge: amber at ~32% alpha.
+pub const SCHEMA_BADGE_UNIQUE_BORDER: u32 = 0xd9_a2_5a_52;
+/// Border/background color of the foreign-key link chip: link hue at low
+/// alpha.
+pub const SCHEMA_BADGE_LINK_BORDER: u32 = 0x7f_9c_ff_4d;
+/// Background fill of the foreign-key link chip: link hue at very low alpha.
+pub const SCHEMA_BADGE_LINK_BG: u32 = 0x7f_9c_ff_12;
+/// Text size of the foreign-key link chip, slightly larger than a plain
+/// [`SCHEMA_BADGE_TEXT_SIZE`] badge so its arrow and target read clearly.
+pub const SCHEMA_FK_CHIP_TEXT_SIZE: f32 = 11.0;
+/// Corner radius of the foreign-key link chip.
+pub const SCHEMA_FK_CHIP_RADIUS: f32 = 5.0;
+/// Label text of the primary-key badge.
+pub const SCHEMA_BADGE_PK_LABEL: &str = "PK";
+/// Label text of the unique badge.
+pub const SCHEMA_BADGE_UNIQUE_LABEL: &str = "UNIQUE";
+/// Label text of the check badge.
+pub const SCHEMA_BADGE_CHECK_LABEL: &str = "CHECK";
+/// Arrow glyph leading a foreign-key link chip.
+pub const SCHEMA_FK_ARROW: &str = "->";
+
+/// Label shown in a column's Null cell when it is declared `NOT NULL`.
+pub const SCHEMA_NOT_NULL_LABEL: &str = "not null";
+/// Label shown in a column's Null cell when it may be null.
+pub const SCHEMA_NULLABLE_LABEL: &str = "nullable";
+/// Placeholder shown in a column's Default cell when it has no default.
+pub const SCHEMA_DEFAULT_NONE_PLACEHOLDER: &str = "-";
+/// Label shown in an index row's Unique cell when the index enforces
+/// uniqueness.
+pub const SCHEMA_INDEX_UNIQUE_LABEL: &str = "unique";
+
+/// Fixed pixel widths of the Columns table's cells, in display order
+/// (Column, Type, Null, Default, Keys).
+pub const SCHEMA_COLUMNS_WIDTHS: [Pixels; 5] =
+    [px(190.0), px(100.0), px(90.0), px(220.0), px(220.0)];
+/// Fixed pixel widths of the Indexes table's cells, in display order (Name,
+/// Method, Unique, Definition).
+pub const SCHEMA_INDEXES_WIDTHS: [Pixels; 4] = [px(220.0), px(100.0), px(80.0), px(360.0)];
+/// Fixed pixel widths of the Constraints table's cells, in display order
+/// (Name, Type, Definition).
+pub const SCHEMA_CONSTRAINTS_WIDTHS: [Pixels; 3] = [px(260.0), px(140.0), px(360.0)];

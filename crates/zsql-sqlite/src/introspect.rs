@@ -9,7 +9,7 @@ use crate::error::map_introspect_error;
 /// `SQLite`'s fixed name for a connection's primary (always-present) database,
 /// as opposed to `temp` or any database added later via `ATTACH`. v0 does not
 /// attach extra databases, so this is the only schema namespace introspected.
-const MAIN_SCHEMA_NAME: &str = "main";
+pub(crate) const MAIN_SCHEMA_NAME: &str = "main";
 
 /// Displayed in place of a file path for an in-memory connection, whose
 /// `PRAGMA database_list` file column is an empty string.
