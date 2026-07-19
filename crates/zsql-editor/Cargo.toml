@@ -9,6 +9,11 @@ publish = false
 gpui = { workspace = true }
 zsql-ui = { path = "../zsql-ui" }
 tracing = { workspace = true }
+# SQL syntax highlighting. Pinned exact (pre-1.0, like gpui above): tree-sitter
+# 0.25 and tree-sitter-sequel 0.3.11 are a confirmed-compatible pair whose C
+# grammar builds cleanly via tree-sitter-sequel's own `cc` build script.
+tree-sitter = "=0.25.10"
+tree-sitter-sequel = "=0.3.11"
 
 [features]
 # Exposes `EditorView`'s test-only accessors (`set_text_for_test` and

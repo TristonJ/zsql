@@ -19,7 +19,7 @@ use zsql_ui::colors;
 use zsql_ui::icon::{IconName, icon};
 
 use crate::theme;
-use crate::{Highlighter, PlainHighlighter, Position, Selection, StyleSpan, TextBuffer};
+use crate::{Highlighter, Position, Selection, SqlHighlighter, TextBuffer};
 
 /// The key context the editor's own key bindings are scoped to, so they only
 /// fire while the editor pane is focused.
@@ -114,7 +114,7 @@ pub fn init(cx: &mut App) {
 /// positions and buffer positions for the cursor, selection, and mouse).
 pub struct EditorView {
     buffer: TextBuffer,
-    highlighter: PlainHighlighter,
+    highlighter: Box<dyn Highlighter>,
     focus_handle: FocusHandle,
     run_query: QueryRunner,
     /// Invoked after every manual text edit; see [`EditListener`].
@@ -149,7 +149,7 @@ impl EditorView {
     pub fn new(run_query: QueryRunner, cx: &mut Context<Self>) -> Self {
         Self {
             buffer: TextBuffer::new(),
-            highlighter: PlainHighlighter,
+            highlighter: Box::new(SqlHighlighter::new()),
             focus_handle: cx.focus_handle(),
             run_query,
             on_edit: None,
@@ -168,6 +168,7 @@ impl EditorView {
     /// is a programmatic write, not a manual edit.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer = TextBuffer::from_text(text);
+        self.sync_highlighter();
         cx.notify();
     }
 
@@ -201,10 +202,17 @@ impl EditorView {
     /// [`EditorView::set_text`] -- and, if one is installed, run the
     /// [`EditListener`].
     fn notify_edit(&mut self, cx: &mut Context<Self>) {
+        self.sync_highlighter();
         cx.notify();
         if let Some(on_edit) = &self.on_edit {
             on_edit(cx);
         }
+    }
+
+    /// Re-derive the highlighter's cached spans from the buffer's current
+    /// text. Called by every path that can change the buffer's text.
+    fn sync_highlighter(&mut self) {
+        self.highlighter.set_text(&self.buffer.text());
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1083,14 +1091,30 @@ fn selection_highlight_quads(
         .collect()
 }
 
-/// Style runs for one buffer line: an underlined run for the portion (if
-/// any) of the active IME composition that falls on this line, plain runs
-/// either side of it.
-///
-/// The highlighter seam is consulted here so a real highlighter can be
-/// substituted for `PlainHighlighter` later without touching this call
-/// site; `PlainHighlighter` always returns no spans, so every line renders
-/// as plain text today.
+/// The active IME composition range, clipped to `line_index`'s own
+/// char-indexed coordinates, or `None` if there is no active composition or
+/// it does not touch this line.
+fn active_marked_range_on_line(
+    editor: &EditorView,
+    line_index: usize,
+    line_char_len: usize,
+) -> Option<Range<usize>> {
+    let marked_range = editor.marked_range.as_ref()?;
+    let line_start = editor
+        .buffer
+        .char_offset_for_position(Position::new(line_index, 0));
+    let line_end = line_start + line_char_len;
+
+    let start = marked_range.start.clamp(line_start, line_end);
+    let end = marked_range.end.clamp(line_start, line_end);
+    (start < end).then_some(start - line_start..end - line_start)
+}
+
+/// Style runs for one buffer line: colored per the highlighter's spans for
+/// that line, with an underline over the portion (if any) of the active IME
+/// composition that falls on this line. A run inside the composition keeps
+/// its highlight color and additionally gets the underline, rather than the
+/// underline replacing the highlight color.
 fn build_runs(
     editor: &EditorView,
     line_index: usize,
@@ -1098,59 +1122,83 @@ fn build_runs(
     font: &Font,
     color: Hsla,
 ) -> Vec<TextRun> {
-    let highlighter_spans: Vec<StyleSpan> = editor.highlighter.spans(raw_line);
-    debug_assert!(
-        highlighter_spans.is_empty(),
-        "PlainHighlighter is a no-op seam and must never produce spans"
-    );
-
-    let base_run = |len: usize| TextRun {
-        len,
-        font: font.clone(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-
-    let Some(marked_range) = editor.marked_range.as_ref() else {
-        return vec![base_run(raw_line.len())];
-    };
-
-    let line_start = editor
-        .buffer
-        .char_offset_for_position(Position::new(line_index, 0));
     let line_char_len = raw_line.chars().count();
-    let line_end = line_start + line_char_len;
+    let spans = editor.highlighter.spans_for_line(line_index);
+    let marked_range = active_marked_range_on_line(editor, line_index, line_char_len);
 
-    let marked_start = marked_range.start.clamp(line_start, line_end);
-    let marked_end = marked_range.end.clamp(line_start, line_end);
-    if marked_start >= marked_end {
-        return vec![base_run(raw_line.len())];
+    // Every span/marked-range boundary that falls inside this line, plus the
+    // line's own ends. Between any two consecutive boundaries the set of
+    // spans/marked-range covering the text cannot change, so each such
+    // interval becomes exactly one run.
+    let mut boundaries: Vec<usize> = vec![0, line_char_len];
+    for span in spans {
+        boundaries.push(span.start.min(line_char_len));
+        boundaries.push(span.end.min(line_char_len));
+    }
+    if let Some(marked) = &marked_range {
+        boundaries.push(marked.start);
+        boundaries.push(marked.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let underline_style = UnderlineStyle {
+        color: Some(color),
+        thickness: px(1.0),
+        wavy: false,
+    };
+
+    let mut runs: Vec<TextRun> = Vec::new();
+    for window in boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        if start >= end {
+            continue;
+        }
+
+        let run_color = spans
+            .iter()
+            .find(|span| span.start <= start && end <= span.end)
+            .map_or(color, |span| {
+                Hsla::from(rgb(theme::syntax_color(span.kind)))
+            });
+        let underlined = marked_range
+            .as_ref()
+            .is_some_and(|marked| marked.start <= start && end <= marked.end);
+
+        let byte_start = editor
+            .buffer
+            .line_byte_offset(Position::new(line_index, start));
+        let byte_end = editor
+            .buffer
+            .line_byte_offset(Position::new(line_index, end));
+        let run = TextRun {
+            len: byte_end - byte_start,
+            font: font.clone(),
+            color: run_color,
+            background_color: None,
+            underline: underlined.then_some(underline_style),
+            strikethrough: None,
+        };
+
+        match runs.last_mut() {
+            Some(last) if last.color == run.color && last.underline == run.underline => {
+                last.len += run.len;
+            }
+            _ => runs.push(run),
+        }
     }
 
-    let byte_start = editor
-        .buffer
-        .line_byte_offset(Position::new(line_index, marked_start - line_start));
-    let byte_end = editor
-        .buffer
-        .line_byte_offset(Position::new(line_index, marked_end - line_start));
+    if runs.is_empty() {
+        runs.push(TextRun {
+            len: raw_line.len(),
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
 
-    let mut runs = Vec::with_capacity(3);
-    if byte_start > 0 {
-        runs.push(base_run(byte_start));
-    }
-    runs.push(TextRun {
-        underline: Some(UnderlineStyle {
-            color: Some(color),
-            thickness: px(1.0),
-            wavy: false,
-        }),
-        ..base_run(byte_end - byte_start)
-    });
-    if byte_end < raw_line.len() {
-        runs.push(base_run(raw_line.len() - byte_end));
-    }
     runs
 }
 
@@ -1197,6 +1245,7 @@ impl EditorView {
 
     pub fn set_text_for_test(&mut self, text: &str) {
         self.buffer = TextBuffer::from_text(text);
+        self.sync_highlighter();
     }
 
     /// Insert `text` at the cursor as a manual edit -- i.e. this fires the
@@ -1243,12 +1292,16 @@ mod tests {
         MouseUpEvent, TestAppContext, VisualTestContext,
     };
 
+    use gpui::{Hsla, UnderlineStyle, rgb};
+
     use super::{
         Backspace, Copy, Cut, DeleteForward, EditorView, MoveDocumentEnd, MoveDocumentStart,
         MoveDown, MoveLeft, MoveLineEnd, MoveLineStart, MoveRight, MoveUp, Newline, Paste,
         Position, QueryRunner, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart,
-        SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp,
+        SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp, build_runs,
     };
+    use crate::HighlightKind;
+    use crate::theme::syntax_color;
 
     /// A `QueryRunner` double that records every SQL string it was asked to
     /// run instead of running anything, in place of a real session/database.
@@ -1917,6 +1970,119 @@ mod tests {
             cx.notify();
         });
         vcx.run_until_parked();
+    }
+
+    /// The default `EditorView` paints with the real SQL highlighter, not
+    /// `PlainHighlighter`; this drives a full paint over SQL text exercising
+    /// keywords, a string, a number, and both comment forms, asserting only
+    /// that painting a frame does not panic (gpui cannot render headlessly
+    /// here, so pixel colors are the human's visual pass via `cargo run`).
+    #[gpui::test]
+    fn rendering_a_multiline_sql_buffer_with_the_sql_highlighter_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, cx| {
+            view.set_text_for_test(
+                "-- top comment\nSELECT id, 'paid' AS status /* inline */\nFROM orders WHERE total > 42.5",
+            );
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+
+    // -- highlighting --------------------------------------------------
+
+    #[gpui::test]
+    fn build_runs_keeps_the_highlight_color_and_gains_the_underline_where_they_overlap(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("SELECT 1");
+            // Marks columns 2..6 ("LECT"), overlapping part of the "SELECT"
+            // keyword span (0..6) but not all of it, and not touching the
+            // "1" literal's span (7..8) at all.
+            view.marked_range = Some(2..6);
+        });
+
+        let (font, base_color) = vcx.update(|window, _cx| {
+            let style = window.text_style();
+            (style.font(), style.color)
+        });
+
+        harness.editor.update(vcx, |view, _cx| {
+            let runs = build_runs(view, 0, "SELECT 1", &font, base_color);
+
+            let keyword_color = Hsla::from(rgb(syntax_color(HighlightKind::Keyword)));
+            let number_color = Hsla::from(rgb(syntax_color(HighlightKind::Number)));
+            let underline = UnderlineStyle {
+                color: Some(base_color),
+                thickness: gpui::px(1.0),
+                wavy: false,
+            };
+
+            assert_eq!(
+                runs.len(),
+                4,
+                "expected: unmarked keyword head, marked+underlined keyword \
+                 tail, unstyled space, number literal"
+            );
+            assert_eq!(runs[0].color, keyword_color);
+            assert_eq!(runs[0].underline, None);
+
+            assert_eq!(
+                runs[1].color, keyword_color,
+                "the overlapping run keeps the keyword's highlight color"
+            );
+            assert_eq!(
+                runs[1].underline,
+                Some(underline),
+                "the overlapping run also gains the IME underline"
+            );
+
+            assert_eq!(runs[2].color, base_color);
+            assert_eq!(runs[2].underline, None);
+
+            assert_eq!(runs[3].color, number_color);
+            assert_eq!(runs[3].underline, None);
+        });
+    }
+
+    #[gpui::test]
+    fn typing_a_keyword_highlights_it_on_the_next_render(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+
+        let (font, base_color) = vcx.update(|window, _cx| {
+            let style = window.text_style();
+            (style.font(), style.color)
+        });
+
+        harness.editor.update(vcx, |view, _cx| {
+            let runs = build_runs(view, 0, "", &font, base_color);
+            assert_eq!(
+                runs.first().map(|run| run.color),
+                Some(base_color),
+                "an empty buffer has nothing highlighted yet"
+            );
+        });
+
+        // `insert_text_for_test` goes through the same manual-edit path real
+        // typing does (it fires the `EditListener`), unlike
+        // `set_text_for_test`.
+        harness.editor.update(vcx, |view, cx| {
+            view.insert_text_for_test("SELECT", cx);
+        });
+
+        harness.editor.update(vcx, |view, _cx| {
+            let runs = build_runs(view, 0, "SELECT", &font, base_color);
+            let keyword_color = Hsla::from(rgb(syntax_color(HighlightKind::Keyword)));
+            assert_eq!(
+                runs.first().map(|run| run.color),
+                Some(keyword_color),
+                "the keyword just typed is highlighted without any extra step"
+            );
+        });
     }
 
     // -- mouse -----------------------------------------------------------
