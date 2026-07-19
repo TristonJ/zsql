@@ -11,5 +11,5 @@ mod theme;
 mod view;
 
 pub use buffer::{Position, Selection, TextBuffer};
-pub use highlighter::{Highlighter, PlainHighlighter, StyleSpan};
+pub use highlighter::{HighlightKind, Highlighter, PlainHighlighter, SqlHighlighter, StyleSpan};
 pub use view::{EditListener, EditorView, KEY_CONTEXT, QueryRunner, RunQuery, init};
