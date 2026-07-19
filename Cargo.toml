@@ -4,6 +4,7 @@ members = [
     "crates/zsql-core",
     "crates/zsql-postgres",
     "crates/zsql-sqlite",
+    "crates/zsql-mssql",
     "crates/zsql-ui",
     "crates/zsql-editor",
     "crates/zsql",

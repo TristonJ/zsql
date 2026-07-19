@@ -906,6 +906,43 @@ mod tests {
         after_slash.split('?').next().unwrap_or(after_slash)
     }
 
+    /// Builds a [`PgConnection`] whose pools only ever parse `UNREACHABLE_DSN`
+    /// (`connect_lazy` never touches the network), so a test can exercise
+    /// `preview_query` -- pure string-building, no I/O -- without a live
+    /// database.
+    fn connection_for_test() -> PgConnection {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_DSN)
+            .expect("connect_lazy only parses the DSN; it must not touch the network");
+        let cancel_pool = pool.clone();
+        let probe_pool = pool.clone();
+        PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        }
+    }
+
+    #[test]
+    fn preview_query_quotes_both_identifiers_and_applies_the_limit() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query("public", "orders", 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
     #[test]
     fn stream_query_pushes_single_error_when_pool_is_unreachable() {
         let pool = sqlx::postgres::PgPoolOptions::new()

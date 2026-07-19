@@ -18,9 +18,21 @@ pub fn quote_ident(ident: &str) -> String {
     out
 }
 
+/// The click-to-preview query for `relation` in `schema`, capped at `limit`
+/// rows, in the dialect [`crate::driver::Connection::preview_query`]'s
+/// default implementation uses.
+#[must_use]
+pub fn default_preview_query(schema: &str, relation: &str, limit: u64) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {limit}",
+        quote_ident(schema),
+        quote_ident(relation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::quote_ident;
+    use super::{default_preview_query, quote_ident};
 
     #[test]
     fn quote_ident_wraps_a_plain_name_in_double_quotes() {
@@ -40,5 +52,23 @@ mod tests {
             quote_ident("a\"; DROP TABLE users; --"),
             "\"a\"\"; DROP TABLE users; --\""
         );
+    }
+
+    #[test]
+    fn default_preview_query_quotes_both_identifiers_and_applies_the_limit() {
+        assert_eq!(
+            default_preview_query("public", "orders", 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_is_safe_against_an_injection_attempting_relation_name() {
+        let sql = default_preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
     }
 }
