@@ -405,7 +405,7 @@ async fn run_query(
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver, RelationSchema};
+    use zsql_core::{ConnConfig, Connection, Driver};
 
     use super::{MssqlDriver, row_count_from_partition_stats};
 
@@ -567,25 +567,57 @@ mod tests {
         assert_eq!(sql, "SELECT TOP (10) * FROM [dbo].[weird]]name]");
     }
 
-    /// Reads `ZSQL_TEST_MSSQL_URL`, or returns `None` (after printing why).
-    /// Deliberately its own env var, distinct from the Postgres suite's
-    /// `ZSQL_TEST_DATABASE_URL`, so this crate's live tests never collide
-    /// with a concurrently running Postgres driver's own live tests.
-    fn live_database_url() -> Option<String> {
-        let Ok(url) = std::env::var("ZSQL_TEST_MSSQL_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_MSSQL_URL not set");
-            return None;
-        };
-        Some(url)
+    #[test]
+    fn stream_query_pushes_single_error_when_the_host_is_unreachable() {
+        let (tx, rx) = flume::unbounded();
+        let config = super::build_tiberius_config(
+            &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
+        );
+        let handle = super::MssqlConnection { config };
+        let _query_handle = handle.stream_query("SELECT 1".to_owned(), tx);
+
+        let evt = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stream_query must push exactly one event, not hang");
+        match evt {
+            Err(zsql_core::CoreError::Connection(msg)) => assert!(!msg.is_empty()),
+            other => panic!("expected a single CoreError::Connection, got {other:?}"),
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no further events should follow the error"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "driver-integration-tests")]
+mod database_tests {
+    use std::time::Duration;
+
+    use zsql_core::{ConnConfig, Driver, RelationSchema};
+
+    use super::MssqlDriver;
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        futures::executor::block_on(fut)
     }
 
-    /// Connects to `ZSQL_TEST_MSSQL_URL` via [`live_database_url`], or
-    /// returns `None` so callers can skip.
-    fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
-        let url = live_database_url()?;
+    /// Reads `ZSQL_TEST_MSSQL_URL` for database-tests. Deliberately its own
+    /// env var, distinct from the Postgres suite's `ZSQL_TEST_POSTGRES_URL`,
+    /// so this crate's database tests never collide with a concurrently
+    /// running Postgres driver's own database tests.
+    fn live_database_url() -> String {
+        std::env::var("ZSQL_TEST_MSSQL_URL")
+            .expect("ZSQL_TEST_MSSQL_URL must be set to run database tests")
+    }
+
+    /// Connects to `ZSQL_TEST_MSSQL_URL` via [`live_database_url`]
+    fn live_connection() -> Box<dyn zsql_core::Connection> {
+        let url = live_database_url();
         let driver = MssqlDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
-        Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
+        block_on(driver.connect(&cfg)).expect("connect should succeed")
     }
 
     /// Receive one event with a generous timeout so a broken implementation
@@ -599,24 +631,18 @@ mod tests {
 
     #[test]
     fn connect_succeeds_against_a_live_database_when_configured() {
-        let Some(_conn) = live_connection() else {
-            return;
-        };
+        live_connection();
     }
 
     #[test]
     fn ping_succeeds_against_a_live_database_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
         block_on(conn.ping()).expect("ping should succeed against a reachable database");
     }
 
     #[test]
     fn ping_completes_while_a_slow_query_is_streaming_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query("WAITFOR DELAY '00:00:03'".to_owned(), tx);
@@ -644,32 +670,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_query_pushes_single_error_when_the_host_is_unreachable() {
-        let (tx, rx) = flume::unbounded();
-        let config = super::build_tiberius_config(
-            &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
-        );
-        let handle = super::MssqlConnection { config };
-        let _query_handle = handle.stream_query("SELECT 1".to_owned(), tx);
-
-        let evt = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("stream_query must push exactly one event, not hang");
-        match evt {
-            Err(zsql_core::CoreError::Connection(msg)) => assert!(!msg.is_empty()),
-            other => panic!("expected a single CoreError::Connection, got {other:?}"),
-        }
-        assert!(
-            rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "no further events should follow the error"
-        );
-    }
-
-    #[test]
     fn stream_query_maps_a_representative_type_spread_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let sql = "SELECT \
             CAST(1 AS bit) AS b, \
@@ -752,9 +754,7 @@ mod tests {
 
     #[test]
     fn stream_query_maps_an_unmapped_money_type_to_unknown_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT CAST(19.99 AS money) AS mny".to_owned(), tx);
@@ -781,9 +781,7 @@ mod tests {
 
     #[test]
     fn stream_query_keeps_statements_as_separate_result_sets_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS n; SELECT 2 AS n".to_owned(), tx);
@@ -822,9 +820,7 @@ mod tests {
 
     #[test]
     fn stream_query_batches_large_result_sets_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let (tx, rx) = flume::unbounded();
@@ -867,9 +863,7 @@ mod tests {
 
     #[test]
     fn stream_query_reports_affected_rows_for_dml_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         run_ddl(
             &*conn,
@@ -895,9 +889,7 @@ mod tests {
 
     #[test]
     fn stream_query_emits_columns_for_a_zero_row_result_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS one WHERE 1 = 0".to_owned(), tx);
@@ -914,9 +906,7 @@ mod tests {
 
     #[test]
     fn preview_query_executes_against_a_live_seeded_table_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         // The `TOP` preview must be valid T-SQL end to end, not merely the
         // right string: a `LIMIT`-shaped query would come back as an Err here.
@@ -950,9 +940,7 @@ mod tests {
 
     #[test]
     fn dropping_the_query_handle_stops_further_rows_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query(
@@ -989,9 +977,7 @@ mod tests {
 
     #[test]
     fn calling_cancel_stops_further_rows_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query(
@@ -1029,9 +1015,7 @@ mod tests {
 
     #[test]
     fn introspect_builds_schema_tree_matching_the_seeded_database_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         assert_eq!(tree.catalogs.len(), 1);
@@ -1083,9 +1067,7 @@ mod tests {
 
     #[test]
     fn introspect_orders_schemas_relations_and_columns_deterministically_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let catalog = &tree.catalogs[0];
@@ -1120,9 +1102,7 @@ mod tests {
 
     #[test]
     fn introspect_includes_a_second_schema_including_an_empty_one_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let catalog = &tree.catalogs[0];
@@ -1149,9 +1129,7 @@ mod tests {
 
     #[test]
     fn count_rows_returns_an_estimated_count_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let table = "zsql_test_count_rows_estimated";
         run_ddl(
@@ -1183,9 +1161,7 @@ mod tests {
 
     #[test]
     fn count_rows_falls_back_to_exact_for_a_view_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         // A view has no `sys.dm_db_partition_stats` row of its own, so
         // `count_rows` must fall back to an exact `COUNT(*)`.
@@ -1254,9 +1230,7 @@ mod tests {
 
     #[test]
     fn describe_relation_reports_column_key_and_default_detail_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
         let schema = describe_seeded_child(&*conn, "cols");
 
         let id = schema
@@ -1300,9 +1274,7 @@ mod tests {
 
     #[test]
     fn describe_relation_reports_the_primary_and_secondary_indexes_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
         let schema = describe_seeded_child(&*conn, "idx");
 
         let pk_index = schema
@@ -1324,9 +1296,7 @@ mod tests {
 
     #[test]
     fn describe_relation_reports_the_primary_foreign_and_check_constraints_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
         let schema = describe_seeded_child(&*conn, "con");
 
         let pk_constraint = schema
@@ -1363,9 +1333,7 @@ mod tests {
 
     #[test]
     fn describe_relation_reports_a_single_column_unique_constraint_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         run_ddl(
             &*conn,
@@ -1406,9 +1374,7 @@ mod tests {
 
     #[test]
     fn describe_relation_returns_err_for_a_nonexistent_relation_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let result = block_on(conn.describe_relation("dbo", "zsql_test_describe_missing"));
         assert!(
