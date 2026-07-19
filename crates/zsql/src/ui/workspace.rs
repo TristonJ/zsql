@@ -196,7 +196,7 @@ impl WorkspaceView {
     }
 
     /// Set the tracked active connection, e.g. once the startup connect
-    /// (`main.rs`, via [`Session::connect`]'s resolved DSN) succeeds. Threads
+    /// (`main.rs`, via [`Session::connect`]'s resolved URL) succeeds. Threads
     /// straight through to the connection-manager modal, which is the single
     /// owner of this state; the footer observes that entity and updates
     /// itself.

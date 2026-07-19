@@ -32,8 +32,8 @@ use zsql_core::{
     RowBatch, RowCount, SchemaTree,
 };
 
-use crate::dsn::MssqlDsn;
 use crate::error::{map_connect_error, map_io_connect_error, map_query_error};
+use crate::url::MssqlUrl;
 use crate::values::{column_metas, decode_row};
 
 /// Rows are grouped into batches of at most this many rows before a
@@ -62,17 +62,17 @@ impl Driver for MssqlDriver {
         "Microsoft SQL Server"
     }
 
-    fn parse_dsn(&self, dsn: &str) -> Result<ConnConfig, CoreError> {
-        crate::dsn::parse(dsn)?;
-        ConnConfig::from_dsn(dsn)
+    fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
+        crate::url::parse(url)?;
+        ConnConfig::from_url(url)
     }
 
     #[tracing::instrument(name = "mssql_connect", skip_all, fields(driver = self.id()))]
     async fn connect(&self, cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
         // Never log `cfg.url`: it may embed a password. Only non-secret
         // fields (the driver id, above) are attached to this span.
-        let dsn = crate::dsn::parse(&cfg.url)?;
-        let config = build_tiberius_config(&dsn);
+        let url = crate::url::parse(&cfg.url)?;
+        let config = build_tiberius_config(&url);
         let mut client = open_client(&config).await?;
         liveness_check(&mut client).await?;
         drop(client);
@@ -81,24 +81,24 @@ impl Driver for MssqlDriver {
     }
 }
 
-/// Build a `tiberius::Config` from this crate's own parsed DSN fields.
-fn build_tiberius_config(dsn: &MssqlDsn) -> tiberius::Config {
+/// Build a `tiberius::Config` from this crate's own parsed URL fields.
+fn build_tiberius_config(url: &MssqlUrl) -> tiberius::Config {
     let mut config = tiberius::Config::new();
-    config.host(&dsn.host);
-    config.port(dsn.port);
-    if let Some(database) = &dsn.database {
+    config.host(&url.host);
+    config.port(url.port);
+    if let Some(database) = &url.database {
         config.database(database);
     }
-    if let Some(user) = &dsn.user {
-        let password = dsn.password.as_deref().unwrap_or_default();
+    if let Some(user) = &url.user {
+        let password = url.password.as_deref().unwrap_or_default();
         config.authentication(tiberius::AuthMethod::sql_server(user, password));
     }
-    config.encryption(if dsn.encrypt {
+    config.encryption(if url.encrypt {
         tiberius::EncryptionLevel::Required
     } else {
         tiberius::EncryptionLevel::Off
     });
-    if dsn.trust_server_certificate {
+    if url.trust_server_certificate {
         config.trust_cert();
     }
     config
@@ -409,7 +409,7 @@ mod tests {
 
     use super::{MssqlDriver, row_count_from_partition_stats};
 
-    const UNREACHABLE_DSN: &str = "mssql://sa:pass@zsql-test-nonexistent-host.invalid/db";
+    const UNREACHABLE_URL: &str = "mssql://sa:pass@zsql-test-nonexistent-host.invalid/db";
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         futures::executor::block_on(fut)
@@ -423,28 +423,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_dsn_rejects_empty_string() {
+    fn parse_url_rejects_empty_string() {
         let driver = MssqlDriver;
-        assert!(driver.parse_dsn("   ").is_err());
+        assert!(driver.parse_url("   ").is_err());
     }
 
     #[test]
-    fn parse_dsn_rejects_a_malformed_dsn() {
+    fn parse_url_rejects_a_malformed_url() {
         let driver = MssqlDriver;
-        assert!(driver.parse_dsn("not a valid dsn").is_err());
+        assert!(driver.parse_url("not a valid url").is_err());
     }
 
     #[test]
-    fn parse_dsn_accepts_a_well_formed_dsn() {
+    fn parse_url_accepts_a_well_formed_url() {
         let driver = MssqlDriver;
-        assert!(driver.parse_dsn("mssql://sa:pass@localhost/db").is_ok());
-        assert!(driver.parse_dsn("sqlserver://localhost").is_ok());
+        assert!(driver.parse_url("mssql://sa:pass@localhost/db").is_ok());
+        assert!(driver.parse_url("sqlserver://localhost").is_ok());
     }
 
     #[test]
     fn connect_maps_unreachable_host_to_core_connection_error() {
         let driver = MssqlDriver;
-        let cfg = ConnConfig::from_dsn(UNREACHABLE_DSN).unwrap();
+        let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
             Err(zsql_core::CoreError::Connection(msg)) => {
@@ -456,13 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn connect_maps_malformed_dsn_to_core_dsn_error() {
+    fn connect_maps_malformed_url_to_core_url_error() {
         let driver = MssqlDriver;
         let cfg = ConnConfig {
-            url: "not a valid dsn".to_owned(),
+            url: "not a valid url".to_owned(),
         };
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Dsn(_))));
+        assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));
     }
 
     #[test]
@@ -515,7 +515,7 @@ mod tests {
     /// `tiberius` client.
     fn connection_for_test() -> super::MssqlConnection {
         let config = super::build_tiberius_config(
-            &crate::dsn::parse(UNREACHABLE_DSN).expect("dsn should parse"),
+            &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
         );
         super::MssqlConnection { config }
     }
@@ -584,7 +584,7 @@ mod tests {
     fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
         let url = live_database_url()?;
         let driver = MssqlDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
     }
 
@@ -647,7 +647,7 @@ mod tests {
     fn stream_query_pushes_single_error_when_the_host_is_unreachable() {
         let (tx, rx) = flume::unbounded();
         let config = super::build_tiberius_config(
-            &crate::dsn::parse(UNREACHABLE_DSN).expect("dsn should parse"),
+            &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
         );
         let handle = super::MssqlConnection { config };
         let _query_handle = handle.stream_query("SELECT 1".to_owned(), tx);

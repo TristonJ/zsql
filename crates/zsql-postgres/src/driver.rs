@@ -149,8 +149,8 @@ impl Driver for PostgresDriver {
         "PostgreSQL"
     }
 
-    fn parse_dsn(&self, dsn: &str) -> Result<ConnConfig, CoreError> {
-        ConnConfig::from_dsn(dsn)
+    fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
+        ConnConfig::from_url(url)
     }
 
     #[tracing::instrument(name = "pg_connect", skip_all, fields(driver = self.id()))]
@@ -372,7 +372,7 @@ async fn run_query(
     cancel_rx: flume::Receiver<()>,
 ) {
     // The SQL text itself carries no connection secrets (those live only in
-    // the DSN, never logged here), so it is fine to record at debug level.
+    // the URL, never logged here), so it is fine to record at debug level.
     tracing::debug!(sql = %sql, "streaming query");
 
     let mut conn = match pool.acquire().await {
@@ -524,7 +524,7 @@ mod tests {
 
     use super::{PgConnection, PostgresDriver};
 
-    const UNREACHABLE_DSN: &str = "postgres://user:pass@zsql-test-nonexistent-host.invalid/db";
+    const UNREACHABLE_URL: &str = "postgres://user:pass@zsql-test-nonexistent-host.invalid/db";
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         futures::executor::block_on(fut)
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn connect_maps_unreachable_host_to_core_connection_error() {
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(UNREACHABLE_DSN).unwrap();
+        let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
             Err(zsql_core::CoreError::Connection(msg)) => {
@@ -545,20 +545,20 @@ mod tests {
     }
 
     #[test]
-    fn connect_maps_malformed_dsn_to_core_connection_error() {
+    fn connect_maps_malformed_url_to_core_connection_error() {
         let driver = PostgresDriver;
         // Not a valid postgres URL at all (no scheme).
         let cfg = ConnConfig {
-            url: "not a valid dsn".to_owned(),
+            url: "not a valid url".to_owned(),
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
     }
 
     #[test]
-    fn parse_dsn_rejects_empty_string() {
+    fn parse_url_rejects_empty_string() {
         let driver = PostgresDriver;
-        assert!(driver.parse_dsn("   ").is_err());
+        assert!(driver.parse_url("   ").is_err());
     }
 
     #[test]
@@ -580,8 +580,8 @@ mod tests {
     #[test]
     fn introspect_maps_unreachable_host_to_core_introspection_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_DSN)
-            .expect("connect_lazy only parses the DSN; it must not touch the network");
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
         let conn = PgConnection {
@@ -603,8 +603,8 @@ mod tests {
     #[test]
     fn ping_maps_unreachable_host_to_core_connection_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_DSN)
-            .expect("connect_lazy only parses the DSN; it must not touch the network");
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
         let conn = PgConnection {
@@ -637,7 +637,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -676,7 +676,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
@@ -906,14 +906,14 @@ mod tests {
         after_slash.split('?').next().unwrap_or(after_slash)
     }
 
-    /// Builds a [`PgConnection`] whose pools only ever parse `UNREACHABLE_DSN`
+    /// Builds a [`PgConnection`] whose pools only ever parse `UNREACHABLE_URL`
     /// (`connect_lazy` never touches the network), so a test can exercise
     /// `preview_query` -- pure string-building, no I/O -- without a live
     /// database.
     fn connection_for_test() -> PgConnection {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_DSN)
-            .expect("connect_lazy only parses the DSN; it must not touch the network");
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
         PgConnection {
@@ -946,8 +946,8 @@ mod tests {
     #[test]
     fn stream_query_pushes_single_error_when_pool_is_unreachable() {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_DSN)
-            .expect("connect_lazy only parses the DSN; it must not touch the network");
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
         let conn = PgConnection {
@@ -1360,7 +1360,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -1490,7 +1490,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let table = "zsql_test_count_rows_estimated";
@@ -1538,7 +1538,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let table = "zsql_test_count_rows_unanalyzed";
@@ -1576,7 +1576,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let table = "zsql_test_count_rows_analyzed_empty";
@@ -1687,7 +1687,7 @@ mod tests {
             return;
         };
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
         let parents = DESCRIBE_RELATION_PARENTS_TABLE;
         let children = DESCRIBE_RELATION_CHILDREN_TABLE;
@@ -1836,7 +1836,7 @@ mod tests {
     fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
         let url = live_database_url()?;
         let driver = PostgresDriver;
-        let cfg = ConnConfig::from_dsn(&url).unwrap();
+        let cfg = ConnConfig::from_url(&url).unwrap();
         Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
     }
 

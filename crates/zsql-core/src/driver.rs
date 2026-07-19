@@ -55,11 +55,11 @@ pub trait Driver: Send + Sync {
     /// Human-readable backend name, e.g. `"PostgreSQL"`.
     fn display_name(&self) -> &'static str;
 
-    /// Parse a DSN into a [`ConnConfig`] for this backend.
+    /// Parse a URL into a [`ConnConfig`] for this backend.
     ///
     /// # Errors
-    /// Returns an error if the DSN is malformed for this backend.
-    fn parse_dsn(&self, dsn: &str) -> Result<ConnConfig, CoreError>;
+    /// Returns an error if the URL is malformed for this backend.
+    fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError>;
 
     /// Establish a connection.
     ///

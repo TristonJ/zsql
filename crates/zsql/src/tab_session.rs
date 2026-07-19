@@ -362,7 +362,7 @@ mod tests {
         );
     }
 
-    /// A connection's real URL (e.g. a saved connection's DSN, which can
+    /// A connection's real URL (e.g. a saved connection's URL, which can
     /// embed a plaintext password) is never handed to this module at all --
     /// only its stable display name is. This proves the persisted bytes
     /// never contain such a URL or credential even for a connection whose

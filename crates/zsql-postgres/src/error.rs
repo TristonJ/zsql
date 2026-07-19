@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn io_error_maps_to_connection_error_with_network_prefix_and_no_added_dsn() {
+    fn io_error_maps_to_connection_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
         let mapped = map_connect_error(sqlx::Error::Io(io_err));
         match mapped {
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn io_error_maps_to_query_error_with_network_prefix_and_no_added_dsn() {
+    fn io_error_maps_to_query_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
         let mapped = map_query_error(sqlx::Error::Io(io_err));
         match mapped {
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn io_error_maps_to_introspection_error_with_network_prefix_and_no_added_dsn() {
+    fn io_error_maps_to_introspection_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
         let mapped = map_introspect_error(sqlx::Error::Io(io_err));
         match mapped {

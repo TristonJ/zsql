@@ -326,7 +326,7 @@ impl ConnectionManagerView {
 
     /// Replace the tracked active connection, e.g. after a successful
     /// connect (see [`Self::connect_index`]) or at startup once
-    /// [`Session::connect`]'s fallback DSN resolves (see
+    /// [`Session::connect`]'s fallback URL resolves (see
     /// [`active_connection_for_url`]).
     pub fn set_active(&mut self, active: Option<ActiveConnection>, cx: &mut Context<Self>) {
         self.active = active;
@@ -943,7 +943,7 @@ mod tests {
         }
     }
 
-    fn session_with_no_dsn() -> Session {
+    fn session_with_no_url() -> Session {
         Session::new(&crate::config::Config::default())
     }
 
@@ -968,7 +968,7 @@ mod tests {
         // whatever `store` happens to hold in memory.
         let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, reloaded, cx));
 
         manager.read_with(cx, |view, _app| {
@@ -995,7 +995,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.read_with(cx, |view, _app| {
@@ -1021,7 +1021,7 @@ mod tests {
 
         let path = base.join("connections.toml");
         let store = ConnectionStore::load(&path).expect("initial load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1049,7 +1049,7 @@ mod tests {
     fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("add");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1074,7 +1074,7 @@ mod tests {
     fn adding_a_connection_clears_the_pending_inputs(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("clears");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1090,7 +1090,7 @@ mod tests {
     fn pending_driver_id_previews_the_add_forms_current_url(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("preview");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1118,7 +1118,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let session_for_assert = session.clone();
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
@@ -1138,7 +1138,7 @@ mod tests {
     fn connecting_an_out_of_range_index_does_not_panic(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("out-of-range");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1162,7 +1162,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let session_for_assert = session.clone();
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
@@ -1187,7 +1187,7 @@ mod tests {
     ) {
         let temp = TempStorePath::new("reject-empty-name");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1212,7 +1212,7 @@ mod tests {
     ) {
         let temp = TempStorePath::new("reject-empty-url");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1237,7 +1237,7 @@ mod tests {
     ) {
         let temp = TempStorePath::new("reject-bad-scheme");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1365,7 +1365,7 @@ mod tests {
     fn opening_the_modal_starts_on_the_list_panel(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("open");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1380,7 +1380,7 @@ mod tests {
     fn closing_the_modal_clears_is_open(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("close");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1394,7 +1394,7 @@ mod tests {
     fn escape_closes_an_open_modal(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("escape");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1416,7 +1416,7 @@ mod tests {
     fn a_non_escape_key_does_not_close_the_modal(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("non-escape");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1438,7 +1438,7 @@ mod tests {
     fn show_add_form_then_cancel_returns_to_the_list_without_persisting(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("cancel-add");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1471,7 +1471,7 @@ mod tests {
     fn adding_a_connection_returns_the_modal_to_the_list_panel(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("add-returns-to-list");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1506,7 +1506,7 @@ mod tests {
             })
             .expect("add second");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1524,7 +1524,7 @@ mod tests {
     fn deleting_an_out_of_range_row_does_not_panic(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("delete-out-of-range");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1549,7 +1549,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         let task = manager.update(cx, |view, cx| view.connect_index(0, cx));
@@ -1578,7 +1578,7 @@ mod tests {
     fn active_tab_session_key_is_none_when_no_connection_is_tracked(cx: &mut TestAppContext) {
         let temp = TempStorePath::new("key-none");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.read_with(cx, |view, _app| {
@@ -1598,7 +1598,7 @@ mod tests {
                 url: "postgres://localhost/app".to_owned(),
             })
             .expect("add must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1625,7 +1625,7 @@ mod tests {
     ) {
         let temp = TempStorePath::new("key-unsaved");
         let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         manager.update(cx, |view, cx| {
@@ -1662,7 +1662,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let session_for_assert = session.clone();
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
@@ -1699,7 +1699,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 
         let task = manager.update(cx, |view, cx| view.connect_index(0, cx));
@@ -1735,7 +1735,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let (manager, vcx) =
             cx.add_window_view(|_window, cx| ConnectionManagerView::new(session, store, cx));
 
@@ -1772,7 +1772,7 @@ mod tests {
             })
             .expect("add must succeed");
 
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let session_for_assert = session.clone();
         let manager = cx.new(|cx| ConnectionManagerView::new(session, store, cx));
 

@@ -48,10 +48,10 @@ async fn generate(output_path: &str) -> sqlx::Result<()> {
     let _ = std::fs::remove_file(path);
 
     let started = Instant::now();
-    let dsn = format!("sqlite://{}?mode=rwc", path.display());
+    let url = format!("sqlite://{}?mode=rwc", path.display());
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect(&dsn)
+        .connect(&url)
         .await?;
 
     // Durability is irrelevant for a throwaway stress fixture; trade it for

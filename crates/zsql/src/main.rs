@@ -38,10 +38,10 @@ fn main() -> anyhow::Result<()> {
     };
     // Snapshot before `connection_store` is moved into `WorkspaceView::new`
     // below: the startup connect task still needs it to resolve the footer's
-    // active-connection label for a `DATABASE_URL`/`Config`-fallback DSN
+    // active-connection label for a `DATABASE_URL`/`Config`-fallback URL
     // that matches (or doesn't match) a saved connection.
     let saved_connections = connection_store.connections().to_vec();
-    let resolved_dsn = cfg.resolve_url();
+    let resolved_url = cfg.resolve_url();
 
     Application::new()
         .with_assets(zsql_ui::icon::IconAssetSource)
@@ -102,8 +102,8 @@ fn main() -> anyhow::Result<()> {
                         })?;
 
                         if is_connected {
-                            if let Some(dsn) = &resolved_dsn {
-                                let active = active_connection_for_url(dsn, &saved_connections);
+                            if let Some(url) = &resolved_url {
+                                let active = active_connection_for_url(url, &saved_connections);
                                 startup_workspace.update(cx, |workspace, cx| {
                                     workspace.set_active_connection(active, cx);
                                 })?;

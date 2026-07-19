@@ -38,7 +38,7 @@ fn scheme_of(url: &str) -> Option<String> {
 /// Select the registered driver whose [`Driver::id`] matches `url`'s scheme.
 ///
 /// # Errors
-/// Returns [`CoreError::Dsn`] if `url` has no recognizable scheme, the
+/// Returns [`CoreError::Url`] if `url` has no recognizable scheme, the
 /// scheme is not one this function knows how to route, or no driver with the
 /// matching id is present in `drivers`. The error message names the
 /// offending scheme only, never the full `url` (which may embed
@@ -47,13 +47,13 @@ pub fn select_driver<'a>(
     drivers: &'a [Arc<dyn Driver>],
     url: &str,
 ) -> Result<&'a Arc<dyn Driver>, CoreError> {
-    let scheme = scheme_of(url).ok_or_else(|| CoreError::Dsn("missing URL scheme".to_owned()))?;
+    let scheme = scheme_of(url).ok_or_else(|| CoreError::Url("missing URL scheme".to_owned()))?;
     let driver_id = driver_id_for_scheme(&scheme)
-        .ok_or_else(|| CoreError::Dsn(format!("unrecognized URL scheme '{scheme}'")))?;
+        .ok_or_else(|| CoreError::Url(format!("unrecognized URL scheme '{scheme}'")))?;
     drivers
         .iter()
         .find(|driver| driver.id() == driver_id)
-        .ok_or_else(|| CoreError::Dsn(format!("no driver registered for scheme '{scheme}'")))
+        .ok_or_else(|| CoreError::Url(format!("no driver registered for scheme '{scheme}'")))
 }
 
 #[cfg(test)]
@@ -79,8 +79,8 @@ mod tests {
             self.0
         }
 
-        fn parse_dsn(&self, dsn: &str) -> Result<ConnConfig, CoreError> {
-            ConnConfig::from_dsn(dsn)
+        fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
+            ConnConfig::from_url(url)
         }
 
         async fn connect(&self, _cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
@@ -135,14 +135,14 @@ mod tests {
         let url = "cassandra://secret-password@host/db";
         let result = select_driver(&drivers, url);
         match result {
-            Err(CoreError::Dsn(message)) => {
+            Err(CoreError::Url(message)) => {
                 assert!(message.contains("cassandra"), "message: {message}");
                 assert!(
                     !message.contains("secret-password"),
                     "the offending scheme's message must not leak the full URL: {message}"
                 );
             }
-            Err(other) => panic!("expected CoreError::Dsn, got {other:?}"),
+            Err(other) => panic!("expected CoreError::Url, got {other:?}"),
             Ok(_) => panic!("expected an error, got a resolved driver"),
         }
     }
@@ -152,11 +152,11 @@ mod tests {
         let drivers = registry();
         assert!(matches!(
             select_driver(&drivers, "not-a-url"),
-            Err(CoreError::Dsn(_))
+            Err(CoreError::Url(_))
         ));
         assert!(matches!(
             select_driver(&drivers, ""),
-            Err(CoreError::Dsn(_))
+            Err(CoreError::Url(_))
         ));
     }
 
@@ -168,7 +168,7 @@ mod tests {
         let drivers = registry();
         assert!(matches!(
             select_driver(&drivers, ":memory:"),
-            Err(CoreError::Dsn(_))
+            Err(CoreError::Url(_))
         ));
     }
 
@@ -177,7 +177,7 @@ mod tests {
         // Only a sqlite driver registered; a postgres URL has nowhere to go.
         let drivers: Vec<Arc<dyn Driver>> = vec![Arc::new(FakeDriver("sqlite"))];
         let result = select_driver(&drivers, "postgres://user@host/db");
-        assert!(matches!(result, Err(CoreError::Dsn(_))));
+        assert!(matches!(result, Err(CoreError::Url(_))));
     }
 
     #[test]

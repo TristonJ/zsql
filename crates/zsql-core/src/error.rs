@@ -17,7 +17,7 @@ pub enum CoreError {
     #[error("introspection error: {0}")]
     Introspection(String),
 
-    /// A DSN could not be parsed for the target backend.
-    #[error("invalid DSN: {0}")]
-    Dsn(String),
+    /// A URL could not be parsed for the target backend.
+    #[error("invalid URL: {0}")]
+    Url(String),
 }

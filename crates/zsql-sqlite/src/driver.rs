@@ -93,13 +93,13 @@ impl Driver for SqliteDriver {
         "SQLite"
     }
 
-    fn parse_dsn(&self, dsn: &str) -> Result<ConnConfig, CoreError> {
-        ConnConfig::from_dsn(dsn)
+    fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
+        ConnConfig::from_url(url)
     }
 
     #[tracing::instrument(name = "sqlite_connect", skip_all, fields(driver = self.id()))]
     async fn connect(&self, cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
-        // Unlike a Postgres DSN, a SQLite DSN is normally just a file path
+        // Unlike a Postgres URL, a SQLite URL is normally just a file path
         // (or `:memory:`) with no embedded credentials, but it is still kept
         // out of the span for consistency with the other driver.
         let pool = Self::build_pool(&cfg.url).await?;
@@ -346,7 +346,7 @@ mod tests {
     /// (its parent directory does not exist and `SQLite` is not asked to
     /// create it), used to exercise the connect/introspect error paths
     /// without touching any real filesystem state.
-    fn unopenable_dsn() -> String {
+    fn unopenable_url() -> String {
         format!(
             "sqlite:{}/zsql-sqlite-test-nonexistent-dir/db.sqlite3",
             std::env::temp_dir().display()
@@ -367,7 +367,7 @@ mod tests {
             Self(path)
         }
 
-        fn dsn(&self) -> String {
+        fn url(&self) -> String {
             format!("sqlite://{}?mode=rwc", self.0.display())
         }
     }
@@ -386,15 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_dsn_rejects_empty_string() {
+    fn parse_url_rejects_empty_string() {
         let driver = SqliteDriver;
-        assert!(driver.parse_dsn("   ").is_err());
+        assert!(driver.parse_url("   ").is_err());
     }
 
     #[test]
     fn connect_succeeds_against_an_in_memory_database() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
         drop(conn);
     }
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn preview_query_matches_the_shared_default_limit_form() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
         assert_eq!(
             conn.preview_query("public", "orders", 200),
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
         let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
         assert_eq!(
@@ -449,7 +449,7 @@ mod tests {
     fn connect_succeeds_against_a_fresh_temp_file_database() {
         let db = TempDbPath::new("connect");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
         drop(conn);
     }
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn connect_maps_an_unopenable_path_to_core_connection_error() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&unopenable_dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&unopenable_url()).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
             Err(zsql_core::CoreError::Connection(msg)) => {
@@ -471,8 +471,8 @@ mod tests {
     #[test]
     fn introspect_maps_an_unopenable_path_to_core_introspection_error() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect_lazy(&unopenable_dsn())
-            .expect("connect_lazy only parses the DSN; it must not touch the filesystem");
+            .connect_lazy(&unopenable_url())
+            .expect("connect_lazy only parses the URL; it must not touch the filesystem");
         let conn = SqliteConnectionImpl { pool };
 
         let result = block_on(conn.introspect());
@@ -489,7 +489,7 @@ mod tests {
     fn introspect_builds_a_schema_tree_from_a_seeded_temp_file_database() {
         let db = TempDbPath::new("introspect-shape");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         run_ddl(
@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn introspect_names_the_catalog_after_the_memory_pseudo_file_for_an_in_memory_database() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
@@ -574,7 +574,7 @@ mod tests {
     fn introspect_orders_relations_and_columns_deterministically() {
         let db = TempDbPath::new("introspect-order");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         // Table names deliberately out of alphabetical creation order.
@@ -618,7 +618,7 @@ mod tests {
     fn introspect_includes_a_view_with_no_tables_alongside_it_when_none_exist() {
         let db = TempDbPath::new("introspect-view-only");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         run_ddl(
@@ -642,7 +642,7 @@ mod tests {
     fn describe_relation_reports_columns_indexes_and_constraints() {
         let db = TempDbPath::new("describe-relation");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         run_ddl(
@@ -727,7 +727,7 @@ mod tests {
     fn describe_relation_errors_for_a_relation_that_does_not_exist() {
         let db = TempDbPath::new("describe-relation-missing");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let result = block_on(conn.describe_relation("main", "does_not_exist"));
@@ -777,7 +777,7 @@ mod tests {
     fn count_rows_returns_the_exact_seeded_row_count() {
         let db = TempDbPath::new("count-rows");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         run_ddl(
@@ -799,7 +799,7 @@ mod tests {
     fn count_rows_returns_exact_zero_for_an_empty_table() {
         let db = TempDbPath::new("count-rows-empty");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         run_ddl(&*conn, "CREATE TABLE empty_items(id INTEGER PRIMARY KEY)");
@@ -813,7 +813,7 @@ mod tests {
     fn count_rows_errors_for_a_relation_that_does_not_exist() {
         let db = TempDbPath::new("count-rows-missing-relation");
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let result = block_on(conn.count_rows("main", "zsql_test_relation_that_does_not_exist"));
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn stream_query_pushes_single_error_for_invalid_sql() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn stream_query_maps_a_representative_type_spread() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let sql = "SELECT \
@@ -896,7 +896,7 @@ mod tests {
     #[test]
     fn stream_query_keeps_statements_as_separate_result_sets() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         // Both statements name their column "n", so a naive concatenation
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn stream_query_batches_large_result_sets() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn stream_query_reports_affected_rows_for_dml() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (setup_tx, setup_rx) = flume::unbounded();
@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn stream_query_emits_columns_for_a_zero_row_result() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn dropping_the_query_handle_stops_further_rows() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -1064,7 +1064,7 @@ mod tests {
     #[test]
     fn calling_cancel_stops_further_rows() {
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();
@@ -1088,7 +1088,7 @@ mod tests {
         // thing that could go wrong here is the shared connection itself
         // ending up wedged or closed.
         let driver = SqliteDriver;
-        let cfg = ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
         let (tx, rx) = flume::unbounded();

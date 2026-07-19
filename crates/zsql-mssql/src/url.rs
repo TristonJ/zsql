@@ -1,5 +1,5 @@
-//! Parsing an `mssql://` (or `sqlserver://`) DSN into the fields
-//! `tiberius::Config` needs. `tiberius` has no URL-DSN parser of its own
+//! Parsing an `mssql://` (or `sqlserver://`) URL into the fields
+//! `tiberius::Config` needs. `tiberius` has no URL-URL parser of its own
 //! (only ADO.NET and JDBC connection-string formats), so this module owns a
 //! small, dependency-free parser instead of pulling in a general-purpose URL
 //! crate for one format.
@@ -10,9 +10,9 @@ use zsql_core::CoreError;
 /// explicit port.
 const DEFAULT_PORT: u16 = 1433;
 
-/// The parsed fields of an `mssql://`/`sqlserver://` DSN.
+/// The parsed fields of an `mssql://`/`sqlserver://` URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MssqlDsn {
+pub(crate) struct MssqlUrl {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) user: Option<String>,
@@ -27,24 +27,24 @@ pub(crate) struct MssqlDsn {
     pub(crate) trust_server_certificate: bool,
 }
 
-/// Parse `dsn` into its [`MssqlDsn`] fields.
+/// Parse `url` into its [`MssqlUrl`] fields.
 ///
 /// # Errors
-/// Returns [`CoreError::Dsn`] if `dsn` is empty, has no `mssql://`/
+/// Returns [`CoreError::Url`] if `url` is empty, has no `mssql://`/
 /// `sqlserver://` scheme, or is missing a host.
-pub(crate) fn parse(dsn: &str) -> Result<MssqlDsn, CoreError> {
-    let dsn = dsn.trim();
-    if dsn.is_empty() {
-        return Err(CoreError::Dsn("empty DSN".to_owned()));
+pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(CoreError::Url("empty URL".to_owned()));
     }
 
-    let Some((scheme, rest)) = dsn.split_once("://") else {
-        return Err(CoreError::Dsn(
-            "DSN has no scheme (expected mssql:// or sqlserver://)".to_owned(),
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err(CoreError::Url(
+            "URL has no scheme (expected mssql:// or sqlserver://)".to_owned(),
         ));
     };
     if !scheme.eq_ignore_ascii_case("mssql") && !scheme.eq_ignore_ascii_case("sqlserver") {
-        return Err(CoreError::Dsn(format!(
+        return Err(CoreError::Url(format!(
             "unrecognized scheme '{scheme}' (expected mssql or sqlserver)"
         )));
     }
@@ -64,8 +64,8 @@ pub(crate) fn parse(dsn: &str) -> Result<MssqlDsn, CoreError> {
     };
     // Userinfo is split into user/password on the first literal `:`, so a
     // password containing a literal `:`, `/`, `?`, or `@` -- any of which
-    // would otherwise be misread as a DSN delimiter -- must be
-    // percent-encoded by whoever writes the DSN and is decoded back here.
+    // would otherwise be misread as a URL delimiter -- must be
+    // percent-encoded by whoever writes the URL and is decoded back here.
     let (user, password) = match userinfo {
         Some(userinfo) => match userinfo.split_once(':') {
             Some((user, password)) => {
@@ -80,13 +80,13 @@ pub(crate) fn parse(dsn: &str) -> Result<MssqlDsn, CoreError> {
         Some((host, port_text)) => {
             let port: u16 = port_text
                 .parse()
-                .map_err(|_| CoreError::Dsn(format!("invalid port '{port_text}'")))?;
+                .map_err(|_| CoreError::Url(format!("invalid port '{port_text}'")))?;
             (host, port)
         }
         None => (host_port, DEFAULT_PORT),
     };
     if host.is_empty() {
-        return Err(CoreError::Dsn("DSN is missing a host".to_owned()));
+        return Err(CoreError::Url("URL is missing a host".to_owned()));
     }
 
     let database = path
@@ -110,7 +110,7 @@ pub(crate) fn parse(dsn: &str) -> Result<MssqlDsn, CoreError> {
         }
     }
 
-    Ok(MssqlDsn {
+    Ok(MssqlUrl {
         host: host.to_owned(),
         port,
         user,
@@ -121,13 +121,13 @@ pub(crate) fn parse(dsn: &str) -> Result<MssqlDsn, CoreError> {
     })
 }
 
-/// Percent-decode `text` (`%XX` -> the byte `0xXX`), the mechanism a DSN
+/// Percent-decode `text` (`%XX` -> the byte `0xXX`), the mechanism a URL
 /// author uses to embed a delimiter character (`:`, `/`, `?`, `@`) literally
-/// inside a username or password instead of having it misread as DSN
+/// inside a username or password instead of having it misread as URL
 /// syntax.
 ///
 /// # Errors
-/// Returns [`CoreError::Dsn`] if a `%` is not followed by two hex digits, or
+/// Returns [`CoreError::Url`] if a `%` is not followed by two hex digits, or
 /// if the decoded bytes are not valid UTF-8.
 fn percent_decode(text: &str) -> Result<String, CoreError> {
     let bytes = text.as_bytes();
@@ -139,7 +139,7 @@ fn percent_decode(text: &str) -> Result<String, CoreError> {
                 .get(i + 1..i + 3)
                 .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| {
-                    CoreError::Dsn("invalid percent-encoding in DSN userinfo".to_owned())
+                    CoreError::Url("invalid percent-encoding in URL userinfo".to_owned())
                 })?;
             // The slice was just validated as two ASCII hex digits, so this
             // radix-16 parse cannot fail.
@@ -151,17 +151,17 @@ fn percent_decode(text: &str) -> Result<String, CoreError> {
         }
     }
     String::from_utf8(decoded)
-        .map_err(|_| CoreError::Dsn("DSN userinfo is not valid UTF-8 after decoding".to_owned()))
+        .map_err(|_| CoreError::Url("URL userinfo is not valid UTF-8 after decoding".to_owned()))
 }
 
 /// Parse a query-parameter value as a boolean, accepting the common
-/// spellings a hand-written DSN is likely to use.
+/// spellings a hand-written URL is likely to use.
 fn parse_bool_param(key: &str, value: &str) -> Result<bool, CoreError> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
-        other => Err(CoreError::Dsn(format!(
-            "invalid value '{other}' for DSN parameter '{key}'"
+        other => Err(CoreError::Url(format!(
+            "invalid value '{other}' for URL parameter '{key}'"
         ))),
     }
 }
@@ -171,13 +171,13 @@ mod tests {
     use super::parse;
 
     #[test]
-    fn rejects_an_empty_dsn() {
+    fn rejects_an_empty_url() {
         assert!(parse("").is_err());
         assert!(parse("   ").is_err());
     }
 
     #[test]
-    fn rejects_a_dsn_with_no_scheme() {
+    fn rejects_a_url_with_no_scheme() {
         assert!(parse("localhost/db").is_err());
     }
 
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_dsn_with_no_host() {
+    fn rejects_a_url_with_no_host() {
         assert!(parse("mssql://").is_err());
         assert!(parse("mssql:///db").is_err());
     }
@@ -198,28 +198,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_minimal_dsn_with_just_a_host() {
-        let dsn = parse("mssql://localhost").unwrap();
-        assert_eq!(dsn.host, "localhost");
-        assert_eq!(dsn.port, 1433);
-        assert_eq!(dsn.user, None);
-        assert_eq!(dsn.password, None);
-        assert_eq!(dsn.database, None);
-        assert!(dsn.encrypt);
-        assert!(!dsn.trust_server_certificate);
+    fn parses_a_minimal_url_with_just_a_host() {
+        let url = parse("mssql://localhost").unwrap();
+        assert_eq!(url.host, "localhost");
+        assert_eq!(url.port, 1433);
+        assert_eq!(url.user, None);
+        assert_eq!(url.password, None);
+        assert_eq!(url.database, None);
+        assert!(url.encrypt);
+        assert!(!url.trust_server_certificate);
     }
 
     #[test]
-    fn parses_a_full_dsn() {
+    fn parses_a_full_url() {
         // The password's `@` is percent-encoded (`%40`) so it is not
         // misread as the userinfo/host separator, then decoded back to a
         // literal `@` once the real separator has been found.
-        let dsn = parse("mssql://sa:Str0ngP%40ss@db.example.com:14330/zsql").unwrap();
-        assert_eq!(dsn.host, "db.example.com");
-        assert_eq!(dsn.port, 14330);
-        assert_eq!(dsn.user.as_deref(), Some("sa"));
-        assert_eq!(dsn.password.as_deref(), Some("Str0ngP@ss"));
-        assert_eq!(dsn.database.as_deref(), Some("zsql"));
+        let url = parse("mssql://sa:Str0ngP%40ss@db.example.com:14330/zsql").unwrap();
+        assert_eq!(url.host, "db.example.com");
+        assert_eq!(url.port, 14330);
+        assert_eq!(url.user.as_deref(), Some("sa"));
+        assert_eq!(url.password.as_deref(), Some("Str0ngP@ss"));
+        assert_eq!(url.database.as_deref(), Some("zsql"));
     }
 
     #[test]
@@ -228,18 +228,18 @@ mod tests {
         // authority/path boundary (e.g. host would parse as `sa:p`,
         // rejected as an invalid port); percent-encoding it as `%2F` avoids
         // that ambiguity and is decoded back to `/` here.
-        let dsn = parse("mssql://sa:p%2Fw@localhost/db").unwrap();
-        assert_eq!(dsn.host, "localhost");
-        assert_eq!(dsn.user.as_deref(), Some("sa"));
-        assert_eq!(dsn.password.as_deref(), Some("p/w"));
-        assert_eq!(dsn.database.as_deref(), Some("db"));
+        let url = parse("mssql://sa:p%2Fw@localhost/db").unwrap();
+        assert_eq!(url.host, "localhost");
+        assert_eq!(url.user.as_deref(), Some("sa"));
+        assert_eq!(url.password.as_deref(), Some("p/w"));
+        assert_eq!(url.database.as_deref(), Some("db"));
     }
 
     #[test]
     fn a_username_with_a_percent_encoded_colon_decodes_correctly() {
-        let dsn = parse("mssql://us%3Aer:pw@localhost").unwrap();
-        assert_eq!(dsn.user.as_deref(), Some("us:er"));
-        assert_eq!(dsn.password.as_deref(), Some("pw"));
+        let url = parse("mssql://us%3Aer:pw@localhost").unwrap();
+        assert_eq!(url.user.as_deref(), Some("us:er"));
+        assert_eq!(url.password.as_deref(), Some("pw"));
     }
 
     #[test]
@@ -255,9 +255,9 @@ mod tests {
 
     #[test]
     fn the_sqlserver_scheme_is_accepted_as_an_alias() {
-        let dsn = parse("sqlserver://localhost/db").unwrap();
-        assert_eq!(dsn.host, "localhost");
-        assert_eq!(dsn.database.as_deref(), Some("db"));
+        let url = parse("sqlserver://localhost/db").unwrap();
+        assert_eq!(url.host, "localhost");
+        assert_eq!(url.database.as_deref(), Some("db"));
     }
 
     #[test]
@@ -268,9 +268,9 @@ mod tests {
 
     #[test]
     fn parses_query_parameters() {
-        let dsn = parse("mssql://localhost/db?encrypt=false&trustServerCertificate=true").unwrap();
-        assert!(!dsn.encrypt);
-        assert!(dsn.trust_server_certificate);
+        let url = parse("mssql://localhost/db?encrypt=false&trustServerCertificate=true").unwrap();
+        assert!(!url.encrypt);
+        assert!(url.trust_server_certificate);
     }
 
     #[test]
@@ -280,8 +280,8 @@ mod tests {
 
     #[test]
     fn a_user_with_no_password_is_allowed() {
-        let dsn = parse("mssql://sa@localhost/db").unwrap();
-        assert_eq!(dsn.user.as_deref(), Some("sa"));
-        assert_eq!(dsn.password, None);
+        let url = parse("mssql://sa@localhost/db").unwrap();
+        assert_eq!(url.user.as_deref(), Some("sa"));
+        assert_eq!(url.password, None);
     }
 }

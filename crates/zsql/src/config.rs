@@ -64,7 +64,7 @@ pub struct QueryConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectionConfig {
-    /// Optional default DSN; the `DATABASE_URL` env var overrides it.
+    /// Optional default URL; the `DATABASE_URL` env var overrides it.
     pub default_url: Option<String>,
 }
 

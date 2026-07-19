@@ -3,10 +3,10 @@
 
 mod describe;
 mod driver;
-mod dsn;
 mod error;
 mod introspect;
 mod quoting;
+mod url;
 mod values;
 
 pub use driver::{MssqlConnection, MssqlDriver};

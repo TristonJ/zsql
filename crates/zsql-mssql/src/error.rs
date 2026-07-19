@@ -30,7 +30,7 @@ pub(crate) fn map_introspect_error(err: tiberius::error::Error) -> CoreError {
 
 /// Render a short, useful description of a `tiberius::Error`. Never includes
 /// connection-string text: `tiberius::Error` carries none of it (that lives
-/// only in the DSN this crate parses, never handed to `tiberius::Error`).
+/// only in the URL this crate parses, never handed to `tiberius::Error`).
 fn describe(err: tiberius::error::Error) -> String {
     use tiberius::error::Error;
     match err {

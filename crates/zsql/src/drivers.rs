@@ -30,15 +30,15 @@ pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
 /// borrowing anything from its caller's stack frame.
 ///
 /// # Errors
-/// Returns [`CoreError::Dsn`] if `url` is empty or its scheme has no
+/// Returns [`CoreError::Url`] if `url` is empty or its scheme has no
 /// registered driver, or whatever error the selected driver's own
-/// `parse_dsn`/`connect` returns.
+/// `parse_url`/`connect` returns.
 #[tracing::instrument(name = "connect_via_selected_driver", skip_all)]
 pub async fn connect(url: String) -> Result<Box<dyn Connection>, CoreError> {
     let drivers = registered_drivers();
     let driver = zsql_core::select_driver(&drivers, &url)?;
     tracing::info!(driver = driver.id(), "driver selected for connection");
-    let cfg = driver.parse_dsn(&url)?;
+    let cfg = driver.parse_url(&url)?;
     driver.connect(&cfg).await
 }
 
@@ -81,7 +81,7 @@ mod tests {
     fn connect_rejects_an_unrecognized_scheme_without_naming_the_full_url() {
         let result = block_on(connect("cassandra://secret-password@host/db".to_owned()));
         match result {
-            Err(zsql_core::CoreError::Dsn(message)) => {
+            Err(zsql_core::CoreError::Url(message)) => {
                 assert!(message.contains("cassandra"), "message: {message}");
                 assert!(
                     !message.contains("secret-password"),
@@ -89,16 +89,16 @@ mod tests {
                 );
             }
             Err(other) => {
-                panic!("expected CoreError::Dsn for an unrecognized scheme, got {other:?}")
+                panic!("expected CoreError::Url for an unrecognized scheme, got {other:?}")
             }
             Ok(_) => panic!("expected an unrecognized scheme to fail"),
         }
     }
 
     #[test]
-    fn connect_rejects_an_empty_url_with_a_dsn_error() {
+    fn connect_rejects_an_empty_url_with_a_url_error() {
         let result = block_on(connect(String::new()));
-        assert!(matches!(result, Err(zsql_core::CoreError::Dsn(_))));
+        assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));
     }
 
     /// Live-database test, gated on `ZSQL_TEST_DATABASE_URL` so `cargo test`

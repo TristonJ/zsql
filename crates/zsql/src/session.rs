@@ -16,7 +16,7 @@ use crate::drivers;
 /// What the session (and the results grid it drives) currently displays.
 #[derive(Debug, Clone)]
 pub enum SessionState {
-    /// No DSN is configured (`DATABASE_URL` unset and no
+    /// No URL is configured (`DATABASE_URL` unset and no
     /// `connection.default_url` in the loaded [`Config`])
     Empty,
     /// A connection attempt is in flight.
@@ -68,8 +68,8 @@ pub enum LivenessState {
 
 /// Owns the active connection and the current query's lifecycle.
 pub struct Session {
-    /// Resolved DSN (`Config::resolve_url`), if any.
-    dsn: Option<String>,
+    /// Resolved URL (`Config::resolve_url`), if any.
+    url: Option<String>,
     /// The live connection, once `connect` succeeds
     connection: Option<Arc<dyn Connection>>,
     /// The current lifecycle state a view renders.
@@ -137,14 +137,14 @@ impl Session {
     /// Build a session for `cfg`'s resolved connection URL
     #[must_use]
     pub fn new(cfg: &Config) -> Self {
-        let dsn = cfg.resolve_url();
-        let state = if dsn.is_some() {
+        let url = cfg.resolve_url();
+        let state = if url.is_some() {
             SessionState::Connecting
         } else {
             SessionState::Empty
         };
         Self {
-            dsn,
+            url,
             connection: None,
             state,
             schema: SchemaState::NotLoaded,
@@ -241,17 +241,17 @@ impl Session {
         self.row_count
     }
 
-    /// Connect using the resolved DSN (`DATABASE_URL`, or else
+    /// Connect using the resolved URL (`DATABASE_URL`, or else
     /// `Config::connection.default_url`) as a fallback/seed when no saved
     /// connection has been explicitly chosen. If none is configured, sets
     /// [`SessionState::Empty`] and returns a completed task
     pub fn connect(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        let Some(dsn) = self.dsn.clone() else {
+        let Some(url) = self.url.clone() else {
             self.state = SessionState::Empty;
             cx.notify();
             return Task::ready(());
         };
-        self.connect_url(dsn, cx)
+        self.connect_url(url, cx)
     }
 
     /// Connect to an explicitly chosen URL (e.g. a saved connection picked
@@ -710,7 +710,7 @@ impl Session {
     /// result set
     pub(crate) fn new_for_render_test(state: SessionState, result: ResultSet) -> Self {
         Self {
-            dsn: None,
+            url: None,
             connection: None,
             state,
             schema: SchemaState::NotLoaded,
@@ -854,19 +854,19 @@ mod tests {
 
     use super::{Config, Session, SessionState};
 
-    fn session_with_no_dsn() -> Session {
+    fn session_with_no_url() -> Session {
         Session::new(&Config::default())
     }
 
     #[test]
-    fn new_session_with_no_dsn_starts_empty() {
-        let session = session_with_no_dsn();
+    fn new_session_with_no_url_starts_empty() {
+        let session = session_with_no_url();
         assert!(matches!(session.state(), SessionState::Empty));
     }
 
     #[test]
     fn preview_sql_with_no_connection_falls_back_to_the_shared_default_form() {
-        let session = session_with_no_dsn();
+        let session = session_with_no_url();
         assert_eq!(
             session.preview_sql("public", "orders"),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200"
@@ -874,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_with_a_configured_dsn_starts_connecting() {
+    fn new_session_with_a_configured_url_starts_connecting() {
         let mut cfg = Config::default();
         cfg.connection.default_url = Some("postgres://localhost/db".to_owned());
         let session = Session::new(&cfg);
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn columns_then_batches_then_done_builds_the_expected_result_set() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         session.apply_query_event(Ok(QueryEvent::Columns(vec![
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn multiple_batches_accumulate_into_the_final_result_set_correctly() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_second_result_set_replaces_the_first_keeping_only_the_last() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         // First statement's result set.
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn done_with_no_columns_reports_affected_rows_for_dml_style_results() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         session.apply_query_event(Ok(QueryEvent::Columns(Vec::new())));
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn columns_and_batches_paint_incrementally_before_done_arrives() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn an_error_event_produces_a_readable_error_state() {
-        let mut session = session_with_no_dsn();
+        let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
         session.apply_query_event(Err(CoreError::Query(
@@ -1186,13 +1186,13 @@ mod gpui_tests {
 
     use super::{Config, LivenessState, SchemaState, Session, SessionState};
 
-    fn session_with_no_dsn() -> Session {
+    fn session_with_no_url() -> Session {
         Session::new(&Config::default())
     }
 
     #[gpui::test]
     async fn run_query_without_a_connection_sets_a_not_connected_error(cx: &mut TestAppContext) {
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
 
         session
             .update(cx, |session, cx| session.run_query("SELECT 1", cx))
@@ -1213,7 +1213,7 @@ mod gpui_tests {
     async fn introspect_without_a_connection_sets_a_schema_error_and_leaves_state_untouched(
         cx: &mut TestAppContext,
     ) {
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
         let state_before = session.read_with(cx, |session, _app| format!("{:?}", session.state()));
 
         session.update(cx, Session::introspect).await;
@@ -1237,8 +1237,8 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    async fn connect_with_no_dsn_configured_stays_empty(cx: &mut TestAppContext) {
-        let session = cx.new(|_cx| session_with_no_dsn());
+    async fn connect_with_no_url_configured_stays_empty(cx: &mut TestAppContext) {
+        let session = cx.new(|_cx| session_with_no_url());
 
         session.update(cx, Session::connect).await;
 
@@ -1252,7 +1252,7 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    async fn connect_with_an_empty_resolved_dsn_reports_a_readable_error(cx: &mut TestAppContext) {
+    async fn connect_with_an_empty_resolved_url_reports_a_readable_error(cx: &mut TestAppContext) {
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(String::new());
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -1266,8 +1266,8 @@ mod gpui_tests {
         session.read_with(cx, |session, _app| match session.state() {
             SessionState::Error(message) => {
                 assert!(
-                    message.to_lowercase().contains("dsn"),
-                    "expected an invalid-DSN error, got: {message}"
+                    message.to_lowercase().contains("url"),
+                    "expected an invalid-URL error, got: {message}"
                 );
             }
             other => panic!("expected SessionState::Error, got {other:?}"),
@@ -1323,16 +1323,16 @@ mod gpui_tests {
 
     /// `Session::connect_to` (used by the connection manager to connect an
     /// explicitly chosen saved connection) must dispatch through the exact
-    /// same selection-based path as `connect`, independent of whatever DSN
+    /// same selection-based path as `connect`, independent of whatever URL
     /// (if any) `Config` resolved at startup.
     #[gpui::test]
-    async fn connect_to_opens_a_sqlite_url_regardless_of_the_configured_dsn(
+    async fn connect_to_opens_a_sqlite_url_regardless_of_the_configured_url(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        // No configured DSN at all: `connect_to` must still work on its own.
+        // No configured URL at all: `connect_to` must still work on its own.
         let session = cx.new(|_cx| Session::new(&Config::default()));
 
         session
@@ -1610,7 +1610,7 @@ mod gpui_tests {
 
     #[gpui::test]
     fn liveness_probe_does_not_run_before_a_connection_exists(cx: &mut TestAppContext) {
-        let session = cx.new(|_cx| session_with_no_dsn());
+        let session = cx.new(|_cx| session_with_no_url());
 
         // No `connect()` (let alone a successful one) has ever happened, so
         // no probe loop was ever started: advancing well past several probe
@@ -1642,7 +1642,7 @@ mod gpui_tests {
         let ping_sender = connection.ping_sender();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             // Simulate a query mid-flight: a probe tick landing now must
             // not disturb this.
@@ -1682,7 +1682,7 @@ mod gpui_tests {
         let ping_sender = connection.ping_sender();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session.state = SessionState::Connected;
             session
@@ -1832,7 +1832,7 @@ mod gpui_tests {
         let stale_ping = stale_connection.ping_sender();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(stale_connection));
             session.state = SessionState::Connected;
             session
@@ -1896,7 +1896,7 @@ mod gpui_tests {
         let connection = FakeConnection::new(sinks.clone(), queries);
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2059,7 +2059,7 @@ mod gpui_tests {
         let connection = FakeConnection::new(sinks.clone(), queries);
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2124,7 +2124,7 @@ mod gpui_tests {
         connection.introspect_outcome = FakeIntrospectOutcome::Ready(sample_schema_tree());
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2150,7 +2150,7 @@ mod gpui_tests {
         connection.introspect_outcome = FakeIntrospectOutcome::Ready(sample_schema_tree());
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2212,7 +2212,7 @@ mod gpui_tests {
             FakeIntrospectOutcome::Failed("permission denied for schema pg_catalog".to_owned());
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.state = SessionState::Connected;
             session.connection = Some(Arc::new(connection));
             session
@@ -2295,7 +2295,7 @@ mod gpui_tests {
         let count_calls = connection.count_call_counter();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2332,7 +2332,7 @@ mod gpui_tests {
         let count_calls = connection.count_call_counter();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2364,7 +2364,7 @@ mod gpui_tests {
         connection.set_count_outcome(Err("boom".to_owned()));
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2417,7 +2417,7 @@ mod gpui_tests {
         let release_count = connection.gate_count();
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(Arc::new(connection));
             session
         });
@@ -2463,7 +2463,7 @@ mod gpui_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let cfg = zsql_core::ConnConfig::from_dsn("sqlite::memory:").unwrap();
+        let cfg = zsql_core::ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = zsql_sqlite::SqliteDriver
             .connect(&cfg)
             .await
@@ -2485,7 +2485,7 @@ mod gpui_tests {
         {}
 
         let session = cx.new(|_cx| {
-            let mut session = session_with_no_dsn();
+            let mut session = session_with_no_url();
             session.connection = Some(conn);
             session
         });
@@ -2845,7 +2845,7 @@ mod live_tests {
         // so the disconnect below can target exactly this test's backends,
         // not every backend on the database - other live tests may be
         // running against the same server concurrently.
-        let tagged_url = tag_dsn_with_application_name(&url, "zsql_test_liveness_disconnect");
+        let tagged_url = tag_url_with_application_name(&url, "zsql_test_liveness_disconnect");
 
         let mut cfg = Config::default();
         cfg.connection.default_url = Some(tagged_url);
@@ -2907,21 +2907,21 @@ mod live_tests {
 
     /// Append `?application_name=<tag>` to `url`, so every connection built
     /// from the result is identifiable in `pg_stat_activity` by `tag` alone.
-    fn tag_dsn_with_application_name(url: &str, tag: &str) -> String {
+    fn tag_url_with_application_name(url: &str, tag: &str) -> String {
         let separator = if url.contains('?') { '&' } else { '?' };
         format!("{url}{separator}application_name={tag}")
     }
 
     /// Open a throwaway connection to `url` and terminate every backend
     /// tagged with `application_name = tag` (see
-    /// [`tag_dsn_with_application_name`]), simulating a dropped connection
+    /// [`tag_url_with_application_name`]), simulating a dropped connection
     /// from outside the app. Scoped to `tag` rather than every backend on
     /// the database, so this cannot disturb another live test running
     /// concurrently against the same server. Runs entirely through
     /// `zsql_postgres`/`zsql_core` so this test file never names `sqlx`
     /// directly.
     async fn terminate_backends_tagged(url: &str, tag: &str) {
-        let cfg = zsql_core::ConnConfig::from_dsn(url).expect("a valid test DSN");
+        let cfg = zsql_core::ConnConfig::from_url(url).expect("a valid test URL");
         let conn = zsql_postgres::PostgresDriver
             .connect(&cfg)
             .await
