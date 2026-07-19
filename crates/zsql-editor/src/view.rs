@@ -2,21 +2,20 @@
 //! keyboard/IME input into the buffer via `EntityInputHandler`, paints the
 //! buffer's lines with a line-number gutter, a blinking-free cursor, and a
 //! selection highlight, and runs the buffer's query text through the
-//! caller-supplied [`QueryRunner`] seam on cmd/ctrl-enter or the toolbar's
-//! Run button.
+//! caller-supplied [`QueryRunner`] seam on cmd/ctrl-enter or a call to
+//! [`EditorView::run_current_query`] from the embedding app.
 
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId,
-    Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Div, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
+    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString, Style,
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
     relative, rgb, rgba, size,
 };
 use zsql_ui::colors;
-use zsql_ui::icon::{IconName, icon};
 
 use crate::theme;
 use crate::{Highlighter, Position, Selection, SqlHighlighter, TextBuffer};
@@ -120,8 +119,7 @@ pub struct EditorView {
     /// Invoked after every manual text edit; see [`EditListener`].
     on_edit: Option<EditListener>,
     /// Whether this editor renders as a compact, single-line strip -- no
-    /// toolbar, no line-number gutter -- instead of the full multi-line
-    /// pane.
+    /// line-number gutter -- instead of the full multi-line pane.
     compact: bool,
     /// The IME composition range, as flat character offsets into
     /// `buffer.text()`. `None` when there is no composition in progress.
@@ -404,9 +402,10 @@ impl EditorView {
 
     /// Run the buffer's query text (the selection if there is one,
     /// otherwise the whole document) through the `run_query` seam. A blank
-    /// query is a no-op. Shared by the `RunQuery` action and the toolbar's
-    /// Run button.
-    fn run_current_query(&mut self, cx: &mut Context<Self>) {
+    /// query is a no-op. The single implementation the `RunQuery` keybinding
+    /// and any embedding app's own Run affordance both call, so running the
+    /// current query never has more than one code path.
+    pub fn run_current_query(&mut self, cx: &mut Context<Self>) {
         let sql = self.buffer.query_text();
         if sql.trim().is_empty() {
             return;
@@ -496,69 +495,6 @@ impl EditorView {
 
     // -- rendering helpers -------------------------------------------------
 
-    /// The toolbar above the code area: a pane label on the left and the Run
-    /// button on the right. The button runs the same query the `RunQuery`
-    /// keybinding does.
-    fn render_toolbar(cx: &mut Context<Self>) -> Div {
-        let run_shortcut = if cfg!(target_os = "macos") {
-            "Cmd+Enter"
-        } else {
-            "Ctrl+Enter"
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .flex_shrink_0()
-            .items_center()
-            .justify_between()
-            .h(theme::EDITOR_TOOLBAR_HEIGHT)
-            .px(px(theme::EDITOR_TOOLBAR_PADDING_X))
-            .bg(rgb(colors::PANEL))
-            .border_b_1()
-            .border_color(rgb(colors::LINE))
-            .child(
-                div()
-                    .text_size(px(theme::EDITOR_TOOLBAR_LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors::MUTED))
-                    .child("SQL"),
-            )
-            .child(
-                div()
-                    .id("run-query-button")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(theme::RUN_BUTTON_HEIGHT)
-                    .px(px(theme::RUN_BUTTON_PADDING_X))
-                    .rounded(px(theme::RUN_BUTTON_RADIUS))
-                    .bg(rgb(colors::TEAL))
-                    .text_color(rgb(colors::INK))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::RUN_BUTTON_HOVER_BG)))
-                    .on_click(cx.listener(|editor, _event: &ClickEvent, _window, cx| {
-                        editor.run_current_query(cx);
-                    }))
-                    .child(icon(
-                        IconName::Run,
-                        theme::RUN_BUTTON_ICON_SIZE,
-                        colors::INK,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))
-                            .child("Run"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
-                            .text_color(rgba(theme::RUN_BUTTON_HINT))
-                            .child(run_shortcut),
-                    ),
-            )
-    }
-
     /// The line-number gutter, one row per buffer line, matching the
     /// content element's row spacing so the two stay aligned.
     fn render_gutter(line_count: usize, cursor_line: usize) -> gpui::Stateful<Div> {
@@ -643,7 +579,6 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::run_query))
-            .when(!compact, |el| el.child(Self::render_toolbar(cx)))
             .child(
                 div()
                     .id("sql-editor-code")
@@ -1956,6 +1891,33 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn run_current_query_runs_the_buffer_without_dispatching_the_run_query_action(
+        cx: &mut TestAppContext,
+    ) {
+        // An embedding app's own Run affordance (e.g. a workspace header's
+        // button) calls this method directly rather than dispatching the
+        // `RunQuery` action, since it must work regardless of which element
+        // holds keyboard focus. Pin that this public method alone -- with no
+        // action dispatch and no focused window -- reaches the same
+        // `QueryRunner` seam.
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("select * from orders");
+        });
+
+        harness.editor.update(vcx, EditorView::run_current_query);
+
+        assert_eq!(
+            harness
+                .queries
+                .lock()
+                .expect("queries lock poisoned")
+                .as_slice(),
+            ["select * from orders"]
+        );
+    }
+
     // -- rendering -----------------------------------------------------
 
     #[gpui::test]
@@ -2250,7 +2212,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_mode_toggles_and_renders_without_a_toolbar_or_gutter(cx: &mut TestAppContext) {
+    fn compact_mode_toggles_and_renders_without_a_gutter(cx: &mut TestAppContext) {
         let (harness, vcx) = build_harness(cx);
         harness.editor.update(vcx, |view, _cx| {
             assert!(
