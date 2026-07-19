@@ -4,11 +4,12 @@
 //! unit-testable without a running event loop. The chrome constants here are
 //! centralized so no call site hardcodes a raw pixel or hex literal.
 
-/// Width of an overlaid vertical scrollbar's track and thumb.
+/// Thickness of an overlaid scrollbar's track and thumb (vertical width or
+/// horizontal height).
 pub const TRACK_WIDTH: f32 = 8.0;
 /// Shortest a thumb is ever drawn, regardless of how large the scrolled
-/// content is relative to the viewport, so it stays grabbable on very tall
-/// result sets.
+/// content is relative to the viewport, so it stays grabbable on very large
+/// result sets (tall or wide).
 pub const MIN_THUMB_LENGTH: f32 = 24.0;
 /// Track background: page ink at very low opacity, just enough to read as a
 /// gutter without competing with the grid's row hairlines.
@@ -34,6 +35,18 @@ pub struct ScrollbarGeometry {
 }
 
 impl ScrollbarGeometry {
+    /// A scroll offset clamped into `[0.0, max(0.0, content_extent -
+    /// viewport_extent)]`, so a delta that would scroll past either end of
+    /// the content settles at that end instead of overshooting it. Shared by
+    /// every axis (vertical drag, vertical wheel, horizontal drag,
+    /// horizontal wheel) that needs to turn a proposed offset into one that
+    /// cannot scroll past the content's bounds.
+    #[must_use]
+    pub fn clamp_offset(offset: f32, content_extent: f32, viewport_extent: f32) -> f32 {
+        let max_offset = (content_extent - viewport_extent).max(0.0);
+        offset.clamp(0.0, max_offset)
+    }
+
     /// Geometry for a track of `track_length` pixels, given the scrolled
     /// content's total extent, the viewport's visible extent, and the
     /// current scroll offset (`0.0` at the top/left, growing positive
@@ -66,7 +79,7 @@ impl ScrollbarGeometry {
         let thumb_length = (track_length * visible_fraction).clamp(thumb_floor, track_length);
 
         let max_offset = content_extent - viewport_extent;
-        let clamped_offset = scroll_offset.clamp(0.0, max_offset);
+        let clamped_offset = Self::clamp_offset(scroll_offset, content_extent, viewport_extent);
         let thumb_position = (clamped_offset / max_offset).clamp(0.0, 1.0);
 
         Self {
@@ -109,7 +122,6 @@ impl ScrollbarGeometry {
         if viewport_extent <= 0.0 || content_extent <= viewport_extent {
             return 0.0;
         }
-        let max_offset = content_extent - viewport_extent;
 
         let thumb_length = Self::compute(
             content_extent,
@@ -121,11 +133,12 @@ impl ScrollbarGeometry {
         .thumb_length;
         let max_thumb_travel = track_length - thumb_length;
         if max_thumb_travel <= 0.0 {
-            return offset_start.clamp(0.0, max_offset);
+            return Self::clamp_offset(offset_start, content_extent, viewport_extent);
         }
 
+        let max_offset = content_extent - viewport_extent;
         let offset_delta = pointer_delta * (max_offset / max_thumb_travel);
-        (offset_start + offset_delta).clamp(0.0, max_offset)
+        Self::clamp_offset(offset_start + offset_delta, content_extent, viewport_extent)
     }
 }
 
@@ -135,6 +148,37 @@ mod tests {
 
     const TRACK: f32 = 200.0;
     const MIN_THUMB: f32 = 24.0;
+
+    #[test]
+    // A negative offset clamps to `0.0` verbatim (the clamp's floor arm), so
+    // an exact comparison here is intentional.
+    #[allow(clippy::float_cmp)]
+    fn clamp_offset_floors_a_negative_offset_at_zero() {
+        assert_eq!(ScrollbarGeometry::clamp_offset(-50.0, 1_000.0, 400.0), 0.0);
+    }
+
+    #[test]
+    // An offset past `max_offset` clamps to `max_offset` verbatim (the
+    // clamp's ceiling arm), so an exact comparison here is intentional.
+    #[allow(clippy::float_cmp)]
+    fn clamp_offset_ceils_an_offset_past_the_max_at_max_offset() {
+        let content = 1_000.0;
+        let viewport = 400.0;
+        let max_offset = content - viewport;
+        assert_eq!(
+            ScrollbarGeometry::clamp_offset(max_offset + 500.0, content, viewport),
+            max_offset
+        );
+    }
+
+    #[test]
+    // Content that already fits the viewport has nothing to scroll, so
+    // `max_offset` floors at `0.0` verbatim regardless of how large a
+    // positive offset is proposed.
+    #[allow(clippy::float_cmp)]
+    fn clamp_offset_is_always_zero_when_content_fits_the_viewport() {
+        assert_eq!(ScrollbarGeometry::clamp_offset(200.0, 100.0, 400.0), 0.0);
+    }
 
     #[test]
     // The hidden-geometry branch returns `0.0` verbatim (no arithmetic on
