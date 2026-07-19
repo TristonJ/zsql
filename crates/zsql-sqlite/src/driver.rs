@@ -16,8 +16,8 @@ use futures::StreamExt as _;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RowBatch,
-    RowCount, SchemaTree, quote_ident,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
+    RowBatch, RowCount, SchemaTree, quote_ident,
 };
 
 use crate::error::{map_connect_error, map_query_error};
@@ -165,6 +165,19 @@ impl Connection for SqliteConnectionImpl {
             .await
             .map_err(map_query_error)?;
         Ok(RowCount::Exact(u64::try_from(count).unwrap_or(0)))
+    }
+
+    #[tracing::instrument(
+        name = "sqlite_describe_relation",
+        skip(self),
+        fields(pool_size = self.pool.size())
+    )]
+    async fn describe_relation(
+        &self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<RelationSchema, CoreError> {
+        crate::describe::describe_relation(&self.pool, schema, relation).await
     }
 }
 
@@ -593,6 +606,114 @@ mod tests {
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let main = &tree.catalogs[0].schemas[0];
         assert_eq!(main.tables.len(), 2, "the table and the view both appear");
+    }
+
+    /// Unconditional (no `ZSQL_TEST_DATABASE_URL` gate): seeds a temp-file
+    /// database with a primary key, a foreign key, a unique index, and a
+    /// `CHECK` constraint, then asserts `describe_relation` reports the
+    /// structure it can (columns, PK/FK/nullable/default, the unique index)
+    /// and, per the module doc comment on `zsql_sqlite::describe`, omits the
+    /// `CHECK` constraint entirely rather than reporting it inaccurately.
+    #[test]
+    fn describe_relation_reports_columns_indexes_and_constraints() {
+        let db = TempDbPath::new("describe-relation");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        run_ddl(
+            &*conn,
+            "CREATE TABLE parents(id INTEGER PRIMARY KEY); \
+             CREATE TABLE children(\
+                 id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER NOT NULL REFERENCES parents(id), \
+                 code TEXT NOT NULL, \
+                 total INTEGER NOT NULL DEFAULT 0, \
+                 CHECK (total >= 0)\
+             ); \
+             CREATE UNIQUE INDEX children_code_idx ON children(code)",
+        );
+
+        let detail = block_on(conn.describe_relation("main", "children"))
+            .expect("describe_relation must succeed");
+
+        let id = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .expect("id column is present");
+        assert!(id.is_primary_key);
+
+        let parent_id = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "parent_id")
+            .expect("parent_id column is present");
+        assert!(!parent_id.nullable);
+        let fk = parent_id
+            .foreign_key
+            .as_ref()
+            .expect("parent_id must carry a foreign key");
+        assert_eq!(fk.table, "parents");
+        assert_eq!(fk.columns, vec!["id".to_owned()]);
+
+        let code = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "code")
+            .expect("code column is present");
+        assert!(code.is_unique);
+
+        let total = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "total")
+            .expect("total column is present");
+        assert_eq!(total.default.as_deref(), Some("0"));
+
+        assert_eq!(detail.indexes.len(), 1);
+        assert_eq!(detail.indexes[0].name, "children_code_idx");
+        assert!(detail.indexes[0].unique);
+
+        assert!(
+            detail
+                .constraints
+                .iter()
+                .any(|c| c.kind == zsql_core::ConstraintKind::PrimaryKey),
+            "the primary key must be reported as a constraint"
+        );
+        assert!(
+            detail
+                .constraints
+                .iter()
+                .any(|c| c.kind == zsql_core::ConstraintKind::ForeignKey),
+            "the foreign key must be reported as a constraint"
+        );
+        assert!(
+            detail
+                .constraints
+                .iter()
+                .all(|c| c.kind != zsql_core::ConstraintKind::Check),
+            "sqlite describe_relation cannot introspect CHECK constraints and must not \
+             fabricate one"
+        );
+    }
+
+    #[test]
+    fn describe_relation_errors_for_a_relation_that_does_not_exist() {
+        let db = TempDbPath::new("describe-relation-missing");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_dsn(&db.dsn()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let result = block_on(conn.describe_relation("main", "does_not_exist"));
+        match result {
+            Err(zsql_core::CoreError::Introspection(msg)) => {
+                assert!(!msg.is_empty(), "error message should not be empty");
+            }
+            Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
+            Ok(detail) => panic!("describing a nonexistent relation must fail, got {detail:?}"),
+        }
     }
 
     /// Run `sql` (typically DDL) to completion against `conn` and panic on

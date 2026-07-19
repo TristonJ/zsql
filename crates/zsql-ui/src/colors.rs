@@ -41,12 +41,15 @@ pub const VIEW: u32 = 0x4d_9c_e0;
 pub const MATVIEW: u32 = 0xe8_b1_3a;
 /// Partitioned-table relation-kind tint: a violet.
 pub const PARTITIONED: u32 = 0x8b_7f_d6;
+/// Link/foreign-key hue: a periwinkle blue, distinct from [`VIEW`]'s cooler
+/// blue. Used for the schema view's foreign-key rail tick and link chip.
+pub const LINK: u32 = 0x7f_9c_ff;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOL, BYTES, FAINT, INK, JSON, LINE, LINE_SOFT, MATVIEW, MUTED, NUMBER, PANEL, PARTITIONED,
-        RAISE, TEAL, TEAL_DIM, TEXT, UNKNOWN, VIEW,
+        BOOL, BYTES, FAINT, INK, JSON, LINE, LINE_SOFT, LINK, MATVIEW, MUTED, NUMBER, PANEL,
+        PARTITIONED, RAISE, TEAL, TEAL_DIM, TEXT, UNKNOWN, VIEW,
     };
 
     #[test]
@@ -69,6 +72,7 @@ mod tests {
         assert_eq!(VIEW, 0x4d_9c_e0);
         assert_eq!(MATVIEW, 0xe8_b1_3a);
         assert_eq!(PARTITIONED, 0x8b_7f_d6);
+        assert_eq!(LINK, 0x7f_9c_ff);
     }
 
     #[test]

@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 
 use gpui::{
-    ClickEvent, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, Stateful, UniformListScrollHandle, Window, div, point,
-    prelude::*, px, rgb, rgba, uniform_list,
+    ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Stateful, UniformListScrollHandle, Window,
+    anchored, deferred, div, point, prelude::*, px, rgb, rgba, uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
 use zsql_ui::colors;
@@ -71,6 +71,8 @@ pub struct SidebarView {
     /// State of an in-progress scrollbar thumb drag; `None` when the thumb
     /// is not being dragged.
     thumb_drag: Option<ThumbDrag>,
+    /// The currently open relation-row context menu, if any.
+    context_menu: Option<ContextMenuState>,
 }
 
 /// A scrollbar thumb drag's starting point: the mouse position and the
@@ -80,6 +82,19 @@ pub struct SidebarView {
 struct ThumbDrag {
     start_mouse_y: Pixels,
     start_scroll_offset: Pixels,
+}
+
+/// A relation row's open right-click context menu: which relation it
+/// targets, the flattened index of its triggering row (so the menu can
+/// anchor to that row's right edge), and the triggering click position used
+/// as a fallback anchor before the tree viewport has been measured.
+#[derive(Debug, Clone)]
+struct ContextMenuState {
+    schema: String,
+    relation: String,
+    kind: RelationKind,
+    row_index: usize,
+    fallback_position: Point<Pixels>,
 }
 
 impl SidebarView {
@@ -104,6 +119,7 @@ impl SidebarView {
             synced_schema_generation: 0,
             tree_scroll_handle: UniformListScrollHandle::new(),
             thumb_drag: None,
+            context_menu: None,
         };
         view.sync_rows(cx);
         view
@@ -203,6 +219,87 @@ impl SidebarView {
         }
 
         cx.notify();
+    }
+
+    /// Open `schema.relation`'s (or, if already open, reuse/activate) a
+    /// read-only schema tab showing its columns, indexes, and constraints.
+    fn view_schema(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        kind: RelationKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_relation = Some((schema.to_owned(), relation.to_owned()));
+        self.tabs.update(cx, |tabs, cx| {
+            tabs.open_or_reuse_schema(schema, relation, kind, cx);
+        });
+        cx.notify();
+    }
+
+    /// Open the right-click context menu for `schema.relation`, anchored to
+    /// the right edge of its `row_index` row. `fallback_position` (window
+    /// coordinates, from the triggering mouse event) anchors the menu until
+    /// the tree viewport has been measured.
+    fn open_context_menu(
+        &mut self,
+        schema: String,
+        relation: String,
+        kind: RelationKind,
+        row_index: usize,
+        fallback_position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            schema,
+            relation,
+            kind,
+            row_index,
+            fallback_position,
+        });
+        cx.notify();
+    }
+
+    /// Where to anchor the context menu for the relation row at `row_index`:
+    /// the top of that row at the tree viewport's right edge, in window
+    /// coordinates. `None` before the tree viewport has been measured, when
+    /// the row's on-screen position cannot yet be derived.
+    #[allow(clippy::cast_precision_loss)]
+    fn relation_row_anchor(&self, row_index: usize) -> Option<Point<Pixels>> {
+        let bounds = self.tree_scroll_handle.0.borrow().base_handle.bounds();
+        if bounds.size.height == Pixels::ZERO {
+            return None;
+        }
+        let right_edge_x = bounds.origin.x + bounds.size.width;
+        let row_top_y = bounds.origin.y + ROW_HEIGHT * row_index as f32 - self.tree_scroll_offset();
+        Some(point(right_edge_x, row_top_y))
+    }
+
+    /// Close the open context menu, if any.
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Write the open context menu's relation's bare name to the system
+    /// clipboard, then close the menu. A no-op if no menu is open.
+    fn copy_name(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.context_menu {
+            cx.write_to_clipboard(ClipboardItem::new_string(menu.relation.clone()));
+        }
+        self.close_context_menu(cx);
+    }
+
+    /// Write the open context menu's relation's qualified `schema.relation`
+    /// name to the system clipboard, then close the menu. A no-op if no
+    /// menu is open.
+    fn copy_qualified_name(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.context_menu {
+            let qualified = qualified_relation_name(&menu.schema, &menu.relation);
+            cx.write_to_clipboard(ClipboardItem::new_string(qualified));
+        }
+        self.close_context_menu(cx);
     }
 
     /// The tree scroll region's most recently painted viewport height. Zero
@@ -537,52 +634,200 @@ impl SidebarView {
                 name,
                 kind,
                 column_count,
-            } => {
-                let schema_owned = schema.clone();
-                let name_owned = name.clone();
-                let selected = self
-                    .selected_relation
-                    .as_ref()
-                    .is_some_and(|(s, r)| s == schema && r == name);
-
-                let mut shell = row_shell(theme::SIDEBAR_INDENT_L2)
-                    .id(ix)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(rgb(colors::RAISE)))
-                    .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-                        view.preview(&schema_owned, &name_owned, window, cx);
-                    }))
-                    .child(disclosure_spacer())
-                    .child(row_label(name.clone()))
-                    .child(icon(
-                        relation_icon_name(*kind),
-                        theme::SIDEBAR_RELATION_ICON_SIZE,
-                        relation_tint(*kind),
-                    ))
-                    .child(row_count(format!("{column_count} cols")));
-
-                if selected {
-                    shell = shell
-                        .bg(rgba(theme::SIDEBAR_SELECTED_BG))
-                        .border_l_2()
-                        .border_color(rgb(colors::TEAL));
-                }
-                shell
-            }
+            } => self.render_relation_row(ix, schema, name, *kind, *column_count, cx),
         }
     }
+
+    /// A relation row: left-click previews it, right-click opens its
+    /// context menu, and a currently-selected relation gets a teal left
+    /// border and tinted background.
+    fn render_relation_row(
+        &self,
+        ix: usize,
+        schema: &str,
+        name: &str,
+        kind: RelationKind,
+        column_count: usize,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let schema_owned = schema.to_owned();
+        let name_owned = name.to_owned();
+        let schema_for_menu = schema.to_owned();
+        let name_for_menu = name.to_owned();
+        let selected = self
+            .selected_relation
+            .as_ref()
+            .is_some_and(|(s, r)| s == schema && r == name);
+
+        let mut shell = row_shell(theme::SIDEBAR_INDENT_L2)
+            .id(ix)
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(colors::RAISE)))
+            .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+                view.preview(&schema_owned, &name_owned, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
+                    view.open_context_menu(
+                        schema_for_menu.clone(),
+                        name_for_menu.clone(),
+                        kind,
+                        ix,
+                        event.position,
+                        cx,
+                    );
+                }),
+            )
+            .child(disclosure_spacer())
+            .child(row_label(name.to_owned()))
+            .child(icon(
+                relation_icon_name(kind),
+                theme::SIDEBAR_RELATION_ICON_SIZE,
+                relation_tint(kind),
+            ))
+            .child(row_count(format!("{column_count} cols")));
+
+        if selected {
+            shell = shell
+                .bg(rgba(theme::SIDEBAR_SELECTED_BG))
+                .border_l_2()
+                .border_color(rgb(colors::TEAL));
+        }
+        shell
+    }
+}
+
+impl SidebarView {
+    /// The right-click context menu overlay: `Preview Data`, `View Schema`,
+    /// a separator, then `Copy Name`/`Copy Qualified Name`, anchored to the
+    /// right edge of its triggering relation row. A full-window backdrop
+    /// behind it absorbs off-menu clicks so closing the menu never doubles
+    /// as activating whatever sits beneath it. Renders nothing when no menu
+    /// is open.
+    fn render_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.context_menu.clone()?;
+        let schema = menu.schema.clone();
+        let relation = menu.relation.clone();
+        let kind = menu.kind;
+        let anchor = self
+            .relation_row_anchor(menu.row_index)
+            .unwrap_or(menu.fallback_position);
+
+        let preview_schema = schema.clone();
+        let preview_relation = relation.clone();
+        let view_schema_schema = schema.clone();
+        let view_schema_relation = relation.clone();
+
+        let content = div()
+            .id("sidebar-context-menu")
+            .occlude()
+            .w(theme::CONTEXT_MENU_WIDTH)
+            .p(theme::CONTEXT_MENU_PADDING)
+            .bg(rgb(colors::RAISE))
+            .border_1()
+            .border_color(rgb(colors::LINE))
+            .rounded(px(theme::CONTEXT_MENU_RADIUS))
+            .child(context_menu_item(
+                cx,
+                "Preview Data",
+                move |view, window, cx| {
+                    view.preview(&preview_schema, &preview_relation, window, cx);
+                    view.close_context_menu(cx);
+                },
+            ))
+            .child(context_menu_item(
+                cx,
+                "View Schema",
+                move |view, _window, cx| {
+                    view.view_schema(&view_schema_schema, &view_schema_relation, kind, cx);
+                    view.close_context_menu(cx);
+                },
+            ))
+            .child(context_menu_separator())
+            .child(context_menu_item(cx, "Copy Name", |view, _window, cx| {
+                view.copy_name(cx);
+            }))
+            .child(context_menu_item(
+                cx,
+                "Copy Qualified Name",
+                |view, _window, cx| {
+                    view.copy_qualified_name(cx);
+                },
+            ));
+
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_context_menu(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_context_menu(cx);
+                }),
+            )
+            .child(anchored().position(anchor).snap_to_window().child(content));
+
+        Some(deferred(backdrop).with_priority(1).into_any_element())
+    }
+}
+
+/// One context menu row.
+fn context_menu_item(
+    cx: &Context<SidebarView>,
+    label: &'static str,
+    on_click: impl Fn(&mut SidebarView, &mut Window, &mut Context<SidebarView>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(label)
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(theme::CONTEXT_MENU_ITEM_HEIGHT)
+        .px(theme::CONTEXT_MENU_ITEM_PADDING_X)
+        .rounded(px(theme::CONTEXT_MENU_ITEM_RADIUS))
+        .cursor_pointer()
+        .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
+        .text_color(rgb(colors::TEXT))
+        .hover(|el| el.bg(rgba(theme::SIDEBAR_SELECTED_BG)))
+        .child(label)
+        .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+            on_click(view, window, cx);
+        }))
+}
+
+/// A thin horizontal divider between context menu item groups.
+fn context_menu_separator() -> Div {
+    div()
+        .h(theme::CONTEXT_MENU_SEPARATOR_HEIGHT)
+        .my(theme::CONTEXT_MENU_SEPARATOR_MARGIN_Y)
+        .bg(rgb(colors::LINE_SOFT))
+}
+
+/// `schema.relation`, the text `Copy Qualified Name` writes to the
+/// clipboard.
+fn qualified_relation_name(schema: &str, relation: &str) -> String {
+    format!("{schema}.{relation}")
 }
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.nudge_scrollbar_when_tree_unmeasured(cx);
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(colors::PANEL))
             .child(Self::render_header())
             .child(self.render_body(window, cx))
+            .children(self.render_context_menu(cx))
     }
 }
 
@@ -886,7 +1131,7 @@ mod render_tests {
     use gpui::AppContext as _;
     use zsql_core::{Catalog, ColumnMeta, Relation, RelationKind, SchemaNs, SchemaTree};
 
-    use super::SidebarView;
+    use super::{SidebarView, qualified_relation_name};
     use crate::session::{SchemaState, Session};
     use crate::ui::results::ResultsView;
     use crate::ui::tabs::TabModel;
@@ -1082,6 +1327,194 @@ mod render_tests {
         });
         results.update(vcx, |view, _cx| {
             assert_eq!(view.source_label_for_test(), "public.orders");
+        });
+    }
+
+    #[gpui::test]
+    fn view_schema_selects_the_relation_and_opens_a_schema_tab(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let tabs_for_view = tabs.clone();
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.view_schema("public", "orders", RelationKind::Table, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.selected_relation,
+                Some(("public".to_owned(), "orders".to_owned()))
+            );
+        });
+        tabs.read_with(vcx, |tabs, _app| {
+            assert_eq!(tabs.tabs().len(), 1, "View Schema opens exactly one tab");
+            assert!(tabs.tabs()[0].is_schema());
+        });
+    }
+
+    #[gpui::test]
+    fn opening_and_closing_the_context_menu_toggles_its_state(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.open_context_menu(
+                "public".to_owned(),
+                "orders".to_owned(),
+                RelationKind::Table,
+                0,
+                gpui::point(gpui::px(10.0), gpui::px(20.0)),
+                cx,
+            );
+        });
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.context_menu.is_some());
+        });
+
+        sidebar.update(vcx, SidebarView::close_context_menu);
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.context_menu.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn copy_name_writes_the_relations_bare_name_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.open_context_menu(
+                "public".to_owned(),
+                "orders".to_owned(),
+                RelationKind::Table,
+                0,
+                gpui::point(gpui::px(10.0), gpui::px(20.0)),
+                cx,
+            );
+            view.copy_name(cx);
+        });
+
+        let copied =
+            vcx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(copied.as_deref(), Some("orders"));
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.context_menu.is_none(),
+                "Copy Name must also close the menu it was chosen from"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copy_qualified_name_writes_schema_dot_relation_to_the_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.open_context_menu(
+                "public".to_owned(),
+                "orders".to_owned(),
+                RelationKind::Table,
+                0,
+                gpui::point(gpui::px(10.0), gpui::px(20.0)),
+                cx,
+            );
+            view.copy_qualified_name(cx);
+        });
+
+        let copied =
+            vcx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(copied.as_deref(), Some("public.orders"));
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.context_menu.is_none(),
+                "Copy Qualified Name must also close the menu it was chosen from"
+            );
+        });
+    }
+
+    #[test]
+    fn qualified_relation_name_joins_schema_and_relation_with_a_dot() {
+        assert_eq!(qualified_relation_name("public", "orders"), "public.orders");
+    }
+
+    #[gpui::test]
+    fn the_rendered_context_menu_does_not_panic_while_open(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.open_context_menu(
+                "public".to_owned(),
+                "orders".to_owned(),
+                RelationKind::Table,
+                0,
+                gpui::point(gpui::px(10.0), gpui::px(20.0)),
+                cx,
+            );
+        });
+        // Forces a render pass with `render_context_menu`'s deferred/anchored
+        // overlay on screen, catching a panic in the overlay itself (e.g. an
+        // element-id collision or anchoring failure) that a state-only
+        // assertion would miss.
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.context_menu.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_anchors_to_the_triggering_rows_right_edge(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+        vcx.run_until_parked();
+
+        // Once the tree viewport is measured, a row anchor is derived from
+        // the row's laid-out geometry (its top at the viewport's right edge),
+        // and successive rows anchor lower than their predecessors.
+        sidebar.read_with(vcx, |view, _app| {
+            let first = view
+                .relation_row_anchor(0)
+                .expect("a measured tree yields a row anchor");
+            let second = view
+                .relation_row_anchor(1)
+                .expect("a measured tree yields a row anchor");
+            assert!(
+                second.y > first.y,
+                "a later row must anchor below an earlier one"
+            );
+            assert_eq!(
+                first.x, second.x,
+                "every row anchors at the same right-edge x"
+            );
         });
     }
 

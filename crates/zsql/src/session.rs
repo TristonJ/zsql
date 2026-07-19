@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use futures::future::Either;
 use gpui::{BackgroundExecutor, Context, Task, prelude::*};
-use zsql_core::{Connection, CoreError, QueryEvent, ResultSet, RowCount, SchemaTree};
+use zsql_core::{
+    Connection, CoreError, QueryEvent, RelationSchema, ResultSet, RowCount, SchemaTree,
+};
 
 use crate::config::Config;
 use crate::drivers;
@@ -524,6 +526,60 @@ impl Session {
         preview_task
     }
 
+    /// Fetch `schema.relation`'s full structural detail (columns, indexes,
+    /// constraints) via the active connection's
+    /// [`Connection::describe_relation`], as its own background task.
+    ///
+    /// Independent of [`Session::run_query`]/[`Session::preview_relation`]'s
+    /// query-lifecycle state (`state`, `accumulating`, `row_count`): a
+    /// describe never touches any of it, so any number of describes (e.g.
+    /// for several open schema tabs) can be in flight at once, concurrently
+    /// with each other and with a running query, without interfering with
+    /// one another.
+    ///
+    /// # Errors
+    /// The returned task resolves to an error if there is no active
+    /// connection, or to whatever [`Connection::describe_relation`] itself
+    /// returns.
+    pub fn describe_relation(
+        &self,
+        schema: &str,
+        relation: &str,
+        cx: &Context<Self>,
+    ) -> Task<Result<RelationSchema, CoreError>> {
+        let Some(connection) = self.connection.clone() else {
+            return Task::ready(Err(CoreError::Connection(
+                "cannot describe relation: not connected".to_owned(),
+            )));
+        };
+        let schema = schema.to_owned();
+        let relation = relation.to_owned();
+        cx.background_spawn(describe_relation_via(connection, schema, relation))
+    }
+
+    /// Fetch `schema.relation`'s total row count via the active connection's
+    /// [`Connection::count_rows`], as its own background task, independent
+    /// of [`Session::preview_relation`]'s own count fetch.
+    ///
+    /// # Errors
+    /// The returned task resolves to an error if there is no active
+    /// connection, or to whatever [`Connection::count_rows`] itself returns.
+    pub fn relation_row_count(
+        &self,
+        schema: &str,
+        relation: &str,
+        cx: &Context<Self>,
+    ) -> Task<Result<RowCount, CoreError>> {
+        let Some(connection) = self.connection.clone() else {
+            return Task::ready(Err(CoreError::Connection(
+                "cannot fetch row count: not connected".to_owned(),
+            )));
+        };
+        let schema = schema.to_owned();
+        let relation = relation.to_owned();
+        cx.background_spawn(count_relation_rows(connection, schema, relation))
+    }
+
     /// Fold one `QueryEvent` (or a terminal error) into `state`/`accumulating`.
     ///
     /// Once `state` has moved to [`SessionState::Limited`] for the query
@@ -729,6 +785,16 @@ async fn count_relation_rows(
     relation: String,
 ) -> Result<RowCount, CoreError> {
     connection.count_rows(&schema, &relation).await
+}
+
+/// Describe `schema.relation`'s full structure via `connection`.
+#[tracing::instrument(name = "session_describe_relation", skip(connection))]
+async fn describe_relation_via(
+    connection: Arc<dyn Connection>,
+    schema: String,
+    relation: String,
+) -> Result<RelationSchema, CoreError> {
+    connection.describe_relation(&schema, &relation).await
 }
 
 /// Ping `connection`, failing the probe if it does not complete within
@@ -1435,6 +1501,14 @@ mod gpui_tests {
                 .expect("count_outcome lock poisoned")
                 .clone()
                 .map_err(CoreError::Query)
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            Ok(zsql_core::RelationSchema::default())
         }
     }
 

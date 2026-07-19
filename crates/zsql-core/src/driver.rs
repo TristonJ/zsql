@@ -6,6 +6,7 @@ use crate::config::ConnConfig;
 use crate::error::CoreError;
 use crate::row_count::RowCount;
 use crate::schema::SchemaTree;
+use crate::schema_detail::RelationSchema;
 use crate::value::{ColumnMeta, RowBatch};
 
 /// An incremental event emitted while a query streams to the UI.
@@ -103,4 +104,17 @@ pub trait Connection: Send + Sync {
     /// Returns an error if the count cannot be determined (e.g. the relation
     /// does not exist, or the underlying query fails).
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError>;
+
+    /// The full structural detail of `relation` in `schema`: its columns
+    /// (with key/default detail beyond [`crate::value::ColumnMeta`]),
+    /// indexes, and constraints.
+    ///
+    /// # Errors
+    /// Returns an error if the relation does not exist or introspecting its
+    /// structure fails.
+    async fn describe_relation(
+        &self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<RelationSchema, CoreError>;
 }

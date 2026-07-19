@@ -1091,7 +1091,7 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
 
 /// Groups digits every three places when rendering a total row count in the
 /// status bar.
-const THOUSANDS_SEPARATOR: char = ',';
+pub(crate) const THOUSANDS_SEPARATOR: char = ',';
 
 /// Appended after the number when a total row count is a planner estimate
 /// rather than an exact count, so the distinction reads clearly even without
@@ -1124,7 +1124,7 @@ fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
 
 /// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
 /// the right, e.g. `1234567` -> `"1,234,567"`.
-fn group_thousands(n: u64) -> String {
+pub(crate) fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().rev().enumerate() {
