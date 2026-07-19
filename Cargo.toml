@@ -43,6 +43,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Tab-session persistence (`zsql::tab_session`): nested enum/struct data that
+# TOML's array-of-tables shape does not represent cleanly.
+serde_json = "1"
 dirs = "5"
 
 [workspace.lints.clippy]

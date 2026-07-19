@@ -15,6 +15,9 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// File name of the persisted connection store, under `APP_CONFIG_DIR_NAME`.
 /// See [`crate::connections::ConnectionStore`].
 const CONNECTIONS_FILE_NAME: &str = "connections.toml";
+/// File name of the persisted per-connection tab-session store, under
+/// `APP_CONFIG_DIR_NAME`. See [`crate::tab_session`].
+const TAB_SESSIONS_FILE_NAME: &str = "tab_sessions.json";
 
 /// Top-level application config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -178,6 +181,15 @@ impl Config {
     #[must_use]
     pub fn connections_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(CONNECTIONS_FILE_NAME))
+    }
+
+    /// Path to the persisted tab-session store
+    /// (`$XDG_CONFIG_HOME/zsql/tab_sessions.json`), if resolvable. Lives
+    /// alongside [`Config::default_path`], under the same app config
+    /// directory.
+    #[must_use]
+    pub fn tab_sessions_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(TAB_SESSIONS_FILE_NAME))
     }
 
     /// Load config from `path`, falling back to defaults if it does not exist.

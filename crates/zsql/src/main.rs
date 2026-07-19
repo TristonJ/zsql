@@ -6,6 +6,7 @@ mod drivers;
 mod observability;
 mod session;
 mod sql;
+mod tab_session;
 #[cfg(test)]
 mod test_support;
 mod ui;
@@ -60,17 +61,33 @@ fn main() -> anyhow::Result<()> {
 
                     let workspace_session = session.clone();
                     let workspace_layout = cfg.layout.clone();
+                    let tab_sessions_path = Config::tab_sessions_path();
                     let workspace = cx.new(|cx| {
                         WorkspaceView::new(
                             workspace_session,
                             workspace_layout,
                             connection_store,
+                            tab_sessions_path,
                             cx,
                         )
                     });
                     if let Some(handle) = workspace.read(cx).editor_focus_handle(cx) {
                         window.focus(&handle);
                     }
+
+                    // Flush the active connection's tab session to disk on
+                    // quit, so an edit made just before quitting is not lost
+                    // to a fire-and-forget background write racing process
+                    // exit.
+                    let quit_workspace = workspace.clone();
+                    cx.on_app_quit(move |cx| {
+                        let task =
+                            quit_workspace.update(cx, WorkspaceView::flush_tab_session_on_quit);
+                        async move {
+                            task.await;
+                        }
+                    })
+                    .detach();
 
                     let startup_session = session.clone();
                     let startup_workspace = workspace.clone();
