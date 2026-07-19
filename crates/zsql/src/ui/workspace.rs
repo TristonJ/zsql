@@ -6,9 +6,10 @@ use std::rc::Rc;
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Window, canvas, div, prelude::*,
-    px, rgb,
+    px, rgb, rgba,
 };
 use zsql_ui::colors;
+use zsql_ui::icon::{IconName, icon};
 
 use super::connections::{ActiveConnection, ConnectionManagerView};
 use super::footer::ConnectionFooterView;
@@ -191,11 +192,14 @@ impl WorkspaceView {
                 start_height,
             }) => {
                 let delta = event.position.y - origin_y;
-                // The tab bar sits above the editor pane inside the same
-                // measured column, so its fixed height is not itself
-                // resizable and must be carved out of the container height
-                // before splitting the rest between the editor and results.
-                let available_height = self.column_height.get() - zsql_ui::tabs::TAB_BAR_HEIGHT;
+                // The tab bar and the workspace header both sit above the
+                // editor pane inside the same measured column, so their
+                // fixed heights are not themselves resizable and must be
+                // carved out of the container height before splitting the
+                // rest between the editor and results.
+                let available_height = self.column_height.get()
+                    - zsql_ui::tabs::TAB_BAR_HEIGHT
+                    - theme::WORKSPACE_HEADER_HEIGHT;
                 self.editor_height = clamp_editor_height(
                     available_height,
                     start_height,
@@ -225,6 +229,22 @@ impl WorkspaceView {
             tabs.new_script_tab(cx);
         });
         self.focus_active_editor(window, cx);
+    }
+
+    /// Run the active tab's query through the same seam its `RunQuery`
+    /// keybinding uses, regardless of which element currently holds
+    /// keyboard focus. The workspace header's Run button's click handler;
+    /// a no-op when every tab has been closed.
+    fn run_active_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .map(|tab| tab.editor().clone())
+        else {
+            return;
+        };
+        editor.update(cx, zsql_editor::EditorView::run_current_query);
     }
 
     /// The tab bar: one entry per open tab, in order, plus the trailing "+"
@@ -296,6 +316,71 @@ impl WorkspaceView {
                         cx.stop_propagation();
                         view.close_tab(id, window, cx);
                     })),
+            )
+    }
+
+    /// The header above the active tab's content: a pane label on the left
+    /// and the Run button, with its keyboard-shortcut hint, on the right.
+    /// Rendered once per frame regardless of the active tab's kind, so both
+    /// a full `Script` editor and a compact `Generated` strip get a Run
+    /// affordance.
+    fn render_header(cx: &Context<Self>) -> impl IntoElement {
+        let run_shortcut = if cfg!(target_os = "macos") {
+            "Cmd+Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(theme::WORKSPACE_HEADER_HEIGHT)
+            .px(px(theme::WORKSPACE_HEADER_PADDING_X))
+            .bg(rgb(colors::PANEL))
+            .border_b_1()
+            .border_color(rgb(colors::LINE))
+            .child(
+                div()
+                    .text_size(px(theme::WORKSPACE_HEADER_LABEL_TEXT_SIZE))
+                    .text_color(rgb(colors::MUTED))
+                    .child("SQL"),
+            )
+            .child(
+                div()
+                    .id("workspace-run-query-button")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(theme::RUN_BUTTON_HEIGHT)
+                    .px(px(theme::RUN_BUTTON_PADDING_X))
+                    .rounded(px(theme::RUN_BUTTON_RADIUS))
+                    .bg(rgb(colors::TEAL))
+                    .text_color(rgb(colors::INK))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::RUN_BUTTON_HOVER_BG)))
+                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                        view.run_active_tab(cx);
+                    }))
+                    .child(icon(
+                        IconName::Run,
+                        theme::RUN_BUTTON_ICON_SIZE,
+                        colors::INK,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))
+                            .child("Run"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
+                            .text_color(rgba(theme::RUN_BUTTON_HINT))
+                            .child(run_shortcut),
+                    ),
             )
     }
 
@@ -465,6 +550,7 @@ impl Render for WorkspaceView {
                                 .inset_0(),
                             )
                             .child(self.render_tab_bar(cx))
+                            .child(Self::render_header(cx))
                             .child(self.render_active_body(cx))
                             .child(
                                 div()
@@ -795,5 +881,205 @@ mod render_tests {
             assert_eq!(workspace.sidebar_width, expected_sidebar_width);
             assert_eq!(workspace.editor_height, expected_editor_height);
         });
+    }
+}
+
+/// Tests for the workspace header's Run button: it dispatches a run for the
+/// active tab through the same `Session`/`QueryRunner` path
+/// `TabModel::run_for_tab` already uses, for both a `Script` and a
+/// `Generated` active tab, independent of keyboard focus.
+#[cfg(test)]
+mod header_tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use gpui::{AppContext as _, Entity, TestAppContext};
+    use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, RowCount, SchemaTree};
+
+    use super::WorkspaceView;
+    use crate::config::LayoutConfig;
+    use crate::connections::ConnectionStore;
+    use crate::session::Session;
+    use crate::ui::tabs::generated_tab_sql;
+
+    /// A `Connection` double that records every SQL string `stream_query` is
+    /// called with, in place of a real session/database, so a test can
+    /// assert the header's Run button reached `Session::run_query`.
+    struct RecordingConnection {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Connection for RecordingConnection {
+        fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
+            self.queries
+                .lock()
+                .expect("queries lock poisoned")
+                .push(sql);
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            Ok(SchemaTree::default())
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            Ok(RowCount::Exact(0))
+        }
+    }
+
+    /// An empty connection store backed by a path this test never writes to.
+    fn empty_store_for_test() -> ConnectionStore {
+        let path = std::env::temp_dir().join(format!(
+            "zsql-workspace-header-test-{}.toml",
+            std::process::id()
+        ));
+        ConnectionStore::load(&path).expect("loading a nonexistent path must succeed empty")
+    }
+
+    /// A session backed by a [`RecordingConnection`], and the queries it
+    /// records.
+    fn recording_session(cx: &mut TestAppContext) -> (Entity<Session>, Arc<Mutex<Vec<String>>>) {
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+            queries: queries.clone(),
+        });
+        let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+        (session, queries)
+    }
+
+    #[gpui::test]
+    fn header_run_button_dispatches_run_for_the_active_script_tab(cx: &mut TestAppContext) {
+        let (session, queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .expect("a workspace always opens with an active script tab")
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.set_text("select * from orders", cx);
+        });
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+
+        assert_eq!(
+            queries.lock().expect("queries lock poisoned").as_slice(),
+            ["select * from orders"],
+            "the header's Run button must dispatch the active script tab's SQL"
+        );
+    }
+
+    #[gpui::test]
+    fn header_run_button_dispatches_run_for_the_active_generated_tab(cx: &mut TestAppContext) {
+        let (session, queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.open_or_reuse_generated("public", "orders", 200, cx);
+            });
+        });
+        vcx.run_until_parked();
+        // Opening a generated tab already dispatches its own preview run;
+        // isolate what the header's own click contributes.
+        queries.lock().expect("queries lock poisoned").clear();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+
+        assert_eq!(
+            queries.lock().expect("queries lock poisoned").as_slice(),
+            [generated_tab_sql("public", "orders", 200)],
+            "the header's Run button must dispatch the active generated tab's SQL"
+        );
+    }
+
+    #[gpui::test]
+    fn header_renders_above_both_a_script_and_a_generated_active_tab_without_panicking(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, _queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+        // A fresh workspace's active tab is a Script tab: this first frame
+        // already exercises the header above a Script tab's full editor.
+        vcx.run_until_parked();
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.open_or_reuse_generated("public", "orders", 200, cx);
+            });
+        });
+        vcx.run_until_parked();
+        // The newly opened generated tab is now active: this frame exercises
+        // the same header above a Generated tab's compact strip instead.
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace
+                    .tabs
+                    .read(cx)
+                    .active_tab()
+                    .is_some_and(super::Tab::is_generated),
+                "the generated tab must be active for this frame to cover it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn header_run_button_is_a_no_op_when_all_tabs_are_closed(cx: &mut TestAppContext) {
+        let (session, queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(session, LayoutConfig::default(), empty_store_for_test(), cx)
+        });
+
+        // Close the default script tab, leaving no active tab
+        workspace.update(vcx, |workspace, cx| {
+            let tab_id = workspace
+                .tabs
+                .read(cx)
+                .active_id()
+                .expect("workspace should have an active tab initially");
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.close_tab(tab_id, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Verify there's no active tab
+        workspace.read_with(vcx, |workspace, cx| {
+            assert_eq!(
+                workspace.tabs.read(cx).active_id(),
+                None,
+                "all tabs should be closed"
+            );
+        });
+
+        // Attempt to run the active tab when none exists
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+
+        // Verify no queries were recorded (it was a no-op)
+        let locked_queries = queries.lock().expect("queries lock poisoned");
+        assert!(
+            locked_queries.is_empty(),
+            "running when no active tab exists must be a no-op"
+        );
     }
 }

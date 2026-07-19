@@ -23,6 +23,31 @@ pub const STATUS_DISCONNECTED: u32 = 0xe2_6d_78;
 /// connection attempt in flight.
 pub const STATUS_LIMITED: u32 = 0xe8_a1_3a;
 
+/// Height of the workspace header above the active tab's content, holding
+/// the pane label and the Run button.
+pub const WORKSPACE_HEADER_HEIGHT: Pixels = px(38.0);
+/// Horizontal padding inside the workspace header.
+pub const WORKSPACE_HEADER_PADDING_X: f32 = 10.0;
+/// Text size of the workspace header's left-hand pane label.
+pub const WORKSPACE_HEADER_LABEL_TEXT_SIZE: f32 = 10.5;
+/// Height of the Run button.
+pub const RUN_BUTTON_HEIGHT: Pixels = px(25.0);
+/// Horizontal padding inside the Run button.
+pub const RUN_BUTTON_PADDING_X: f32 = 11.0;
+/// Corner radius of the Run button.
+pub const RUN_BUTTON_RADIUS: f32 = 5.0;
+/// Text size of the Run button's label.
+pub const RUN_BUTTON_TEXT_SIZE: f32 = 11.5;
+/// Size of the Run button's play icon.
+pub const RUN_BUTTON_ICON_SIZE: Pixels = px(12.0);
+/// Text size of the Run button's keyboard-shortcut hint.
+pub const RUN_BUTTON_HINT_TEXT_SIZE: f32 = 10.0;
+/// Run button background when hovered: a lighter teal than the resting accent.
+pub const RUN_BUTTON_HOVER_BG: u32 = 0x46_cf_ba;
+/// Run button shortcut-hint color: the page ink at reduced opacity, so it
+/// reads as secondary against the teal fill.
+pub const RUN_BUTTON_HINT: u32 = 0x10_12_17_b3;
+
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
 /// Height of the sticky column-header row.

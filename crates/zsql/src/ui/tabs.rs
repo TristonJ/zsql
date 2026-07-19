@@ -273,12 +273,24 @@ impl TabModel {
     /// Run `sql` for tab `id` through `session`, the `RunQuery`/Run-button
     /// seam every tab's editor is wired to (see [`TabModel::build_editor`]).
     fn run_for_tab(&mut self, id: TabId, sql: String, cx: &mut Context<Self>) {
-        let Some(label) = self.tab(id).map(display_label) else {
+        let Some(tab) = self.tab(id) else {
             return;
         };
-        let task = self
-            .session
-            .update(cx, |session, cx| session.run_query(sql, cx));
+        let label = display_label(tab);
+        let kind = tab.kind.clone();
+        // A live generated tab is a preview of its relation, so re-running it
+        // must refresh that relation's total row count the same way opening it
+        // did. preview_relation fetches the count; a plain run_query would
+        // leave it cleared. Once edited (kind Script) the tab is an ordinary
+        // query and runs its own text verbatim.
+        let task = match kind {
+            TabKind::Generated { schema, relation } => self.session.update(cx, |session, cx| {
+                session.preview_relation(&schema, &relation, cx)
+            }),
+            TabKind::Script => self
+                .session
+                .update(cx, |session, cx| session.run_query(sql, cx)),
+        };
         self.dispatch_run(id, label, task, cx);
     }
 
@@ -544,6 +556,40 @@ mod tests {
         let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session_for_results, "", cx)));
         let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
         (model, sinks)
+    }
+
+    #[gpui::test]
+    fn re_running_a_generated_preview_tab_refreshes_the_relation_row_count(
+        cx: &mut TestAppContext,
+    ) {
+        let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+        let connection: Arc<dyn Connection> = Arc::new(RecordingConnection { sinks });
+        let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+        let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+        let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results, cx)));
+
+        // Opening a generated preview tab fetches the relation's total row count.
+        let id = model.update(cx, |model, cx| {
+            model.open_or_reuse_generated("public", "orders", 100, cx)
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _cx| {
+            assert_eq!(session.row_count(), Some(RowCount::Exact(0)));
+        });
+
+        // Re-running that preview tab (the Run button / RunQuery path) must
+        // refresh the count, not clear it the way a plain run_query would.
+        model.update(cx, |model, cx| {
+            model.run_for_tab(id, "SELECT 1".to_owned(), cx);
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _cx| {
+            assert_eq!(
+                session.row_count(),
+                Some(RowCount::Exact(0)),
+                "re-running a generated preview tab must refresh its relation row count"
+            );
+        });
     }
 
     fn build_model(cx: &mut TestAppContext) -> Entity<TabModel> {
