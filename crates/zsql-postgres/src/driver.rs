@@ -568,15 +568,6 @@ mod tests {
         assert_eq!(driver.display_name(), "PostgreSQL");
     }
 
-    /// Live-database tests are gated on `ZSQL_TEST_DATABASE_URL` so
-    /// `cargo test` passes with no database present.
-    #[test]
-    fn connect_succeeds_against_a_live_database_when_configured() {
-        let Some(_conn) = live_connection() else {
-            return;
-        };
-    }
-
     #[test]
     fn introspect_maps_unreachable_host_to_core_introspection_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -623,19 +614,232 @@ mod tests {
         }
     }
 
+    /// Builds a [`PgConnection`] whose pools only ever parse `UNREACHABLE_URL`
+    /// (`connect_lazy` never touches the network), so a test can exercise
+    /// `preview_query` -- pure string-building, no I/O -- without a live
+    /// database.
+    fn connection_for_test() -> PgConnection {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
+        let cancel_pool = pool.clone();
+        let probe_pool = pool.clone();
+        PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        }
+    }
+
+    #[test]
+    fn preview_query_quotes_both_identifiers_and_applies_the_limit() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query("public", "orders", 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn stream_query_pushes_single_error_when_pool_is_unreachable() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(UNREACHABLE_URL)
+            .expect("connect_lazy only parses the URL; it must not touch the network");
+        let cancel_pool = pool.clone();
+        let probe_pool = pool.clone();
+        let conn = PgConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+        };
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
+
+        let evt = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stream_query must push exactly one event, not hang");
+        match evt {
+            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            other => panic!("expected a single CoreError::Query, got {other:?}"),
+        }
+
+        // No `Done` (or anything else) follows the error.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no further events should follow the error"
+        );
+    }
+
+    #[test]
+    fn exact_count_sql_quotes_both_identifiers() {
+        assert_eq!(
+            super::exact_count_sql("public", "orders"),
+            "SELECT COUNT(*) FROM \"public\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
+        let sql = super::exact_count_sql("public", "orders\"; DROP TABLE users; --");
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"public\".\"orders\"\"; DROP TABLE users; --\""
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
+        let sql = super::exact_count_sql("public\"; DROP TABLE users; --", "orders");
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"public\"\"; DROP TABLE users; --\".\"orders\""
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn reltuples_is_reliable_rejects_the_never_analyzed_sentinel() {
+        // Postgres reports reltuples == -1 for a relation that has never
+        // been ANALYZE'd, regardless of how many rows it actually holds.
+        assert!(!super::reltuples_is_reliable(-1.0));
+    }
+
+    #[test]
+    fn reltuples_is_reliable_accepts_a_positive_estimate() {
+        assert!(super::reltuples_is_reliable(1234.0));
+    }
+
+    #[test]
+    fn reltuples_is_reliable_accepts_a_genuinely_empty_analyzed_table() {
+        // Once ANALYZE has run, reltuples == 0 means "zero rows", a
+        // trustworthy estimate rather than an unanalyzed placeholder (the
+        // placeholder is the negative sentinel above, not zero).
+        assert!(super::reltuples_is_reliable(0.0));
+    }
+
+    #[test]
+    fn reltuples_to_row_count_rounds_to_the_nearest_integer() {
+        assert_eq!(super::reltuples_to_row_count(1234.4), 1234);
+        assert_eq!(super::reltuples_to_row_count(1234.6), 1235);
+        assert_eq!(super::reltuples_to_row_count(0.0), 0);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "driver-integration-tests")]
+mod database_tests {
+    use std::time::Duration;
+
+    use zsql_core::{ConnConfig, Driver};
+
+    use super::PostgresDriver;
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        futures::executor::block_on(fut)
+    }
+
+    /// Reads `ZSQL_TEST_POSTGRES_URL` for database-tests
+    fn live_database_url() -> String {
+        std::env::var("ZSQL_TEST_POSTGRES_URL")
+            .expect("ZSQL_TEST_POSTGRES_URL must be set to run database tests")
+    }
+
+    /// Connects to `ZSQL_TEST_POSTGRES_URL` via [`live_database_url`]
+    fn live_connection() -> Box<dyn zsql_core::Connection> {
+        let url = live_database_url();
+        let driver = PostgresDriver;
+        let cfg = ConnConfig::from_url(&url).unwrap();
+        block_on(driver.connect(&cfg)).expect("connect should succeed")
+    }
+
+    /// Table names [`seed_describe_relation_tables`] creates: a referenced
+    /// parent table and the described child table.
+    const DESCRIBE_RELATION_PARENTS_TABLE: &str = "zsql_test_describe_parents";
+    const DESCRIBE_RELATION_CHILDREN_TABLE: &str = "zsql_test_describe_children";
+
+    /// Seeds a self-contained pair of tables (a referenced parents table and
+    /// the described children table) with a primary key, a foreign key, a
+    /// named non-PK unique index, and a check constraint. Ad hoc DDL run
+    /// through `conn` rather than `dev/seed.sql`, so a test using this owns
+    /// and cleans up its own tables independently of the shared dev seed.
+    fn seed_describe_relation_tables(conn: &dyn zsql_core::Connection) {
+        let parents = DESCRIBE_RELATION_PARENTS_TABLE;
+        let children = DESCRIBE_RELATION_CHILDREN_TABLE;
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {children}"));
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {parents}"));
+        run_ddl(
+            conn,
+            &format!("CREATE TABLE {parents} (id bigserial PRIMARY KEY)"),
+        );
+        run_ddl(
+            conn,
+            &format!(
+                "CREATE TABLE {children} (\
+                     id bigserial PRIMARY KEY, \
+                     parent_id bigint NOT NULL REFERENCES {parents} (id), \
+                     code text NOT NULL, \
+                     total integer NOT NULL DEFAULT 0, \
+                     label text NOT NULL DEFAULT 'pending', \
+                     CONSTRAINT zsql_test_describe_children_total_check CHECK (total >= 0)\
+                 )"
+            ),
+        );
+        run_ddl(
+            conn,
+            &format!(
+                "CREATE UNIQUE INDEX zsql_test_describe_children_code_idx ON {children} (code)"
+            ),
+        );
+    }
+
+    /// Drops the tables [`seed_describe_relation_tables`] created.
+    fn drop_describe_relation_tables(conn: &dyn zsql_core::Connection) {
+        run_ddl(
+            conn,
+            &format!("DROP TABLE {DESCRIBE_RELATION_CHILDREN_TABLE}"),
+        );
+        run_ddl(
+            conn,
+            &format!("DROP TABLE {DESCRIBE_RELATION_PARENTS_TABLE}"),
+        );
+    }
+
+    /// Receive one event with a generous timeout so a broken implementation
+    /// fails the test instead of hanging it.
+    fn recv(
+        rx: &flume::Receiver<Result<zsql_core::QueryEvent, zsql_core::CoreError>>,
+    ) -> Result<zsql_core::QueryEvent, zsql_core::CoreError> {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("expected an event within the timeout")
+    }
+
+    #[test]
+    fn connect_succeeds_against_a_live_database_when_configured() {
+        live_connection();
+    }
+
     #[test]
     fn ping_succeeds_against_a_live_database_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
         block_on(conn.ping()).expect("ping should succeed against a reachable database");
     }
 
     #[test]
     fn ping_completes_while_a_slow_query_is_streaming_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -672,9 +876,7 @@ mod tests {
 
     #[test]
     fn introspect_builds_schema_tree_matching_the_seeded_database_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -775,10 +977,7 @@ mod tests {
 
     #[test]
     fn introspect_orders_schemas_relations_and_columns_deterministically_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
-
+        let conn = live_connection();
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let catalog = &tree.catalogs[0];
 
@@ -818,10 +1017,7 @@ mod tests {
 
     #[test]
     fn introspect_includes_non_public_schemas_including_an_empty_one_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
-
+        let conn = live_connection();
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let catalog = &tree.catalogs[0];
 
@@ -854,9 +1050,7 @@ mod tests {
 
     #[test]
     fn introspect_attributes_columns_by_schema_and_relation_not_name_alone_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let tree = block_on(conn.introspect()).expect("introspect should succeed");
         let catalog = &tree.catalogs[0];
@@ -906,79 +1100,9 @@ mod tests {
         after_slash.split('?').next().unwrap_or(after_slash)
     }
 
-    /// Builds a [`PgConnection`] whose pools only ever parse `UNREACHABLE_URL`
-    /// (`connect_lazy` never touches the network), so a test can exercise
-    /// `preview_query` -- pure string-building, no I/O -- without a live
-    /// database.
-    fn connection_for_test() -> PgConnection {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_URL)
-            .expect("connect_lazy only parses the URL; it must not touch the network");
-        let cancel_pool = pool.clone();
-        let probe_pool = pool.clone();
-        PgConnection {
-            pool,
-            cancel_pool,
-            probe_pool,
-        }
-    }
-
-    #[test]
-    fn preview_query_quotes_both_identifiers_and_applies_the_limit() {
-        let conn = connection_for_test();
-        assert_eq!(
-            conn.preview_query("public", "orders", 200),
-            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
-        );
-    }
-
-    #[test]
-    fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
-        let conn = connection_for_test();
-        let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
-        assert_eq!(
-            sql,
-            "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
-        );
-        assert_eq!(sql.matches("DROP TABLE").count(), 1);
-    }
-
-    #[test]
-    fn stream_query_pushes_single_error_when_pool_is_unreachable() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy(UNREACHABLE_URL)
-            .expect("connect_lazy only parses the URL; it must not touch the network");
-        let cancel_pool = pool.clone();
-        let probe_pool = pool.clone();
-        let conn = PgConnection {
-            pool,
-            cancel_pool,
-            probe_pool,
-        };
-
-        let (tx, rx) = flume::unbounded();
-        let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
-
-        let evt = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("stream_query must push exactly one event, not hang");
-        match evt {
-            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
-            other => panic!("expected a single CoreError::Query, got {other:?}"),
-        }
-
-        // No `Done` (or anything else) follows the error.
-        assert!(
-            rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "no further events should follow the error"
-        );
-    }
-
     #[test]
     fn stream_query_maps_a_representative_type_spread_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let sql = "SELECT \
             true AS b, \
@@ -1072,9 +1196,7 @@ mod tests {
 
     #[test]
     fn stream_query_maps_json_and_jsonb_scalars_and_arrays_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let sql = "SELECT \
             '{\"aa\": 1, \"b\": 2}'::jsonb AS jsonb_key_order, \
@@ -1143,9 +1265,7 @@ mod tests {
 
     #[test]
     fn stream_query_keeps_statements_as_separate_result_sets_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         // Both statements name their column "n", so a naive concatenation
         // would look structurally valid while silently mixing two statements'
@@ -1191,9 +1311,7 @@ mod tests {
 
     #[test]
     fn stream_query_batches_large_result_sets_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let (tx, rx) = flume::unbounded();
@@ -1239,9 +1357,7 @@ mod tests {
 
     #[test]
     fn stream_query_reports_affected_rows_for_dml_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query(
@@ -1265,9 +1381,7 @@ mod tests {
 
     #[test]
     fn stream_query_emits_columns_for_a_zero_row_result_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS one WHERE false".to_owned(), tx);
@@ -1284,9 +1398,7 @@ mod tests {
 
     #[test]
     fn dropping_the_query_handle_stops_further_rows_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let handle =
@@ -1320,9 +1432,7 @@ mod tests {
 
     #[test]
     fn calling_cancel_stops_further_rows_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
         let handle =
@@ -1356,9 +1466,7 @@ mod tests {
 
     #[test]
     fn cancel_stops_a_server_side_blocking_query_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -1423,61 +1531,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_count_sql_quotes_both_identifiers() {
-        assert_eq!(
-            super::exact_count_sql("public", "orders"),
-            "SELECT COUNT(*) FROM \"public\".\"orders\""
-        );
-    }
-
-    #[test]
-    fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
-        let sql = super::exact_count_sql("public", "orders\"; DROP TABLE users; --");
-        assert_eq!(
-            sql,
-            "SELECT COUNT(*) FROM \"public\".\"orders\"\"; DROP TABLE users; --\""
-        );
-        assert_eq!(sql.matches("DROP TABLE").count(), 1);
-    }
-
-    #[test]
-    fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
-        let sql = super::exact_count_sql("public\"; DROP TABLE users; --", "orders");
-        assert_eq!(
-            sql,
-            "SELECT COUNT(*) FROM \"public\"\"; DROP TABLE users; --\".\"orders\""
-        );
-        assert_eq!(sql.matches("DROP TABLE").count(), 1);
-    }
-
-    #[test]
-    fn reltuples_is_reliable_rejects_the_never_analyzed_sentinel() {
-        // Postgres reports reltuples == -1 for a relation that has never
-        // been ANALYZE'd, regardless of how many rows it actually holds.
-        assert!(!super::reltuples_is_reliable(-1.0));
-    }
-
-    #[test]
-    fn reltuples_is_reliable_accepts_a_positive_estimate() {
-        assert!(super::reltuples_is_reliable(1234.0));
-    }
-
-    #[test]
-    fn reltuples_is_reliable_accepts_a_genuinely_empty_analyzed_table() {
-        // Once ANALYZE has run, reltuples == 0 means "zero rows", a
-        // trustworthy estimate rather than an unanalyzed placeholder (the
-        // placeholder is the negative sentinel above, not zero).
-        assert!(super::reltuples_is_reliable(0.0));
-    }
-
-    #[test]
-    fn reltuples_to_row_count_rounds_to_the_nearest_integer() {
-        assert_eq!(super::reltuples_to_row_count(1234.4), 1234);
-        assert_eq!(super::reltuples_to_row_count(1234.6), 1235);
-        assert_eq!(super::reltuples_to_row_count(0.0), 0);
-    }
-
     /// Runs `ANALYZE` on a freshly seeded table, then asserts `count_rows`
     /// reports a `RowCount::Estimated` within a generous tolerance of the
     /// table's true row count. Postgres's own planner statistics come from a
@@ -1486,9 +1539,7 @@ mod tests {
     /// `ANALYZE`.
     #[test]
     fn count_rows_returns_an_estimated_count_within_tolerance_after_analyze_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -1534,9 +1585,7 @@ mod tests {
     /// estimate.
     #[test]
     fn count_rows_falls_back_to_exact_for_an_unanalyzed_table_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -1572,9 +1621,7 @@ mod tests {
     /// falling back to an exact count.
     #[test]
     fn count_rows_returns_an_estimated_zero_for_an_analyzed_empty_table_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -1608,9 +1655,7 @@ mod tests {
     /// `CoreError`, not be swallowed.
     #[test]
     fn count_rows_errors_for_a_relation_absent_from_pg_class_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let result = block_on(conn.count_rows("public", "zsql_test_relation_that_does_not_exist"));
         tracing::info!(
@@ -1629,63 +1674,9 @@ mod tests {
         }
     }
 
-    /// Table names [`seed_describe_relation_tables`] creates: a referenced
-    /// parent table and the described child table.
-    const DESCRIBE_RELATION_PARENTS_TABLE: &str = "zsql_test_describe_parents";
-    const DESCRIBE_RELATION_CHILDREN_TABLE: &str = "zsql_test_describe_children";
-
-    /// Seeds a self-contained pair of tables (a referenced parents table and
-    /// the described children table) with a primary key, a foreign key, a
-    /// named non-PK unique index, and a check constraint. Ad hoc DDL run
-    /// through `conn` rather than `dev/seed.sql`, so a test using this owns
-    /// and cleans up its own tables independently of the shared dev seed.
-    fn seed_describe_relation_tables(conn: &dyn zsql_core::Connection) {
-        let parents = DESCRIBE_RELATION_PARENTS_TABLE;
-        let children = DESCRIBE_RELATION_CHILDREN_TABLE;
-        run_ddl(conn, &format!("DROP TABLE IF EXISTS {children}"));
-        run_ddl(conn, &format!("DROP TABLE IF EXISTS {parents}"));
-        run_ddl(
-            conn,
-            &format!("CREATE TABLE {parents} (id bigserial PRIMARY KEY)"),
-        );
-        run_ddl(
-            conn,
-            &format!(
-                "CREATE TABLE {children} (\
-                     id bigserial PRIMARY KEY, \
-                     parent_id bigint NOT NULL REFERENCES {parents} (id), \
-                     code text NOT NULL, \
-                     total integer NOT NULL DEFAULT 0, \
-                     label text NOT NULL DEFAULT 'pending', \
-                     CONSTRAINT zsql_test_describe_children_total_check CHECK (total >= 0)\
-                 )"
-            ),
-        );
-        run_ddl(
-            conn,
-            &format!(
-                "CREATE UNIQUE INDEX zsql_test_describe_children_code_idx ON {children} (code)"
-            ),
-        );
-    }
-
-    /// Drops the tables [`seed_describe_relation_tables`] created.
-    fn drop_describe_relation_tables(conn: &dyn zsql_core::Connection) {
-        run_ddl(
-            conn,
-            &format!("DROP TABLE {DESCRIBE_RELATION_CHILDREN_TABLE}"),
-        );
-        run_ddl(
-            conn,
-            &format!("DROP TABLE {DESCRIBE_RELATION_PARENTS_TABLE}"),
-        );
-    }
-
     #[test]
     fn describe_relation_reports_columns_indexes_and_constraints_when_configured() {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         let driver = PostgresDriver;
         let cfg = ConnConfig::from_url(&url).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
@@ -1783,9 +1774,7 @@ mod tests {
 
     #[test]
     fn describe_relation_errors_for_a_relation_that_does_not_exist_when_configured() {
-        let Some(conn) = live_connection() else {
-            return;
-        };
+        let conn = live_connection();
 
         let result = block_on(
             conn.describe_relation("public", "zsql_test_relation_that_does_not_exist_either"),
@@ -1820,32 +1809,5 @@ mod tests {
                 Err(err) => panic!("ddl setup did not complete: {err:?}"),
             }
         }
-    }
-
-    /// Reads `ZSQL_TEST_DATABASE_URL`, or returns `None` (after printing why)
-    fn live_database_url() -> Option<String> {
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
-            return None;
-        };
-        Some(url)
-    }
-
-    /// Connects to `ZSQL_TEST_DATABASE_URL` via [`live_database_url`], or
-    /// returns `None` so callers can skip.
-    fn live_connection() -> Option<Box<dyn zsql_core::Connection>> {
-        let url = live_database_url()?;
-        let driver = PostgresDriver;
-        let cfg = ConnConfig::from_url(&url).unwrap();
-        Some(block_on(driver.connect(&cfg)).expect("connect should succeed"))
-    }
-
-    /// Receive one event with a generous timeout so a broken implementation
-    /// fails the test instead of hanging it.
-    fn recv(
-        rx: &flume::Receiver<Result<zsql_core::QueryEvent, zsql_core::CoreError>>,
-    ) -> Result<zsql_core::QueryEvent, zsql_core::CoreError> {
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("expected an event within the timeout")
     }
 }

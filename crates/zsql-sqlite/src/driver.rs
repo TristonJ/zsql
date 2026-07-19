@@ -632,12 +632,6 @@ mod tests {
         assert_eq!(main.tables.len(), 2, "the table and the view both appear");
     }
 
-    /// Unconditional (no `ZSQL_TEST_DATABASE_URL` gate): seeds a temp-file
-    /// database with a primary key, a foreign key, a unique index, and a
-    /// `CHECK` constraint, then asserts `describe_relation` reports the
-    /// structure it can (columns, PK/FK/nullable/default, the unique index)
-    /// and, per the module doc comment on `zsql_sqlite::describe`, omits the
-    /// `CHECK` constraint entirely rather than reporting it inaccurately.
     #[test]
     fn describe_relation_reports_columns_indexes_and_constraints() {
         let db = TempDbPath::new("describe-relation");

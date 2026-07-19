@@ -1744,24 +1744,14 @@ mod tests {
         manager.update(vcx, ConnectionManagerView::cancel_add);
     }
 
-    // ---- live-database gated switch test -------------------------------------
-
-    /// Live-database test, gated on `ZSQL_TEST_DATABASE_URL` so `cargo test`
-    /// passes with no database present. Proves the modal's row-click switch
-    /// path (`connect_index`) actually drives `Session` to `Connected`
-    /// against a real Postgres and updates the active-connection label to
-    /// that row's saved name -- not just the sqlite-backed happy path above.
     #[gpui::test]
-    async fn connecting_a_chosen_row_to_a_live_postgres_connection_updates_the_active_label_when_configured(
+    async fn connecting_a_chosen_row_to_a_live_sqlite_connection_updates_the_active_label_when_configured(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
-            return;
-        };
+        let url = "sqlite::memory:".to_owned();
 
         let temp = TempStorePath::new("connect-active-live");
         let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");

@@ -101,18 +101,13 @@ mod tests {
         assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));
     }
 
-    /// Live-database test, gated on `ZSQL_TEST_DATABASE_URL` so `cargo test`
-    /// passes with no database present.
+    /// Live-database test
     #[test]
-    fn connect_opens_a_live_postgres_database_through_selection_when_configured() {
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
-            return;
-        };
+    fn connect_opens_a_live_sqlite_database_through_selection_when_configured() {
+        let url = "sqlite::memory:".to_string();
         let _guard = crate::test_support::serialize_real_io();
 
-        let conn =
-            block_on(connect(url)).expect("postgres connect through selection should succeed");
+        let conn = block_on(connect(url)).expect("connect through selection should succeed");
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS one".to_owned(), tx);

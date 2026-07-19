@@ -57,25 +57,39 @@ mod tests {
     }
 }
 
-/// Live-database end-to-end tests, gated on `ZSQL_TEST_DATABASE_URL` so
-/// `cargo test` passes with no database present
 #[cfg(test)]
 mod live_tests {
     use std::time::Duration;
 
-    use gpui::{AppContext as _, Focusable as _, TestAppContext, Timer};
+    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, Timer};
     use zsql_editor::{QueryRunner, RunQuery};
 
     use super::new_tab_editor_view;
     use crate::config::Config;
     use crate::session::{Session, SessionState};
 
-    fn live_database_url() -> Option<String> {
-        let Ok(url) = std::env::var("ZSQL_TEST_DATABASE_URL") else {
-            eprintln!("skipping live test: ZSQL_TEST_DATABASE_URL not set");
-            return None;
-        };
-        Some(url)
+    fn live_database_url() -> String {
+        "sqlite::memory:".to_owned()
+    }
+
+    async fn seed_test_data(cx: &mut TestAppContext, session: &Entity<Session>) {
+        let run_task = session.update(cx, |session, cx| {
+            session.run_query(
+                "CREATE TABLE orders(\
+               id INTEGER PRIMARY KEY, \
+               user_id INTEGER NOT NULL, \
+               total_cents INTEGER NOT NULL, \
+               status TEXT NOT NULL, \
+               metadata TEXT, \
+               placed_at TEXT NOT NULL); \
+               INSERT INTO orders(user_id, total_cents, status, metadata, placed_at) VALUES \
+               (1, 1299, 'shipped', '{\"gift\": true}', '2024-01-01T12:00:00Z'), \
+               (2, 4900, 'pending', '{\"gift\": false}', '2024-01-02T15:30:00Z'), \
+               (3, 250, 'delivered', '{\"gift\": true}', '2024-01-03T09:45:00Z')",
+                cx,
+            )
+        });
+        run_task.await;
     }
 
     /// Types a query into a focused, adapter-wired `EditorView`, dispatches
@@ -83,9 +97,7 @@ mod live_tests {
     /// state -- the type-and-run loop end to end.
     #[gpui::test]
     async fn dispatching_run_query_reaches_live_results_when_configured(cx: &mut TestAppContext) {
-        let Some(url) = live_database_url() else {
-            return;
-        };
+        let url = live_database_url();
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
@@ -101,6 +113,7 @@ mod live_tests {
                 session.state()
             );
         });
+        seed_test_data(cx, &session).await;
 
         let session_for_runner = session.clone();
         let run_query: QueryRunner = Box::new(move |sql, cx| {

@@ -17,3 +17,6 @@ async-global-executor = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+driver-integration-tests = []
