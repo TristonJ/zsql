@@ -38,6 +38,16 @@ pub struct Table<V: Render> {
     row_count: usize,
     gutter: Gutter<V>,
     rows: Option<RowRenderer<V>>,
+    table_height: TableHeight,
+}
+
+/// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableHeight {
+    /// Fit the table's height to its parent, showing scrollbars if the table's rows overflow.
+    Fit,
+    /// Let the table's height grow to fit all its rows, showing no vertical scrollbar.
+    Fill,
 }
 
 impl<V: Render> Table<V> {
@@ -54,6 +64,7 @@ impl<V: Render> Table<V> {
             row_count: 0,
             gutter: Gutter::None,
             rows: None,
+            table_height: TableHeight::Fit,
         }
     }
 
@@ -93,6 +104,13 @@ impl<V: Render> Table<V> {
         self
     }
 
+    /// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fit`].
+    #[must_use]
+    pub fn table_height(mut self, table_height: TableHeight) -> Self {
+        self.table_height = table_height;
+        self
+    }
+
     /// The data pane's batch cell renderer, wired through `cx.processor` so
     /// it keeps `&mut V` access for building each visible range's cells.
     /// Each returned [`TableRow`] is expected to carry at most one cell per
@@ -124,6 +142,7 @@ impl<V: Render> Table<V> {
             row_count,
             gutter,
             rows,
+            table_height,
         } = self;
         let rows = rows.unwrap_or_else(|| -> RowRenderer<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
@@ -188,6 +207,10 @@ impl<V: Render> Table<V> {
             )
             .flex_1()
             .min_w(content_extent)
+            .with_sizing_behavior(match table_height {
+                TableHeight::Fit => gpui::ListSizingBehavior::Auto,
+                TableHeight::Fill => gpui::ListSizingBehavior::Infer,
+            })
             .track_scroll(handles.row_scroll_handle.clone()),
         );
 

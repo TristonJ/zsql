@@ -222,10 +222,6 @@ pub const SCHEMA_SECTION_LABEL_MARGIN_BOTTOM: Pixels = px(8.0);
 pub const SCHEMA_SECTION_COUNT_PILL_RADIUS: f32 = 20.0;
 /// Horizontal padding inside a section label's trailing count pill.
 pub const SCHEMA_SECTION_COUNT_PILL_PADDING_X: Pixels = px(7.0);
-/// Corner radius of one of the schema view's tables.
-pub const SCHEMA_TABLE_RADIUS: f32 = 8.0;
-/// Text size of a schema table's column-header labels.
-pub const SCHEMA_TABLE_HEADER_TEXT_SIZE: f32 = 10.5;
 
 /// Width of a column row's left key-rail tick.
 pub const SCHEMA_RAIL_WIDTH: Pixels = px(3.0);

@@ -18,7 +18,7 @@ mod row;
 mod state;
 mod style;
 
-pub use builder::Table;
+pub use builder::{Table, TableHeight};
 pub use column::TableColumn;
 pub use gutter::{Gutter, RowNumberStyle};
 pub use row::TableRow;
