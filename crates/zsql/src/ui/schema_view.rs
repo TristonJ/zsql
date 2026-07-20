@@ -349,6 +349,21 @@ fn table_shell() -> gpui::Div {
         .overflow_hidden()
 }
 
+/// Chrome shared by every fixed-width cell (header or body) in this view's
+/// own Columns/Indexes/Constraints tables.
+fn cell_shell(width: gpui::Pixels) -> gpui::Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .w(width)
+        .h_full()
+        .px(px(grid::CELL_PADDING_X))
+        .truncate()
+        .border_r_1()
+        .border_color(rgb(colors::LINE_SOFT))
+}
+
 /// A header row of `labels`, each cell sized to its matching entry in
 /// `widths`. The trailing cell drops its vertical separator so the table's
 /// own border carries the right edge.
@@ -361,7 +376,7 @@ fn header_row<const N: usize>(widths: [gpui::Pixels; N], labels: [&str; N]) -> i
         .border_color(rgb(colors::LINE));
     let last = N.saturating_sub(1);
     for (index, (width, label)) in widths.into_iter().zip(labels).enumerate() {
-        let mut cell = grid::header_cell_shell(width)
+        let mut cell = cell_shell(width)
             .text_size(px(theme::SCHEMA_TABLE_HEADER_TEXT_SIZE))
             .text_color(rgb(colors::MUTED))
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -403,7 +418,7 @@ fn render_column_row(
         .border_b_1()
         .border_color(rgb(colors::LINE_SOFT))
         .child(
-            grid::body_cell_shell(name_w)
+            cell_shell(name_w)
                 .relative()
                 .when_some(rail_color(column), |el, color| {
                     el.child(
@@ -424,12 +439,10 @@ fn render_column_row(
                 ),
         )
         .child(type_cell(type_w, &column.type_name))
-        .child(grid::body_cell_shell(null_w).child(null_label(column.nullable)))
+        .child(cell_shell(null_w).child(null_label(column.nullable)))
+        .child(cell_shell(default_w).child(render_default_cell(column.default.as_deref())))
         .child(
-            grid::body_cell_shell(default_w).child(render_default_cell(column.default.as_deref())),
-        )
-        .child(
-            grid::body_cell_shell(keys_w)
+            cell_shell(keys_w)
                 .border_r_0()
                 .child(render_keys_cell(column, constraints)),
         )
@@ -529,7 +542,7 @@ fn render_index_row(index: &IndexInfo, widths: [gpui::Pixels; 4]) -> impl IntoEl
         .border_b_1()
         .border_color(rgb(colors::LINE_SOFT))
         .child(
-            grid::body_cell_shell(name_w).child(
+            cell_shell(name_w).child(
                 div()
                     .text_color(rgb(colors::TEXT))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -537,13 +550,13 @@ fn render_index_row(index: &IndexInfo, widths: [gpui::Pixels; 4]) -> impl IntoEl
             ),
         )
         .child(
-            grid::body_cell_shell(method_w).child(
+            cell_shell(method_w).child(
                 div()
                     .text_color(rgb(colors::MUTED))
                     .child(index.method.clone()),
             ),
         )
-        .child(grid::body_cell_shell(unique_w).child(if index.unique {
+        .child(cell_shell(unique_w).child(if index.unique {
             div()
                 .text_color(rgb(colors::BOOL))
                 .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
@@ -553,7 +566,7 @@ fn render_index_row(index: &IndexInfo, widths: [gpui::Pixels; 4]) -> impl IntoEl
                 .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
         }))
         .child(
-            grid::body_cell_shell(def_w).border_r_0().child(
+            cell_shell(def_w).border_r_0().child(
                 div()
                     .text_color(rgb(colors::MUTED))
                     .child(index.definition.clone()),
@@ -574,16 +587,16 @@ fn render_constraint_row(
         .border_b_1()
         .border_color(rgb(colors::LINE_SOFT))
         .child(
-            grid::body_cell_shell(name_w).child(
+            cell_shell(name_w).child(
                 div()
                     .text_color(rgb(colors::TEXT))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(constraint.name.clone()),
             ),
         )
-        .child(grid::body_cell_shell(kind_w).child(key_badge(kind_label, kind_color, colors::LINE)))
+        .child(cell_shell(kind_w).child(key_badge(kind_label, kind_color, colors::LINE)))
         .child(
-            grid::body_cell_shell(def_w).border_r_0().child(
+            cell_shell(def_w).border_r_0().child(
                 div()
                     .text_color(rgb(colors::MUTED))
                     .child(constraint.definition.clone()),

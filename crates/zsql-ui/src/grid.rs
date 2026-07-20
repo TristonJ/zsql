@@ -1,9 +1,10 @@
-//! Presentational building blocks for a virtualized data grid: cell chrome,
-//! a type-name badge, and a small status dot. Each function takes only
+//! Small presentational `gpui` builders shared across zsql's views -- a
+//! type-name badge and status-dot indicators -- plus the pixel metrics
+//! callers size grid cells and badges with. Each function takes only
 //! primitives (a pixel width, a color, a string) and returns an `Element`,
 //! so the caller owns all row/column data.
 
-use gpui::{Div, Pixels, div, prelude::*, px, rgb, rgba};
+use gpui::{Div, div, prelude::*, px, rgb, rgba};
 
 use crate::colors;
 
@@ -19,40 +20,6 @@ pub const TYPE_TAG_BORDER: u32 = 0x33_c2_ac_47;
 pub const TYPE_TAG_RADIUS: f32 = 4.0;
 /// Diameter of a status dot.
 pub const STATUS_DOT_SIZE: f32 = 6.0;
-
-/// Shared chrome for a header cell: fixed width, vertical centering, a
-/// trailing hairline border, and truncation for overflowing content.
-#[must_use]
-pub fn header_cell_shell(width: Pixels) -> Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .w(width)
-        .h_full()
-        .px(px(CELL_PADDING_X))
-        .truncate()
-        .border_r_1()
-        .border_color(rgb(colors::LINE_SOFT))
-}
-
-/// Shared chrome for a body cell. Kept as a distinct function from
-/// [`header_cell_shell`] even though they currently render identically, so
-/// header and body chrome can diverge later without one call site
-/// accidentally affecting the other.
-#[must_use]
-pub fn body_cell_shell(width: Pixels) -> Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .w(width)
-        .h_full()
-        .px(px(CELL_PADDING_X))
-        .truncate()
-        .border_r_1()
-        .border_color(rgb(colors::LINE_SOFT))
-}
 
 /// A small type-name badge, e.g. shown next to a column's name in a header.
 #[must_use]
@@ -93,17 +60,7 @@ pub fn status_dot_outline(border_color: u32) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use gpui::px;
-
-    use super::{
-        body_cell_shell, colors, header_cell_shell, status_dot, status_dot_outline, type_tag,
-    };
-
-    #[test]
-    fn header_and_body_cell_shells_build_for_a_width() {
-        let _header = header_cell_shell(px(80.0));
-        let _body = body_cell_shell(px(80.0));
-    }
+    use super::{colors, status_dot, status_dot_outline, type_tag};
 
     #[test]
     fn type_tag_builds_for_a_type_name() {

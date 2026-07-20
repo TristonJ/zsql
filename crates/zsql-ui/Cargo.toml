@@ -30,5 +30,8 @@ name = "text_field_demo"
 [[example]]
 name = "scrollable_demo"
 
+[[example]]
+name = "table_demo"
+
 [lints]
 workspace = true

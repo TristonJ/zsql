@@ -50,10 +50,6 @@ pub const RUN_BUTTON_HINT: u32 = 0x10_12_17_b3;
 
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
-/// Height of the sticky column-header row.
-pub const HEADER_ROW_HEIGHT: Pixels = px(28.0);
-/// Height of each body row in the virtualized grid.
-pub const BODY_ROW_HEIGHT: Pixels = px(24.0);
 /// Height of the bottom connection/status bar.
 pub const STATUS_BAR_HEIGHT: Pixels = px(26.0);
 
