@@ -48,6 +48,10 @@ async-trait = { workspace = true }
 # Exposes `EditorView`'s test-only accessors so the adapter/live tests can
 # drive an editor entity directly, without reaching into its private fields.
 zsql-editor = { path = "../zsql-editor", features = ["test-support"] }
+# Exposes `zsql_ui::scrollable`'s scrollbar-thumb debug-selector helpers, so
+# `sidebar.rs`'s own render tests can locate a thumb via
+# `VisualTestContext::debug_bounds` without duplicating the selector format.
+zsql-ui = { path = "../zsql-ui", features = ["test-support"] }
 
 [lints]
 workspace = true
