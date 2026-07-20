@@ -6,13 +6,13 @@ use std::collections::HashSet;
 
 use gpui::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Stateful, UniformListScrollHandle, Window,
-    anchored, deferred, div, point, prelude::*, px, rgb, rgba, uniform_list,
+    Pixels, Point, Render, Stateful, UniformListScrollHandle, Window, anchored, deferred, div,
+    point, prelude::*, px, rgb, rgba, uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
 use zsql_ui::colors;
 use zsql_ui::icon::{IconName, icon};
-use zsql_ui::scrollbar::{self, ScrollbarGeometry};
+use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
 // Imported by name rather than as `zsql_ui::tree::...`: this module already
 // uses `tree` as a local variable/parameter name for a `SchemaTree`, and
 // qualifying every call here would read as if it referred to that value.
@@ -68,20 +68,10 @@ pub struct SidebarView {
     /// scrollbar overlay drawn on top of it, so both read/drive the same
     /// offset.
     tree_scroll_handle: UniformListScrollHandle,
-    /// State of an in-progress scrollbar thumb drag; `None` when the thumb
-    /// is not being dragged.
-    thumb_drag: Option<ThumbDrag>,
+    /// The tree's scrollbar state.
+    scroll: Entity<ScrollableState>,
     /// The currently open relation-row context menu, if any.
     context_menu: Option<ContextMenuState>,
-}
-
-/// A scrollbar thumb drag's starting point: the mouse position and the
-/// tree's scroll offset at the moment the drag began, so later mouse-move
-/// deltas can be converted to a new absolute scroll offset.
-#[derive(Debug, Clone, Copy)]
-struct ThumbDrag {
-    start_mouse_y: Pixels,
-    start_scroll_offset: Pixels,
 }
 
 /// A relation row's open right-click context menu: which relation it
@@ -118,35 +108,11 @@ impl SidebarView {
             rows: Vec::new(),
             synced_schema_generation: 0,
             tree_scroll_handle: UniformListScrollHandle::new(),
-            thumb_drag: None,
+            scroll: cx.new(ScrollableState::new),
             context_menu: None,
         };
         view.sync_rows(cx);
         view
-    }
-
-    /// The tree scrollbar's size is computed from the scroll viewport's
-    /// laid-out height, which reads back as zero during the render that first
-    /// lays the tree out (a scroll container's bounds are only known after
-    /// that render). The tree only appears once the schema loads, so its first
-    /// frame always starts unmeasured. When that state is detected - the tree
-    /// is shown but its viewport has not been measured yet - schedule exactly
-    /// one re-render so the scrollbar appears on the next frame instead of
-    /// staying hidden until a wheel/keyboard scroll forces a repaint. This
-    /// settles immediately: once the viewport is measured the condition is
-    /// false. `request_animation_frame` cannot do this - it only queues a
-    /// callback without forcing a draw, so on an idle window it never fires.
-    fn nudge_scrollbar_when_tree_unmeasured(&mut self, cx: &mut Context<Self>) {
-        let tree_shown = matches!(
-            self.session.read(cx).schema(),
-            SchemaState::Ready(tree) if !tree.catalogs.is_empty()
-        );
-        if tree_shown && self.tree_viewport_height() == Pixels::ZERO {
-            cx.spawn(async move |this, cx| {
-                this.update(cx, |_, cx| cx.notify()).ok();
-            })
-            .detach();
-        }
     }
 
     /// Rebuild `rows` from the session's current schema state and this
@@ -301,100 +267,12 @@ impl SidebarView {
         self.close_context_menu(cx);
     }
 
-    /// The tree scroll region's most recently painted viewport height. Zero
-    /// before the first paint.
-    fn tree_viewport_height(&self) -> Pixels {
-        self.tree_scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .bounds()
-            .size
-            .height
-    }
-
     /// The tree's current downward scroll offset (zero at the top).
     /// `ScrollHandle::offset` is negative-down, matching `EditorView`'s
     /// scroll handle convention, so this negates it back to a
     /// positive-down offset for the scrollbar geometry.
     fn tree_scroll_offset(&self) -> Pixels {
         -self.tree_scroll_handle.0.borrow().base_handle.offset().y
-    }
-
-    /// Move the tree's scroll offset to `offset` (positive-down, clamping is
-    /// the caller's responsibility).
-    fn set_tree_scroll_offset(&self, offset: Pixels) {
-        self.tree_scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(px(0.0), -offset));
-    }
-
-    /// Begin dragging the scrollbar thumb, recording the drag's starting
-    /// mouse position and scroll offset.
-    fn on_thumb_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.thumb_drag = Some(ThumbDrag {
-            start_mouse_y: event.position.y,
-            start_scroll_offset: self.tree_scroll_offset(),
-        });
-        cx.notify();
-    }
-
-    /// While a thumb drag is in progress, convert the mouse's vertical
-    /// travel since the drag started into a new tree scroll offset, using
-    /// the same track-pixels-to-content-pixels ratio as the geometry
-    /// function's offset formula.
-    fn on_thumb_drag_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(drag) = self.thumb_drag else {
-            return;
-        };
-
-        let content_height = f32::from(sidebar_tree_content_height(self.rows.len()));
-        let viewport_height = f32::from(self.tree_viewport_height());
-        let geometry = ScrollbarGeometry::compute(
-            content_height,
-            viewport_height,
-            f32::from(drag.start_scroll_offset),
-            viewport_height,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-        if !geometry.visible {
-            return;
-        }
-
-        let mouse_delta = f32::from(event.position.y - drag.start_mouse_y);
-        let new_offset = ScrollbarGeometry::scroll_offset_for_drag(
-            f32::from(drag.start_scroll_offset),
-            mouse_delta,
-            content_height,
-            viewport_height,
-            viewport_height,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-
-        self.set_tree_scroll_offset(px(new_offset));
-        cx.notify();
-    }
-
-    /// End a scrollbar thumb drag, if one was in progress.
-    fn on_thumb_drag_end(
-        &mut self,
-        _: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        self.thumb_drag = None;
     }
 
     /// The "SCHEMA" header bar.
@@ -481,29 +359,44 @@ impl SidebarView {
             )
     }
 
-    /// The tree scrollbar's geometry, computed from the flattened row count's
-    /// content height, the scroll viewport's laid-out height, and the current
-    /// scroll offset. Read fresh each render so it stays in sync with wheel
-    /// and keyboard scrolling and with rows appearing as the schema loads.
-    fn tree_scrollbar_geometry(&self) -> ScrollbarGeometry {
-        let viewport_height = f32::from(self.tree_viewport_height());
-        ScrollbarGeometry::compute(
-            f32::from(sidebar_tree_content_height(self.rows.len())),
-            viewport_height,
-            f32::from(self.tree_scroll_offset()),
-            viewport_height,
-            scrollbar::MIN_THUMB_LENGTH,
-        )
+    /// The tree scrollbar's chrome, from the sidebar's own theme constants.
+    /// The track paints no background.
+    fn tree_scrollbar_style() -> ScrollbarStyle {
+        ScrollbarStyle {
+            track_width: f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH),
+            track_color: None,
+            thumb_color: theme::SIDEBAR_SCROLLBAR_THUMB,
+            thumb_hover_color: Some(theme::SIDEBAR_SCROLLBAR_THUMB_HOVER),
+            radius: theme::SIDEBAR_SCROLLBAR_RADIUS,
+            inset: f32::from(theme::SIDEBAR_SCROLLBAR_GAP),
+            ..ScrollbarStyle::default()
+        }
     }
 
     /// The virtualized tree body: only rows scrolled into view are built.
-    /// Wraps the `uniform_list` in a `relative` viewport div so the
-    /// scrollbar overlay can be pinned to its right edge without shifting
-    /// the tree rows' layout.
     fn render_tree(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let row_count = self.rows.len();
-        let viewport_height = self.tree_viewport_height();
-        let geometry = self.tree_scrollbar_geometry();
+        let content_height = f32::from(sidebar_tree_content_height(row_count));
+        let tree_scroll_handle = self.tree_scroll_handle.clone();
+
+        self.scroll.update(cx, |scroll, _cx| {
+            scroll.vertical(Axis::new(
+                ScrollSource::UniformList(tree_scroll_handle),
+                content_height,
+            ));
+        });
+
+        let list = uniform_list(
+            "sidebar-rows",
+            row_count,
+            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .map(|ix| this.render_row(&this.rows[ix], ix, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .track_scroll(self.tree_scroll_handle.clone());
 
         div()
             .id("sidebar-tree")
@@ -514,64 +407,12 @@ impl SidebarView {
             .py(px(theme::SIDEBAR_TREE_PADDING_Y))
             .child(
                 div()
-                    .id("sidebar-tree-viewport")
-                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .on_mouse_move(cx.listener(Self::on_thumb_drag_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_thumb_drag_end))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_thumb_drag_end))
-                    .child(
-                        uniform_list(
-                            "sidebar-rows",
-                            row_count,
-                            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                                range
-                                    .map(|ix| this.render_row(&this.rows[ix], ix, cx))
-                                    .collect::<Vec<_>>()
-                            }),
-                        )
-                        .flex_1()
-                        .track_scroll(self.tree_scroll_handle.clone()),
-                    )
-                    .when(geometry.visible, |el| {
-                        el.child(Self::render_scrollbar(
-                            geometry,
-                            f32::from(viewport_height),
-                            cx,
-                        ))
-                    }),
-            )
-    }
-
-    /// The scrollbar overlay: a track pinned to the right edge of the tree
-    /// viewport, sized to the viewport height, holding a thumb positioned
-    /// and sized from `geometry`.
-    fn render_scrollbar(
-        geometry: ScrollbarGeometry,
-        track_length: f32,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        div()
-            .id("sidebar-scrollbar-track")
-            .absolute()
-            .top_0()
-            .right(theme::SIDEBAR_SCROLLBAR_GAP)
-            .bottom_0()
-            .w(theme::SIDEBAR_SCROLLBAR_WIDTH)
-            .child(
-                div()
-                    .id("sidebar-scrollbar-thumb")
-                    .absolute()
-                    .top(px(geometry.thumb_offset(track_length)))
-                    .w_full()
-                    .h(px(geometry.thumb_length))
-                    .rounded(px(theme::SIDEBAR_SCROLLBAR_RADIUS))
-                    .bg(rgba(theme::SIDEBAR_SCROLLBAR_THUMB))
-                    .hover(|el| el.bg(rgba(theme::SIDEBAR_SCROLLBAR_THUMB_HOVER)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_thumb_mouse_down)),
+                    .child(list)
+                    .with_scrollbars(&self.scroll, Self::tree_scrollbar_style(), cx),
             )
     }
 
@@ -817,13 +658,21 @@ fn qualified_relation_name(schema: &str, relation: &str) -> String {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.nudge_scrollbar_when_tree_unmeasured(cx);
+        let handlers = ScrollableState::drag_handlers(&self.scroll);
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(colors::PANEL))
+            // Attached here, at the view root, so a scrollbar thumb-drag
+            // keeps tracking the pointer even once it leaves the tree's own
+            // (much smaller) viewport: gpui's mouse-move/mouse-up listeners
+            // only fire while the pointer is within the registering
+            // element's own hit-tested bounds.
+            .on_mouse_move(handlers.on_move)
+            .on_mouse_up(MouseButton::Left, handlers.on_up)
+            .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
             .child(Self::render_header())
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
@@ -921,9 +770,10 @@ mod tests {
     use zsql_ui::tree::ROW_HEIGHT;
 
     use super::{
-        SidebarRow, flatten_schema_tree, relation_icon_name, relation_tint,
+        SidebarRow, SidebarView, flatten_schema_tree, relation_icon_name, relation_tint,
         sidebar_tree_content_height,
     };
+    use crate::ui::theme;
 
     fn sample_tree() -> SchemaTree {
         SchemaTree {
@@ -1123,6 +973,25 @@ mod tests {
         assert_eq!(sidebar_tree_content_height(0), gpui::px(0.0));
         assert_eq!(sidebar_tree_content_height(7), ROW_HEIGHT * 7.0);
     }
+
+    #[test]
+    fn tree_scrollbar_style_matches_every_one_of_the_sidebars_theme_constants() {
+        let style = SidebarView::tree_scrollbar_style();
+        assert!(
+            (style.track_width - f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH)).abs() < f32::EPSILON
+        );
+        assert_eq!(
+            style.track_color, None,
+            "the tree scrollbar's track paints no background"
+        );
+        assert_eq!(style.thumb_color, theme::SIDEBAR_SCROLLBAR_THUMB);
+        assert_eq!(
+            style.thumb_hover_color,
+            Some(theme::SIDEBAR_SCROLLBAR_THUMB_HOVER)
+        );
+        assert!((style.radius - theme::SIDEBAR_SCROLLBAR_RADIUS).abs() < f32::EPSILON);
+        assert!((style.inset - f32::from(theme::SIDEBAR_SCROLLBAR_GAP)).abs() < f32::EPSILON);
+    }
 }
 
 #[cfg(test)]
@@ -1236,11 +1105,65 @@ mod render_tests {
         let (sidebar, vcx) = cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
         vcx.run_until_parked();
 
-        sidebar.read_with(vcx, |view, _app| {
+        sidebar.read_with(vcx, |view, app| {
             assert!(
-                view.tree_scrollbar_geometry().visible,
+                view.scroll.read(app).vertical_visible(),
                 "the tree scrollbar must be visible when 300 rows overflow the sidebar viewport"
             );
+        });
+    }
+
+    /// A thumb-drag started on the tree scrollbar must keep tracking the
+    /// pointer even once it leaves the tree viewport's own small bounds:
+    /// `SidebarView::render` attaches `ScrollableState::drag_handlers` at
+    /// its own render root precisely so this holds after the
+    /// `with_scrollbars` port.
+    #[gpui::test]
+    fn dragging_the_tree_scrollbar_thumb_moves_the_scroll_offset(cx: &mut gpui::TestAppContext) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tall_schema_tree(300))));
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
+        vcx.run_until_parked();
+
+        let selector = zsql_ui::scrollable::vertical_thumb_debug_selector(
+            &sidebar.read_with(vcx, |view, _app| view.scroll.clone()),
+        );
+        let thumb_center = vcx
+            .debug_bounds(selector)
+            .expect("the tree scrollbar thumb must be painted once the viewport is measured")
+            .center();
+
+        vcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: thumb_center,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        // Far below the tree's own (much smaller) viewport, but still
+        // inside the test window.
+        let far_below = gpui::point(thumb_center.x, thumb_center.y + gpui::px(600.0));
+        vcx.simulate_event(gpui::MouseMoveEvent {
+            position: far_below,
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::default(),
+        });
+        vcx.run_until_parked();
+
+        let offset_after_drag = sidebar.read_with(vcx, |view, _app| view.tree_scroll_offset());
+        assert!(
+            offset_after_drag > gpui::px(0.0),
+            "dragging the tree scrollbar thumb down must increase the tree's scroll offset, \
+             even once the pointer has moved outside the tree viewport's own small bounds"
+        );
+
+        vcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: far_below,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
         });
     }
 

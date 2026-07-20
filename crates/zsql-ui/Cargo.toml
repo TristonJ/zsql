@@ -9,6 +9,14 @@ publish = false
 gpui = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Exposes scrollbar-thumb debug tagging (`VisualTestContext::debug_bounds`
+# lookup keys) outside this crate's own `#[cfg(test)]` build, matching
+# `zsql-editor`'s `test-support` pattern, so a consumer crate's own render
+# tests can assert a scrollbar thumb's painted position. Enabled only as a
+# dev-dependency feature, never reaching a shipped build.
+test-support = []
+
 [dev-dependencies]
 # Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test
 # harness) for `TextField`'s behavior tests. Unified with the `gpui`
@@ -18,6 +26,9 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [[example]]
 name = "text_field_demo"
+
+[[example]]
+name = "scrollable_demo"
 
 [lints]
 workspace = true
