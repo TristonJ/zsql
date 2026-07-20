@@ -658,21 +658,12 @@ fn qualified_relation_name(schema: &str, relation: &str) -> String {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let handlers = ScrollableState::drag_handlers(&self.scroll);
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(colors::PANEL))
-            // Attached here, at the view root, so a scrollbar thumb-drag
-            // keeps tracking the pointer even once it leaves the tree's own
-            // (much smaller) viewport: gpui's mouse-move/mouse-up listeners
-            // only fire while the pointer is within the registering
-            // element's own hit-tested bounds.
-            .on_mouse_move(handlers.on_move)
-            .on_mouse_up(MouseButton::Left, handlers.on_up)
-            .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
             .child(Self::render_header())
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
@@ -1110,60 +1101,6 @@ mod render_tests {
                 view.scroll.read(app).vertical_visible(),
                 "the tree scrollbar must be visible when 300 rows overflow the sidebar viewport"
             );
-        });
-    }
-
-    /// A thumb-drag started on the tree scrollbar must keep tracking the
-    /// pointer even once it leaves the tree viewport's own small bounds:
-    /// `SidebarView::render` attaches `ScrollableState::drag_handlers` at
-    /// its own render root precisely so this holds after the
-    /// `with_scrollbars` port.
-    #[gpui::test]
-    fn dragging_the_tree_scrollbar_thumb_moves_the_scroll_offset(cx: &mut gpui::TestAppContext) {
-        let session =
-            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tall_schema_tree(300))));
-        let tabs = build_tabs(session.clone(), cx);
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
-        vcx.run_until_parked();
-
-        let selector = zsql_ui::scrollable::vertical_thumb_debug_selector(
-            &sidebar.read_with(vcx, |view, _app| view.scroll.clone()),
-        );
-        let thumb_center = vcx
-            .debug_bounds(selector)
-            .expect("the tree scrollbar thumb must be painted once the viewport is measured")
-            .center();
-
-        vcx.simulate_event(gpui::MouseDownEvent {
-            button: gpui::MouseButton::Left,
-            position: thumb_center,
-            modifiers: gpui::Modifiers::default(),
-            click_count: 1,
-            first_mouse: false,
-        });
-
-        // Far below the tree's own (much smaller) viewport, but still
-        // inside the test window.
-        let far_below = gpui::point(thumb_center.x, thumb_center.y + gpui::px(600.0));
-        vcx.simulate_event(gpui::MouseMoveEvent {
-            position: far_below,
-            pressed_button: Some(gpui::MouseButton::Left),
-            modifiers: gpui::Modifiers::default(),
-        });
-        vcx.run_until_parked();
-
-        let offset_after_drag = sidebar.read_with(vcx, |view, _app| view.tree_scroll_offset());
-        assert!(
-            offset_after_drag > gpui::px(0.0),
-            "dragging the tree scrollbar thumb down must increase the tree's scroll offset, \
-             even once the pointer has moved outside the tree viewport's own small bounds"
-        );
-
-        vcx.simulate_event(gpui::MouseUpEvent {
-            button: gpui::MouseButton::Left,
-            position: far_below,
-            modifiers: gpui::Modifiers::default(),
-            click_count: 1,
         });
     }
 

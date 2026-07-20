@@ -11,7 +11,7 @@ use zsql_core::{
     RelationSchema, RowCount,
 };
 use zsql_ui::icon::{IconName, icon};
-use zsql_ui::table::{Table, TableColumn, TableHeight, TableRow, TableState, TableStyle};
+use zsql_ui::table::{Table, TableColumn, TableRow, TableSizing, TableState, TableStyle};
 use zsql_ui::{colors, grid};
 
 use super::results::group_thousands;
@@ -244,7 +244,7 @@ impl SchemaTabView {
                 .columns(columns)
                 .row_count(detail.columns.len())
                 .rows(Self::render_columns_table_row_cells)
-                .table_height(TableHeight::Fill)
+                .vertical_sizing(TableSizing::Fit)
                 .render(cx),
         )
     }
@@ -334,13 +334,13 @@ impl SchemaTabView {
             Table::new("schema-indexes-table", &self.indexes_table)
                 .columns(columns)
                 .row_count(detail.indexes.len())
-                .rows(Self::render_indexe_table_row_cells)
-                .table_height(TableHeight::Fill)
+                .rows(Self::render_index_table_row_cells)
+                .vertical_sizing(TableSizing::Fit)
                 .render(cx),
         )
     }
 
-    fn render_indexe_table_row_cells(
+    fn render_index_table_row_cells(
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
@@ -349,7 +349,7 @@ impl SchemaTabView {
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
-                "render_indexe_table_row_cells called before schema is ready"
+                "render_index_table_row_cells called before schema is ready"
             );
             return vec![];
         };
@@ -411,7 +411,7 @@ impl SchemaTabView {
                 .columns(columns)
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)
-                .table_height(TableHeight::Fill)
+                .vertical_sizing(TableSizing::Fit)
                 .render(cx),
         )
     }

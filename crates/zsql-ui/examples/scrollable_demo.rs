@@ -7,7 +7,7 @@
 //! nudge path). Run with `cargo run -p zsql-ui --example scrollable_demo`.
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, MouseButton, Render, ScrollHandle,
+    App, Application, Bounds, ClickEvent, Context, Entity, Render, ScrollHandle,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, rgba,
     size, uniform_list,
 };
@@ -298,14 +298,6 @@ impl DemoRoot {
 
 impl Render for DemoRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Attached here, at the view root, rather than on any pane's own
-        // (much smaller) with_scrollbars wrapper: a thumb-drag must keep
-        // tracking the pointer even once it leaves the pane's own bounds --
-        // see ScrollableState's own docs for why.
-        let vertical_only_drag = ScrollableState::drag_handlers(&self.vertical_only.scroll);
-        let horizontal_only_drag = ScrollableState::drag_handlers(&self.horizontal_only.scroll);
-        let both_axes_drag = ScrollableState::drag_handlers(&self.both_axes.scroll);
-
         div()
             .flex()
             .flex_col()
@@ -313,15 +305,6 @@ impl Render for DemoRoot {
             .size_full()
             .p(px(PAGE_PADDING))
             .bg(rgb(colors::INK))
-            .on_mouse_move(vertical_only_drag.on_move)
-            .on_mouse_up(MouseButton::Left, vertical_only_drag.on_up)
-            .on_mouse_up_out(MouseButton::Left, vertical_only_drag.on_up_out)
-            .on_mouse_move(horizontal_only_drag.on_move)
-            .on_mouse_up(MouseButton::Left, horizontal_only_drag.on_up)
-            .on_mouse_up_out(MouseButton::Left, horizontal_only_drag.on_up_out)
-            .on_mouse_move(both_axes_drag.on_move)
-            .on_mouse_up(MouseButton::Left, both_axes_drag.on_up)
-            .on_mouse_up_out(MouseButton::Left, both_axes_drag.on_up_out)
             .child(
                 div()
                     .text_size(px(LABEL_TEXT_SIZE))

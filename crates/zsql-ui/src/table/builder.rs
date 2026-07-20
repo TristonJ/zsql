@@ -38,16 +38,16 @@ pub struct Table<V: Render> {
     row_count: usize,
     gutter: Gutter<V>,
     rows: Option<RowRenderer<V>>,
-    table_height: TableHeight,
+    vertical_sizing: TableSizing,
 }
 
-/// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fit`].
+/// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fill`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableHeight {
+pub enum TableSizing {
     /// Fit the table's height to its parent, showing scrollbars if the table's rows overflow.
-    Fit,
-    /// Let the table's height grow to fit all its rows, showing no vertical scrollbar.
     Fill,
+    /// Let the table's height grow to fit all its rows, showing no vertical scrollbar.
+    Fit,
 }
 
 impl<V: Render> Table<V> {
@@ -64,7 +64,7 @@ impl<V: Render> Table<V> {
             row_count: 0,
             gutter: Gutter::None,
             rows: None,
-            table_height: TableHeight::Fit,
+            vertical_sizing: TableSizing::Fill,
         }
     }
 
@@ -104,10 +104,10 @@ impl<V: Render> Table<V> {
         self
     }
 
-    /// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fit`].
+    /// How to size the table's vertical extent in its parent. Defaults to [`TableSizing::Fill`].
     #[must_use]
-    pub fn table_height(mut self, table_height: TableHeight) -> Self {
-        self.table_height = table_height;
+    pub fn vertical_sizing(mut self, sizing: TableSizing) -> Self {
+        self.vertical_sizing = sizing;
         self
     }
 
@@ -142,7 +142,7 @@ impl<V: Render> Table<V> {
             row_count,
             gutter,
             rows,
-            table_height,
+            vertical_sizing: table_height,
         } = self;
         let rows = rows.unwrap_or_else(|| -> RowRenderer<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
@@ -208,8 +208,8 @@ impl<V: Render> Table<V> {
             .flex_1()
             .min_w(content_extent)
             .with_sizing_behavior(match table_height {
-                TableHeight::Fit => gpui::ListSizingBehavior::Auto,
-                TableHeight::Fill => gpui::ListSizingBehavior::Infer,
+                TableSizing::Fill => gpui::ListSizingBehavior::Auto,
+                TableSizing::Fit => gpui::ListSizingBehavior::Infer,
             })
             .track_scroll(handles.row_scroll_handle.clone()),
         );
@@ -834,7 +834,6 @@ mod tests {
                 .map(|ix| TableColumn::new(self.column_width, format!("col{ix}")))
                 .collect();
             let column_count = self.column_count;
-            let handlers = self.table_state.read(cx).drag_handlers();
 
             let gutter = match self.gutter {
                 GutterPreset::None => Gutter::None,
@@ -870,19 +869,14 @@ mod tests {
             }
             let table = table.render(cx);
 
-            div()
-                .size_full()
-                .on_mouse_move(handlers.on_move)
-                .on_mouse_up(MouseButton::Left, handlers.on_up)
-                .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
-                .child(
-                    div()
-                        .w(px(PANE_SIZE))
-                        .h(px(PANE_SIZE))
-                        .flex()
-                        .flex_col()
-                        .child(table),
-                )
+            div().size_full().child(
+                div()
+                    .w(px(PANE_SIZE))
+                    .h(px(PANE_SIZE))
+                    .flex()
+                    .flex_col()
+                    .child(table),
+            )
         }
     }
 

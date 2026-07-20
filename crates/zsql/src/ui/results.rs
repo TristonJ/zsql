@@ -4,8 +4,8 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Context, Div, Entity, MouseButton, Pixels, Render, SharedString, Window, div,
-    prelude::*, px, rgb,
+    AnyElement, App, Context, Div, Entity, Pixels, Render, SharedString, Window, div, prelude::*,
+    px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::colors;
@@ -449,18 +449,11 @@ impl ResultsView {
 
 impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let handlers = self.table_state.read(cx).drag_handlers();
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(colors::INK))
-            // Attached here, above the grid, so a scrollbar thumb-drag keeps
-            // tracking the pointer even once it leaves the thumb's own
-            // small hit region.
-            .on_mouse_move(handlers.on_move)
-            .on_mouse_up(MouseButton::Left, handlers.on_up)
-            .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))

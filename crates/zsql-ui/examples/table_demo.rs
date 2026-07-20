@@ -188,7 +188,6 @@ impl Render for DemoRoot {
         let row_count = self.row_count;
         let column_count = self.column_count;
         let gutter = self.gutter;
-        let handlers = self.table_state.read(cx).drag_handlers();
 
         let table = Table::new("table-demo", &self.table_state)
             .style(self.style())
@@ -229,9 +228,6 @@ impl Render for DemoRoot {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                 view.handle_key_down(event, cx);
             }))
-            .on_mouse_move(handlers.on_move)
-            .on_mouse_up(gpui::MouseButton::Left, handlers.on_up)
-            .on_mouse_up_out(gpui::MouseButton::Left, handlers.on_up_out)
             .flex()
             .flex_col()
             .gap_2()

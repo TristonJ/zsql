@@ -3,8 +3,8 @@
 //! in-progress thumb drag.
 
 use gpui::{
-    App, Context, Entity, IsZero, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Styled,
-    UniformList, Window, px,
+    App, Context, Entity, IsZero, MouseMoveEvent, Pixels, ScrollWheelEvent, Styled, UniformList,
+    Window, px,
 };
 
 use crate::scrollbar::ScrollbarGeometry;
@@ -20,34 +20,8 @@ pub fn restrict_wheel_to_own_axis(mut list: UniformList) -> UniformList {
     list
 }
 
-/// A boxed mouse-move listener, as returned by [`ScrollableState::drag_handlers`].
-type MoveListener = Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>;
-/// A boxed mouse-up listener, as returned by [`ScrollableState::drag_handlers`].
-type UpListener = Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>;
 /// A boxed scroll-wheel listener, as returned by [`ScrollableState::wheel_handler`].
 type WheelListener = Box<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
-
-/// Mouse-move/mouse-up/mouse-up-out listeners for tracking a scrollbar
-/// thumb-drag, meant to be attached at the caller's own view root -- see
-/// [`ScrollableState::drag_handlers`].
-pub struct DragHandlers {
-    pub on_move: MoveListener,
-    pub on_up: UpListener,
-    pub on_up_out: UpListener,
-}
-
-fn end_drag_listener(state: &Entity<ScrollableState>) -> UpListener {
-    let state = state.clone();
-    Box::new(
-        move |_event: &MouseUpEvent, _window: &mut Window, cx: &mut App| {
-            state.update(cx, |state, cx| {
-                if state.end_drag() {
-                    cx.notify();
-                }
-            });
-        },
-    )
-}
 
 /// Where a scrollbar thumb-drag started
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +116,17 @@ impl ScrollableState {
             .as_ref()
             .is_some_and(|state| !state.axis.source.viewport_measured(Orientation::Horizontal));
         vertical_unmeasured || horizontal_unmeasured
+    }
+
+    /// Whether the scrollbars are currently being dragged
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.vertical
+            .as_ref()
+            .is_some_and(|state| state.drag.is_some())
+            || self
+                .horizontal
+                .as_ref()
+                .is_some_and(|state| state.drag.is_some())
     }
 
     /// Whether `with_scrollbars` should schedule a first-frame re-render
@@ -375,29 +360,6 @@ impl ScrollableState {
             .source
             .set_offset_along(Orientation::Horizontal, px(-new_offset));
         true
-    }
-
-    /// Mouse-move/mouse-up/mouse-up-out listeners for the caller to attach
-    /// at their own view root, so a thumb drag keeps tracking the pointer
-    /// once it leaves the small overlay `with_scrollbars` built
-    #[must_use = "the returned listeners do nothing unless attached to the caller's view root"]
-    pub fn drag_handlers(state: &Entity<Self>) -> DragHandlers {
-        let move_state = state.clone();
-        let on_move: MoveListener = Box::new(
-            move |event: &MouseMoveEvent, _window: &mut Window, cx: &mut App| {
-                move_state.update(cx, |state, cx| {
-                    if state.handle_drag_move(event) {
-                        cx.notify();
-                    }
-                });
-            },
-        );
-
-        DragHandlers {
-            on_move,
-            on_up: end_drag_listener(state),
-            on_up_out: end_drag_listener(state),
-        }
     }
 
     /// A listener for the caller to attach with `.on_scroll_wheel(...)` on

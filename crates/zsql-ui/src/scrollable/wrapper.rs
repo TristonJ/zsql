@@ -2,8 +2,8 @@
 //! its [`ScrollableState`] configures.
 
 use gpui::{
-    App, Context, Div, Entity, IntoElement, MouseButton, MouseDownEvent, Render, SharedString,
-    Stateful, Window, div, prelude::*, px, rgba,
+    App, Canvas, Context, Div, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, SharedString, Stateful, Window, canvas, div, prelude::*, px, rgba,
 };
 
 use super::source::Orientation;
@@ -83,7 +83,42 @@ fn build<V: Render>(
         wrapper = wrapper.child(horizontal_track(axis, &style, vertical_visible, state));
     }
 
+    if state.read(cx).is_dragging() {
+        wrapper = wrapper.child(global_drag_listener(state));
+    }
+
     wrapper
+}
+
+/// Use a hidden canvas to attach mouse listeners for dragging globally
+fn global_drag_listener(state: &Entity<ScrollableState>) -> Canvas<()> {
+    let move_state = state.clone();
+    let up_state = state.clone();
+    canvas(
+        |_, _, _| {},
+        move |_bounds, (), window, _cx| {
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase.bubble() {
+                    move_state.update(cx, |s, cx| {
+                        if s.handle_drag_move(event) {
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
+                if phase.bubble() {
+                    up_state.update(cx, |s, cx| {
+                        if s.end_drag() {
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+        },
+    )
+    .absolute() // so it contributes no layout
+    .size_0()
 }
 
 /// Schedule at most one outstanding re-render of the caller's own view while
@@ -453,25 +488,16 @@ mod tests {
                 inner.with_scrollbars(&self.scroll, style, cx)
             };
 
-            let handlers = ScrollableState::drag_handlers(&self.scroll);
-
-            div()
-                .size_full()
-                .on_mouse_move(handlers.on_move)
-                .on_mouse_up(MouseButton::Left, handlers.on_up)
-                .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
-                .child(
-                    div()
-                        .w(px(PANE_SIZE))
-                        .h(px(PANE_SIZE))
-                        .flex()
-                        .flex_col()
-                        .child(wrapped),
-                )
+            div().size_full().child(
+                div()
+                    .w(px(PANE_SIZE))
+                    .h(px(PANE_SIZE))
+                    .flex()
+                    .flex_col()
+                    .child(wrapped),
+            )
         }
     }
-
-    // -- Spike: drag tracking must survive the pointer leaving the wrapper --
 
     #[gpui::test]
     fn drag_started_on_the_thumb_keeps_tracking_after_the_pointer_leaves_the_wrapper(
@@ -513,10 +539,7 @@ mod tests {
         assert!(
             offset_after_move < px(0.0),
             "a drag started on the thumb must keep tracking pointer movement that leaves the \
-             with_scrollbars wrapper's own (much smaller) bounds -- move/up handlers are \
-             attached at the caller's own view root via ScrollableState::drag_handlers, not on \
-             the wrapper itself, exactly because gpui's on_mouse_move only fires while the \
-             pointer is within the registering element's own hit-tested bounds"
+             with_scrollbars wrapper's own (much smaller) bounds"
         );
 
         vcx.simulate_event(MouseUpEvent {
