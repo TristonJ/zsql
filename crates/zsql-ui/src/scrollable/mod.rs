@@ -17,6 +17,11 @@
 //! `.min_w(px(content_extent))` on its scrolled child, all of which the
 //! caller must apply -- the trait cannot reach into an already-built
 //! element tree to add any of them.
+//!
+//! A third obligation applies to wheel input: any `uniform_list` nested in
+//! a scrollable that also has a horizontal axis must be passed through
+//! [`restrict_wheel_to_own_axis`], or a shift-held gesture scrolls both
+//! axes at once.
 
 mod axis;
 mod source;
@@ -26,7 +31,7 @@ mod wrapper;
 
 pub use axis::Axis;
 pub use source::ScrollSource;
-pub use state::{DragHandlers, ScrollableState};
+pub use state::{DragHandlers, ScrollableState, restrict_wheel_to_own_axis};
 pub use style::ScrollbarStyle;
 pub use wrapper::WithScrollbars;
 #[cfg(any(test, feature = "test-support"))]

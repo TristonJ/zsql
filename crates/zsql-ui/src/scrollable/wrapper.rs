@@ -12,35 +12,9 @@ use super::style::ScrollbarStyle;
 
 /// Wraps a scroll viewport in the track+thumb overlays [`ScrollableState`]'s
 /// configured axes call for.
-///
-/// Implemented for both `Div` and `Stateful<Div>` because a horizontally
-/// scrolling container must be `Stateful<Div>` to carry `.track_scroll()`,
-/// while a vertically-scrolling wrapper around an inner `uniform_list` (the
-/// list itself carries the scroll handle) is often a plain `Div`.
 pub trait WithScrollbars: Sized {
-    /// Wrap `self` -- the scroll viewport, already carrying whatever
-    /// `.track_scroll()`/`uniform_list` wiring the caller needs -- in a
-    /// `.relative()` container and hang track/thumb overlays beside it as
-    /// siblings, for every axis `state` has configured this render. An axis
-    /// whose content already fits its viewport renders nothing for that
-    /// axis.
-    ///
-    /// The overlays are siblings of `self`, never descendants: gpui
-    /// translates every descendant of a scroll container (including
-    /// `.absolute()` ones) by its scroll offset during prepaint, so a
-    /// scrollbar nested inside the scrolling element would be dragged off
-    /// the viewport's edge as soon as the content scrolls.
-    ///
-    /// The returned wrapper fills a column-direction flex parent in both
-    /// axes, the way `self` would have on its own; a caller embedding it in
-    /// a row-direction or fixed-size layout must account for that.
-    ///
     /// For a horizontal [`super::ScrollSource::Container`] axis, the caller
-    /// must apply three things `with_scrollbars` cannot apply for them --
-    /// by the time it receives `self`, the scrolled child is already sealed
-    /// inside it, and `content_extent` is per-axis configuration on
-    /// [`ScrollableState`], not a property `self` exposes:
-    ///
+    /// must apply three things:
     /// - `.min_w_0()` on `self`, or flexbox refuses to shrink the viewport
     ///   below its content's intrinsic width and there is nothing to scroll.
     /// - `.min_w(px(content_extent))` on the viewport's immediate scrolled
@@ -50,17 +24,6 @@ pub trait WithScrollbars: Sized {
     ///   when at least one overflow axis is non-`Visible`, so without it the
     ///   overflowing content paints straight past the viewport's edge:
     ///   `.track_scroll()` alone moves content but never clips it.
-    ///
-    /// Only a thumb's own mouse-down (starting a drag) is attached here.
-    /// The drag's move/up tracking is not -- see
-    /// [`ScrollableState::drag_handlers`] for why, and where to attach it.
-    ///
-    /// Schedules at most one extra re-render of the caller's own view when a
-    /// configured axis's viewport has not been through a layout pass yet
-    /// (its bounds still read back as zero), so a scrollbar for content that
-    /// overflows on the very first frame it appears still shows up on the
-    /// next frame instead of staying hidden until unrelated input forces a
-    /// repaint.
     fn with_scrollbars<V: Render>(
         self,
         state: &Entity<ScrollableState>,
@@ -124,19 +87,7 @@ fn build<V: Render>(
 }
 
 /// Schedule at most one outstanding re-render of the caller's own view while
-/// a configured axis's viewport bounds still read back as zero: a scroll
-/// container's bounds are only known after the render that first lays it
-/// out, so a scrollbar for overflowing content would otherwise stay hidden
-/// until something unrelated forces a repaint. `ScrollableState` tracks
-/// whether a nudge is already pending so this never schedules a second one
-/// on top of it, and clears that flag once every configured axis is
-/// measured -- an axis that is legitimately, permanently zero-extent (a
-/// collapsed pane) gets exactly one nudge and then settles, rather than
-/// spinning notify -> render -> notify forever.
-///
-/// `request_animation_frame` cannot do this job -- it only queues a
-/// callback without forcing a draw, so on an otherwise idle window it never
-/// fires.
+/// a configured axis's viewport bounds still read back as zero
 fn nudge_when_unmeasured<V: Render>(state: &Entity<ScrollableState>, cx: &mut Context<V>) {
     let should_schedule = state.update(cx, ScrollableState::should_schedule_nudge);
     if !should_schedule {
@@ -148,7 +99,7 @@ fn nudge_when_unmeasured<V: Render>(state: &Entity<ScrollableState>, cx: &mut Co
     .detach();
 }
 
-/// A thin track + draggable thumb pinned to the right edge of the viewport.
+/// A thin track + draggable thumb
 fn vertical_track(
     axis: AxisSnapshot,
     style: &ScrollbarStyle,
@@ -184,12 +135,7 @@ fn vertical_track(
 }
 
 /// A thin track + draggable thumb pinned to the bottom edge of the
-/// viewport. `vertical_visible` reserves room at the track's far end --
-/// `axis.track_length` already excludes it (see
-/// [`ScrollableState::snapshot`]), so the thumb's own length and position
-/// are scaled to the same shortened track the track div is painted at,
-/// and neither ever runs underneath a simultaneously-visible vertical
-/// scrollbar.
+/// viewport
 fn horizontal_track(
     axis: AxisSnapshot,
     style: &ScrollbarStyle,
@@ -237,18 +183,14 @@ fn thumb_id(state: &Entity<ScrollableState>, axis: &str) -> SharedString {
 }
 
 /// Tags a thumb with a lookup key for `VisualTestContext::debug_bounds`, so
-/// render tests can assert its painted position without reaching into
-/// gpui's own layout internals.
+/// render tests can assert its painted position
 #[cfg(any(test, feature = "test-support"))]
 fn debug_tag(thumb: Stateful<Div>, state: &Entity<ScrollableState>, axis: &str) -> Stateful<Div> {
     let selector = thumb_id(state, axis).to_string();
     thumb.debug_selector(move || selector.clone())
 }
 
-/// A no-op outside test builds: gpui's own `debug_selector` already
-/// discards its argument there, but the selector string built above would
-/// still be allocated on every render without this split, since the
-/// allocation happens before `debug_selector` ever sees it.
+/// A no-op outside test builds
 #[cfg(not(any(test, feature = "test-support")))]
 fn debug_tag(thumb: Stateful<Div>, _state: &Entity<ScrollableState>, _axis: &str) -> Stateful<Div> {
     thumb
@@ -272,8 +214,10 @@ pub fn vertical_thumb_debug_selector(state: &Entity<ScrollableState>) -> &'stati
 /// scrollbar thumb, for a consumer crate's own render tests. Requires this
 /// crate's `test-support` feature (or building this crate's own tests).
 ///
-/// The returned `&'static str` is deliberately leaked, for the same reason
-/// as [`vertical_thumb_debug_selector`].
+/// The returned `&'static str` is deliberately leaked:
+/// `VisualTestContext::debug_bounds` takes `&'static str`, and the key is
+/// per-entity so it cannot be a literal. Test-support builds only, and one
+/// small leak per call.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn horizontal_thumb_debug_selector(state: &Entity<ScrollableState>) -> &'static str {
@@ -308,20 +252,15 @@ mod tests {
     use super::{ScrollableState, WithScrollbars};
     use crate::scrollable::{
         Axis, ScrollSource, ScrollbarStyle, horizontal_thumb_debug_selector,
-        vertical_thumb_debug_selector,
+        restrict_wheel_to_own_axis, vertical_thumb_debug_selector,
     };
 
     const ROW_HEIGHT: f32 = 20.0;
-    /// The fixed footprint the harness constrains its scrollable pane to,
-    /// deliberately much smaller than the test window (1920x1080): large
-    /// enough to leave room for a draggable thumb, small enough that a drag
-    /// dispatched well outside it exercises root- vs wrapper-level
-    /// attachment.
+    /// The fixed footprint the harness constrains its scrollable pane to
     const PANE_SIZE: f32 = 220.0;
 
     /// A minimal view exercising `with_scrollbars` with a configurable
-    /// vertical row count and/or horizontal content width, for tests that
-    /// only care about the abstraction's own behavior.
+    /// vertical row count and/or horizontal content width
     struct Harness {
         scroll: Entity<ScrollableState>,
         list_handle: UniformListScrollHandle,
@@ -443,17 +382,19 @@ mod tests {
 
             self.configure_axes(vertical_content_extent, cx);
 
-            let list = uniform_list(
-                "harness-rows",
-                row_count,
-                cx.processor(|_this, range: std::ops::Range<usize>, _window, _cx| {
-                    range
-                        .map(|ix| div().h(px(ROW_HEIGHT)).child(ix.to_string()))
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .flex_1()
-            .track_scroll(self.list_handle.clone());
+            let list = restrict_wheel_to_own_axis(
+                uniform_list(
+                    "harness-rows",
+                    row_count,
+                    cx.processor(|_this, range: std::ops::Range<usize>, _window, _cx| {
+                        range
+                            .map(|ix| div().h(px(ROW_HEIGHT)).child(ix.to_string()))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .track_scroll(self.list_handle.clone()),
+            );
 
             let wrapped: Div = if self.vertical_uses_container {
                 // A container-backed vertical axis: the scrolled child needs
@@ -966,6 +907,49 @@ mod tests {
         assert!(
             container_handle.offset().x < px(0.0),
             "a shift-held wheel event must move the horizontal axis's offset"
+        );
+    }
+
+    #[gpui::test]
+    fn shift_held_wheel_over_both_axes_moves_only_the_horizontal_one(cx: &mut TestAppContext) {
+        // Both axes populated: the vertical one is backed by a real
+        // uniform_list with rows to scroll, which is what makes this
+        // different from the horizontal-only case above.
+        let (harness, vcx) =
+            cx.add_window_view(|_window, cx| Harness::new(true, true, 400, 2_000.0, cx));
+        vcx.run_until_parked();
+
+        let vertical_before = harness.read_with(vcx, |h, _app| {
+            h.list_handle.0.borrow().base_handle.offset().y
+        });
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.0), px(50.0)),
+            delta: ScrollDelta::Pixels(point(px(-40.0), px(0.0))),
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let (container_handle, vertical_after) = harness.read_with(vcx, |h, _app| {
+            (
+                h.container_handle.clone(),
+                h.list_handle.0.borrow().base_handle.offset().y,
+            )
+        });
+        assert!(
+            container_handle.offset().x < px(0.0),
+            "a shift-held wheel event must move the horizontal axis"
+        );
+        assert_eq!(
+            vertical_after, vertical_before,
+            "a shift-held wheel event must leave the vertical axis alone -- the platform swaps \
+             the gesture's magnitude into the horizontal delta, and a nested list that does not \
+             restrict its own wheel scrolling to its own axis will read that component as \
+             vertical motion and scroll both axes at once"
         );
     }
 

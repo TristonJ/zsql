@@ -12,7 +12,9 @@ use gpui::{
     size, uniform_list,
 };
 use zsql_ui::colors;
-use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
+use zsql_ui::scrollable::{
+    Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars, restrict_wheel_to_own_axis,
+};
 
 const WINDOW_WIDTH: f32 = 900.0;
 const WINDOW_HEIGHT: f32 = 420.0;
@@ -129,30 +131,32 @@ impl Pane {
 
         self.configure_axes(cx);
 
-        let list = uniform_list(
-            gpui::SharedString::from(format!("scrollable-demo-rows-{}", self.title)),
-            row_count,
-            move |range: std::ops::Range<usize>, _window, _cx| {
-                range
-                    .map(|ix| {
-                        div()
-                            .flex_shrink_0()
-                            .h(px(ROW_HEIGHT))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(rgb(colors::LINE_SOFT))
-                            .text_size(px(ROW_TEXT_SIZE))
-                            .text_color(rgb(colors::TEXT))
-                            .child(format!("row {ix}"))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-        .flex_1()
-        .track_scroll(self.list_handle.clone());
+        let list = restrict_wheel_to_own_axis(
+            uniform_list(
+                gpui::SharedString::from(format!("scrollable-demo-rows-{}", self.title)),
+                row_count,
+                move |range: std::ops::Range<usize>, _window, _cx| {
+                    range
+                        .map(|ix| {
+                            div()
+                                .flex_shrink_0()
+                                .h(px(ROW_HEIGHT))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(rgb(colors::LINE_SOFT))
+                                .text_size(px(ROW_TEXT_SIZE))
+                                .text_color(rgb(colors::TEXT))
+                                .child(format!("row {ix}"))
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .flex_1()
+            .track_scroll(self.list_handle.clone()),
+        );
 
         let scroll = self.scroll.clone();
         let viewport: gpui::Div = if horizontal_enabled {

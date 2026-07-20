@@ -5,14 +5,9 @@ use crate::scrollbar;
 /// Visual chrome for the track+thumb overlays [`super::WithScrollbars`]
 /// builds: thickness, minimum thumb length, colors, corner radius, and the
 /// gap between a track and the viewport edge it hugs.
-///
-/// [`ScrollbarStyle::default`] reproduces `zsql_ui::scrollbar`'s own
-/// constants, so a caller that never overrides it renders identically to a
-/// track+thumb pinned straight to the viewport edge.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarStyle {
-    /// Thickness of the track and thumb: width for a vertical scrollbar,
-    /// height for a horizontal one.
+    /// Thickness of the track and thumb
     pub track_width: f32,
     /// Shortest a thumb is ever drawn, regardless of how large the scrolled
     /// content is relative to the viewport.
@@ -25,9 +20,7 @@ pub struct ScrollbarStyle {
     /// on hover.
     pub thumb_hover_color: Option<u32>,
     pub radius: f32,
-    /// Gap between a track and the near edge of the viewport it hugs: the
-    /// right edge for a vertical track, the bottom edge for a horizontal
-    /// one.
+    /// Gap between a track and the near edge of the viewport it hugs
     pub inset: f32,
 }
 
@@ -47,8 +40,7 @@ impl Default for ScrollbarStyle {
 
 impl ScrollbarStyle {
     /// This style's inset, plus the vertical track's thickness when a
-    /// vertical scrollbar is visible: how much of a horizontal track's far
-    /// end stays clear so it never runs underneath that vertical track.
+    /// vertical scrollbar is visible
     #[must_use]
     pub(crate) fn horizontal_reserve(&self, vertical_visible: bool) -> f32 {
         self.inset

@@ -3,8 +3,8 @@
 //! in-progress thumb drag.
 
 use gpui::{
-    App, Context, Entity, IsZero, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Window,
-    px,
+    App, Context, Entity, IsZero, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, Styled,
+    UniformList, Window, px,
 };
 
 use crate::scrollbar::ScrollbarGeometry;
@@ -12,6 +12,13 @@ use crate::scrollbar::ScrollbarGeometry;
 use super::axis::Axis;
 use super::source::Orientation;
 use super::style::ScrollbarStyle;
+
+/// Confine `list`'s own built-in wheel scrolling to its own axis.
+#[must_use]
+pub fn restrict_wheel_to_own_axis(mut list: UniformList) -> UniformList {
+    list.style().restrict_scroll_to_axis = Some(true);
+    list
+}
 
 /// A boxed mouse-move listener, as returned by [`ScrollableState::drag_handlers`].
 type MoveListener = Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>;
@@ -42,9 +49,7 @@ fn end_drag_listener(state: &Entity<ScrollableState>) -> UpListener {
     )
 }
 
-/// Where a scrollbar thumb-drag started: the pointer's position and the
-/// axis's scroll offset at that moment, so later pointer movement can be
-/// translated into a new absolute offset.
+/// Where a scrollbar thumb-drag started
 #[derive(Debug, Clone, Copy)]
 struct DragState {
     pointer_start: f32,
@@ -57,15 +62,12 @@ struct AxisState {
 }
 
 /// One axis's scrollbar geometry, snapshotted once per `with_scrollbars`
-/// call so the wrapper and its track/thumb renderers agree on the same
-/// numbers: the geometry itself, plus the track length (that axis's
-/// measured viewport extent) it was computed against.
+/// call
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AxisSnapshot {
     pub geometry: ScrollbarGeometry,
     pub track_length: f32,
-    /// Where the track starts along the wrapper, carried through from
-    /// [`Axis::track_start`] so the painted track shares the thumb's origin.
+    /// Where the track starts along the wrapper
     pub track_start: f32,
 }
 
@@ -77,46 +79,17 @@ pub(crate) struct Snapshot {
 }
 
 /// Frame-persistent state behind a scrollable region built with
-/// [`super::WithScrollbars::with_scrollbars`]: which scroll handle backs
-/// each axis, that axis's caller-supplied content extent as of the last
-/// render, any in-progress thumb drag, and the [`ScrollbarStyle`] the drag
-/// math was last computed against.
-///
-/// Held by the parent view as `Entity<ScrollableState>` and rebuilt fresh
-/// each render via [`ScrollableState::vertical`]/[`ScrollableState::horizontal`]
-/// -- everything here except the in-progress drag is caller-supplied, not
-/// derived.
-///
-/// A thumb drag's move/up tracking cannot be attached to the small overlay
-/// `with_scrollbars` builds: gpui's `on_mouse_move`/`on_mouse_up` listeners
-/// only fire while the pointer is within the registering element's own
-/// hit-tested bounds (`Interactivity::paint`'s dispatch gates on
-/// `hitbox.is_hovered(window)`), so a drag that carries the pointer outside
-/// a scrollbar's own small viewport -- easy to do, since the viewport is
-/// usually much smaller than the window -- would stop updating mid-drag.
-/// [`ScrollableState::drag_handlers`] returns listeners meant to be attached
-/// at the largest ancestor element the drag should keep tracking within --
-/// tracking still stops the moment the pointer leaves whatever element they
-/// end up attached to, so a caller whose own root is itself a narrow column
-/// (rather than the whole window) only gets drag tracking bounded by that
-/// column's own width.
+/// [`super::WithScrollbars::with_scrollbars`]
 pub struct ScrollableState {
     vertical: Option<AxisState>,
     horizontal: Option<AxisState>,
     style: ScrollbarStyle,
-    /// Whether a first-frame re-render nudge is already pending, so
-    /// [`ScrollableState::should_schedule_nudge`] never schedules a second
-    /// one on top of it.
+    /// Whether a first-frame re-render nudge is already pending
     nudge_pending: bool,
 }
 
 impl ScrollableState {
-    /// An empty state with neither axis configured, ready for the first
-    /// render's [`ScrollableState::vertical`]/[`ScrollableState::horizontal`]
-    /// calls to populate.
-    ///
-    /// Takes `&mut Context<Self>` only so this can be passed directly to
-    /// `cx.new(ScrollableState::new)`; nothing here reads it.
+    /// An empty state with neither axis configured
     #[must_use]
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
@@ -127,31 +100,27 @@ impl ScrollableState {
         }
     }
 
-    /// Configure the vertical axis for this render, preserving any
-    /// in-progress drag from a previous render.
+    /// Configure the vertical axis
     pub fn vertical(&mut self, axis: Axis) -> &mut Self {
         let drag = self.vertical.take().and_then(|state| state.drag);
         self.vertical = Some(AxisState { axis, drag });
         self
     }
 
-    /// Configure the horizontal axis for this render, preserving any
-    /// in-progress drag from a previous render.
+    /// Configure the horizontal axis
     pub fn horizontal(&mut self, axis: Axis) -> &mut Self {
         let drag = self.horizontal.take().and_then(|state| state.drag);
         self.horizontal = Some(AxisState { axis, drag });
         self
     }
 
-    /// Drop the vertical axis: nothing renders or drags on it until the
-    /// next [`ScrollableState::vertical`] call.
+    /// Drop the vertical axis
     pub fn clear_vertical(&mut self) -> &mut Self {
         self.vertical = None;
         self
     }
 
-    /// Drop the horizontal axis: nothing renders or drags on it until the
-    /// next [`ScrollableState::horizontal`] call.
+    /// Drop the horizontal axis
     pub fn clear_horizontal(&mut self) -> &mut Self {
         self.horizontal = None;
         self
@@ -162,8 +131,7 @@ impl ScrollableState {
     }
 
     /// Whether any configured axis's viewport has not yet been through a
-    /// layout pass -- the first-frame state a scroll container's bounds
-    /// read back in before it is measured.
+    /// layout pass
     pub(crate) fn any_axis_unmeasured(&self) -> bool {
         let vertical_unmeasured = self
             .vertical
@@ -177,12 +145,7 @@ impl ScrollableState {
     }
 
     /// Whether `with_scrollbars` should schedule a first-frame re-render
-    /// nudge this call: true at most once per unmeasured stretch, so a
-    /// configured axis whose viewport never measures (a collapsed pane)
-    /// gets exactly one nudge rather than one every render. Clears the
-    /// pending flag once every configured axis is measured, ready for the
-    /// next time an axis becomes unmeasured (e.g. a remounted scroll
-    /// handle).
+    /// nudge this call
     pub(crate) fn should_schedule_nudge(&mut self, _cx: &mut Context<Self>) -> bool {
         if !self.any_axis_unmeasured() {
             self.nudge_pending = false;
@@ -195,9 +158,7 @@ impl ScrollableState {
         true
     }
 
-    /// Whether the vertical axis currently has anything to scroll: its
-    /// content overflows its measured viewport, so `with_scrollbars` would
-    /// draw a track+thumb for it.
+    /// Whether the vertical axis currently has anything to scroll
     #[must_use]
     pub fn vertical_visible(&self) -> bool {
         self.vertical.as_ref().is_some_and(|state| {
@@ -212,9 +173,7 @@ impl ScrollableState {
         })
     }
 
-    /// Whether the horizontal axis currently has anything to scroll: its
-    /// content overflows its measured viewport, so `with_scrollbars` would
-    /// draw a track+thumb for it.
+    /// Whether the horizontal axis currently has anything to scroll
     #[must_use]
     pub fn horizontal_visible(&self) -> bool {
         self.horizontal.as_ref().is_some_and(|state| {
@@ -229,10 +188,7 @@ impl ScrollableState {
         })
     }
 
-    /// Both axes' scrollbar geometry as of this call, the horizontal axis's
-    /// track shortened to leave room for a simultaneously-visible vertical
-    /// scrollbar (see [`ScrollbarStyle::horizontal_reserve`]) so the two
-    /// never paint on top of each other.
+    /// Both axes' scrollbar geometry
     pub(crate) fn snapshot(&self) -> Snapshot {
         let vertical = self.vertical.as_ref().map(|state| {
             axis_snapshot(
@@ -274,8 +230,7 @@ impl ScrollableState {
 
     /// Translate `event`'s pointer position into a new scroll offset for
     /// every axis with an in-progress drag. Returns whether any axis's drag
-    /// state changed: a new offset, or a drag that ended because the mouse
-    /// button is no longer held.
+    /// state changed
     pub(crate) fn handle_drag_move(&mut self, event: &MouseMoveEvent) -> bool {
         let dragging = event.dragging();
         let min_thumb_length = self.style.min_thumb_length;
@@ -328,10 +283,8 @@ impl ScrollableState {
         let current_offset = axis_state.axis.source.scroll_offset(orientation);
         let track_length = (viewport_extent - track_reserve).max(0.0);
 
-        // If the content has shrunk to fit the viewport mid-drag (a schema
-        // collapses, rows get filtered out), there is nothing left to drag:
-        // leave the offset exactly as it is rather than letting
-        // `scroll_offset_for_drag`'s "nothing to scroll" case snap it to 0.
+        // If the content has shrunk to fit the viewport mid-drag, there is
+        // nothing left to drag
         let geometry = ScrollbarGeometry::compute(
             content_extent,
             viewport_extent,
@@ -426,8 +379,7 @@ impl ScrollableState {
 
     /// Mouse-move/mouse-up/mouse-up-out listeners for the caller to attach
     /// at their own view root, so a thumb drag keeps tracking the pointer
-    /// once it leaves the small overlay `with_scrollbars` built. See this
-    /// type's own docs for why wrapper-level attachment is not enough.
+    /// once it leaves the small overlay `with_scrollbars` built
     #[must_use = "the returned listeners do nothing unless attached to the caller's view root"]
     pub fn drag_handlers(state: &Entity<Self>) -> DragHandlers {
         let move_state = state.clone();
@@ -451,6 +403,10 @@ impl ScrollableState {
     /// A listener for the caller to attach with `.on_scroll_wheel(...)` on
     /// the horizontally-scrolling element, wiring [`ScrollableState::on_scroll_wheel`]
     /// to the entity.
+    ///
+    /// Any `uniform_list` nested inside that element must also be passed
+    /// through [`restrict_wheel_to_own_axis`], or it scrolls vertically off
+    /// the same shift-held gesture this listener scrolls horizontally.
     #[must_use = "the returned listener does nothing unless attached with .on_scroll_wheel(...)"]
     pub fn wheel_handler(state: &Entity<Self>) -> WheelListener {
         let state = state.clone();
@@ -467,9 +423,7 @@ impl ScrollableState {
 }
 
 /// One axis's snapshot, its track shortened by `track_reserve` pixels from
-/// its raw measured viewport extent -- `0.0` for an axis that need not make
-/// room for anything else, [`ScrollbarStyle::horizontal_reserve`]'s result
-/// for a horizontal axis sharing its viewport with a vertical scrollbar.
+/// its raw measured viewport extent
 fn axis_snapshot(
     axis: &Axis,
     orientation: Orientation,
@@ -493,9 +447,7 @@ fn axis_snapshot(
     }
 }
 
-/// Select the horizontal component of a shift-held wheel delta, falling
-/// back to the vertical component when the horizontal component is zero
-/// (some platforms do not swap the components before dispatch).
+/// Select the horizontal component of a shift-held wheel delta
 fn horizontal_wheel_delta(delta_x: Pixels, delta_y: Pixels) -> Pixels {
     if delta_x.is_zero() { delta_y } else { delta_x }
 }

@@ -11,9 +11,7 @@ pub(crate) enum Orientation {
 }
 
 /// The concrete gpui handle backing one axis: a virtualized `uniform_list`'s
-/// handle, or a plain overflow container's handle. Both track a full 2D
-/// offset; every method here reads or mutates only the requested axis's
-/// component, leaving the other axis's offset numerically untouched.
+/// handle, or a plain overflow container's handle
 #[derive(Clone, Debug)]
 pub enum ScrollSource {
     /// A virtualized `uniform_list`'s scroll handle.
@@ -44,9 +42,7 @@ impl ScrollSource {
         }
     }
 
-    /// Move this axis's offset to `value` (gpui's own convention: negative
-    /// in the scrolled direction) along `orientation`, leaving the other
-    /// axis's offset component numerically unchanged.
+    /// Move this axis's offset to `value`
     pub(crate) fn set_offset_along(&self, orientation: Orientation, value: Pixels) {
         let current = self.offset();
         let next = match orientation {
@@ -56,9 +52,7 @@ impl ScrollSource {
         self.set_offset(next);
     }
 
-    /// This axis's live scroll offset (positive-down/right), the convention
-    /// [`crate::scrollbar::ScrollbarGeometry`] expects -- the inverse of a
-    /// gpui scroll handle's own negative-in-the-scrolled-direction offset.
+    /// This axis's live scroll offset (positive-down/right)
     pub(crate) fn scroll_offset(&self, orientation: Orientation) -> f32 {
         let offset = self.offset();
         -f32::from(match orientation {
@@ -68,8 +62,7 @@ impl ScrollSource {
     }
 
     /// This axis's live measured viewport extent (height for vertical,
-    /// width for horizontal): zero before the scroll container's first
-    /// layout pass.
+    /// width for horizontal)
     pub(crate) fn viewport_extent(&self, orientation: Orientation) -> f32 {
         let size = self.bounds().size;
         f32::from(match orientation {
