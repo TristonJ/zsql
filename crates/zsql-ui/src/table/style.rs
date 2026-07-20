@@ -1,0 +1,105 @@
+//! Visual chrome for a [`super::Table`]: cell padding, row/header heights,
+//! per-edge borders, and background/border colors.
+
+use gpui::{Pixels, px};
+
+use crate::{colors, grid};
+
+/// Height of a table's header row.
+pub const DEFAULT_HEADER_HEIGHT: Pixels = px(28.0);
+/// Height of each of a table's body rows.
+pub const DEFAULT_ROW_HEIGHT: Pixels = px(24.0);
+
+/// Which structural hairlines a table draws. Each edge is independent, so a
+/// caller can drop e.g. column separators while keeping row separators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableBorders {
+    /// The horizontal hairline under the header row and under every body
+    /// row.
+    pub row: bool,
+    /// The vertical hairline to the right of every cell.
+    pub column: bool,
+    /// The hairline separating a pinned gutter pane from the data pane.
+    pub outer: bool,
+}
+
+impl Default for TableBorders {
+    fn default() -> Self {
+        Self {
+            row: true,
+            column: true,
+            outer: true,
+        }
+    }
+}
+
+/// A table's cell chrome: padding, row/header heights, which structural
+/// hairlines are drawn, and the colors they and the header/gutter
+/// backgrounds paint with.
+#[derive(Debug, Clone, Copy)]
+pub struct TableStyle {
+    /// Horizontal padding inside every cell.
+    pub cell_padding_x: Pixels,
+    /// Height of the header row.
+    pub header_height: Pixels,
+    /// Height of each body row.
+    pub row_height: Pixels,
+    /// Which structural hairlines are drawn.
+    pub borders: TableBorders,
+    /// Background of the header row and a `RowNumbers`/`Custom` gutter's
+    /// header cell.
+    pub header_bg: u32,
+    /// Background of a `RowNumbers`/`Custom` gutter's body cells.
+    pub gutter_bg: u32,
+    /// Color of the header row's bottom hairline.
+    pub header_border: u32,
+    /// Color of every other structural hairline: body row separators,
+    /// column separators, and the gutter/data-pane divider.
+    pub row_border: u32,
+}
+
+impl Default for TableStyle {
+    fn default() -> Self {
+        Self {
+            cell_padding_x: px(grid::CELL_PADDING_X),
+            header_height: DEFAULT_HEADER_HEIGHT,
+            row_height: DEFAULT_ROW_HEIGHT,
+            borders: TableBorders::default(),
+            header_bg: colors::RAISE,
+            gutter_bg: colors::PANEL,
+            header_border: colors::LINE,
+            row_border: colors::LINE_SOFT,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::px;
+
+    use super::{DEFAULT_HEADER_HEIGHT, DEFAULT_ROW_HEIGHT, TableBorders, TableStyle};
+    use crate::{colors, grid};
+
+    #[test]
+    fn default_style_uses_the_shared_grid_dimensions_and_colors() {
+        let style = TableStyle::default();
+        assert_eq!(style.header_height, DEFAULT_HEADER_HEIGHT);
+        assert_eq!(style.header_height, px(28.0));
+        assert_eq!(style.row_height, DEFAULT_ROW_HEIGHT);
+        assert_eq!(style.row_height, px(24.0));
+        assert_eq!(style.cell_padding_x, px(grid::CELL_PADDING_X));
+        assert_eq!(style.header_bg, colors::RAISE);
+        assert_eq!(style.gutter_bg, colors::PANEL);
+        assert_eq!(style.header_border, colors::LINE);
+        assert_eq!(style.row_border, colors::LINE_SOFT);
+        assert_eq!(style.borders, TableBorders::default());
+    }
+
+    #[test]
+    fn default_borders_draw_every_edge() {
+        let borders = TableBorders::default();
+        assert!(borders.row);
+        assert!(borders.column);
+        assert!(borders.outer);
+    }
+}

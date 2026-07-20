@@ -3,12 +3,15 @@
 //! ready, reusing `zsql_ui::grid` primitives and the results grid's
 //! type-tag treatment.
 
-use gpui::{Context, Entity, Render, Window, div, prelude::*, px, rgb, rgba};
+use std::ops::Range;
+
+use gpui::{Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb, rgba};
 use zsql_core::{
-    ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, IndexInfo, KeyBadge, RelationKind,
+    ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, KeyBadge, RelationKind,
     RelationSchema, RowCount,
 };
 use zsql_ui::icon::{IconName, icon};
+use zsql_ui::table::{Table, TableColumn, TableHeight, TableRow, TableState, TableStyle};
 use zsql_ui::{colors, grid};
 
 use super::results::group_thousands;
@@ -34,6 +37,12 @@ pub struct SchemaTabView {
     kind: RelationKind,
     state: FetchState,
     row_count: Option<RowCount>,
+    /// State for the "Columns" table
+    columns_table: Entity<TableState>,
+    /// State for the "Indexes" table
+    indexes_table: Entity<TableState>,
+    /// State for the "Constraints" table
+    constraints_table: Entity<TableState>,
 }
 
 impl SchemaTabView {
@@ -56,6 +65,17 @@ impl SchemaTabView {
             kind,
             state: FetchState::Loading,
             row_count: None,
+            columns_table: cx.new(TableState::new),
+            indexes_table: cx.new(TableState::new),
+            constraints_table: cx.new(TableState::new),
+        }
+    }
+
+    /// Get the current schema, if available
+    fn schema(&self) -> Option<&RelationSchema> {
+        match &self.state {
+            FetchState::Ready(detail) => Some(detail),
+            _ => None,
         }
     }
 
@@ -198,66 +218,245 @@ impl SchemaTabView {
             )
     }
 
-    /// The Columns table: the hero of the schema view.
-    fn render_columns_table(detail: &RelationSchema) -> impl IntoElement {
+    /// The "Columns" table
+    fn render_columns_table(
+        &self,
+        cx: &mut Context<Self>,
+        detail: &RelationSchema,
+    ) -> impl IntoElement {
         let widths = theme::SCHEMA_COLUMNS_WIDTHS;
+        let columns = ["Column", "Type", "Null", "Default", "Keys"]
+            .iter()
+            .zip(widths.iter())
+            .map(|(column, &width)| {
+                TableColumn::new(width, header_cell(column.to_string()).px(cell_x_padding()))
+            })
+            .collect();
+
         section(
             "Columns",
             detail.columns.len(),
-            table_shell()
-                .child(header_row(
-                    widths,
-                    ["Column", "Type", "Null", "Default", "Keys"],
-                ))
-                .children(
-                    detail
-                        .columns
-                        .iter()
-                        .map(|column| render_column_row(column, &detail.constraints, widths)),
-                ),
+            Table::new("schema-columns-table", &self.columns_table)
+                .style(TableStyle {
+                    cell_padding_x: px(0.0),
+                    ..Default::default()
+                })
+                .columns(columns)
+                .row_count(detail.columns.len())
+                .rows(Self::render_columns_table_row_cells)
+                .table_height(TableHeight::Fill)
+                .render(cx),
         )
+    }
+
+    fn render_columns_table_row_cells(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<TableRow> {
+        tracing::debug!("render_columns_table_row_cells: range={:?}", range);
+        let Some(schema) = self.schema() else {
+            debug_assert!(
+                false,
+                "render_columns_table_row_cells called before schema is ready"
+            );
+            return vec![];
+        };
+
+        range
+            .map(|ix| {
+                let Some(column) = schema.columns.get(ix) else {
+                    return TableRow::new(vec![]);
+                };
+                let cells = vec![
+                    div()
+                        .when_some(rail_color(column), |el, color| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(theme::SCHEMA_RAIL_WIDTH)
+                                    .bg(rgb(color)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_color(rgb(colors::TEXT))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(column.name.clone()),
+                        )
+                        .px(cell_x_padding())
+                        .into_any_element(),
+                    div()
+                        .px(cell_x_padding())
+                        .child(
+                            grid::type_tag(&column.type_name)
+                                .flex_shrink_0()
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    null_label(column.nullable)
+                        .px(cell_x_padding())
+                        .into_any_element(),
+                    render_default_cell(column.default.as_deref())
+                        .px(cell_x_padding())
+                        .into_any_element(),
+                    div()
+                        .px(cell_x_padding())
+                        .child(render_keys_cell(column, &schema.constraints))
+                        .into_any_element(),
+                ];
+
+                TableRow::new(cells)
+            })
+            .collect()
     }
 
     /// The Indexes table.
-    fn render_indexes_table(detail: &RelationSchema) -> impl IntoElement {
+    fn render_indexes_table(
+        &self,
+        cx: &mut Context<Self>,
+        detail: &RelationSchema,
+    ) -> impl IntoElement {
         let widths = theme::SCHEMA_INDEXES_WIDTHS;
+        let columns = ["Name", "Method", "Unique", "Definition"]
+            .iter()
+            .zip(widths.iter())
+            .map(|(column, &width)| TableColumn::new(width, header_cell(column.to_string())))
+            .collect();
+
         section(
             "Indexes",
             detail.indexes.len(),
-            table_shell()
-                .child(header_row(
-                    widths,
-                    ["Name", "Method", "Unique", "Definition"],
-                ))
-                .children(
-                    detail
-                        .indexes
-                        .iter()
-                        .map(|index| render_index_row(index, widths)),
-                ),
+            Table::new("schema-indexes-table", &self.indexes_table)
+                .columns(columns)
+                .row_count(detail.indexes.len())
+                .rows(Self::render_indexe_table_row_cells)
+                .table_height(TableHeight::Fill)
+                .render(cx),
         )
     }
 
+    fn render_indexe_table_row_cells(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<TableRow> {
+        let Some(schema) = self.schema() else {
+            debug_assert!(
+                false,
+                "render_indexe_table_row_cells called before schema is ready"
+            );
+            return vec![];
+        };
+
+        range
+            .map(|ix| {
+                let Some(index) = schema.indexes.get(ix) else {
+                    return TableRow::new(vec![]);
+                };
+                let cells = vec![
+                    div()
+                        .text_color(rgb(colors::TEXT))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(index.name.clone())
+                        .into_any_element(),
+                    div()
+                        .text_color(rgb(colors::MUTED))
+                        .child(index.method.clone())
+                        .into_any_element(),
+                    if index.unique {
+                        div()
+                            .text_color(rgb(colors::BOOL))
+                            .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .text_color(rgb(colors::FAINT))
+                            .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
+                            .into_any_element()
+                    },
+                    div()
+                        .text_color(rgb(colors::MUTED))
+                        .child(index.definition.clone())
+                        .into_any_element(),
+                ];
+
+                TableRow::new(cells)
+            })
+            .collect()
+    }
+
     /// The Constraints table.
-    fn render_constraints_table(detail: &RelationSchema) -> impl IntoElement {
+    fn render_constraints_table(
+        &self,
+        cx: &mut Context<Self>,
+        detail: &RelationSchema,
+    ) -> impl IntoElement {
         let widths = theme::SCHEMA_CONSTRAINTS_WIDTHS;
+        let columns = ["Name", "Method", "Unique", "Definition"]
+            .iter()
+            .zip(widths.iter())
+            .map(|(column, &width)| TableColumn::new(width, header_cell(column.to_string())))
+            .collect();
+
         section(
             "Constraints",
             detail.constraints.len(),
-            table_shell()
-                .child(header_row(widths, ["Name", "Type", "Definition"]))
-                .children(
-                    detail
-                        .constraints
-                        .iter()
-                        .map(|constraint| render_constraint_row(constraint, widths)),
-                ),
+            Table::new("schema-constraints-table", &self.constraints_table)
+                .columns(columns)
+                .row_count(detail.constraints.len())
+                .rows(Self::render_constraints_table_row_cells)
+                .table_height(TableHeight::Fill)
+                .render(cx),
         )
+    }
+
+    fn render_constraints_table_row_cells(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<TableRow> {
+        let Some(schema) = self.schema() else {
+            debug_assert!(
+                false,
+                "render_constraints_table_row_cells called before schema is ready"
+            );
+            return vec![];
+        };
+
+        range
+            .map(|ix| {
+                let Some(constraint) = schema.constraints.get(ix) else {
+                    return TableRow::new(vec![]);
+                };
+                let (kind_label, kind_color) = constraint_kind_badge(constraint.kind);
+                let cells = vec![
+                    div()
+                        .text_color(rgb(colors::TEXT))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(constraint.name.clone())
+                        .into_any_element(),
+                    key_badge(kind_label, kind_color, colors::LINE).into_any_element(),
+                    div()
+                        .text_color(rgb(colors::MUTED))
+                        .child(constraint.definition.clone())
+                        .into_any_element(),
+                ];
+
+                TableRow::new(cells)
+            })
+            .collect()
     }
 }
 
 impl Render for SchemaTabView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body: gpui::AnyElement = match &self.state {
             FetchState::Loading => {
                 Self::render_placeholder(colors::FAINT, "Loading schema...", "Fetching structure.")
@@ -283,9 +482,9 @@ impl Render for SchemaTabView {
                         .overflow_y_scroll()
                         .p(theme::SCHEMA_SCROLL_PADDING)
                         .gap(theme::SCHEMA_SECTION_GAP)
-                        .child(Self::render_columns_table(detail))
-                        .child(Self::render_indexes_table(detail))
-                        .child(Self::render_constraints_table(detail)),
+                        .child(self.render_columns_table(cx, detail))
+                        .child(self.render_indexes_table(cx, detail))
+                        .child(self.render_constraints_table(cx, detail)),
                 )
                 .into_any_element(),
         };
@@ -338,101 +537,13 @@ fn section(label: &str, count: usize, table: impl IntoElement) -> impl IntoEleme
         .child(table)
 }
 
-/// Shared chrome for one of the schema view's tables.
-fn table_shell() -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .border_1()
-        .border_color(rgb(colors::LINE_SOFT))
-        .rounded(px(theme::SCHEMA_TABLE_RADIUS))
-        .overflow_hidden()
+/// Get the default cell horizontal padding to use, if needed.
+fn cell_x_padding() -> gpui::Pixels {
+    px(grid::CELL_PADDING_X)
 }
 
-/// A header row of `labels`, each cell sized to its matching entry in
-/// `widths`. The trailing cell drops its vertical separator so the table's
-/// own border carries the right edge.
-fn header_row<const N: usize>(widths: [gpui::Pixels; N], labels: [&str; N]) -> impl IntoElement {
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .bg(rgb(colors::RAISE))
-        .border_b_1()
-        .border_color(rgb(colors::LINE));
-    let last = N.saturating_sub(1);
-    for (index, (width, label)) in widths.into_iter().zip(labels).enumerate() {
-        let mut cell = grid::header_cell_shell(width)
-            .text_size(px(theme::SCHEMA_TABLE_HEADER_TEXT_SIZE))
-            .text_color(rgb(colors::MUTED))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .child(label.to_owned());
-        if index == last {
-            cell = cell.border_r_0();
-        }
-        row = row.child(cell);
-    }
-    row
-}
-
-/// The Type cell: the teal type tag shown in full, never clipped mid-glyph
-/// even for a long Postgres type name.
-fn type_cell(width: gpui::Pixels, type_name: &str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .w(width)
-        .h_full()
-        .px(px(grid::CELL_PADDING_X))
-        .border_r_1()
-        .border_color(rgb(colors::LINE_SOFT))
-        .child(grid::type_tag(type_name).flex_shrink_0())
-}
-
-/// One row of the Columns table: the left key-rail tick, then Column/Type/
-/// Null/Default/Keys cells.
-fn render_column_row(
-    column: &ColumnDetail,
-    constraints: &[ConstraintInfo],
-    widths: [gpui::Pixels; 5],
-) -> impl IntoElement {
-    let [name_w, type_w, null_w, default_w, keys_w] = widths;
-    div()
-        .flex()
-        .flex_row()
-        .border_b_1()
-        .border_color(rgb(colors::LINE_SOFT))
-        .child(
-            grid::body_cell_shell(name_w)
-                .relative()
-                .when_some(rail_color(column), |el, color| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(theme::SCHEMA_RAIL_WIDTH)
-                            .bg(rgb(color)),
-                    )
-                })
-                .child(
-                    div()
-                        .text_color(rgb(colors::TEXT))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(column.name.clone()),
-                ),
-        )
-        .child(type_cell(type_w, &column.type_name))
-        .child(grid::body_cell_shell(null_w).child(null_label(column.nullable)))
-        .child(
-            grid::body_cell_shell(default_w).child(render_default_cell(column.default.as_deref())),
-        )
-        .child(
-            grid::body_cell_shell(keys_w)
-                .border_r_0()
-                .child(render_keys_cell(column, constraints)),
-        )
+fn header_cell(text: String) -> gpui::Div {
+    div().text_color(rgb(colors::TEXT)).child(text)
 }
 
 /// The Null cell's text and color for `nullable`.
@@ -518,77 +629,6 @@ fn fk_link_chip(target: &str) -> gpui::Div {
         .px(theme::SCHEMA_BADGE_PADDING_X)
         .child(theme::SCHEMA_FK_ARROW)
         .child(target.to_owned())
-}
-
-/// One row of the Indexes table.
-fn render_index_row(index: &IndexInfo, widths: [gpui::Pixels; 4]) -> impl IntoElement {
-    let [name_w, method_w, unique_w, def_w] = widths;
-    div()
-        .flex()
-        .flex_row()
-        .border_b_1()
-        .border_color(rgb(colors::LINE_SOFT))
-        .child(
-            grid::body_cell_shell(name_w).child(
-                div()
-                    .text_color(rgb(colors::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(index.name.clone()),
-            ),
-        )
-        .child(
-            grid::body_cell_shell(method_w).child(
-                div()
-                    .text_color(rgb(colors::MUTED))
-                    .child(index.method.clone()),
-            ),
-        )
-        .child(grid::body_cell_shell(unique_w).child(if index.unique {
-            div()
-                .text_color(rgb(colors::BOOL))
-                .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
-        } else {
-            div()
-                .text_color(rgb(colors::FAINT))
-                .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
-        }))
-        .child(
-            grid::body_cell_shell(def_w).border_r_0().child(
-                div()
-                    .text_color(rgb(colors::MUTED))
-                    .child(index.definition.clone()),
-            ),
-        )
-}
-
-/// One row of the Constraints table.
-fn render_constraint_row(
-    constraint: &ConstraintInfo,
-    widths: [gpui::Pixels; 3],
-) -> impl IntoElement {
-    let [name_w, kind_w, def_w] = widths;
-    let (kind_label, kind_color) = constraint_kind_badge(constraint.kind);
-    div()
-        .flex()
-        .flex_row()
-        .border_b_1()
-        .border_color(rgb(colors::LINE_SOFT))
-        .child(
-            grid::body_cell_shell(name_w).child(
-                div()
-                    .text_color(rgb(colors::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(constraint.name.clone()),
-            ),
-        )
-        .child(grid::body_cell_shell(kind_w).child(key_badge(kind_label, kind_color, colors::LINE)))
-        .child(
-            grid::body_cell_shell(def_w).border_r_0().child(
-                div()
-                    .text_color(rgb(colors::MUTED))
-                    .child(constraint.definition.clone()),
-            ),
-        )
 }
 
 /// The label and text color a [`ConstraintKind`] renders its type badge

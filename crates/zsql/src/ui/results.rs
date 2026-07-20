@@ -4,12 +4,13 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Context, Div, Entity, IsZero, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Render, ScrollHandle, ScrollWheelEvent, SharedString, UniformList,
-    UniformListScrollHandle, Window, div, point, prelude::*, px, rgb, rgba, uniform_list,
+    AnyElement, App, Context, Div, Entity, MouseButton, Pixels, Render, SharedString, Window, div,
+    prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
-use zsql_ui::{colors, grid, scrollbar};
+use zsql_ui::colors;
+use zsql_ui::grid;
+use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
@@ -44,41 +45,9 @@ pub struct ResultsView {
     /// How many of `session.result().rows` have already been folded into
     /// `column_max_body_chars`
     folded_row_count: usize,
-    row_number_width: Pixels,
-    /// Shared vertical scroll state between the row-number pane's list and
-    /// the data pane's list, so the two stay in lockstep
-    row_scroll_handle: UniformListScrollHandle,
-    /// Set while the user is dragging the vertical scrollbar's thumb, so
-    /// mouse-move events know to translate pointer movement into a new
-    /// scroll offset instead of being ignored.
-    vscrollbar_drag: Option<VscrollbarDrag>,
-    /// Horizontal scroll state of the data pane -- the column-header row and
-    /// the body's virtualized list are both children of the container this
-    /// handle tracks, so scrolling it moves them in lockstep. The row-number
-    /// pane sits outside this container and never scrolls horizontally.
-    col_scroll_handle: ScrollHandle,
-    /// Set while the user is dragging the horizontal scrollbar's thumb, so
-    /// mouse-move events know to translate pointer movement into a new
-    /// scroll offset instead of being ignored.
-    hscrollbar_drag: Option<HscrollbarDrag>,
-}
-
-/// The pointer position and scroll offset captured when a vertical
-/// scrollbar thumb-drag starts, used to translate subsequent pointer
-/// movement into a new scroll offset.
-#[derive(Debug, Clone, Copy)]
-struct VscrollbarDrag {
-    pointer_start_y: Pixels,
-    offset_start_y: Pixels,
-}
-
-/// The pointer position and scroll offset captured when a horizontal
-/// scrollbar thumb-drag starts, used to translate subsequent pointer
-/// movement into a new scroll offset.
-#[derive(Debug, Clone, Copy)]
-struct HscrollbarDrag {
-    pointer_start_x: Pixels,
-    offset_start_x: Pixels,
+    /// The grid's mechanical (scroll/drag) state, composed via
+    /// `zsql_ui::table`.
+    table_state: Entity<TableState>,
 }
 
 impl ResultsView {
@@ -104,51 +73,10 @@ impl ResultsView {
             column_widths: Vec::new(),
             column_max_body_chars: Vec::new(),
             folded_row_count: 0,
-            row_number_width: row_number_column_width(0),
-            row_scroll_handle: UniformListScrollHandle::new(),
-            vscrollbar_drag: None,
-            col_scroll_handle: ScrollHandle::new(),
-            hscrollbar_drag: None,
+            table_state: cx.new(TableState::new),
         };
         view.sync_dimensions(cx);
         view
-    }
-
-    /// Both scrollbars' visibility and size are computed from their scroll
-    /// viewport's laid-out extent, which reads back as zero during the
-    /// render that first lays the grid out (a scroll container's bounds are
-    /// only known after that render). The grid itself only appears once a
-    /// query returns rows, so the first grid frame always starts unmeasured.
-    /// When that state is detected - the grid is shown but the vertical or
-    /// horizontal viewport has not been measured yet - schedule exactly one
-    /// re-render so the scrollbars appear on the next frame instead of
-    /// staying hidden until unrelated input forces a repaint. This settles
-    /// immediately: once both viewports are measured (non-zero) the
-    /// condition is false, so no further nudges fire.
-    /// `request_animation_frame` cannot do this - it only queues a callback
-    /// without forcing a draw, so on an otherwise idle window it never
-    /// fires.
-    fn nudge_scrollbar_when_grid_unmeasured(&mut self, cx: &mut Context<Self>) {
-        let grid_shown = matches!(self.effective_state(cx), SessionState::Results(_))
-            || (matches!(self.effective_state(cx), SessionState::Running)
-                && !self.effective_result(cx).columns.is_empty());
-        let vertical_viewport_unmeasured = self
-            .row_scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .bounds()
-            .size
-            .height
-            == Pixels::ZERO;
-        let horizontal_viewport_unmeasured =
-            self.col_scroll_handle.bounds().size.width == Pixels::ZERO;
-        if grid_shown && (vertical_viewport_unmeasured || horizontal_viewport_unmeasured) {
-            cx.spawn(async move |this, cx| {
-                this.update(cx, |_, cx| cx.notify()).ok();
-            })
-            .detach();
-        }
     }
 
     /// Follow `session`'s state/result live under `source_label`, e.g. for
@@ -183,7 +111,6 @@ impl ResultsView {
         self.column_widths = Vec::new();
         self.column_max_body_chars = Vec::new();
         self.folded_row_count = 0;
-        self.row_number_width = row_number_column_width(0);
     }
 
     /// The result set this view currently renders: `session`'s live result
@@ -205,8 +132,9 @@ impl ResultsView {
         }
     }
 
-    /// Bring `column_widths`/`row_number_width` up to date with the
-    /// session's current result set
+    /// Bring `column_widths` up to date with the session's current result
+    /// set, folding only the rows that streamed in since the last call.
+    #[tracing::instrument(name = "results_sync_dimensions", skip_all)]
     fn sync_dimensions(&mut self, cx: &mut Context<Self>) {
         // Matched directly on the `frozen` field (rather than through the
         // `effective_result` method) so the borrow checker sees this as
@@ -224,6 +152,7 @@ impl ResultsView {
             self.folded_row_count = 0;
         }
 
+        let rows_folded_this_call = result.rows.len().saturating_sub(self.folded_row_count);
         for row in result.rows.iter().skip(self.folded_row_count) {
             for (index, max_chars) in self.column_max_body_chars.iter_mut().enumerate() {
                 if let Some(value) = row.0.get(index) {
@@ -236,13 +165,22 @@ impl ResultsView {
         }
         self.folded_row_count = result.rows.len();
 
+        let table_style = Self::table_style();
         self.column_widths = result
             .columns
             .iter()
             .zip(self.column_max_body_chars.iter())
-            .map(|(column, &max_body_chars)| column_width_from_parts(column, max_body_chars))
+            .map(|(column, &max_body_chars)| {
+                column_width_from_parts(column, max_body_chars, &table_style)
+            })
             .collect();
-        self.row_number_width = row_number_column_width(result.rows.len());
+
+        tracing::debug!(
+            column_count = result.columns.len(),
+            rows_folded_this_call,
+            total_folded_row_count = self.folded_row_count,
+            "remeasured results grid column widths"
+        );
     }
 
     /// The results header bar: row count + source/relation label.
@@ -364,503 +302,39 @@ impl ResultsView {
     }
 
     /// The two-pane virtualized grid (pinned row numbers + horizontally
-    /// scrolling data columns)
+    /// scrolling data columns), built by composing `zsql_ui::table::Table`.
     fn render_grid(&mut self, cx: &mut Context<Self>) -> Div {
         let row_count = self.effective_result(cx).rows.len();
-        let row_number_width = self.row_number_width;
-        // The column content lays out at its full summed width inside the
-        // clipped data pane, so it genuinely overflows and can be scrolled;
-        // stretching it to the pane width instead would leave nothing to
-        // scroll. A narrow result still fills the pane via the pane's own
-        // stretch, since this only sets a lower bound.
-        let content_extent = px(content_extent_for_columns(&self.column_widths));
+        let columns = self.build_columns(cx);
 
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            // The row-number pane is pinned outside the horizontally
-            // scrolling data pane below, rather than using CSS-style
-            // `position: sticky` as the mockup's `.rownum` does: gpui 0.2.2
-            // has no sticky-positioning primitive, so a fixed-width left
-            // pane plus a horizontally-scrolling right pane is used instead
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_shrink_0()
-                    .w(row_number_width)
-                    .h_full()
-                    .border_r_1()
-                    .border_color(rgb(colors::LINE_SOFT))
-                    .child(Self::render_row_number_header())
-                    .child(vertical_only_wheel(
-                        uniform_list(
-                            "results-rownums",
-                            row_count,
-                            cx.processor(|this, range, window, cx| {
-                                this.render_row_number_cells(range, window, cx)
-                            }),
-                        )
-                        .flex_1()
-                        .track_scroll(self.row_scroll_handle.clone()),
-                    )),
-            )
-            .child(
-                // Both scrollbars are siblings of the horizontally scrolling
-                // "results-h-scroll" pane below, not descendants of it: gpui
-                // translates every descendant of a scroll container by its
-                // scroll offset during prepaint (including absolutely
-                // positioned ones), so nesting a scrollbar inside the
-                // scrolling pane would drag it off the viewport's edge
-                // whenever the grid is scrolled. This outer div carries the
-                // `.relative()` anchor instead, so each scrollbar's
-                // `.absolute()` positioning is relative to a container
-                // unaffected by the pane's own scrolling. It must NOT set
-                // `min_w_full`: as a `flex_1` child sharing this flex-row
-                // with the fixed-width row-number pane, a 100% min-width
-                // would force it wider than the row and push the vertical
-                // scrollbar's pinned right edge off-screen. The inner pane
-                // below fills the width instead.
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    // Without min-width:0 a flex item refuses to shrink below
-                    // its content's intrinsic width, so this pane would grow to
-                    // the full column width and overflow the row instead of
-                    // clipping. Constraining it to the available width is what
-                    // makes it a horizontal scroll viewport.
-                    .min_w_0()
-                    .min_h_0()
-                    .h_full()
-                    .child(
-                        div()
-                            .id("results-h-scroll")
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .w_full()
-                            .min_w_0()
-                            .min_h_0()
-                            .h_full()
-                            .overflow_x_hidden()
-                            .track_scroll(&self.col_scroll_handle)
-                            .on_scroll_wheel(cx.listener(Self::on_data_pane_scroll_wheel))
-                            .child(self.render_column_headers(cx))
-                            .child(vertical_only_wheel(
-                                uniform_list(
-                                    "results-grid",
-                                    row_count,
-                                    cx.processor(|this, range, window, cx| {
-                                        this.render_data_row_cells(range, window, cx)
-                                    }),
-                                )
-                                .flex_1()
-                                .min_w(content_extent)
-                                .track_scroll(self.row_scroll_handle.clone()),
-                            )),
-                    )
-                    .children(self.render_vertical_scrollbar(row_count, cx))
-                    .children(self.render_horizontal_scrollbar(row_count, cx)),
-            )
+        Table::new("results-grid", &self.table_state)
+            .style(Self::table_style())
+            .columns(columns)
+            .row_count(row_count)
+            .gutter(Gutter::RowNumbers(RowNumberStyle {
+                char_width: theme::CELL_CHAR_WIDTH,
+                min_width: theme::ROW_NUMBER_MIN_WIDTH,
+            }))
+            .rows(Self::render_data_row_cells)
+            .render(cx)
     }
 
-    /// The vertical scrollbar's current geometry, read fresh from
-    /// `row_scroll_handle`'s live offset and bounds (never cached), so it
-    /// stays in sync with wheel scrolling, keyboard scrolling, and rows
-    /// streaming in across renders.
-    fn vertical_scrollbar_geometry(&self, row_count: usize) -> scrollbar::ScrollbarGeometry {
-        let (viewport_extent, scroll_offset) = {
-            let state = self.row_scroll_handle.0.borrow();
-            (
-                f32::from(state.base_handle.bounds().size.height),
-                f32::from(-state.base_handle.offset().y),
-            )
-        };
-        scrollbar::ScrollbarGeometry::compute(
-            content_extent_for_row_count(row_count),
-            viewport_extent,
-            scroll_offset,
-            viewport_extent,
-            scrollbar::MIN_THUMB_LENGTH,
-        )
+    /// The one `TableStyle` both `render_grid`'s live `Table` and
+    /// `column_width_from_parts`'s width estimate use, so a column's
+    /// measured width can never drift from the padding it is actually
+    /// rendered with.
+    fn table_style() -> zsql_ui::table::TableStyle {
+        zsql_ui::table::TableStyle::default()
     }
 
-    /// A thin track + draggable thumb overlaid on the right edge of the
-    /// data pane, or `None` once `row_count` rows already fit inside the
-    /// viewport and there is nothing to scroll.
-    fn render_vertical_scrollbar(&self, row_count: usize, cx: &Context<Self>) -> Option<Div> {
-        let geometry = self.vertical_scrollbar_geometry(row_count);
-        if !geometry.visible {
-            return None;
-        }
-
-        let track_length = f32::from(
-            self.row_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .bounds()
-                .size
-                .height,
-        );
-        let thumb_top = geometry.thumb_offset(track_length);
-
-        Some(
-            div()
-                .absolute()
-                .top(theme::HEADER_ROW_HEIGHT)
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .w(px(scrollbar::TRACK_WIDTH))
-                .bg(rgba(scrollbar::TRACK_COLOR))
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(thumb_top))
-                        .right(px(0.0))
-                        .w(px(scrollbar::TRACK_WIDTH))
-                        .h(px(geometry.thumb_length))
-                        .rounded(px(scrollbar::TRACK_WIDTH / 2.0))
-                        .bg(rgba(scrollbar::THUMB_COLOR))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::on_vscrollbar_mouse_down),
-                        ),
-                ),
-        )
-    }
-
-    /// Start a vertical scrollbar thumb-drag, capturing the pointer's
-    /// starting position and the grid's current scroll offset.
-    fn on_vscrollbar_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let offset_start_y = self.row_scroll_handle.0.borrow().base_handle.offset().y;
-        self.vscrollbar_drag = Some(VscrollbarDrag {
-            pointer_start_y: event.position.y,
-            offset_start_y,
-        });
-        cx.notify();
-    }
-
-    /// While a thumb-drag is in progress, translate pointer movement into a
-    /// new grid scroll offset via [`scrollbar::ScrollbarGeometry::scroll_offset_for_drag`].
-    /// A no-op when no drag is in progress, or when the left button is no
-    /// longer held: if the button was released outside the window mid-drag,
-    /// neither `on_mouse_up` nor `on_mouse_up_out` fires, so this handler
-    /// must independently notice the button is gone and end the drag itself
-    /// rather than leaving the thumb stuck to a button-less pointer.
-    fn on_vscrollbar_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !event.dragging() {
-            if self.vscrollbar_drag.take().is_some() {
-                cx.notify();
-            }
-            return;
-        }
-
-        let Some(drag) = self.vscrollbar_drag else {
-            return;
-        };
-
-        let row_count = self.effective_result(cx).rows.len();
-        let content_extent = content_extent_for_row_count(row_count);
-        let viewport_extent = f32::from(
-            self.row_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .bounds()
-                .size
-                .height,
-        );
-        let pointer_delta = f32::from(event.position.y - drag.pointer_start_y);
-        let new_offset_y = scrollbar::ScrollbarGeometry::scroll_offset_for_drag(
-            f32::from(-drag.offset_start_y),
-            pointer_delta,
-            content_extent,
-            viewport_extent,
-            viewport_extent,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-
-        let current_offset_x = self.row_scroll_handle.0.borrow().base_handle.offset().x;
-        self.row_scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .set_offset(point(current_offset_x, px(-new_offset_y)));
-        cx.notify();
-    }
-
-    /// End a vertical scrollbar thumb-drag, on both a mouse-up over the
-    /// thumb and a mouse-up anywhere else in the window (the pointer often
-    /// leaves the thumb's small hit region mid-drag).
-    fn on_vscrollbar_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.vscrollbar_drag.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// A shift-held wheel event over the data pane changes the horizontal
-    /// scroll offset by the wheel's magnitude; a plain wheel event is left
-    /// untouched so vertical scrolling (handled entirely by the row list's
-    /// own scroll handle) never creeps sideways.
-    fn on_data_pane_scroll_wheel(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !event.modifiers.shift {
-            return;
-        }
-
-        // The platform layer swaps a shift-held wheel gesture's magnitude
-        // into the horizontal delta component before this event is
-        // dispatched, but a fallback to the vertical component keeps this
-        // handler correct even if that swap does not happen.
-        let delta = event.delta.pixel_delta(window.line_height());
-        let wheel_delta_x = horizontal_wheel_delta(delta.x, delta.y);
-
-        let content_extent = content_extent_for_columns(&self.column_widths);
-        let viewport_extent = f32::from(self.col_scroll_handle.bounds().size.width);
-        let current_offset = f32::from(-self.col_scroll_handle.offset().x);
-        let new_offset = horizontal_offset_after_wheel(
-            current_offset,
-            f32::from(wheel_delta_x),
-            content_extent,
-            viewport_extent,
-        );
-
-        let offset_y = self.col_scroll_handle.offset().y;
-        self.col_scroll_handle
-            .set_offset(point(px(-new_offset), offset_y));
-        cx.notify();
-    }
-
-    /// The horizontal scrollbar's current geometry, read fresh from
-    /// `col_scroll_handle`'s live offset and bounds (never cached), so it
-    /// stays in sync with shift-wheel scrolling, thumb dragging, and column
-    /// widths changing across renders.
-    fn horizontal_scrollbar_geometry(&self) -> scrollbar::ScrollbarGeometry {
-        let viewport_extent = f32::from(self.col_scroll_handle.bounds().size.width);
-        let scroll_offset = f32::from(-self.col_scroll_handle.offset().x);
-        scrollbar::ScrollbarGeometry::compute(
-            content_extent_for_columns(&self.column_widths),
-            viewport_extent,
-            scroll_offset,
-            viewport_extent,
-            scrollbar::MIN_THUMB_LENGTH,
-        )
-    }
-
-    /// A thin track + draggable thumb overlaid on the bottom edge of the
-    /// data pane, or `None` once the columns already fit inside the
-    /// viewport and there is nothing to scroll.
-    fn render_horizontal_scrollbar(&self, row_count: usize, cx: &Context<Self>) -> Option<Div> {
-        let geometry = self.horizontal_scrollbar_geometry();
-        if !geometry.visible {
-            return None;
-        }
-
-        let track_length = f32::from(self.col_scroll_handle.bounds().size.width);
-        let thumb_left = geometry.thumb_offset(track_length);
-        let vertical_is_visible = self.vertical_scrollbar_geometry(row_count).visible;
-        let right_inset = if vertical_is_visible {
-            scrollbar::TRACK_WIDTH
-        } else {
-            0.0
-        };
-
-        Some(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(right_inset))
-                .bottom(px(0.0))
-                .h(px(scrollbar::TRACK_WIDTH))
-                .bg(rgba(scrollbar::TRACK_COLOR))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(thumb_left))
-                        .bottom(px(0.0))
-                        .w(px(geometry.thumb_length))
-                        .h(px(scrollbar::TRACK_WIDTH))
-                        .rounded(px(scrollbar::TRACK_WIDTH / 2.0))
-                        .bg(rgba(scrollbar::THUMB_COLOR))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::on_hscrollbar_mouse_down),
-                        ),
-                ),
-        )
-    }
-
-    /// Start a horizontal scrollbar thumb-drag, capturing the pointer's
-    /// starting position and the grid's current horizontal scroll offset.
-    fn on_hscrollbar_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let offset_start_x = self.col_scroll_handle.offset().x;
-        self.hscrollbar_drag = Some(HscrollbarDrag {
-            pointer_start_x: event.position.x,
-            offset_start_x,
-        });
-        cx.notify();
-    }
-
-    /// While a thumb-drag is in progress, translate pointer movement into a
-    /// new grid scroll offset via [`scrollbar::ScrollbarGeometry::scroll_offset_for_drag`].
-    /// A no-op when no drag is in progress, or when the left button is no
-    /// longer held: if the button was released outside the window mid-drag,
-    /// neither `on_mouse_up` nor `on_mouse_up_out` fires, so this handler
-    /// must independently notice the button is gone and end the drag itself
-    /// rather than leaving the thumb stuck to a button-less pointer.
-    fn on_hscrollbar_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !event.dragging() {
-            if self.hscrollbar_drag.take().is_some() {
-                cx.notify();
-            }
-            return;
-        }
-
-        let Some(drag) = self.hscrollbar_drag else {
-            return;
-        };
-
-        let content_extent = content_extent_for_columns(&self.column_widths);
-        let viewport_extent = f32::from(self.col_scroll_handle.bounds().size.width);
-        let pointer_delta = f32::from(event.position.x - drag.pointer_start_x);
-        let new_offset_x = scrollbar::ScrollbarGeometry::scroll_offset_for_drag(
-            f32::from(-drag.offset_start_x),
-            pointer_delta,
-            content_extent,
-            viewport_extent,
-            viewport_extent,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-
-        let current_offset_y = self.col_scroll_handle.offset().y;
-        self.col_scroll_handle
-            .set_offset(point(px(-new_offset_x), current_offset_y));
-        cx.notify();
-    }
-
-    /// End a horizontal scrollbar thumb-drag, on both a mouse-up over the
-    /// thumb and a mouse-up anywhere else in the window (the pointer often
-    /// leaves the thumb's small hit region mid-drag).
-    fn on_hscrollbar_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.hscrollbar_drag.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// The sticky header cell for the pinned row-number pane
-    fn render_row_number_header() -> Div {
-        div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_end()
-            .h(theme::HEADER_ROW_HEIGHT)
-            .px(px(grid::CELL_PADDING_X))
-            .bg(rgb(colors::RAISE))
-            .border_b_1()
-            .border_color(rgb(colors::LINE))
-            .text_color(rgb(colors::FAINT))
-            .child("#")
-    }
-
-    /// The sticky column-header row for the data pane
-    fn render_column_headers(&self, cx: &Context<Self>) -> Div {
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .flex_shrink_0()
-            .min_w(px(content_extent_for_columns(&self.column_widths)))
-            .h(theme::HEADER_ROW_HEIGHT)
-            .bg(rgb(colors::RAISE))
-            .border_b_1()
-            .border_color(rgb(colors::LINE));
-
+    /// The data pane's columns: each column's cached width plus its header
+    /// content (name + type-tag badge).
+    fn build_columns(&self, cx: &Context<Self>) -> Vec<TableColumn> {
         let columns: &[ColumnMeta] = &self.effective_result(cx).columns;
-
-        for (column, width) in columns.iter().zip(self.column_widths.iter()) {
-            row = row.child(
-                grid::header_cell_shell(*width)
-                    .flex_row()
-                    .items_baseline()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_color(rgb(colors::TEXT))
-                            .child(column.name.clone()),
-                    )
-                    .child(grid::type_tag(&column.type_name)),
-            );
-        }
-
-        row
-    }
-
-    /// Render the row-number cells in `range` for the pinned pane's
-    /// virtualized list
-    fn render_row_number_cells(
-        &mut self,
-        range: Range<usize>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Vec<Div> {
-        let width = self.row_number_width;
-
-        range
-            .map(|ix| {
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_end()
-                    .w(width)
-                    .h(theme::BODY_ROW_HEIGHT)
-                    .px(px(grid::CELL_PADDING_X))
-                    .bg(rgb(colors::PANEL))
-                    .border_b_1()
-                    .border_color(rgb(colors::LINE_SOFT))
-                    .text_color(rgb(colors::FAINT))
-                    .child((ix + 1).to_string())
-            })
+        columns
+            .iter()
+            .zip(self.column_widths.iter())
+            .map(|(column, &width)| TableColumn::new(width, column_header(column)))
             .collect()
     }
 
@@ -871,34 +345,29 @@ impl ResultsView {
         range: Range<usize>,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<Div> {
-        let column_widths = &self.column_widths;
+    ) -> Vec<TableRow> {
         let rows: &[zsql_core::Row] = &self.effective_result(cx).rows;
 
         range
             .map(|ix| {
-                let mut row_div = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(theme::BODY_ROW_HEIGHT)
-                    .border_b_1()
-                    .border_color(rgb(colors::LINE_SOFT));
-
-                if let Some(row) = rows.get(ix) {
-                    for (value, width) in row.0.iter().zip(column_widths.iter()) {
-                        let formatted = format_value(value);
-                        let is_null = formatted.kind == ValueKind::Null;
-                        row_div = row_div.child(
-                            grid::body_cell_shell(*width)
-                                .text_color(rgb(kind_color(formatted.kind)))
-                                .when(is_null, gpui::prelude::Styled::italic)
-                                .child(formatted.text),
-                        );
-                    }
-                }
-
-                row_div
+                let cells = rows
+                    .get(ix)
+                    .map(|row| {
+                        row.0
+                            .iter()
+                            .map(|value| {
+                                let formatted = format_value(value);
+                                let is_null = formatted.kind == ValueKind::Null;
+                                div()
+                                    .text_color(rgb(kind_color(formatted.kind)))
+                                    .when(is_null, gpui::prelude::Styled::italic)
+                                    .child(formatted.text)
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                TableRow::new(cells)
             })
             .collect()
     }
@@ -980,7 +449,7 @@ impl ResultsView {
 
 impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.nudge_scrollbar_when_grid_unmeasured(cx);
+        let handlers = self.table_state.read(cx).drag_handlers();
         div()
             .flex()
             .flex_col()
@@ -989,67 +458,29 @@ impl Render for ResultsView {
             // Attached here, above the grid, so a scrollbar thumb-drag keeps
             // tracking the pointer even once it leaves the thumb's own
             // small hit region.
-            .on_mouse_move(cx.listener(Self::on_vscrollbar_mouse_move))
-            .on_mouse_move(cx.listener(Self::on_hscrollbar_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_vscrollbar_mouse_up))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_hscrollbar_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_vscrollbar_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_hscrollbar_mouse_up))
+            .on_mouse_move(handlers.on_move)
+            .on_mouse_up(MouseButton::Left, handlers.on_up)
+            .on_mouse_up_out(MouseButton::Left, handlers.on_up_out)
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
     }
 }
 
-/// Confines a uniform list's built-in wheel scrolling to its vertical axis,
-/// so a shift-held wheel gesture over a nested list never gets misread as
-/// vertical motion: without this, gpui falls back to treating whichever
-/// wheel-delta component the list itself does not scroll on as a vertical
-/// delta, which is exactly the component the platform layer populates for a
-/// shift-held gesture.
-fn vertical_only_wheel(mut list: UniformList) -> UniformList {
-    list.style().restrict_scroll_to_axis = Some(true);
-    list
-}
-
-/// Total pixel height of `row_count` body rows, i.e. the vertical
-/// scrollbar's content extent.
-// Row counts here are always far below `f32`'s exact-integer range, so this
-// conversion cannot lose meaningful precision.
-#[allow(clippy::cast_precision_loss)]
-fn content_extent_for_row_count(row_count: usize) -> f32 {
-    row_count as f32 * f32::from(theme::BODY_ROW_HEIGHT)
-}
-
-/// Total pixel width of the data pane's columns, i.e. the horizontal
-/// scrollbar's content extent. Excludes the pinned row-number pane, which
-/// never scrolls horizontally.
-fn content_extent_for_columns(column_widths: &[Pixels]) -> f32 {
-    column_widths.iter().copied().map(f32::from).sum()
-}
-
-/// The horizontal scroll offset after `wheel_delta_x` pixels of shift-held
-/// wheel motion, clamped into `[0.0, max(0.0, content_extent -
-/// viewport_extent)]` so a wheel gesture can never scroll past the first or
-/// last column.
-fn horizontal_offset_after_wheel(
-    current_offset: f32,
-    wheel_delta_x: f32,
-    content_extent: f32,
-    viewport_extent: f32,
-) -> f32 {
-    scrollbar::ScrollbarGeometry::clamp_offset(
-        current_offset - wheel_delta_x,
-        content_extent,
-        viewport_extent,
-    )
-}
-
-/// Select the horizontal component of a shift-held wheel delta, falling back
-/// to the vertical component if the horizontal component is zero (for
-/// platforms that do not swap the components before dispatch).
-fn horizontal_wheel_delta(delta_x: Pixels, delta_y: Pixels) -> Pixels {
-    if delta_x.is_zero() { delta_y } else { delta_x }
+/// A data column's header content: its name plus a type-name badge.
+fn column_header(column: &ColumnMeta) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .gap_2()
+        .child(
+            div()
+                .text_color(rgb(colors::TEXT))
+                .child(column.name.clone()),
+        )
+        .child(grid::type_tag(&column.type_name))
+        .into_any_element()
 }
 
 /// The bottom status bar's dot color and label for `state`. A `liveness` of
@@ -1151,50 +582,81 @@ fn kind_color(kind: ValueKind) -> u32 {
 }
 
 /// Estimate a column's pixel width from its header (name + type tag) and
-/// `max_body_chars`.
-// Cell content lengths here are always small (column names, formatted
-// scalar values), so the `usize -> f32` conversions below cannot lose
-// meaningful precision.
-#[allow(clippy::cast_precision_loss)]
-fn column_width_from_parts(column: &ColumnMeta, max_body_chars: usize) -> Pixels {
+/// `max_body_chars`, using `style`'s cell padding -- the same `TableStyle`
+/// the live grid renders with, so the estimate and the render never drift.
+fn column_width_from_parts(
+    column: &ColumnMeta,
+    max_body_chars: usize,
+    style: &zsql_ui::table::TableStyle,
+) -> Pixels {
     let header_chars = column.name.chars().count() + column.type_name.chars().count();
-    let header_width = grid::CELL_PADDING_X * 2.0
-        + header_chars as f32 * theme::CELL_CHAR_WIDTH
-        + theme::TYPE_TAG_EXTRA_WIDTH;
-
-    let body_width = grid::CELL_PADDING_X * 2.0 + max_body_chars as f32 * theme::CELL_CHAR_WIDTH;
-
-    px(header_width
-        .max(body_width)
-        .clamp(theme::MIN_COLUMN_WIDTH, theme::MAX_COLUMN_WIDTH))
-}
-
-/// Width of the leading row-number column, wide enough for the largest row
-/// number in the result set.
-#[allow(clippy::cast_precision_loss)]
-fn row_number_column_width(row_count: usize) -> Pixels {
-    let digits = row_count.to_string().chars().count().max(1);
-    let width = grid::CELL_PADDING_X * 2.0 + digits as f32 * theme::CELL_CHAR_WIDTH;
-    px(width.max(theme::ROW_NUMBER_MIN_WIDTH))
+    measure::column_width(
+        header_chars,
+        max_body_chars,
+        style,
+        measure::ColumnWidthLimits {
+            char_width: theme::CELL_CHAR_WIDTH,
+            header_extra_width: theme::TYPE_TAG_EXTRA_WIDTH,
+            min_width: theme::MIN_COLUMN_WIDTH,
+            max_width: theme::MAX_COLUMN_WIDTH,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use gpui::{AppContext as _, px};
+    use gpui::AppContext as _;
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
-        SessionState, column_width_from_parts, content_extent_for_columns, format_total_row_count,
-        horizontal_offset_after_wheel, horizontal_wheel_delta, row_number_column_width,
+        ResultsView, SessionState, column_width_from_parts, format_total_row_count,
         status_indicator, status_metrics,
     };
-    use zsql_ui::{colors, scrollbar};
 
     use crate::session::{LivenessState, Session};
-    use crate::ui::format::format_value;
     use crate::ui::theme;
+    use zsql_ui::colors;
+
+    fn column(name: &str, type_name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn column_width_from_parts_grows_for_a_longer_type_name() {
+        let style = ResultsView::table_style();
+        let short_type = column("id", "int8");
+        let long_type = column("id", "timestamp with time zone");
+
+        let narrow = column_width_from_parts(&short_type, 0, &style);
+        let wide = column_width_from_parts(&long_type, 0, &style);
+
+        assert!(
+            f32::from(wide) > f32::from(narrow),
+            "a longer type_name must widen the column even with an identical name and no body \
+             content: narrow={narrow:?} wide={wide:?}"
+        );
+    }
+
+    #[test]
+    fn column_width_from_parts_clamps_at_the_configured_minimum() {
+        let style = ResultsView::table_style();
+        let width = column_width_from_parts(&column("a", "b"), 0, &style);
+        assert!(f32::from(width) >= theme::MIN_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn column_width_from_parts_clamps_at_the_configured_maximum() {
+        let style = ResultsView::table_style();
+        let width =
+            column_width_from_parts(&column(&"x".repeat(500), &"y".repeat(500)), 5_000, &style);
+        assert!((f32::from(width) - theme::MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
+    }
 
     fn sample_result() -> ResultSet {
         ResultSet {
@@ -1220,160 +682,6 @@ mod tests {
             affected: None,
             notices: Vec::new(),
         }
-    }
-
-    fn max_body_chars(result: &ResultSet, index: usize) -> usize {
-        result
-            .rows
-            .iter()
-            .filter_map(|row| row.0.get(index))
-            .map(|value| format_value(value).text.chars().count())
-            .max()
-            .unwrap_or(0)
-    }
-
-    #[test]
-    fn column_width_grows_with_the_longest_cell() {
-        let result = sample_result();
-        let narrow = column_width_from_parts(&result.columns[0], max_body_chars(&result, 0));
-        let wide = column_width_from_parts(&result.columns[1], max_body_chars(&result, 1));
-        assert!(f32::from(wide) > f32::from(narrow));
-    }
-
-    #[test]
-    fn column_width_never_shrinks_below_the_minimum() {
-        let result = sample_result();
-        let width = column_width_from_parts(&result.columns[0], max_body_chars(&result, 0));
-        assert!(f32::from(width) >= super::theme::MIN_COLUMN_WIDTH);
-    }
-
-    #[test]
-    // `clamp`'s ceiling arm returns `MAX_COLUMN_WIDTH` verbatim (no further
-    // arithmetic on it), so an exact comparison here is intentional
-    #[allow(clippy::float_cmp)]
-    fn column_width_clamps_to_the_maximum() {
-        let mut result = sample_result();
-        result.rows[1].0[1] = Value::Text("x".repeat(500));
-        let width = column_width_from_parts(&result.columns[1], max_body_chars(&result, 1));
-        assert_eq!(f32::from(width), super::theme::MAX_COLUMN_WIDTH);
-    }
-
-    #[test]
-    fn content_extent_for_columns_sums_the_column_widths() {
-        let widths = vec![px(100.0), px(150.0), px(80.0)];
-        assert!((content_extent_for_columns(&widths) - 330.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn content_extent_for_columns_is_zero_for_no_columns() {
-        assert!((content_extent_for_columns(&[]) - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn horizontal_visibility_matches_content_vs_viewport_extent() {
-        let viewport = 400.0;
-
-        let narrow_widths = vec![px(100.0), px(100.0)];
-        let narrow_geometry = scrollbar::ScrollbarGeometry::compute(
-            content_extent_for_columns(&narrow_widths),
-            viewport,
-            0.0,
-            viewport,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-        assert!(
-            !narrow_geometry.visible,
-            "columns that already fit the viewport must hide the scrollbar"
-        );
-
-        let wide_widths = vec![px(300.0); 10];
-        let wide_geometry = scrollbar::ScrollbarGeometry::compute(
-            content_extent_for_columns(&wide_widths),
-            viewport,
-            0.0,
-            viewport,
-            scrollbar::MIN_THUMB_LENGTH,
-        );
-        assert!(
-            wide_geometry.visible,
-            "columns that overflow the viewport must show the scrollbar"
-        );
-    }
-
-    #[test]
-    // A wheel delta large enough to overshoot the left edge clamps to `0.0`
-    // verbatim (the clamp's floor arm), so an exact comparison here is
-    // intentional.
-    #[allow(clippy::float_cmp)]
-    fn horizontal_offset_after_wheel_clamps_at_the_left_edge() {
-        let offset = horizontal_offset_after_wheel(0.0, 10_000.0, 2_000.0, 400.0);
-        assert_eq!(offset, 0.0);
-    }
-
-    #[test]
-    // A wheel delta large enough to overshoot the right edge clamps to
-    // `content_extent - viewport_extent` verbatim (the clamp's ceiling arm),
-    // so an exact comparison here is intentional.
-    #[allow(clippy::float_cmp)]
-    fn horizontal_offset_after_wheel_clamps_at_the_right_edge() {
-        let content = 2_000.0;
-        let viewport = 400.0;
-        let max_offset = content - viewport;
-        let offset = horizontal_offset_after_wheel(max_offset, -10_000.0, content, viewport);
-        assert_eq!(offset, max_offset);
-    }
-
-    #[test]
-    fn horizontal_offset_after_wheel_moves_by_the_wheel_delta_within_bounds() {
-        let offset = horizontal_offset_after_wheel(100.0, -20.0, 2_000.0, 400.0);
-        assert!((offset - 120.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn horizontal_wheel_delta_uses_x_when_nonzero() {
-        assert_eq!(horizontal_wheel_delta(px(10.0), px(5.0)), px(10.0));
-    }
-
-    #[test]
-    fn horizontal_wheel_delta_falls_back_to_y_when_x_is_zero() {
-        assert_eq!(horizontal_wheel_delta(px(0.0), px(15.0)), px(15.0));
-    }
-
-    #[test]
-    fn horizontal_wheel_delta_returns_zero_when_both_are_zero() {
-        assert_eq!(horizontal_wheel_delta(px(0.0), px(0.0)), px(0.0));
-    }
-
-    #[test]
-    fn horizontal_wheel_delta_returns_negative_y_when_x_is_zero() {
-        assert_eq!(horizontal_wheel_delta(px(0.0), px(-8.0)), px(-8.0));
-    }
-
-    #[test]
-    // `.max()` returns `ROW_NUMBER_MIN_WIDTH` verbatim when it wins (no
-    // further arithmetic on it), so an exact comparison here is intentional.
-    #[allow(clippy::float_cmp)]
-    fn row_number_width_clamps_to_the_minimum_for_small_row_counts() {
-        // Both counts have few enough digits that the computed width sits
-        // below `ROW_NUMBER_MIN_WIDTH`, so both clamp to the same floor.
-        let single_digit = row_number_column_width(9);
-        let seven_digit = row_number_column_width(1_000_000);
-        assert_eq!(f32::from(single_digit), super::theme::ROW_NUMBER_MIN_WIDTH);
-        assert_eq!(f32::from(seven_digit), super::theme::ROW_NUMBER_MIN_WIDTH);
-    }
-
-    #[test]
-    fn row_number_width_grows_with_digit_count() {
-        // `row_number_column_width` clamps to `ROW_NUMBER_MIN_WIDTH`, so the
-        // "large" side needs enough digits to actually clear that floor
-        // (1_000_000 alone still clamps to the minimum).
-        let small = row_number_column_width(9);
-        // 100_000_000 is the smallest 9-digit row count; nine digits is the
-        // first digit count whose computed width clears `ROW_NUMBER_MIN_WIDTH`'s
-        // floor, so this is the smallest row count that actually demonstrates
-        // growth over `small`.
-        let large = row_number_column_width(100_000_000);
-        assert!(f32::from(large) > f32::from(small));
     }
 
     #[test]
@@ -1638,7 +946,6 @@ mod tests {
         let mut result = sample_result();
         let template = result.rows[0].clone();
         result.rows = (0..400).map(|_| template.clone()).collect();
-        let row_count = result.rows.len();
         let session = cx.new(|_cx| {
             Session::new_for_render_test(
                 SessionState::Results(std::time::Duration::from_millis(1)),
@@ -1649,15 +956,14 @@ mod tests {
             cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
         vcx.run_until_parked();
 
-        view.update(vcx, |v, cx| {
-            let geometry = v.vertical_scrollbar_geometry(row_count);
+        view.read_with(vcx, |v, app| {
             assert!(
-                geometry.visible,
-                "the scrollbar geometry must be visible for 400 overflowing rows"
-            );
-            assert!(
-                v.render_vertical_scrollbar(row_count, cx).is_some(),
-                "the scrollbar overlay must be rendered once the viewport is laid out"
+                v.table_state
+                    .read(app)
+                    .scroll()
+                    .read(app)
+                    .vertical_visible(),
+                "the vertical scrollbar must be visible for 400 overflowing rows"
             );
         });
     }
@@ -1696,25 +1002,14 @@ mod tests {
             cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
         vcx.run_until_parked();
 
-        view.update(vcx, |v, cx| {
-            let row_count = v.effective_result(cx).rows.len();
-            let geometry = v.horizontal_scrollbar_geometry();
+        view.read_with(vcx, |v, app| {
             assert!(
-                geometry.visible,
-                "the scrollbar geometry must be visible for 40 overflowing wide columns"
-            );
-            assert!(
-                v.render_horizontal_scrollbar(row_count, cx).is_some(),
-                "the scrollbar overlay must be rendered once the viewport is laid out"
-            );
-            // gpui clamps the scroll offset to its own measured content
-            // extent, so the columns must genuinely overflow the pane (a
-            // positive max offset) for shift-scrolling to move anything. If
-            // the content were stretched to the viewport width instead, this
-            // would be zero and scrolling would silently do nothing.
-            assert!(
-                v.col_scroll_handle.max_offset().width > px(0.0),
-                "overflowing columns must leave the data pane actually scrollable"
+                v.table_state
+                    .read(app)
+                    .scroll()
+                    .read(app)
+                    .horizontal_visible(),
+                "the horizontal scrollbar must be visible for 40 overflowing wide columns"
             );
         });
     }
@@ -1734,16 +1029,14 @@ mod tests {
             cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
         vcx.run_until_parked();
 
-        view.update(vcx, |v, cx| {
-            let row_count = v.effective_result(cx).rows.len();
-            let geometry = v.horizontal_scrollbar_geometry();
+        view.read_with(vcx, |v, app| {
             assert!(
-                !geometry.visible,
-                "the scrollbar geometry must be hidden when columns already fit the viewport"
-            );
-            assert!(
-                v.render_horizontal_scrollbar(row_count, cx).is_none(),
-                "the scrollbar overlay must be absent, not merely invisible"
+                !v.table_state
+                    .read(app)
+                    .scroll()
+                    .read(app)
+                    .horizontal_visible(),
+                "the horizontal scrollbar must be absent when columns already fit the viewport"
             );
         });
     }
