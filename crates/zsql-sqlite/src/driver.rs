@@ -75,8 +75,16 @@ impl SqliteDriver {
 /// Run a trivial `SELECT 1` against `pool` to confirm the connection is
 /// actually usable, not just accepted. Returns the decoded value.
 async fn liveness_check(pool: &SqlitePool) -> Result<i64, CoreError> {
+    // Because the sqlite pool only has one connection, if that connection is busy
+    // we have no way to get a second connection to run the liveness check, so we
+    // just assume that the connection is still alive.
+    let Some(mut connection) = pool.try_acquire() else {
+        tracing::info!("sqlite pool is busy, skipping liveness check");
+        return Ok(1);
+    };
+
     let row = sqlx::query("SELECT 1 AS one")
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await
         .map_err(map_connect_error)?;
     let one: i64 = row.try_get("one").map_err(map_connect_error)?;
