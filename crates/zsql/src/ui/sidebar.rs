@@ -526,7 +526,9 @@ impl SidebarView {
                 theme::SIDEBAR_RELATION_ICON_SIZE,
                 relation_tint(kind),
             ))
-            .child(row_count(format!("{column_count} cols")));
+            // left-pad the row count so that the icons are always aligned (
+            // assuming <9999 columns)
+            .child(row_count(format!("{column_count:>4} cols")));
 
         if selected {
             shell = shell
