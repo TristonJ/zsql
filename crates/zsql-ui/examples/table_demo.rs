@@ -185,7 +185,7 @@ impl Focusable for DemoRoot {
 
 impl Render for DemoRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let row_count = self.row_count;
         let column_count = self.column_count;
         let gutter = self.gutter;
@@ -200,9 +200,9 @@ impl Render for DemoRoot {
                 GutterPreset::Custom => Gutter::Custom {
                     width: px(60.0),
                     header: div().child("KIND").into_any_element(),
-                    render: Box::new(move |_this: &mut Self, range, _window, _cx| {
+                    render: Box::new(move |_this: &mut Self, range, _window, cx| {
                         range
-                            .map(|ix| row_kind_tag(ix, &theme).into_any_element())
+                            .map(|ix| row_kind_tag(ix, cx.theme()).into_any_element())
                             .collect::<Vec<AnyElement>>()
                     }),
                 },

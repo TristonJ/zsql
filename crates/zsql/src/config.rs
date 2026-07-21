@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use gpui::{Pixels, px};
 use serde::{Deserialize, Serialize};
+use zsql_ui::theme::{DEFAULT_FONT_DATA, DEFAULT_FONT_UI};
 
 /// Directory name under the OS config dir that holds every zsql config/data
 /// file: `dirs::config_dir().join(APP_CONFIG_DIR_NAME)`.
@@ -39,12 +40,23 @@ pub struct Config {
     pub layout: LayoutConfig,
 }
 
+/// Font settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontConfig {
+    /// The font used in code blocks, values, tables, etc.
+    pub data: String,
+    /// The font used in UI elements, e.g. buttons, labels, etc.
+    pub ui: String,
+}
+
 /// Appearance settings. Placeholder for the eventual theming system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Named theme (e.g. `dark`).
     pub name: String,
+    /// Font used for data, code, and other similar content. Typically a monospace font.
+    pub fonts: FontConfig,
 }
 
 /// Query execution limits and defaults.
@@ -128,6 +140,16 @@ impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "dark".to_owned(),
+            fonts: FontConfig::default(),
+        }
+    }
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            data: DEFAULT_FONT_DATA.to_string(),
+            ui: DEFAULT_FONT_UI.to_string(),
         }
     }
 }

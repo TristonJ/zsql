@@ -37,7 +37,7 @@ pub fn row_shell(indent: f32, theme: &Theme) -> Div {
         .pr_6()
         .flex_shrink_0()
         .w_full()
-        .font_family("monospace")
+        .font_family(&theme.fonts.data)
         .text_size(px(ROW_TEXT_SIZE))
         .text_color(rgb(theme.colors.text_primary))
 }
@@ -87,7 +87,7 @@ pub fn row_meta(text: impl Into<SharedString>, theme: &Theme) -> Div {
         .pl_2()
         .text_size(px(META_TEXT_SIZE))
         .text_color(rgb(theme.colors.text_tertiary))
-        .font_family("monospace")
+        .font_family(&theme.fonts.data)
         .child(text.into())
 }
 
@@ -100,7 +100,7 @@ pub fn row_kind(text: impl Into<SharedString>, theme: &Theme) -> Div {
         .pl_2()
         .text_size(px(KIND_TEXT_SIZE))
         .text_color(rgb(theme.colors.text_tertiary))
-        .font_family("monospace")
+        .font_family(&theme.fonts.data)
         .child(text.into())
 }
 
@@ -112,7 +112,7 @@ pub fn row_count(text: impl Into<SharedString>, theme: &Theme) -> Div {
         .pl_2()
         .text_size(px(META_TEXT_SIZE))
         .text_color(rgb(theme.colors.text_tertiary))
-        .font_family("monospace")
+        .font_family(&theme.fonts.data)
         .child(text.into())
 }
 

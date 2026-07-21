@@ -804,7 +804,7 @@ impl ConnectionManagerView {
                             .child(row.connection.url.clone()),
                     ),
             )
-            .child(grid::type_tag(&driver_label, &active_theme))
+            .child(grid::type_tag(&driver_label, active_theme))
             .child({
                 let hover_group = format!("delete-connection-button-hover-{index}");
                 div()
@@ -831,7 +831,7 @@ impl ConnectionManagerView {
             });
 
         if is_active {
-            item = item.bg(rgba(theme::modal_row_active_bg(&active_theme)));
+            item = item.bg(rgba(theme::modal_row_active_bg(active_theme)));
         }
         item
     }
@@ -870,7 +870,7 @@ impl ConnectionManagerView {
                                 .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
                                 .text_color(rgb(colors.text_tertiary))
                                 .child("detected driver")
-                                .child(grid::type_tag(&driver_preview, &active_theme)),
+                                .child(grid::type_tag(&driver_preview, active_theme)),
                         )
                     }),
             )

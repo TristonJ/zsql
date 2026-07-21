@@ -165,7 +165,7 @@ impl ResultsView {
         }
         self.folded_row_count = result.rows.len();
 
-        let table_style = Self::table_style(&cx.theme());
+        let table_style = Self::table_style(cx.theme());
         self.column_widths = result
             .columns
             .iter()
@@ -226,14 +226,14 @@ impl ResultsView {
                     )
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(&cx.theme().fonts.data)
                             .text_color(rgb(colors.accent))
                             .child(count_text),
                     ),
             )
             .child(
                 div()
-                    .font_family("monospace")
+                    .font_family(&cx.theme().fonts.data)
                     .text_size(px(theme::RESULTS_META_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
                     .child(self.source_label.clone()),
@@ -259,31 +259,31 @@ impl ResultsView {
                 active_theme.colors.text_tertiary,
                 "No connection configured",
                 "Set DATABASE_URL or connection.default_url in your zsql config, then restart.",
-                &active_theme,
+                active_theme,
             ),
             SessionState::Connecting => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Connecting…",
                 "Establishing a connection to the configured database.",
-                &active_theme,
+                active_theme,
             ),
             SessionState::Connected => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Connected",
                 "Run a query to see results here.",
-                &active_theme,
+                active_theme,
             ),
             SessionState::Running => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Running query…",
                 "Streaming results from the database.",
-                &active_theme,
+                active_theme,
             ),
             SessionState::Error(message) => Self::render_placeholder(
                 active_theme.colors.status_error,
                 "Query failed",
                 &message,
-                &active_theme,
+                active_theme,
             ),
         }
     }
@@ -327,7 +327,7 @@ impl ResultsView {
         let columns = self.build_columns(cx);
 
         Table::new("results-grid", &self.table_state)
-            .style(Self::table_style(&active_theme))
+            .style(Self::table_style(active_theme))
             .columns(columns)
             .row_count(row_count)
             .gutter(Gutter::RowNumbers(RowNumberStyle {
@@ -354,7 +354,7 @@ impl ResultsView {
         columns
             .iter()
             .zip(self.column_widths.iter())
-            .map(|(column, &width)| TableColumn::new(width, column_header(column, &active_theme)))
+            .map(|(column, &width)| TableColumn::new(width, column_header(column, active_theme)))
             .collect()
     }
 
@@ -380,7 +380,7 @@ impl ResultsView {
                                 let formatted = format_value(value);
                                 let is_null = formatted.kind == ValueKind::Null;
                                 div()
-                                    .text_color(rgb(kind_color(formatted.kind, &active_theme)))
+                                    .text_color(rgb(kind_color(formatted.kind, active_theme)))
                                     .when(is_null, gpui::prelude::Styled::italic)
                                     .child(formatted.text)
                                     .into_any_element()
@@ -406,7 +406,7 @@ impl ResultsView {
         // frozen to an older, still-successful snapshot.
         let liveness = session.liveness().clone();
         let state = self.effective_state(cx);
-        let (dot_color, label) = status_indicator(state, &liveness, &active_theme);
+        let (dot_color, label) = status_indicator(state, &liveness, active_theme);
 
         let mut bar = div()
             .flex()
@@ -419,7 +419,7 @@ impl ResultsView {
             .bg(rgb(colors.bg_panel))
             .border_t_1()
             .border_color(rgb(colors.border))
-            .font_family("monospace")
+            .font_family(&cx.theme().fonts.data)
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
             .text_color(rgb(colors.text_secondary))
             .child(grid::status_dot(dot_color))

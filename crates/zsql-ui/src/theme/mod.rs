@@ -4,17 +4,23 @@
 
 pub mod catppuccin;
 mod colors;
+mod fonts;
+
+use std::sync::LazyLock;
 
 pub use colors::Colors;
+pub use fonts::{DEFAULT_FONT_DATA, DEFAULT_FONT_UI, Fonts, get_builtin_fonts};
 
 /// The active visual theme: a color palette. A single-field wrapper today so
 /// the palette is reached as `cx.theme().colors.<role>`, leaving room for a
 /// theme to grow other dimensions (sizing, spacing) later without rewriting
 /// every call site.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Theme {
     /// The active color palette.
     pub colors: Colors,
+    /// The active fonts.
+    pub fonts: Fonts,
 }
 
 impl gpui::Global for Theme {}
@@ -22,8 +28,8 @@ impl gpui::Global for Theme {}
 /// The built-in [`Theme`] named `name` (one of the [`catppuccin`] flavor
 /// names), or `None` if `name` does not match a built-in.
 #[must_use]
-pub fn built_in_theme(name: &str) -> Option<Theme> {
-    catppuccin::built_in_by_name(name).map(|colors| Theme { colors })
+pub fn built_in_theme(name: &str) -> Option<Colors> {
+    catppuccin::built_in_by_name(name)
 }
 
 /// Ergonomic access to the active [`Theme`]: any type that derefs to
@@ -34,12 +40,19 @@ pub trait ActiveTheme {
     /// [`Theme::default`] if no global has been set yet -- e.g. in a test
     /// that never opens the real app's window (see `main.rs`, the sole
     /// place a real run sets one).
-    fn theme(&self) -> Theme;
+    fn theme(&self) -> &Theme;
 }
 
+// To safely support the below implementation, keep around a static
+// Theme so we can pass around references to it.
+static DEFAULT_THEME: LazyLock<Theme> = LazyLock::new(Theme::default);
+
 impl ActiveTheme for gpui::App {
-    fn theme(&self) -> Theme {
-        self.try_global::<Theme>().copied().unwrap_or_default()
+    fn theme(&self) -> &Theme {
+        if let Some(t) = self.try_global::<Theme>() {
+            return t;
+        }
+        &DEFAULT_THEME
     }
 }
 

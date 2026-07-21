@@ -176,7 +176,7 @@ impl SchemaTabView {
             .pb(theme::SCHEMA_HEAD_PADDING_BOTTOM)
             .border_b_1()
             .border_color(rgb(colors.border))
-            .font_family("monospace")
+            .font_family(&active_theme.fonts.data)
             .child(
                 div()
                     .flex()
@@ -257,7 +257,7 @@ impl SchemaTabView {
             .map(|(column, &width)| {
                 TableColumn::new(
                     width,
-                    header_cell(column.to_string(), &active_theme).px(cell_x_padding()),
+                    header_cell(column.to_string(), active_theme).px(cell_x_padding()),
                 )
             })
             .collect();
@@ -268,14 +268,14 @@ impl SchemaTabView {
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
-                    ..TableStyle::themed(&active_theme)
+                    ..TableStyle::themed(active_theme)
                 })
                 .columns(columns)
                 .row_count(detail.columns.len())
                 .rows(Self::render_columns_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
-            active_theme,
+            cx.theme(),
         )
     }
 
@@ -301,7 +301,7 @@ impl SchemaTabView {
                 };
                 let cells = vec![
                     div()
-                        .when_some(rail_color(column, &active_theme), |el, color| {
+                        .when_some(rail_color(column, active_theme), |el, color| {
                             el.child(
                                 div()
                                     .absolute()
@@ -323,20 +323,20 @@ impl SchemaTabView {
                     div()
                         .px(cell_x_padding())
                         .child(
-                            grid::type_tag(&column.type_name, &active_theme)
+                            grid::type_tag(&column.type_name, active_theme)
                                 .flex_shrink_0()
                                 .into_any_element(),
                         )
                         .into_any_element(),
-                    null_label(column.nullable, &active_theme)
+                    null_label(column.nullable, active_theme)
                         .px(cell_x_padding())
                         .into_any_element(),
-                    render_default_cell(column.default.as_deref(), &active_theme)
+                    render_default_cell(column.default.as_deref(), active_theme)
                         .px(cell_x_padding())
                         .into_any_element(),
                     div()
                         .px(cell_x_padding())
-                        .child(render_keys_cell(column, &schema.constraints, &active_theme))
+                        .child(render_keys_cell(column, &schema.constraints, active_theme))
                         .into_any_element(),
                 ];
 
@@ -357,7 +357,7 @@ impl SchemaTabView {
             .iter()
             .zip(widths.iter())
             .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), &active_theme))
+                TableColumn::new(width, header_cell(column.to_string(), active_theme))
             })
             .collect();
 
@@ -370,7 +370,7 @@ impl SchemaTabView {
                 .rows(Self::render_index_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
-            active_theme,
+            cx.theme(),
         )
     }
 
@@ -438,7 +438,7 @@ impl SchemaTabView {
             .iter()
             .zip(widths.iter())
             .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), &active_theme))
+                TableColumn::new(width, header_cell(column.to_string(), active_theme))
             })
             .collect();
 
@@ -451,7 +451,7 @@ impl SchemaTabView {
                 .rows(Self::render_constraints_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
-            active_theme,
+            cx.theme(),
         )
     }
 
@@ -476,8 +476,7 @@ impl SchemaTabView {
                 let Some(constraint) = schema.constraints.get(ix) else {
                     return TableRow::new(vec![]);
                 };
-                let (kind_label, kind_color) =
-                    constraint_kind_badge(constraint.kind, &active_theme);
+                let (kind_label, kind_color) = constraint_kind_badge(constraint.kind, active_theme);
                 let cells = vec![
                     div()
                         .text_color(rgb(colors.text_primary))
@@ -499,20 +498,19 @@ impl SchemaTabView {
 
 impl Render for SchemaTabView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_theme = cx.theme();
         let body: gpui::AnyElement = match &self.state {
             FetchState::Loading => Self::render_placeholder(
-                active_theme.colors.text_tertiary,
+                cx.theme().colors.text_tertiary,
                 "Loading schema...",
                 "Fetching structure.",
-                &active_theme,
+                cx.theme(),
             )
             .into_any_element(),
             FetchState::Error(message) => Self::render_placeholder(
-                active_theme.colors.status_error,
+                cx.theme().colors.status_error,
                 "Schema unavailable",
                 message,
-                &active_theme,
+                cx.theme(),
             )
             .into_any_element(),
             FetchState::Ready(detail) => {
@@ -541,7 +539,7 @@ impl Render for SchemaTabView {
                     .flex_col()
                     .min_h_0()
                     .flex_1()
-                    .child(self.render_head(detail, &active_theme))
+                    .child(self.render_head(detail, cx.theme()))
                     .child(page)
                     .into_any_element()
             }
@@ -552,7 +550,7 @@ impl Render for SchemaTabView {
             .flex_col()
             .min_h_0()
             .flex_1()
-            .bg(rgb(active_theme.colors.bg_app))
+            .bg(rgb(cx.theme().colors.bg_app))
             .child(body)
     }
 }
@@ -575,7 +573,7 @@ fn section(
     label: &str,
     count: usize,
     table: impl IntoElement,
-    active_theme: Theme,
+    active_theme: &Theme,
 ) -> impl IntoElement {
     let colors = active_theme.colors;
     div()
@@ -701,7 +699,7 @@ fn fk_link_chip(target: &str, active_theme: &Theme) -> gpui::Div {
         .items_center()
         .gap_1()
         .text_size(px(theme::SCHEMA_FK_CHIP_TEXT_SIZE))
-        .font_family("monospace")
+        .font_family(&active_theme.fonts.data)
         .text_color(rgb(colors.key_fk))
         .bg(rgba(colors.fk_wash()))
         .border_1()

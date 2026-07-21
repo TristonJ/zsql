@@ -327,7 +327,7 @@ impl SidebarView {
 
         match placeholder {
             Some((color, title, detail)) => {
-                Self::render_placeholder(color, title, &detail, &active_theme).into_any_element()
+                Self::render_placeholder(color, title, &detail, active_theme).into_any_element()
             }
             None => self.render_tree(window, cx).into_any_element(),
         }
@@ -386,7 +386,6 @@ impl SidebarView {
         let row_count = self.rows.len();
         let content_height = f32::from(sidebar_tree_content_height(row_count));
         let tree_scroll_handle = self.tree_scroll_handle.clone();
-        let active_theme = cx.theme();
 
         self.scroll.update(cx, |scroll, _cx| {
             scroll.vertical(Axis::new(
@@ -421,7 +420,7 @@ impl SidebarView {
                     .flex_1()
                     .min_h_0()
                     .child(list)
-                    .with_scrollbars(&self.scroll, Self::tree_scrollbar_style(&active_theme), cx),
+                    .with_scrollbars(&self.scroll, Self::tree_scrollbar_style(cx.theme()), cx),
             )
     }
 
@@ -435,14 +434,14 @@ impl SidebarView {
                 schema_count,
             } => {
                 let name_owned = name.clone();
-                row_shell(theme::SIDEBAR_INDENT_L0, &active_theme)
+                row_shell(theme::SIDEBAR_INDENT_L0, active_theme)
                     .id(ix)
                     .cursor_pointer()
                     .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_catalog(&name_owned, cx);
                     }))
-                    .child(disclosure_glyph(*expanded, &active_theme))
+                    .child(disclosure_glyph(*expanded, active_theme))
                     .child(icon(
                         IconName::Database,
                         theme::SIDEBAR_ROW_ICON_SIZE,
@@ -450,7 +449,7 @@ impl SidebarView {
                     ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
-                        el.child(row_meta(format!("{schema_count} schemas"), &active_theme))
+                        el.child(row_meta(format!("{schema_count} schemas"), active_theme))
                     })
             }
             SidebarRow::Schema {
@@ -461,14 +460,14 @@ impl SidebarView {
             } => {
                 let catalog_owned = catalog.clone();
                 let name_owned = name.clone();
-                row_shell(theme::SIDEBAR_INDENT_L1, &active_theme)
+                row_shell(theme::SIDEBAR_INDENT_L1, active_theme)
                     .id(ix)
                     .cursor_pointer()
                     .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_schema(&catalog_owned, &name_owned, cx);
                     }))
-                    .child(disclosure_glyph(*expanded, &active_theme))
+                    .child(disclosure_glyph(*expanded, active_theme))
                     .child(icon(
                         IconName::Schema,
                         theme::SIDEBAR_ROW_ICON_SIZE,
@@ -476,7 +475,7 @@ impl SidebarView {
                     ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
-                        el.child(row_meta(format!("{relation_count} rel"), &active_theme))
+                        el.child(row_meta(format!("{relation_count} rel"), active_theme))
                     })
             }
             SidebarRow::Relation {
@@ -510,7 +509,7 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|(s, r)| s == schema && r == name);
 
-        let mut shell = row_shell(theme::SIDEBAR_INDENT_L2, &active_theme)
+        let mut shell = row_shell(theme::SIDEBAR_INDENT_L2, active_theme)
             .id(ix)
             .cursor_pointer()
             .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
@@ -535,15 +534,15 @@ impl SidebarView {
             .child(icon(
                 relation_icon_name(kind),
                 theme::SIDEBAR_RELATION_ICON_SIZE,
-                relation_tint(kind, &active_theme),
+                relation_tint(kind, active_theme),
             ))
             // left-pad the row count so that the icons are always aligned (
             // assuming <9999 columns)
-            .child(row_count(format!("{column_count:>4} cols"), &active_theme));
+            .child(row_count(format!("{column_count:>4} cols"), active_theme));
 
         if selected {
             shell = shell
-                .bg(rgba(theme::sidebar_selected_bg(&active_theme)))
+                .bg(rgba(theme::sidebar_selected_bg(active_theme)))
                 .border_l_2()
                 .border_color(rgb(active_theme.colors.accent));
         }
@@ -598,7 +597,7 @@ impl SidebarView {
                     view.close_context_menu(cx);
                 },
             ))
-            .child(context_menu_separator(&active_theme))
+            .child(context_menu_separator(active_theme))
             .child(context_menu_item(cx, "Copy Name", |view, _window, cx| {
                 view.copy_name(cx);
             }))
@@ -650,7 +649,7 @@ fn context_menu_item(
         .cursor_pointer()
         .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
         .text_color(rgb(active_theme.colors.text_primary))
-        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(&active_theme))))
+        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(active_theme))))
         .child(label)
         .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
             on_click(view, window, cx);
@@ -680,7 +679,7 @@ impl Render for SidebarView {
             .flex_col()
             .size_full()
             .bg(rgb(active_theme.colors.bg_panel))
-            .child(Self::render_header(&active_theme))
+            .child(Self::render_header(active_theme))
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
     }

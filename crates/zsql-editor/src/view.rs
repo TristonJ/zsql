@@ -594,7 +594,7 @@ impl Render for EditorView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .font_family("monospace")
+                    .font_family(&cx.theme().fonts.data)
                     .text_size(px(theme::EDITOR_TEXT_SIZE))
                     .text_color(rgb(active_theme.colors.text_primary))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -614,11 +614,7 @@ impl Render for EditorView {
                             .flex_none()
                             .h(editor_content_height(line_count))
                             .when(!compact, |el| {
-                                el.child(Self::render_gutter(
-                                    line_count,
-                                    cursor_line,
-                                    &active_theme,
-                                ))
+                                el.child(Self::render_gutter(line_count, cursor_line, active_theme))
                             })
                             .child(
                                 div()
@@ -893,7 +889,7 @@ impl Element for EditorContentElement {
             .iter()
             .enumerate()
             .map(|(line_index, raw_line)| {
-                let runs = build_runs(editor, line_index, raw_line, &font, color, &active_theme);
+                let runs = build_runs(editor, line_index, raw_line, &font, color, active_theme);
                 window.text_system().shape_line(
                     SharedString::from(raw_line.clone()),
                     font_size,
@@ -921,7 +917,7 @@ impl Element for EditorContentElement {
             .flatten();
 
         let selection_quads = selection.map_or_else(Vec::new, |selection| {
-            selection_highlight_quads(selection, &lines, &editor.buffer, bounds, &active_theme)
+            selection_highlight_quads(selection, &lines, &editor.buffer, bounds, active_theme)
         });
 
         EditorPrepaintState {
@@ -1989,11 +1985,10 @@ mod tests {
 
         harness.editor.update(vcx, |view, cx| {
             let active_theme = cx.theme();
-            let runs = build_runs(view, 0, "SELECT 1", &font, base_color, &active_theme);
+            let runs = build_runs(view, 0, "SELECT 1", &font, base_color, active_theme);
 
-            let keyword_color =
-                Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Keyword)));
-            let number_color = Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Number)));
+            let keyword_color = Hsla::from(rgb(syntax_color(active_theme, HighlightKind::Keyword)));
+            let number_color = Hsla::from(rgb(syntax_color(active_theme, HighlightKind::Number)));
             let underline = UnderlineStyle {
                 color: Some(base_color),
                 thickness: gpui::px(1.0),
@@ -2038,7 +2033,7 @@ mod tests {
 
         harness.editor.update(vcx, |view, cx| {
             let active_theme = cx.theme();
-            let runs = build_runs(view, 0, "", &font, base_color, &active_theme);
+            let runs = build_runs(view, 0, "", &font, base_color, active_theme);
             assert_eq!(
                 runs.first().map(|run| run.color),
                 Some(base_color),
@@ -2055,9 +2050,8 @@ mod tests {
 
         harness.editor.update(vcx, |view, cx| {
             let active_theme = cx.theme();
-            let runs = build_runs(view, 0, "SELECT", &font, base_color, &active_theme);
-            let keyword_color =
-                Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Keyword)));
+            let runs = build_runs(view, 0, "SELECT", &font, base_color, active_theme);
+            let keyword_color = Hsla::from(rgb(syntax_color(active_theme, HighlightKind::Keyword)));
             assert_eq!(
                 runs.first().map(|run| run.color),
                 Some(keyword_color),

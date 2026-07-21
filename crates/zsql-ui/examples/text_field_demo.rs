@@ -65,9 +65,9 @@ impl Render for DemoRoot {
             .size_full()
             .p(px(PAGE_PADDING))
             .bg(rgb(theme.colors.bg_panel))
-            .child(Self::labeled_field("Name", self.name.clone(), &theme))
-            .child(Self::labeled_field("URL", self.url.clone(), &theme))
-            .child(Self::labeled_field("Notes", self.notes.clone(), &theme))
+            .child(Self::labeled_field("Name", self.name.clone(), theme))
+            .child(Self::labeled_field("URL", self.url.clone(), theme))
+            .child(Self::labeled_field("Notes", self.notes.clone(), theme))
     }
 }
 

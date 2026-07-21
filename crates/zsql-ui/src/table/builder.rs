@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::scrollable::restrict_wheel_to_own_axis;
 use crate::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
+use crate::theme::ActiveTheme;
 
 use super::column::TableColumn;
 use super::gutter::{
@@ -230,6 +231,7 @@ impl<V: Render> Table<V> {
             .overflow_x_hidden()
             .track_scroll(&handles.col_scroll_handle)
             .on_scroll_wheel(ScrollableState::wheel_handler(&handles.scroll))
+            .font_family(&cx.theme().fonts.data)
             .child(header_row)
             .child(data_list);
 

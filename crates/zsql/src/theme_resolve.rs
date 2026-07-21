@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use zsql_ui::theme::{Colors, Theme, built_in_theme};
+use zsql_ui::theme::{Colors, built_in_theme};
 
 /// Resolve `theme_name` into the [`Theme`] to render with.
 ///
@@ -18,7 +18,7 @@ use zsql_ui::theme::{Colors, Theme, built_in_theme};
 /// failure reason -- this never panics and never blocks startup on a bad
 /// theme.
 #[tracing::instrument(name = "theme_resolve", skip(themes_dir))]
-pub fn resolve(theme_name: &str, themes_dir: Option<&Path>) -> Theme {
+pub fn resolve(theme_name: &str, themes_dir: Option<&Path>) -> Colors {
     if let Some(theme) = built_in_theme(theme_name) {
         tracing::info!(theme = theme_name, "resolved a built-in theme");
         return theme;
@@ -30,7 +30,7 @@ pub fn resolve(theme_name: &str, themes_dir: Option<&Path>) -> Theme {
             "no themes directory is available and the name does not match a built-in flavor; \
              falling back to the default theme"
         );
-        return Theme::default();
+        return Colors::default();
     };
 
     let path = theme_file_path(dir, theme_name);
@@ -43,14 +43,14 @@ pub fn resolve(theme_name: &str, themes_dir: Option<&Path>) -> Theme {
                 error = %err,
                 "failed to read theme file; falling back to the default theme"
             );
-            return Theme::default();
+            return Colors::default();
         }
     };
 
     match serde_json::from_str::<Colors>(&text) {
         Ok(colors) => {
             tracing::info!(theme = theme_name, path = %path.display(), "loaded theme from disk");
-            Theme { colors }
+            colors
         }
         Err(err) => {
             tracing::warn!(
@@ -59,7 +59,7 @@ pub fn resolve(theme_name: &str, themes_dir: Option<&Path>) -> Theme {
                 error = %err,
                 "failed to parse theme file; falling back to the default theme"
             );
-            Theme::default()
+            Colors::default()
         }
     }
 }
@@ -74,10 +74,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use zsql_ui::theme::Theme;
     use zsql_ui::theme::catppuccin::{
         FRAPPE_NAME, LATTE_NAME, MACCHIATO_NAME, MOCHA_NAME, frappe, latte, macchiato, mocha,
     };
+    use zsql_ui::theme::{Colors, Theme};
 
     use super::resolve;
 
@@ -111,42 +111,42 @@ mod tests {
 
     #[test]
     fn each_built_in_flavor_name_resolves_to_its_own_colors_without_touching_disk() {
-        assert_eq!(resolve(LATTE_NAME, None).colors, latte());
-        assert_eq!(resolve(FRAPPE_NAME, None).colors, frappe());
-        assert_eq!(resolve(MACCHIATO_NAME, None).colors, macchiato());
-        assert_eq!(resolve(MOCHA_NAME, None).colors, mocha());
+        assert_eq!(resolve(LATTE_NAME, None), latte());
+        assert_eq!(resolve(FRAPPE_NAME, None), frappe());
+        assert_eq!(resolve(MACCHIATO_NAME, None), macchiato());
+        assert_eq!(resolve(MOCHA_NAME, None), mocha());
     }
 
     #[test]
     fn an_unknown_name_with_no_themes_dir_falls_back_to_the_default_theme() {
-        assert_eq!(resolve("nonexistent", None), Theme::default());
+        assert_eq!(resolve("nonexistent", None), Colors::default());
     }
 
     #[test]
     fn a_missing_theme_file_falls_back_to_the_default_theme() {
         let dir = TestThemesDir::new("missing-file");
-        assert_eq!(resolve("nonexistent", Some(&dir.0)), Theme::default());
+        assert_eq!(resolve("nonexistent", Some(&dir.0)), Colors::default());
     }
 
     #[test]
     fn malformed_json_falls_back_to_the_default_theme() {
         let dir = TestThemesDir::new("malformed-json");
         dir.write("broken", "{ this is not json");
-        assert_eq!(resolve("broken", Some(&dir.0)), Theme::default());
+        assert_eq!(resolve("broken", Some(&dir.0)), Colors::default());
     }
 
     #[test]
     fn an_unknown_color_role_key_falls_back_to_the_default_theme() {
         let dir = TestThemesDir::new("unknown-key");
         dir.write("typo", "{\"accentt\": \"#33c2ac\"}");
-        assert_eq!(resolve("typo", Some(&dir.0)), Theme::default());
+        assert_eq!(resolve("typo", Some(&dir.0)), Colors::default());
     }
 
     #[test]
     fn a_malformed_hex_value_falls_back_to_the_default_theme() {
         let dir = TestThemesDir::new("bad-hex");
         dir.write("bad-hex", "{\"accent\": \"not-a-color\"}");
-        assert_eq!(resolve("bad-hex", Some(&dir.0)), Theme::default());
+        assert_eq!(resolve("bad-hex", Some(&dir.0)), Colors::default());
     }
 
     #[test]
@@ -156,12 +156,11 @@ mod tests {
 
         let theme = resolve("warmer", Some(&dir.0));
 
-        let expected = Theme {
-            colors: zsql_ui::theme::Colors {
-                accent: 0xe0_a3_3f,
-                ..Theme::default().colors
-            },
+        let expected = zsql_ui::theme::Colors {
+            accent: 0xe0_a3_3f,
+            ..Theme::default().colors
         };
+
         assert_eq!(theme, expected);
     }
 
@@ -170,6 +169,6 @@ mod tests {
         let dir = TestThemesDir::new("shadowed");
         dir.write(MOCHA_NAME, "{\"accent\": \"#000000\"}");
 
-        assert_eq!(resolve(MOCHA_NAME, Some(&dir.0)).colors, mocha());
+        assert_eq!(resolve(MOCHA_NAME, Some(&dir.0)), mocha());
     }
 }

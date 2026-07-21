@@ -17,6 +17,7 @@ use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px
 use session::{Session, SessionState};
 use ui::connections::active_connection_for_url;
 use ui::workspace::WorkspaceView;
+use zsql_ui::theme::{Theme, get_builtin_fonts};
 
 /// Default window size for the workspace.
 const WINDOW_WIDTH: f32 = 1180.0;
@@ -47,8 +48,17 @@ fn main() -> anyhow::Result<()> {
     Application::new()
         .with_assets(zsql_ui::icon::IconAssetSource)
         .run(move |cx: &mut App| {
-            let theme = theme_resolve::resolve(&cfg.theme.name, Config::themes_dir().as_deref());
-            cx.set_global(theme);
+            let colors = theme_resolve::resolve(&cfg.theme.name, Config::themes_dir().as_deref());
+            cx.set_global(Theme {
+                colors,
+                ..Default::default()
+            });
+            if let Err(e) = cx.text_system().add_fonts(get_builtin_fonts()) {
+                tracing::error!("failed to register builtin fonts: {}", e);
+            }
+            let available_fonts = cx.text_system().all_font_names().join(",");
+            tracing::debug!("all available fonts are: {}", available_fonts);
+
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
 

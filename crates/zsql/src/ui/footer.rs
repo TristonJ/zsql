@@ -69,7 +69,7 @@ impl Render for ConnectionFooterView {
             .border_color(rgb(colors.border))
             .cursor_pointer()
             .hover(|el| el.bg(rgb(colors.bg_raised)))
-            .font_family("monospace")
+            .font_family(&cx.theme().fonts.data)
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
             .on_click(cx.listener(Self::open_modal));
 

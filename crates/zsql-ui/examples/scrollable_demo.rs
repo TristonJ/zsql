@@ -125,7 +125,6 @@ impl Pane {
     }
 
     fn render(&self, cx: &mut Context<DemoRoot>) -> gpui::AnyElement {
-        let theme = cx.theme();
         let row_count = self.row_count();
         let content_width = self.content_width();
         let horizontal_enabled = self.horizontal_enabled;
@@ -136,7 +135,7 @@ impl Pane {
             uniform_list(
                 gpui::SharedString::from(format!("scrollable-demo-rows-{}", self.title)),
                 row_count,
-                move |range: std::ops::Range<usize>, _window, _cx| {
+                move |range: std::ops::Range<usize>, _window, cx| {
                     range
                         .map(|ix| {
                             div()
@@ -146,9 +145,9 @@ impl Pane {
                                 .flex()
                                 .items_center()
                                 .border_b_1()
-                                .border_color(rgb(theme.colors.border_soft))
+                                .border_color(rgb(cx.theme().colors.border_soft))
                                 .text_size(px(ROW_TEXT_SIZE))
-                                .text_color(rgb(theme.colors.text_primary))
+                                .text_color(rgb(cx.theme().colors.text_primary))
                                 .child(format!("row {ix}"))
                                 .into_any_element()
                         })
@@ -202,7 +201,7 @@ impl Pane {
             .child(
                 div()
                     .text_size(px(LABEL_TEXT_SIZE))
-                    .text_color(rgb(theme.colors.text_tertiary))
+                    .text_color(rgb(cx.theme().colors.text_tertiary))
                     .child(self.title),
             )
             .child(
@@ -210,8 +209,8 @@ impl Pane {
                     .w(px(PANE_WIDTH))
                     .h(px(PANE_HEIGHT))
                     .border_1()
-                    .border_color(rgb(theme.colors.border))
-                    .bg(rgb(theme.colors.bg_panel))
+                    .border_color(rgb(cx.theme().colors.border))
+                    .bg(rgb(cx.theme().colors.bg_panel))
                     .child(viewport),
             )
             .into_any_element()
@@ -255,7 +254,6 @@ impl DemoRoot {
     }
 
     fn pane_column(&mut self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let pane = match index {
             0 => &self.vertical_only,
             1 => &self.horizontal_only,
@@ -285,8 +283,8 @@ impl DemoRoot {
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(Self::button(toggle_label, toggle_click, &theme))
-                .child(Self::button("Remount", remount_click, &theme)),
+                .child(Self::button(toggle_label, toggle_click, cx.theme()))
+                .child(Self::button("Remount", remount_click, cx.theme())),
         )
     }
 

@@ -421,13 +421,13 @@ impl WorkspaceView {
     fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let active_theme = cx.theme();
         let active_id = self.tabs.read(cx).active_id();
-        let mut bar = zsql_ui::tabs::tab_bar_shell(&active_theme);
+        let mut bar = zsql_ui::tabs::tab_bar_shell(active_theme);
         for tab in self.tabs.read(cx).tabs() {
             let active = active_id == Some(tab.id());
             bar = bar.child(Self::render_tab(tab, active, cx));
         }
         bar.child(
-            zsql_ui::tabs::new_tab_glyph(&active_theme)
+            zsql_ui::tabs::new_tab_glyph(active_theme)
                 .id("workspace-new-tab")
                 .cursor_pointer()
                 .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
@@ -443,7 +443,7 @@ impl WorkspaceView {
     fn render_tab(tab: &Tab, active: bool, cx: &Context<Self>) -> impl IntoElement {
         let active_theme = cx.theme();
         let id = tab.id();
-        let mut shell = zsql_ui::tabs::tab_shell(active, &active_theme).id(("workspace-tab", id));
+        let mut shell = zsql_ui::tabs::tab_shell(active, active_theme).id(("workspace-tab", id));
 
         shell = match tab.kind() {
             TabKind::Generated { .. } => {
@@ -457,7 +457,7 @@ impl WorkspaceView {
                     )
                     .child(div().italic().child(tab.title().to_owned()));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
                 }
                 shell
             }
@@ -468,7 +468,7 @@ impl WorkspaceView {
                 }
                 shell = shell.child(div().child(label));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
                 }
                 shell
             }
@@ -481,7 +481,7 @@ impl WorkspaceView {
                     ))
                     .child(div().child(tab.title().to_owned()));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
                 }
                 shell
             }
@@ -493,7 +493,7 @@ impl WorkspaceView {
                 view.activate_tab(id, window, cx);
             }))
             .child(
-                zsql_ui::tabs::close_glyph(&active_theme)
+                zsql_ui::tabs::close_glyph(active_theme)
                     .id(("workspace-tab-close", id))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
@@ -547,7 +547,7 @@ impl WorkspaceView {
                     .bg(rgb(colors.accent))
                     .text_color(rgb(colors.bg_app))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::run_button_hover_bg(&active_theme))))
+                    .hover(|style| style.bg(rgb(theme::run_button_hover_bg(active_theme))))
                     .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                         view.run_active_tab(cx);
                     }))
@@ -564,7 +564,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
-                            .text_color(rgba(theme::run_button_hint(&active_theme)))
+                            .text_color(rgba(theme::run_button_hint(active_theme)))
                             .child(run_shortcut),
                     ),
             )
@@ -582,7 +582,7 @@ impl WorkspaceView {
         };
 
         if active.is_generated() {
-            Self::render_generated_strip(active, &active_theme).into_any_element()
+            Self::render_generated_strip(active, active_theme).into_any_element()
         } else {
             div()
                 .flex_shrink_0()
@@ -726,6 +726,7 @@ impl Render for WorkspaceView {
             .flex_col()
             .size_full()
             .bg(rgb(colors.bg_app))
+            .font_family(&cx.theme().fonts.ui)
             .child(
                 div()
                     .flex()
