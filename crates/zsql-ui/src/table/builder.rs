@@ -41,7 +41,7 @@ pub struct Table<V: Render> {
     vertical_sizing: TableSizing,
 }
 
-/// How to size the table's vertical extent in its parent. Defaults to [`TableHeight::Fill`].
+/// How to size the table's vertical extent in its parent. Defaults to [`TableSizing::Fill`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSizing {
     /// Fit the table's height to its parent, showing scrollbars if the table's rows overflow.
@@ -166,6 +166,7 @@ impl<V: Render> Table<V> {
             column_widths.len(),
             content_extent,
             style,
+            table_height,
             cx,
         );
 
@@ -259,6 +260,7 @@ fn sync_scroll_axes<V: Render>(
     column_count: usize,
     content_extent: Pixels,
     style: TableStyle,
+    table_height: TableSizing,
     cx: &mut Context<V>,
 ) {
     let TableScrollHandles {
@@ -275,13 +277,26 @@ fn sync_scroll_axes<V: Render>(
         "recomputed the table's scroll axes for this render"
     );
     scroll.update(cx, |scroll, _cx| {
-        scroll.vertical(
-            Axis::new(
-                ScrollSource::UniformList(row_scroll_handle.clone()),
-                vertical_extent,
-            )
-            .track_start(f32::from(style.header_height)),
-        );
+        // A `Fit` table grows to all its rows and never scrolls vertically on
+        // its own -- its parent page scrolls instead -- so it must not
+        // configure a vertical axis, or it would paint a vertical scrollbar
+        // over content the parent is responsible for scrolling. A `Fill`
+        // table is bounded by its parent and scrolls its rows internally, so
+        // it keeps its vertical axis.
+        match table_height {
+            TableSizing::Fill => {
+                scroll.vertical(
+                    Axis::new(
+                        ScrollSource::UniformList(row_scroll_handle.clone()),
+                        vertical_extent,
+                    )
+                    .track_start(f32::from(style.header_height)),
+                );
+            }
+            TableSizing::Fit => {
+                scroll.clear_vertical();
+            }
+        }
         scroll.horizontal(Axis::new(
             ScrollSource::Container(col_scroll_handle.clone()),
             f32::from(content_extent),

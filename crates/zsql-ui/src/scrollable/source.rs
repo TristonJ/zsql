@@ -71,6 +71,23 @@ impl ScrollSource {
         })
     }
 
+    /// This axis's maximum scroll offset, as gpui measured it last paint:
+    /// `content_extent - viewport_extent`, clamped at zero. Adding it back to
+    /// [`Self::viewport_extent`] recovers the content extent, which is what
+    /// lets a container-backed axis size itself rather than being told how
+    /// far its content runs. Zero before the first layout pass, or when the
+    /// content already fits.
+    pub(crate) fn max_offset(&self, orientation: Orientation) -> f32 {
+        let size = match self {
+            Self::UniformList(handle) => handle.0.borrow().base_handle.max_offset(),
+            Self::Container(handle) => handle.max_offset(),
+        };
+        f32::from(match orientation {
+            Orientation::Vertical => size.height,
+            Orientation::Horizontal => size.width,
+        })
+    }
+
     /// Whether this axis's viewport has been laid out at least once.
     pub(crate) fn viewport_measured(&self, orientation: Orientation) -> bool {
         let size = self.bounds().size;

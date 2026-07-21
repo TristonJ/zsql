@@ -27,12 +27,14 @@ mod axis;
 mod source;
 mod state;
 mod style;
+mod view;
 mod wrapper;
 
 pub use axis::Axis;
 pub use source::ScrollSource;
 pub use state::{ScrollableState, restrict_wheel_to_own_axis};
 pub use style::ScrollbarStyle;
+pub use view::{ScrollView, vertical_scroll};
 pub use wrapper::WithScrollbars;
 #[cfg(any(test, feature = "test-support"))]
 pub use wrapper::{horizontal_thumb_debug_selector, vertical_thumb_debug_selector};

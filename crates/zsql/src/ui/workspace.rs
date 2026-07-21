@@ -602,6 +602,8 @@ impl WorkspaceView {
             // omitted; the schema view fills the whole pane below the tab bar.
             return vec![
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
                     .child(schema_view.clone())

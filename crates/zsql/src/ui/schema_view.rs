@@ -11,6 +11,7 @@ use zsql_core::{
     RelationSchema, RowCount,
 };
 use zsql_ui::icon::{IconName, icon};
+use zsql_ui::scrollable::{ScrollView, ScrollbarStyle, vertical_scroll};
 use zsql_ui::table::{Table, TableColumn, TableRow, TableSizing, TableState, TableStyle};
 use zsql_ui::{colors, grid};
 
@@ -43,6 +44,9 @@ pub struct SchemaTabView {
     indexes_table: Entity<TableState>,
     /// State for the "Constraints" table
     constraints_table: Entity<TableState>,
+    /// Vertical scroll for the whole tab body: the three `Fit` tables never
+    /// scroll themselves, so the page scrolls all of them together.
+    page_scroll: ScrollView,
 }
 
 impl SchemaTabView {
@@ -68,6 +72,7 @@ impl SchemaTabView {
             columns_table: cx.new(TableState::new),
             indexes_table: cx.new(TableState::new),
             constraints_table: cx.new(TableState::new),
+            page_scroll: ScrollView::new(cx),
         }
     }
 
@@ -255,7 +260,6 @@ impl SchemaTabView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
-        tracing::debug!("render_columns_table_row_cells: range={:?}", range);
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -466,27 +470,36 @@ impl Render for SchemaTabView {
                 Self::render_placeholder(theme::STATUS_ERROR, "Schema unavailable", message)
                     .into_any_element()
             }
-            FetchState::Ready(detail) => div()
-                .flex()
-                .flex_col()
-                .min_h_0()
-                .flex_1()
-                .child(self.render_head(detail))
-                .child(
-                    div()
-                        .id("schema-tab-scroll")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .p(theme::SCHEMA_SCROLL_PADDING)
-                        .gap(theme::SCHEMA_SECTION_GAP)
-                        .child(self.render_columns_table(cx, detail))
-                        .child(self.render_indexes_table(cx, detail))
-                        .child(self.render_constraints_table(cx, detail)),
-                )
-                .into_any_element(),
+            FetchState::Ready(detail) => {
+                // The scrolled content: a single non-shrinking column of the
+                // three tables. `flex_shrink_0` keeps it at its natural
+                // height so it can overflow the page and actually scroll,
+                // rather than being squeezed to the viewport.
+                let content = div()
+                    .flex()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .p(theme::SCHEMA_SCROLL_PADDING)
+                    .gap(theme::SCHEMA_SECTION_GAP)
+                    .child(self.render_columns_table(cx, detail))
+                    .child(self.render_indexes_table(cx, detail))
+                    .child(self.render_constraints_table(cx, detail));
+                let page = vertical_scroll(
+                    "schema-tab-scroll",
+                    &self.page_scroll,
+                    ScrollbarStyle::default(),
+                    content,
+                    cx,
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .flex_1()
+                    .child(self.render_head(detail))
+                    .child(page)
+                    .into_any_element()
+            }
         };
 
         div()

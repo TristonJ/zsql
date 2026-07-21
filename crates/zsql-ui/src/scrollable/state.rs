@@ -263,7 +263,7 @@ impl ScrollableState {
             return false;
         };
 
-        let content_extent = axis_state.axis.content_extent;
+        let content_extent = axis_state.axis.content_extent(orientation);
         let viewport_extent = axis_state.axis.source.viewport_extent(orientation);
         let current_offset = axis_state.axis.source.scroll_offset(orientation);
         let track_length = (viewport_extent - track_reserve).max(0.0);
@@ -336,7 +336,7 @@ impl ScrollableState {
         let delta = event.delta.pixel_delta(window.line_height());
         let wheel_delta_x = horizontal_wheel_delta(delta.x, delta.y);
 
-        let content_extent = axis_state.axis.content_extent;
+        let content_extent = axis_state.axis.content_extent(Orientation::Horizontal);
         let viewport_extent = axis_state
             .axis
             .source
@@ -396,7 +396,7 @@ fn axis_snapshot(
     let scroll_offset = axis.source.scroll_offset(orientation);
     let track_length = (viewport_extent - track_reserve).max(0.0);
     let geometry = ScrollbarGeometry::compute(
-        axis.content_extent,
+        axis.content_extent(orientation),
         viewport_extent,
         scroll_offset,
         track_length,
