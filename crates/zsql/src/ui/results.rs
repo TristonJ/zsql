@@ -4,10 +4,10 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Context, Div, Entity, Pixels, Render, SharedString, Window, div, prelude::*,
-    px, rgb,
+    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
+    Pixels, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
-use zsql_core::{ColumnMeta, ResultSet, RowCount};
+use zsql_core::{ColumnMeta, ResultSet, RowCount, Value};
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -15,6 +15,27 @@ use zsql_ui::theme::{ActiveTheme, Theme};
 use super::format::{ValueKind, format_value};
 use super::theme;
 use crate::session::{LivenessState, Session, SessionState};
+
+/// The key context the results grid's own key bindings are scoped to, so
+/// they only fire while the grid is focused.
+pub const KEY_CONTEXT: &str = "ResultsGrid";
+
+actions!(
+    zsql_results_grid,
+    [Copy, CellUp, CellDown, CellLeft, CellRight]
+);
+
+/// Register the results grid's key bindings. Call once at startup, before
+/// any window that hosts a [`ResultsView`] is opened.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("secondary-c", Copy, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", CellUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", CellDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("left", CellLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("right", CellRight, Some(KEY_CONTEXT)),
+    ]);
+}
 
 /// A tab's captured query outcome: the label, lifecycle state, and result
 /// set a [`ResultsView`] shows while that tab (rather than the live
@@ -48,6 +69,9 @@ pub struct ResultsView {
     /// The grid's mechanical (scroll/drag) state, composed via
     /// `zsql_ui::table`.
     table_state: Entity<TableState>,
+    /// Focus target for the grid, so a click on a data cell can focus it and
+    /// a subsequent Cmd/Ctrl-C is captured by [`ResultsView::copy_focused_cell`].
+    focus_handle: FocusHandle,
 }
 
 impl ResultsView {
@@ -74,6 +98,7 @@ impl ResultsView {
             column_max_body_chars: Vec::new(),
             folded_row_count: 0,
             table_state: cx.new(TableState::new),
+            focus_handle: cx.focus_handle(),
         };
         view.sync_dimensions(cx);
         view
@@ -136,6 +161,34 @@ impl ResultsView {
     /// set, folding only the rows that streamed in since the last call.
     #[tracing::instrument(name = "results_sync_dimensions", skip_all)]
     fn sync_dimensions(&mut self, cx: &mut Context<Self>) {
+        // A selection recorded against a previous, larger result set would
+        // otherwise point past the new one's rows/columns: clearing it here
+        // is simpler than clamping, and loses nothing a fresh click can't
+        // restore. Computed in its own scope (rather than reusing the
+        // `result` binding below) so this mutable `table_state` update does
+        // not fight the immutable borrow of `cx` that binding would still
+        // be holding.
+        let (row_count, col_count) = {
+            let result: &ResultSet = match &self.frozen {
+                Some(snapshot) => &snapshot.result,
+                None => self.session.read(cx).result(),
+            };
+            (result.rows.len(), result.columns.len())
+        };
+        if let Some((row, col)) = self.table_state.read(cx).focused_cell()
+            && (row >= row_count || col >= col_count)
+        {
+            self.table_state.update(cx, |state, cx| {
+                state.clear_focused_cell();
+                cx.notify();
+            });
+            tracing::debug!(
+                row,
+                col,
+                "cleared a results grid selection that no longer fits the current result set"
+            );
+        }
+
         // Matched directly on the `frozen` field (rather than through the
         // `effective_result` method) so the borrow checker sees this as
         // borrowing only `self.frozen`, leaving `self.column_widths` and
@@ -335,6 +388,8 @@ impl ResultsView {
                 min_width: theme::ROW_NUMBER_MIN_WIDTH,
             }))
             .rows(Self::render_data_row_cells)
+            .selectable()
+            .focus_on_cell_click(self.focus_handle.clone())
             .render(cx)
     }
 
@@ -453,6 +508,92 @@ impl ResultsView {
 
         bar
     }
+
+    /// Copy the selected cell's full formatted value to the system
+    /// clipboard. A NULL value copies as an empty string rather than the
+    /// literal "NULL" the grid displays, so pasting a NULL cell elsewhere
+    /// never inserts visible placeholder text. A no-op while nothing is
+    /// selected.
+    #[tracing::instrument(name = "results_copy_focused_cell", skip_all)]
+    fn copy_focused_cell(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.table_state.read(cx).focused_cell() else {
+            tracing::trace!("copy invoked with no results grid selection; nothing to do");
+            return;
+        };
+        let Some(value) = self
+            .effective_result(cx)
+            .rows
+            .get(row)
+            .and_then(|r| r.0.get(col))
+        else {
+            return;
+        };
+        let text = match value {
+            Value::Null => String::new(),
+            other => format_value(other).text,
+        };
+        tracing::debug!(row, col, "copied a results grid cell to the clipboard");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Move the selected cell by `(delta_row, delta_col)`, clamped to the
+    /// current result's bounds with no wraparound. Starts from `(0, 0)` when
+    /// nothing is selected yet; applying the delta only when a selection
+    /// already exists. A no-op for an empty result.
+    fn move_focused_cell(&mut self, delta_row: isize, delta_col: isize, cx: &mut Context<Self>) {
+        let row_count = self.effective_result(cx).rows.len();
+        let col_count = self.effective_result(cx).columns.len();
+        if row_count == 0 || col_count == 0 {
+            return;
+        }
+
+        // If no cell is currently selected, select (0, 0) and return without
+        // applying the delta. This ensures the first arrow press in any
+        // direction lands on the top-left cell consistently.
+        if self.table_state.read(cx).focused_cell().is_none() {
+            tracing::trace!("moved the results grid selection to (0, 0)");
+            self.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 0);
+                cx.notify();
+            });
+            return;
+        }
+
+        let (current_row, current_col) = self.table_state.read(cx).focused_cell().unwrap();
+        let new_row = current_row
+            .saturating_add_signed(delta_row)
+            .min(row_count - 1);
+        let new_col = current_col
+            .saturating_add_signed(delta_col)
+            .min(col_count - 1);
+        tracing::trace!(new_row, new_col, "moved the results grid selection");
+        self.table_state.update(cx, |state, cx| {
+            state.set_focused_cell(new_row, new_col);
+            cx.notify();
+        });
+    }
+
+    fn cell_up(&mut self, _: &CellUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_focused_cell(-1, 0, cx);
+    }
+
+    fn cell_down(&mut self, _: &CellDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_focused_cell(1, 0, cx);
+    }
+
+    fn cell_left(&mut self, _: &CellLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_focused_cell(0, -1, cx);
+    }
+
+    fn cell_right(&mut self, _: &CellRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_focused_cell(0, 1, cx);
+    }
+}
+
+impl Focusable for ResultsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 /// Test-only accessors used by `ui::sidebar`'s and `ui::tabs`'s tests
@@ -473,6 +614,14 @@ impl ResultsView {
 impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("results-grid-pane")
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::copy_focused_cell))
+            .on_action(cx.listener(Self::cell_up))
+            .on_action(cx.listener(Self::cell_down))
+            .on_action(cx.listener(Self::cell_left))
+            .on_action(cx.listener(Self::cell_right))
             .flex()
             .flex_col()
             .size_full()
@@ -630,16 +779,18 @@ fn column_width_from_parts(
 mod tests {
     use std::time::Duration;
 
-    use gpui::AppContext as _;
+    use gpui::{AppContext as _, Focusable as _, Modifiers, MouseButton, MouseDownEvent, px};
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
-        ResultsView, SessionState, ValueKind, column_width_from_parts, format_total_row_count,
-        kind_color, status_indicator, status_metrics,
+        CellDown, CellLeft, CellRight, CellUp, Copy, ResultsView, SessionState, ValueKind,
+        column_width_from_parts, format_total_row_count, kind_color, status_indicator,
+        status_metrics,
     };
 
     use crate::session::{LivenessState, Session};
     use crate::ui::theme;
+    use zsql_ui::table::body_first_cell_debug_selector;
     use zsql_ui::theme::Theme;
 
     fn column(name: &str, type_name: &str) -> ColumnMeta {
@@ -1167,5 +1318,296 @@ mod tests {
                 "width should grow once a longer cell streams in"
             );
         });
+    }
+
+    // -- cell selection / copy -------------------------------------------
+
+    fn view_with_results(
+        cx: &mut gpui::TestAppContext,
+        result: ResultSet,
+    ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
+        let state = SessionState::Results(Duration::from_millis(1));
+        let session = cx.new(|_cx| Session::new_for_render_test(state, result));
+        cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx))
+    }
+
+    #[gpui::test]
+    fn clicking_a_cell_focuses_the_grid_and_a_following_copy_key_copies_its_value(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: gpui::point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            ),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "clicking the top-of-viewport body cell must select row 0, column 0"
+        );
+
+        vcx.dispatch_action(Copy);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some("1"),
+            "Cmd/Ctrl-C after a click must copy the clicked cell's value, proving the click \
+             also focused the grid (dispatch_action only reaches a focused view's key bindings)"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_with_no_selection_never_writes_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        assert_eq!(vcx.read_from_clipboard().and_then(|item| item.text()), None);
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+        assert_eq!(
+            vcx.read_from_clipboard().and_then(|item| item.text()),
+            None,
+            "copying with no selection must not write anything to the clipboard"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_writes_the_full_formatted_value_not_a_truncated_display_string(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long_value = "a very long value that would visually truncate in a narrow cell but \
+                           must still be copied in full"
+            .to_owned();
+        let result = ResultSet {
+            columns: vec![column("v", "text")],
+            rows: vec![Row(vec![Value::Text(long_value.clone())])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(0, 0));
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some(long_value.as_str()));
+    }
+
+    #[gpui::test]
+    fn copy_of_a_null_cell_writes_an_empty_string(cx: &mut gpui::TestAppContext) {
+        let result = ResultSet {
+            columns: vec![column("v", "text")],
+            rows: vec![Row(vec![Value::Null])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(0, 0));
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(""),
+            "a NULL cell must copy as an empty string, not the literal \"NULL\" the grid \
+             displays"
+        );
+    }
+
+    #[gpui::test]
+    fn a_selection_outside_a_shrunken_result_is_cleared_and_copy_stays_a_noop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut result = sample_result();
+        result
+            .rows
+            .push(Row(vec![Value::Int(3), Value::Text("extra".to_owned())]));
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(2, 1));
+        });
+
+        // The session's result shrinks back to `sample_result`'s two rows,
+        // taking the just-set selection at row 2 out of bounds.
+        let session = view.read_with(vcx, |v, _app| v.session.clone());
+        session.update(vcx, |session, _cx| {
+            session.set_result_for_test(sample_result());
+        });
+        // `Session::set_result_for_test` bypasses `cx.notify()`, so the view
+        // is synced explicitly here rather than relying on the observer.
+        view.update(vcx, super::ResultsView::sync_dimensions);
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "a selection that no longer fits the shrunken result must be cleared"
+        );
+
+        // Re-rendering (the highlight path) and invoking copy (the domain
+        // lookup path) must both stay safe with no selection left to act on.
+        vcx.run_until_parked();
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+        assert_eq!(vcx.read_from_clipboard().and_then(|item| item.text()), None);
+    }
+
+    #[gpui::test]
+    fn copy_of_a_selection_past_a_smaller_results_bounds_stays_a_noop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Sets an out-of-bounds selection directly on `TableState` rather
+        // than going through `sync_dimensions` (which would clear it): this
+        // exercises `copy_focused_cell`'s own `.get()` guard against a
+        // `Some` selection whose (row, col) has no matching value, not the
+        // no-selection (`None`) path a cleared selection would take
+        // instead.
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(50, 50));
+        });
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+
+        assert_eq!(
+            vcx.read_from_clipboard().and_then(|item| item.text()),
+            None,
+            "a selection past the result's own rows/columns must not panic and must not write \
+             anything to the clipboard"
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_result_set_selects_nothing_and_copy_is_a_noop(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, ResultSet::default());
+        vcx.run_until_parked();
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: gpui::point(px(50.0), px(50.0)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "an empty result has no cell to select"
+        );
+
+        view.update_in(vcx, |view, window, cx| {
+            view.copy_focused_cell(&Copy, window, cx);
+        });
+        assert_eq!(vcx.read_from_clipboard().and_then(|item| item.text()), None);
+    }
+
+    #[gpui::test]
+    fn arrow_keys_over_an_empty_result_set_select_nothing_and_do_not_panic(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // `move_focused_cell` computes `row_count - 1`/`col_count - 1` to
+        // clamp a new selection: an empty result must return before that
+        // subtraction, or it would underflow.
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let state = SessionState::Results(Duration::from_millis(1));
+            let session = cx.new(|_cx| Session::new_for_render_test(state, ResultSet::default()));
+            let view = ResultsView::new(session, "public.orders", cx);
+            window.focus(&view.focus_handle(cx));
+            view
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(CellDown);
+        vcx.dispatch_action(CellRight);
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "an empty result has no cell for an arrow key to select"
+        );
+    }
+
+    #[gpui::test]
+    fn arrow_keys_move_the_selection_one_cell_at_a_time_and_clamp_at_the_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let state = SessionState::Results(Duration::from_millis(1));
+            let session = cx.new(|_cx| Session::new_for_render_test(state, sample_result()));
+            let view = ResultsView::new(session, "public.orders", cx);
+            window.focus(&view.focus_handle(cx));
+            view
+        });
+        vcx.run_until_parked();
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+
+        // No wraparound past the top-left corner.
+        vcx.dispatch_action(CellUp);
+        vcx.dispatch_action(CellLeft);
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "moving up/left with nothing selected must land on (0, 0), not go negative"
+        );
+
+        vcx.dispatch_action(CellDown);
+        vcx.dispatch_action(CellRight);
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((1, 1)),
+            "CellDown/CellRight must move exactly one row/column at a time"
+        );
+
+        // `sample_result` has exactly 2 rows and 2 columns: (1, 1) is
+        // already the bottom-right corner, so further Down/Right must not
+        // move past it.
+        vcx.dispatch_action(CellDown);
+        vcx.dispatch_action(CellRight);
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((1, 1)),
+            "moving past the last row/column must clamp at the bounds rather than wrap or \
+             go out of range"
+        );
     }
 }

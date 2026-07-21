@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
 
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
+            ui::results::init(cx);
 
             let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
             cx.open_window(
