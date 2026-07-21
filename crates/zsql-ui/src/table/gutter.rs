@@ -5,8 +5,6 @@ use std::ops::Range;
 
 use gpui::{AnyElement, Context, Div, Pixels, Render, Window, div, prelude::*, rgb};
 
-use crate::colors;
-
 use super::measure;
 use super::style::TableStyle;
 
@@ -97,7 +95,7 @@ pub(super) fn gutter_cell_shell(width: Pixels, style: &TableStyle) -> Div {
 pub(super) fn row_number_header_shell(style: &TableStyle) -> Div {
     gutter_header_shell(style)
         .justify_end()
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(style.row_number_color))
 }
 
 /// [`gutter_cell_shell`] plus [`Gutter::RowNumbers`]' own right-alignment
@@ -105,5 +103,5 @@ pub(super) fn row_number_header_shell(style: &TableStyle) -> Div {
 pub(super) fn row_number_cell_shell(width: Pixels, style: &TableStyle) -> Div {
     gutter_cell_shell(width, style)
         .justify_end()
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(style.row_number_color))
 }

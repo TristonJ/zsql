@@ -4,7 +4,8 @@
 //! [`ConnectionManagerView`] modal.
 
 use gpui::{ClickEvent, Context, Entity, Render, Window, div, prelude::*, px, rgb};
-use zsql_ui::{colors, grid};
+use zsql_ui::grid;
+use zsql_ui::theme::ActiveTheme;
 
 use super::connections::{ConnectionManagerView, FooterDisplay, footer_display};
 use super::theme;
@@ -52,6 +53,7 @@ impl Render for ConnectionFooterView {
             self.session.read(cx).is_connected(),
             self.connections.read(cx).active(),
         );
+        let colors = cx.theme().colors;
 
         let row = div()
             .id("connection-footer")
@@ -64,21 +66,21 @@ impl Render for ConnectionFooterView {
             .h(theme::STATUS_BAR_HEIGHT)
             .px_3()
             .border_t_1()
-            .border_color(rgb(colors::LINE))
+            .border_color(rgb(colors.border))
             .cursor_pointer()
-            .hover(|el| el.bg(rgb(colors::RAISE)))
+            .hover(|el| el.bg(rgb(colors.bg_raised)))
             .font_family("monospace")
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
             .on_click(cx.listener(Self::open_modal));
 
         match display {
             FooterDisplay::Connected { name, host } => row
-                .child(grid::status_dot(colors::TEAL))
+                .child(grid::status_dot(colors.accent))
                 .child(
                     div()
                         .flex_shrink_0()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(colors::TEXT))
+                        .text_color(rgb(colors.text_primary))
                         .child(name),
                 )
                 .child(
@@ -86,21 +88,21 @@ impl Render for ConnectionFooterView {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_color(rgb(colors::FAINT))
+                        .text_color(rgb(colors.text_tertiary))
                         .child(host),
                 ),
             FooterDisplay::Disconnected => row
-                .child(grid::status_dot_outline(colors::FAINT))
+                .child(grid::status_dot_outline(colors.text_tertiary))
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_color(rgb(colors::MUTED))
+                        .text_color(rgb(colors.text_secondary))
                         .child("Not connected"),
                 )
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_color(rgb(colors::TEAL))
+                        .text_color(rgb(colors.accent))
                         .child(". click to connect"),
                 ),
         }

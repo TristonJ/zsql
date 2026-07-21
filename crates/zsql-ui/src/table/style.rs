@@ -3,7 +3,8 @@
 
 use gpui::{Pixels, px};
 
-use crate::{colors, grid};
+use crate::grid;
+use crate::theme::Theme;
 
 /// Height of a table's header row.
 pub const DEFAULT_HEADER_HEIGHT: Pixels = px(28.0);
@@ -56,19 +57,32 @@ pub struct TableStyle {
     /// Color of every other structural hairline: body row separators,
     /// column separators, and the gutter/data-pane divider.
     pub row_border: u32,
+    /// Text color of a [`super::Gutter::RowNumbers`] pane's numbers.
+    pub row_number_color: u32,
 }
 
 impl Default for TableStyle {
+    /// The default theme's chrome -- a caller that needs the live theme's
+    /// colors instead should build via [`TableStyle::themed`].
     fn default() -> Self {
+        Self::themed(&Theme::default())
+    }
+}
+
+impl TableStyle {
+    /// This table's chrome, painted with `theme`'s colors.
+    #[must_use]
+    pub fn themed(theme: &Theme) -> Self {
         Self {
             cell_padding_x: px(grid::CELL_PADDING_X),
             header_height: DEFAULT_HEADER_HEIGHT,
             row_height: DEFAULT_ROW_HEIGHT,
             borders: TableBorders::default(),
-            header_bg: colors::RAISE,
-            gutter_bg: colors::PANEL,
-            header_border: colors::LINE,
-            row_border: colors::LINE_SOFT,
+            header_bg: theme.colors.bg_raised,
+            gutter_bg: theme.colors.bg_panel,
+            header_border: theme.colors.border,
+            row_border: theme.colors.border_soft,
+            row_number_color: theme.colors.text_tertiary,
         }
     }
 }
@@ -78,20 +92,23 @@ mod tests {
     use gpui::px;
 
     use super::{DEFAULT_HEADER_HEIGHT, DEFAULT_ROW_HEIGHT, TableBorders, TableStyle};
-    use crate::{colors, grid};
+    use crate::grid;
+    use crate::theme::Theme;
 
     #[test]
     fn default_style_uses_the_shared_grid_dimensions_and_colors() {
+        let theme = Theme::default();
         let style = TableStyle::default();
         assert_eq!(style.header_height, DEFAULT_HEADER_HEIGHT);
         assert_eq!(style.header_height, px(28.0));
         assert_eq!(style.row_height, DEFAULT_ROW_HEIGHT);
         assert_eq!(style.row_height, px(24.0));
         assert_eq!(style.cell_padding_x, px(grid::CELL_PADDING_X));
-        assert_eq!(style.header_bg, colors::RAISE);
-        assert_eq!(style.gutter_bg, colors::PANEL);
-        assert_eq!(style.header_border, colors::LINE);
-        assert_eq!(style.row_border, colors::LINE_SOFT);
+        assert_eq!(style.header_bg, theme.colors.bg_raised);
+        assert_eq!(style.gutter_bg, theme.colors.bg_panel);
+        assert_eq!(style.header_border, theme.colors.border);
+        assert_eq!(style.row_border, theme.colors.border_soft);
+        assert_eq!(style.row_number_color, theme.colors.text_tertiary);
         assert_eq!(style.borders, TableBorders::default());
     }
 

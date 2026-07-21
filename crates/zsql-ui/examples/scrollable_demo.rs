@@ -11,10 +11,10 @@ use gpui::{
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, rgba,
     size, uniform_list,
 };
-use zsql_ui::colors;
 use zsql_ui::scrollable::{
     Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars, restrict_wheel_to_own_axis,
 };
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 const WINDOW_WIDTH: f32 = 900.0;
 const WINDOW_HEIGHT: f32 = 420.0;
@@ -125,6 +125,7 @@ impl Pane {
     }
 
     fn render(&self, cx: &mut Context<DemoRoot>) -> gpui::AnyElement {
+        let theme = cx.theme();
         let row_count = self.row_count();
         let content_width = self.content_width();
         let horizontal_enabled = self.horizontal_enabled;
@@ -145,9 +146,9 @@ impl Pane {
                                 .flex()
                                 .items_center()
                                 .border_b_1()
-                                .border_color(rgb(colors::LINE_SOFT))
+                                .border_color(rgb(theme.colors.border_soft))
                                 .text_size(px(ROW_TEXT_SIZE))
-                                .text_color(rgb(colors::TEXT))
+                                .text_color(rgb(theme.colors.text_primary))
                                 .child(format!("row {ix}"))
                                 .into_any_element()
                         })
@@ -201,7 +202,7 @@ impl Pane {
             .child(
                 div()
                     .text_size(px(LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(theme.colors.text_tertiary))
                     .child(self.title),
             )
             .child(
@@ -209,8 +210,8 @@ impl Pane {
                     .w(px(PANE_WIDTH))
                     .h(px(PANE_HEIGHT))
                     .border_1()
-                    .border_color(rgb(colors::LINE))
-                    .bg(rgb(colors::PANEL))
+                    .border_color(rgb(theme.colors.border))
+                    .bg(rgb(theme.colors.bg_panel))
                     .child(viewport),
             )
             .into_any_element()
@@ -235,6 +236,7 @@ impl DemoRoot {
     fn button(
         label: &'static str,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        theme: &Theme,
     ) -> impl IntoElement {
         div()
             .id(label)
@@ -242,10 +244,10 @@ impl DemoRoot {
             .py_1()
             .rounded(px(BUTTON_RADIUS))
             .border_1()
-            .border_color(rgb(colors::LINE))
-            .bg(rgb(colors::RAISE))
+            .border_color(rgb(theme.colors.border))
+            .bg(rgb(theme.colors.bg_raised))
             .text_size(px(BUTTON_TEXT_SIZE))
-            .text_color(rgb(colors::TEXT))
+            .text_color(rgb(theme.colors.text_primary))
             .cursor_pointer()
             .hover(|el| el.bg(rgba(BUTTON_HOVER)))
             .child(label)
@@ -253,6 +255,7 @@ impl DemoRoot {
     }
 
     fn pane_column(&mut self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         let pane = match index {
             0 => &self.vertical_only,
             1 => &self.horizontal_only,
@@ -282,8 +285,8 @@ impl DemoRoot {
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(Self::button(toggle_label, toggle_click))
-                .child(Self::button("Remount", remount_click)),
+                .child(Self::button(toggle_label, toggle_click, &theme))
+                .child(Self::button("Remount", remount_click, &theme)),
         )
     }
 
@@ -298,17 +301,18 @@ impl DemoRoot {
 
 impl Render for DemoRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         div()
             .flex()
             .flex_col()
             .gap(px(PANE_GAP))
             .size_full()
             .p(px(PAGE_PADDING))
-            .bg(rgb(colors::INK))
+            .bg(rgb(theme.colors.bg_app))
             .child(
                 div()
                     .text_size(px(LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(theme.colors.text_tertiary))
                     .child(
                         "Each pane's scrollbar appears once its content overflows; toggle \
                          content size or remount a pane to exercise the first-frame path.",

@@ -1,27 +1,38 @@
 //! App-specific spacing/size tokens for the workspace's panes, matching the
-//! locked visual spec. Centralized here so no view hardcodes a raw pixel
+//! locked visual spec, plus this app's own derivations from the shared
+//! [`zsql_ui::theme::Theme`] for washes/borders that used to be baked ARGB
+//! constants. Centralized here so no view hardcodes a raw pixel or color
 //! literal inline. The base color palette and small reusable grid/tree/
 //! scrollbar builders live in the `zsql-ui` crate instead -- see
-//! `zsql_ui::colors`, `zsql_ui::grid`, `zsql_ui::tree`, and
+//! `zsql_ui::theme`, `zsql_ui::grid`, `zsql_ui::tree`, and
 //! `zsql_ui::scrollbar`.
 
 use gpui::{Pixels, px};
-use zsql_ui::colors;
+use zsql_ui::theme::{Colors, Theme};
 
-/// Status-bar "connecting" indicator: a connection attempt is in flight.
-pub const STATUS_CONNECTING: u32 = 0xd9_a2_5a;
-/// Status-bar "error" indicator: connecting or the last query failed.
-pub const STATUS_ERROR: u32 = 0xe2_6d_78;
 /// Status-bar "disconnected" indicator: the liveliness probe reports the
-/// connection unreachable. Deliberately its own constant (even though it
-/// currently shares `STATUS_ERROR`'s hue) so the two can diverge without
-/// hunting down every call site.
-pub const STATUS_DISCONNECTED: u32 = 0xe2_6d_78;
-/// Status-bar "limited" indicator: the last query was cancelled after its
-/// result reached the configured row limit. Its own amber, distinct from
-/// `STATUS_CONNECTING`'s, so a truncated result cannot be mistaken for a
-/// connection attempt in flight.
-pub const STATUS_LIMITED: u32 = 0xe8_a1_3a;
+/// connection unreachable. Deliberately its own function (even though it
+/// currently shares [`Colors::status_error`]'s hue) so the two can diverge
+/// without hunting down every call site.
+#[must_use]
+pub fn status_disconnected(theme: &Theme) -> u32 {
+    theme.colors.status_error
+}
+
+/// Run button background when hovered: a lighter teal than the resting
+/// accent, additively lightened rather than mixed toward another role so it
+/// stays recognizably the accent's own hue.
+#[must_use]
+pub fn run_button_hover_bg(theme: &Theme) -> u32 {
+    Colors::lighten(theme.colors.accent, 19, 13, 14)
+}
+
+/// Run button shortcut-hint color: the page background at reduced opacity,
+/// so it reads as secondary against the accent fill.
+#[must_use]
+pub fn run_button_hint(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.bg_app, 0xb3)
+}
 
 /// Height of the workspace header above the active tab's content, holding
 /// the pane label and the Run button.
@@ -42,11 +53,6 @@ pub const RUN_BUTTON_TEXT_SIZE: f32 = 11.5;
 pub const RUN_BUTTON_ICON_SIZE: Pixels = px(12.0);
 /// Text size of the Run button's keyboard-shortcut hint.
 pub const RUN_BUTTON_HINT_TEXT_SIZE: f32 = 10.0;
-/// Run button background when hovered: a lighter teal than the resting accent.
-pub const RUN_BUTTON_HOVER_BG: u32 = 0x46_cf_ba;
-/// Run button shortcut-hint color: the page ink at reduced opacity, so it
-/// reads as secondary against the teal fill.
-pub const RUN_BUTTON_HINT: u32 = 0x10_12_17_b3;
 
 /// Height of the results header bar (row count + source label).
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
@@ -87,20 +93,18 @@ pub const SIDEBAR_RELATION_ICON_SIZE: Pixels = px(12.0);
 pub const SIDEBAR_SCROLLBAR_WIDTH: Pixels = px(8.0);
 /// Corner radius of the sidebar scrollbar thumb.
 pub const SIDEBAR_SCROLLBAR_RADIUS: f32 = 4.0;
-/// Resting fill of the sidebar scrollbar thumb: faint text color at ~40%
-/// alpha.
-pub const SIDEBAR_SCROLLBAR_THUMB: u32 = 0x59_60_6f_66;
-/// Hovered fill of the sidebar scrollbar thumb.
-pub const SIDEBAR_SCROLLBAR_THUMB_HOVER: u32 = 0x59_60_6f_99;
 /// Distance between the sidebar scrollbar track and the tree's right edge.
 pub const SIDEBAR_SCROLLBAR_GAP: Pixels = px(4.0);
 
 /// Text size of the "SCHEMA" header label.
 pub const SIDEBAR_HEADER_TEXT_SIZE: f32 = 10.5;
 
-/// Background tint for the selected relation row: teal at low opacity
-/// (`0x33c2ac` at ~10% alpha), matching the results grid's teal accent.
-pub const SIDEBAR_SELECTED_BG: u32 = 0x33_c2_ac_1a;
+/// Background tint for the selected relation row: the accent color at low
+/// opacity.
+#[must_use]
+pub fn sidebar_selected_bg(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.accent, 0x1a)
+}
 
 /// Text size of the "Results" label and row count in the results header bar.
 pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
@@ -112,13 +116,23 @@ pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
 /// Height of a `Generated` tab's compact SQL strip, tall enough for one line
 /// of monospace text plus the editor's own vertical padding.
 pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
-/// Background tint of a `Generated` tab's compact strip: teal at very low
-/// opacity (`0x33c2ac` at ~4.5% alpha).
-pub const GENERATED_STRIP_BG: u32 = 0x33_c2_ac_0b;
-/// Left accent border color of a `Generated` tab's compact strip: the
-/// mockup's `genstrip` left accent, `zsql_ui::colors::TEAL_DIM` (the tab
-/// bar's dashed active underline is the brighter `colors::TEAL` instead).
-pub const GENERATED_STRIP_ACCENT: u32 = colors::TEAL_DIM;
+
+/// Background tint of a `Generated` tab's compact strip: the accent color
+/// at very low opacity.
+#[must_use]
+pub fn generated_strip_bg(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.accent, 0x0b)
+}
+
+/// Left accent border color of a `Generated` tab's compact strip: a dimmer
+/// teal than the tab bar's own dashed active underline, which stays the
+/// full accent. Reuses the raw-bytes value role rather than a fresh field,
+/// since the two happen to share this dimmer-teal hue.
+#[must_use]
+pub fn generated_strip_accent(theme: &Theme) -> u32 {
+    theme.colors.value_bytes
+}
+
 /// Horizontal padding around the generated strip's trailing "generated" tag
 /// and hint text.
 pub const GENERATED_STRIP_TRAILING_PADDING_X: f32 = 14.0;
@@ -136,16 +150,15 @@ pub const MODAL_WIDTH: Pixels = px(468.0);
 pub const MODAL_RADIUS: f32 = 10.0;
 /// Height of the modal's title bar.
 pub const MODAL_HEAD_HEIGHT: Pixels = px(44.0);
-/// Dimmed backdrop behind the modal: near-black at ~62% alpha
-/// (`rgba(8,9,12,.62)`).
-pub const MODAL_BACKDROP: u32 = 0x08_09_0c_9e;
 /// Tallest the modal's connection list is allowed to grow before it scrolls.
 pub const MODAL_LIST_MAX_HEIGHT: Pixels = px(300.0);
 /// Corner radius of a connection-list row.
 pub const MODAL_ROW_RADIUS: f32 = 7.0;
-/// Background tint marking the currently-connected row in the modal list:
-/// teal at low opacity (`0x33c2ac` at ~9% alpha).
-pub const MODAL_ROW_ACTIVE_BG: u32 = 0x33_c2_ac_17;
+/// Background tint marking the currently-connected row in the modal list.
+#[must_use]
+pub fn modal_row_active_bg(theme: &Theme) -> u32 {
+    theme.colors.accent_wash_soft()
+}
 /// Text size of a connection-list row's name.
 pub const MODAL_ROW_NAME_TEXT_SIZE: f32 = 12.5;
 /// Text size of a connection-list row's url.
@@ -198,8 +211,6 @@ pub const SCHEMA_HEAD_PADDING_BOTTOM: Pixels = px(12.0);
 pub const SCHEMA_TITLE_TEXT_SIZE: f32 = 15.0;
 /// Text size of the schema tab's kind pill (e.g. "TABLE").
 pub const SCHEMA_KIND_PILL_TEXT_SIZE: f32 = 9.5;
-/// Border color of the schema tab's kind pill: teal at ~30% alpha.
-pub const SCHEMA_KIND_PILL_BORDER: u32 = 0x33_c2_ac_4d;
 /// Corner radius of the schema tab's kind pill.
 pub const SCHEMA_KIND_PILL_RADIUS: f32 = 4.0;
 /// Horizontal padding inside the schema tab's kind pill.
@@ -231,15 +242,14 @@ pub const SCHEMA_BADGE_TEXT_SIZE: f32 = 9.5;
 pub const SCHEMA_BADGE_PADDING_X: Pixels = px(6.0);
 /// Corner radius of a Keys-cell badge or link chip.
 pub const SCHEMA_BADGE_RADIUS: f32 = 4.0;
-/// Border color of the primary-key badge: teal at ~32% alpha.
-pub const SCHEMA_BADGE_PK_BORDER: u32 = 0x33_c2_ac_52;
-/// Border color of the unique badge: amber at ~32% alpha.
-pub const SCHEMA_BADGE_UNIQUE_BORDER: u32 = 0xd9_a2_5a_52;
-/// Border/background color of the foreign-key link chip: link hue at low
-/// alpha.
-pub const SCHEMA_BADGE_LINK_BORDER: u32 = 0x7f_9c_ff_4d;
-/// Background fill of the foreign-key link chip: link hue at very low alpha.
-pub const SCHEMA_BADGE_LINK_BG: u32 = 0x7f_9c_ff_12;
+
+/// Border color of the primary-key badge: the accent at a badge-strength
+/// alpha distinct from [`zsql_ui::theme::Colors::accent_outline`]'s.
+#[must_use]
+pub fn schema_badge_pk_border(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.accent, 0x52)
+}
+
 /// Text size of the foreign-key link chip, slightly larger than a plain
 /// [`SCHEMA_BADGE_TEXT_SIZE`] badge so its arrow and target read clearly.
 pub const SCHEMA_FK_CHIP_TEXT_SIZE: f32 = 11.0;
@@ -276,3 +286,38 @@ pub const SCHEMA_INDEXES_WIDTHS: [Pixels; 4] = [px(220.0), px(100.0), px(80.0), 
 /// Fixed pixel widths of the Constraints table's cells, in display order
 /// (Name, Type, Definition).
 pub const SCHEMA_CONSTRAINTS_WIDTHS: [Pixels; 3] = [px(260.0), px(140.0), px(360.0)];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        generated_strip_accent, generated_strip_bg, modal_row_active_bg, run_button_hint,
+        run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, status_disconnected,
+    };
+    use zsql_ui::theme::Theme;
+
+    /// Every app-level derivation in this module must reproduce the exact
+    /// ARGB value of the baked constant it replaced, the same way the
+    /// underlying `Colors` methods it is built from are pinned in
+    /// `zsql-ui`'s own theme tests.
+    #[test]
+    fn app_level_derivations_reproduce_their_pre_refactor_baked_constants() {
+        let theme = Theme::default();
+
+        // was theme::STATUS_DISCONNECTED.
+        assert_eq!(status_disconnected(&theme), 0xe2_6d_78);
+        // was theme::SIDEBAR_SELECTED_BG.
+        assert_eq!(sidebar_selected_bg(&theme), 0x33_c2_ac_1a);
+        // was theme::GENERATED_STRIP_BG.
+        assert_eq!(generated_strip_bg(&theme), 0x33_c2_ac_0b);
+        // was theme::GENERATED_STRIP_ACCENT (colors::TEAL_DIM).
+        assert_eq!(generated_strip_accent(&theme), 0x2b_85_79);
+        // was theme::SCHEMA_BADGE_PK_BORDER.
+        assert_eq!(schema_badge_pk_border(&theme), 0x33_c2_ac_52);
+        // was theme::RUN_BUTTON_HOVER_BG.
+        assert_eq!(run_button_hover_bg(&theme), 0x46_cf_ba);
+        // was theme::RUN_BUTTON_HINT.
+        assert_eq!(run_button_hint(&theme), 0x10_12_17_b3);
+        // was theme::MODAL_ROW_ACTIVE_BG.
+        assert_eq!(modal_row_active_bg(&theme), 0x33_c2_ac_17);
+    }
+}

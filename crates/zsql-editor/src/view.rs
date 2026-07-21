@@ -15,7 +15,7 @@ use gpui::{
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
     relative, rgb, rgba, size,
 };
-use zsql_ui::colors;
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 use crate::theme;
 use crate::{Highlighter, Position, Selection, SqlHighlighter, TextBuffer};
@@ -497,7 +497,12 @@ impl EditorView {
 
     /// The line-number gutter, one row per buffer line, matching the
     /// content element's row spacing so the two stay aligned.
-    fn render_gutter(line_count: usize, cursor_line: usize) -> gpui::Stateful<Div> {
+    fn render_gutter(
+        line_count: usize,
+        cursor_line: usize,
+        active_theme: &Theme,
+    ) -> gpui::Stateful<Div> {
+        let colors = &active_theme.colors;
         let mut gutter = div()
             .id("sql-editor-gutter")
             .flex()
@@ -506,8 +511,8 @@ impl EditorView {
             .w(theme::EDITOR_GUTTER_WIDTH)
             .py(px(theme::EDITOR_PADDING_Y))
             .border_r_1()
-            .border_color(rgb(colors::LINE_SOFT))
-            .bg(rgb(colors::INK));
+            .border_color(rgb(colors.border_soft))
+            .bg(rgb(colors.bg_app));
 
         for line_index in 0..line_count {
             let is_current = line_index == cursor_line;
@@ -519,9 +524,9 @@ impl EditorView {
                     .h(px(theme::EDITOR_LINE_HEIGHT))
                     .px(px(theme::EDITOR_GUTTER_PADDING_X))
                     .text_color(rgb(if is_current {
-                        colors::MUTED
+                        colors.text_secondary
                     } else {
-                        colors::FAINT
+                        colors.text_tertiary
                     }))
                     .child((line_index + 1).to_string()),
             );
@@ -541,6 +546,7 @@ impl Render for EditorView {
         let line_count = self.buffer.lines().len();
         let cursor_line = self.buffer.cursor().line;
         let compact = self.compact;
+        let active_theme = cx.theme();
 
         div()
             .id("sql-editor")
@@ -554,7 +560,7 @@ impl Render for EditorView {
             // `workspace.rs`), and `h_full()` fills exactly that rather than
             // this view hardcoding its own fixed size.
             .h_full()
-            .bg(rgb(colors::INK))
+            .bg(rgb(active_theme.colors.bg_app))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
@@ -590,7 +596,7 @@ impl Render for EditorView {
                     .track_scroll(&self.scroll_handle)
                     .font_family("monospace")
                     .text_size(px(theme::EDITOR_TEXT_SIZE))
-                    .text_color(rgb(colors::TEXT))
+                    .text_color(rgb(active_theme.colors.text_primary))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -608,7 +614,11 @@ impl Render for EditorView {
                             .flex_none()
                             .h(editor_content_height(line_count))
                             .when(!compact, |el| {
-                                el.child(Self::render_gutter(line_count, cursor_line))
+                                el.child(Self::render_gutter(
+                                    line_count,
+                                    cursor_line,
+                                    &active_theme,
+                                ))
                             })
                             .child(
                                 div()
@@ -866,6 +876,7 @@ impl Element for EditorContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let active_theme = cx.theme();
         let editor = self.editor.read(cx);
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -882,7 +893,7 @@ impl Element for EditorContentElement {
             .iter()
             .enumerate()
             .map(|(line_index, raw_line)| {
-                let runs = build_runs(editor, line_index, raw_line, &font, color);
+                let runs = build_runs(editor, line_index, raw_line, &font, color, &active_theme);
                 window.text_system().shape_line(
                     SharedString::from(raw_line.clone()),
                     font_size,
@@ -904,13 +915,13 @@ impl Element for EditorContentElement {
                         point(bounds.left() + x, top),
                         size(theme::EDITOR_CURSOR_WIDTH, line_height),
                     ),
-                    rgb(colors::TEAL),
+                    rgb(active_theme.colors.accent),
                 ))
             })
             .flatten();
 
         let selection_quads = selection.map_or_else(Vec::new, |selection| {
-            selection_highlight_quads(selection, &lines, &editor.buffer, bounds)
+            selection_highlight_quads(selection, &lines, &editor.buffer, bounds, &active_theme)
         });
 
         EditorPrepaintState {
@@ -997,6 +1008,7 @@ fn selection_highlight_quads(
     lines: &[ShapedLine],
     buffer: &TextBuffer,
     bounds: Bounds<Pixels>,
+    active_theme: &Theme,
 ) -> Vec<PaintQuad> {
     let (start, end) = selection.ordered();
     let line_height = px(theme::EDITOR_LINE_HEIGHT);
@@ -1020,7 +1032,7 @@ fn selection_highlight_quads(
                     point(bounds.left() + start_x, top),
                     point(bounds.left() + end_x, top + line_height),
                 ),
-                rgba(theme::EDITOR_SELECTION_BG),
+                rgba(theme::selection_bg(active_theme)),
             ))
         })
         .collect()
@@ -1056,6 +1068,7 @@ fn build_runs(
     raw_line: &str,
     font: &Font,
     color: Hsla,
+    active_theme: &Theme,
 ) -> Vec<TextRun> {
     let line_char_len = raw_line.chars().count();
     let spans = editor.highlighter.spans_for_line(line_index);
@@ -1094,7 +1107,7 @@ fn build_runs(
             .iter()
             .find(|span| span.start <= start && end <= span.end)
             .map_or(color, |span| {
-                Hsla::from(rgb(theme::syntax_color(span.kind)))
+                Hsla::from(rgb(theme::syntax_color(active_theme, span.kind)))
             });
         let underlined = marked_range
             .as_ref()
@@ -1237,6 +1250,7 @@ mod tests {
     };
     use crate::HighlightKind;
     use crate::theme::syntax_color;
+    use zsql_ui::theme::ActiveTheme;
 
     /// A `QueryRunner` double that records every SQL string it was asked to
     /// run instead of running anything, in place of a real session/database.
@@ -1973,11 +1987,13 @@ mod tests {
             (style.font(), style.color)
         });
 
-        harness.editor.update(vcx, |view, _cx| {
-            let runs = build_runs(view, 0, "SELECT 1", &font, base_color);
+        harness.editor.update(vcx, |view, cx| {
+            let active_theme = cx.theme();
+            let runs = build_runs(view, 0, "SELECT 1", &font, base_color, &active_theme);
 
-            let keyword_color = Hsla::from(rgb(syntax_color(HighlightKind::Keyword)));
-            let number_color = Hsla::from(rgb(syntax_color(HighlightKind::Number)));
+            let keyword_color =
+                Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Keyword)));
+            let number_color = Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Number)));
             let underline = UnderlineStyle {
                 color: Some(base_color),
                 thickness: gpui::px(1.0),
@@ -2020,8 +2036,9 @@ mod tests {
             (style.font(), style.color)
         });
 
-        harness.editor.update(vcx, |view, _cx| {
-            let runs = build_runs(view, 0, "", &font, base_color);
+        harness.editor.update(vcx, |view, cx| {
+            let active_theme = cx.theme();
+            let runs = build_runs(view, 0, "", &font, base_color, &active_theme);
             assert_eq!(
                 runs.first().map(|run| run.color),
                 Some(base_color),
@@ -2036,9 +2053,11 @@ mod tests {
             view.insert_text_for_test("SELECT", cx);
         });
 
-        harness.editor.update(vcx, |view, _cx| {
-            let runs = build_runs(view, 0, "SELECT", &font, base_color);
-            let keyword_color = Hsla::from(rgb(syntax_color(HighlightKind::Keyword)));
+        harness.editor.update(vcx, |view, cx| {
+            let active_theme = cx.theme();
+            let runs = build_runs(view, 0, "SELECT", &font, base_color, &active_theme);
+            let keyword_color =
+                Hsla::from(rgb(syntax_color(&active_theme, HighlightKind::Keyword)));
             assert_eq!(
                 runs.first().map(|run| run.color),
                 Some(keyword_color),

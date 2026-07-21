@@ -13,10 +13,10 @@ use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement,
     KeyDownEvent, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
-use zsql_ui::colors;
 use zsql_ui::table::{
     Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, TableStyle,
 };
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 const WINDOW_WIDTH: f32 = 900.0;
 const WINDOW_HEIGHT: f32 = 560.0;
@@ -114,8 +114,8 @@ impl DemoRoot {
         }
     }
 
-    fn style(&self) -> TableStyle {
-        let mut style = TableStyle::default();
+    fn style(&self, theme: &Theme) -> TableStyle {
+        let mut style = TableStyle::themed(theme);
         style.borders.row = self.borders_on;
         style.borders.column = self.borders_on;
         style.borders.outer = self.borders_on;
@@ -123,13 +123,13 @@ impl DemoRoot {
         style
     }
 
-    fn columns(&self) -> Vec<TableColumn> {
+    fn columns(&self, theme: &Theme) -> Vec<TableColumn> {
         (0..self.column_count)
             .map(|ix| {
                 TableColumn::new(
                     px(COLUMN_WIDTH),
                     div()
-                        .text_color(rgb(colors::TEXT))
+                        .text_color(rgb(theme.colors.text_primary))
                         .child(format!("column_{ix}")),
                 )
             })
@@ -158,13 +158,13 @@ impl DemoRoot {
         cx.notify();
     }
 
-    fn hint_bar(&self) -> impl IntoElement {
+    fn hint_bar(&self, theme: &Theme) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_1()
             .text_size(px(HINT_TEXT_SIZE))
-            .text_color(rgb(colors::FAINT))
+            .text_color(rgb(theme.colors.text_tertiary))
             .child(format!(
                 "rows: {}  columns: {}  borders: {}  padding: {}  gutter: {}",
                 self.row_count,
@@ -185,13 +185,14 @@ impl Focusable for DemoRoot {
 
 impl Render for DemoRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         let row_count = self.row_count;
         let column_count = self.column_count;
         let gutter = self.gutter;
 
         let table = Table::new("table-demo", &self.table_state)
-            .style(self.style())
-            .columns(self.columns())
+            .style(self.style(&theme))
+            .columns(self.columns(&theme))
             .row_count(row_count)
             .gutter(match gutter {
                 GutterPreset::None => Gutter::None,
@@ -199,9 +200,9 @@ impl Render for DemoRoot {
                 GutterPreset::Custom => Gutter::Custom {
                     width: px(60.0),
                     header: div().child("KIND").into_any_element(),
-                    render: Box::new(|_this: &mut Self, range, _window, _cx| {
+                    render: Box::new(move |_this: &mut Self, range, _window, _cx| {
                         range
-                            .map(|ix| row_kind_tag(ix).into_any_element())
+                            .map(|ix| row_kind_tag(ix, &theme).into_any_element())
                             .collect::<Vec<AnyElement>>()
                     }),
                 },
@@ -212,7 +213,7 @@ impl Render for DemoRoot {
                         let cells = (0..column_count)
                             .map(|col| {
                                 div()
-                                    .text_color(rgb(colors::TEXT))
+                                    .text_color(rgb(theme.colors.text_primary))
                                     .child(format!("r{ix}c{col}"))
                                     .into_any_element()
                             })
@@ -233,8 +234,8 @@ impl Render for DemoRoot {
             .gap_2()
             .size_full()
             .p(px(PAGE_PADDING))
-            .bg(rgb(colors::INK))
-            .child(self.hint_bar())
+            .bg(rgb(theme.colors.bg_app))
+            .child(self.hint_bar(&theme))
             .child(
                 div()
                     .flex()
@@ -242,7 +243,7 @@ impl Render for DemoRoot {
                     .flex_1()
                     .min_h_0()
                     .border_1()
-                    .border_color(rgb(colors::LINE))
+                    .border_color(rgb(theme.colors.border))
                     .child(table),
             )
     }
@@ -251,10 +252,10 @@ impl Render for DemoRoot {
 /// A short two-letter tag standing in for arbitrary caller-rendered gutter
 /// content, cycling through a few kinds so a custom gutter reads as
 /// genuinely per-row rather than a fixed label.
-fn row_kind_tag(ix: usize) -> gpui::Div {
+fn row_kind_tag(ix: usize, theme: &Theme) -> gpui::Div {
     const KINDS: [&str; 3] = ["TB", "VW", "MV"];
     div()
-        .text_color(rgb(colors::TEAL))
+        .text_color(rgb(theme.colors.accent))
         .child(KINDS[ix % KINDS.len()])
 }
 

@@ -6,8 +6,8 @@ use gpui::{
     App, Application, Bounds, Context, Entity, Focusable, Render, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
-use zsql_ui::colors;
 use zsql_ui::text_field::{TextFieldState, init};
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 const WINDOW_WIDTH: f32 = 420.0;
 const WINDOW_HEIGHT: f32 = 340.0;
@@ -36,7 +36,11 @@ impl DemoRoot {
         }
     }
 
-    fn labeled_field(label: &'static str, field: Entity<TextFieldState>) -> impl IntoElement {
+    fn labeled_field(
+        label: &'static str,
+        field: Entity<TextFieldState>,
+        theme: &Theme,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -44,7 +48,7 @@ impl DemoRoot {
             .child(
                 div()
                     .text_size(px(LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(theme.colors.text_tertiary))
                     .child(label),
             )
             .child(field)
@@ -52,17 +56,18 @@ impl DemoRoot {
 }
 
 impl Render for DemoRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         div()
             .flex()
             .flex_col()
             .gap(px(FIELD_GAP))
             .size_full()
             .p(px(PAGE_PADDING))
-            .bg(rgb(colors::PANEL))
-            .child(Self::labeled_field("Name", self.name.clone()))
-            .child(Self::labeled_field("URL", self.url.clone()))
-            .child(Self::labeled_field("Notes", self.notes.clone()))
+            .bg(rgb(theme.colors.bg_panel))
+            .child(Self::labeled_field("Name", self.name.clone(), &theme))
+            .child(Self::labeled_field("URL", self.url.clone(), &theme))
+            .child(Self::labeled_field("Notes", self.notes.clone(), &theme))
     }
 }
 

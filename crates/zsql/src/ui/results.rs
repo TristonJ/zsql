@@ -8,9 +8,9 @@ use gpui::{
     px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
-use zsql_ui::colors;
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
@@ -165,7 +165,7 @@ impl ResultsView {
         }
         self.folded_row_count = result.rows.len();
 
-        let table_style = Self::table_style();
+        let table_style = Self::table_style(&cx.theme());
         self.column_widths = result
             .columns
             .iter()
@@ -185,6 +185,7 @@ impl ResultsView {
 
     /// The results header bar: row count + source/relation label.
     fn render_bar(&self, cx: &Context<Self>) -> Div {
+        let colors = cx.theme().colors;
         let count_text = match self.effective_state(cx) {
             SessionState::Results(_) | SessionState::Running | SessionState::Limited { .. } => {
                 self.effective_result(cx).rows.len().to_string()
@@ -203,9 +204,9 @@ impl ResultsView {
             .gap_3()
             .h(theme::RESULTS_BAR_HEIGHT)
             .px_3()
-            .bg(rgb(colors::PANEL))
+            .bg(rgb(colors.bg_panel))
             .border_b_1()
-            .border_color(rgb(colors::LINE_SOFT))
+            .border_color(rgb(colors.border_soft))
             .child(
                 div()
                     .flex()
@@ -216,13 +217,13 @@ impl ResultsView {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(colors::TEXT))
+                            .text_color(rgb(colors.text_primary))
                             .child("Results"),
                     )
                     .child(
                         div()
                             .font_family("monospace")
-                            .text_color(rgb(colors::TEAL))
+                            .text_color(rgb(colors.accent))
                             .child(count_text),
                     ),
             )
@@ -230,7 +231,7 @@ impl ResultsView {
                 div()
                     .font_family("monospace")
                     .text_size(px(theme::RESULTS_META_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(colors.text_tertiary))
                     .child(self.source_label.clone()),
             )
     }
@@ -238,6 +239,7 @@ impl ResultsView {
     /// The main content area: the virtualized grid when results are
     /// available, or a centered prompt/status message otherwise
     fn render_body(&mut self, cx: &mut Context<Self>) -> Div {
+        let active_theme = cx.theme();
         let state = self.effective_state(cx).clone();
         let has_columns = !self.effective_result(cx).columns.is_empty();
 
@@ -250,34 +252,46 @@ impl ResultsView {
             // grid immediately rather than waiting for `Done`
             SessionState::Running if has_columns => self.render_grid(cx),
             SessionState::Empty => Self::render_placeholder(
-                colors::FAINT,
+                active_theme.colors.text_tertiary,
                 "No connection configured",
                 "Set DATABASE_URL or connection.default_url in your zsql config, then restart.",
+                &active_theme,
             ),
             SessionState::Connecting => Self::render_placeholder(
-                colors::FAINT,
+                active_theme.colors.text_tertiary,
                 "Connecting…",
                 "Establishing a connection to the configured database.",
+                &active_theme,
             ),
             SessionState::Connected => Self::render_placeholder(
-                colors::FAINT,
+                active_theme.colors.text_tertiary,
                 "Connected",
                 "Run a query to see results here.",
+                &active_theme,
             ),
             SessionState::Running => Self::render_placeholder(
-                colors::FAINT,
+                active_theme.colors.text_tertiary,
                 "Running query…",
                 "Streaming results from the database.",
+                &active_theme,
             ),
-            SessionState::Error(message) => {
-                Self::render_placeholder(theme::STATUS_ERROR, "Query failed", &message)
-            }
+            SessionState::Error(message) => Self::render_placeholder(
+                active_theme.colors.status_error,
+                "Query failed",
+                &message,
+                &active_theme,
+            ),
         }
     }
 
     /// A centered title + detail message shown in place of the grid for any
     /// non-`Results` state.
-    fn render_placeholder(title_color: u32, title: &str, detail: &str) -> Div {
+    fn render_placeholder(
+        title_color: u32,
+        title: &str,
+        detail: &str,
+        active_theme: &Theme,
+    ) -> Div {
         div()
             .flex()
             .flex_col()
@@ -296,7 +310,7 @@ impl ResultsView {
             .child(
                 div()
                     .text_size(px(theme::RESULTS_META_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(active_theme.colors.text_tertiary))
                     .child(detail.to_owned()),
             )
     }
@@ -305,10 +319,11 @@ impl ResultsView {
     /// scrolling data columns), built by composing `zsql_ui::table::Table`.
     fn render_grid(&mut self, cx: &mut Context<Self>) -> Div {
         let row_count = self.effective_result(cx).rows.len();
+        let active_theme = cx.theme();
         let columns = self.build_columns(cx);
 
         Table::new("results-grid", &self.table_state)
-            .style(Self::table_style())
+            .style(Self::table_style(&active_theme))
             .columns(columns)
             .row_count(row_count)
             .gutter(Gutter::RowNumbers(RowNumberStyle {
@@ -323,18 +338,19 @@ impl ResultsView {
     /// `column_width_from_parts`'s width estimate use, so a column's
     /// measured width can never drift from the padding it is actually
     /// rendered with.
-    fn table_style() -> zsql_ui::table::TableStyle {
-        zsql_ui::table::TableStyle::default()
+    fn table_style(active_theme: &Theme) -> zsql_ui::table::TableStyle {
+        zsql_ui::table::TableStyle::themed(active_theme)
     }
 
     /// The data pane's columns: each column's cached width plus its header
     /// content (name + type-tag badge).
     fn build_columns(&self, cx: &Context<Self>) -> Vec<TableColumn> {
+        let active_theme = cx.theme();
         let columns: &[ColumnMeta] = &self.effective_result(cx).columns;
         columns
             .iter()
             .zip(self.column_widths.iter())
-            .map(|(column, &width)| TableColumn::new(width, column_header(column)))
+            .map(|(column, &width)| TableColumn::new(width, column_header(column, &active_theme)))
             .collect()
     }
 
@@ -346,6 +362,7 @@ impl ResultsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
+        let active_theme = cx.theme();
         let rows: &[zsql_core::Row] = &self.effective_result(cx).rows;
 
         range
@@ -359,7 +376,7 @@ impl ResultsView {
                                 let formatted = format_value(value);
                                 let is_null = formatted.kind == ValueKind::Null;
                                 div()
-                                    .text_color(rgb(kind_color(formatted.kind)))
+                                    .text_color(rgb(kind_color(formatted.kind, &active_theme)))
                                     .when(is_null, gpui::prelude::Styled::italic)
                                     .child(formatted.text)
                                     .into_any_element()
@@ -375,6 +392,8 @@ impl ResultsView {
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
         let session = self.session.read(cx);
         // Liveness is the connection's real-time health, independent of
         // which tab is displayed, so it is read straight off `session`
@@ -383,7 +402,7 @@ impl ResultsView {
         // frozen to an older, still-successful snapshot.
         let liveness = session.liveness().clone();
         let state = self.effective_state(cx);
-        let (dot_color, label) = status_indicator(state, &liveness);
+        let (dot_color, label) = status_indicator(state, &liveness, &active_theme);
 
         let mut bar = div()
             .flex()
@@ -393,17 +412,17 @@ impl ResultsView {
             .gap_4()
             .h(theme::STATUS_BAR_HEIGHT)
             .px_3()
-            .bg(rgb(colors::PANEL))
+            .bg(rgb(colors.bg_panel))
             .border_t_1()
-            .border_color(rgb(colors::LINE))
+            .border_color(rgb(colors.border))
             .font_family("monospace")
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
-            .text_color(rgb(colors::MUTED))
+            .text_color(rgb(colors.text_secondary))
             .child(grid::status_dot(dot_color))
             .child(
                 div()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(colors::TEXT))
+                    .text_color(rgb(colors.text_primary))
                     .child(label),
             );
 
@@ -423,7 +442,7 @@ impl ResultsView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(rgb(theme::STATUS_ERROR))
+                    .text_color(rgb(colors.status_error))
                     .child(message.clone()),
             );
         }
@@ -453,7 +472,7 @@ impl Render for ResultsView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(colors::INK))
+            .bg(rgb(cx.theme().colors.bg_app))
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
@@ -461,7 +480,7 @@ impl Render for ResultsView {
 }
 
 /// A data column's header content: its name plus a type-name badge.
-fn column_header(column: &ColumnMeta) -> AnyElement {
+fn column_header(column: &ColumnMeta, active_theme: &Theme) -> AnyElement {
     div()
         .flex()
         .flex_row()
@@ -469,10 +488,10 @@ fn column_header(column: &ColumnMeta) -> AnyElement {
         .gap_2()
         .child(
             div()
-                .text_color(rgb(colors::TEXT))
+                .text_color(rgb(active_theme.colors.text_primary))
                 .child(column.name.clone()),
         )
-        .child(grid::type_tag(&column.type_name))
+        .child(grid::type_tag(&column.type_name, active_theme))
         .into_any_element()
 }
 
@@ -482,17 +501,22 @@ fn column_header(column: &ColumnMeta) -> AnyElement {
 /// independent of (and can contradict) whatever `state` currently holds -
 /// for instance a query can still be `Running` against a connection the
 /// probe has just found unreachable.
-fn status_indicator(state: &SessionState, liveness: &LivenessState) -> (u32, &'static str) {
+fn status_indicator(
+    state: &SessionState,
+    liveness: &LivenessState,
+    active_theme: &Theme,
+) -> (u32, &'static str) {
+    let colors = active_theme.colors;
     if matches!(liveness, LivenessState::Unreachable(_)) {
-        return (theme::STATUS_DISCONNECTED, "Disconnected");
+        return (theme::status_disconnected(active_theme), "Disconnected");
     }
     match state {
-        SessionState::Empty => (colors::FAINT, "Not connected"),
-        SessionState::Connecting => (theme::STATUS_CONNECTING, "Connecting…"),
-        SessionState::Connected | SessionState::Results(_) => (colors::TEAL, "Connected"),
-        SessionState::Running => (colors::TEAL, "Running…"),
-        SessionState::Limited { .. } => (theme::STATUS_LIMITED, "Limited"),
-        SessionState::Error(_) => (theme::STATUS_ERROR, "Error"),
+        SessionState::Empty => (colors.text_tertiary, "Not connected"),
+        SessionState::Connecting => (colors.status_warn, "Connecting…"),
+        SessionState::Connected | SessionState::Results(_) => (colors.accent, "Connected"),
+        SessionState::Running => (colors.accent, "Running…"),
+        SessionState::Limited { .. } => (colors.status_limited, "Limited"),
+        SessionState::Error(_) => (colors.status_error, "Error"),
     }
 }
 
@@ -561,16 +585,17 @@ pub(crate) fn group_thousands(n: u64) -> String {
 }
 
 /// The text color for a formatted cell's semantic kind.
-fn kind_color(kind: ValueKind) -> u32 {
+fn kind_color(kind: ValueKind, active_theme: &Theme) -> u32 {
+    let colors = active_theme.colors;
     match kind {
-        ValueKind::Null => colors::FAINT,
-        ValueKind::Bool => colors::BOOL,
-        ValueKind::Number => colors::NUMBER,
-        ValueKind::Text => colors::TEXT,
-        ValueKind::Json => colors::JSON,
-        ValueKind::Timestamp => colors::MUTED,
-        ValueKind::Bytes => colors::BYTES,
-        ValueKind::Unknown => colors::UNKNOWN,
+        ValueKind::Null => colors.value_null,
+        ValueKind::Bool => colors.value_bool,
+        ValueKind::Number => colors.value_number,
+        ValueKind::Text => colors.value_text,
+        ValueKind::Json => colors.value_json,
+        ValueKind::Timestamp => colors.value_timestamp,
+        ValueKind::Bytes => colors.value_bytes,
+        ValueKind::Unknown => colors.value_unknown,
     }
 }
 
@@ -604,13 +629,13 @@ mod tests {
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
-        ResultsView, SessionState, column_width_from_parts, format_total_row_count,
-        status_indicator, status_metrics,
+        ResultsView, SessionState, ValueKind, column_width_from_parts, format_total_row_count,
+        kind_color, status_indicator, status_metrics,
     };
 
     use crate::session::{LivenessState, Session};
     use crate::ui::theme;
-    use zsql_ui::colors;
+    use zsql_ui::theme::Theme;
 
     fn column(name: &str, type_name: &str) -> ColumnMeta {
         ColumnMeta {
@@ -622,7 +647,7 @@ mod tests {
 
     #[test]
     fn column_width_from_parts_grows_for_a_longer_type_name() {
-        let style = ResultsView::table_style();
+        let style = ResultsView::table_style(&Theme::default());
         let short_type = column("id", "int8");
         let long_type = column("id", "timestamp with time zone");
 
@@ -638,17 +663,34 @@ mod tests {
 
     #[test]
     fn column_width_from_parts_clamps_at_the_configured_minimum() {
-        let style = ResultsView::table_style();
+        let style = ResultsView::table_style(&Theme::default());
         let width = column_width_from_parts(&column("a", "b"), 0, &style);
         assert!(f32::from(width) >= theme::MIN_COLUMN_WIDTH);
     }
 
     #[test]
     fn column_width_from_parts_clamps_at_the_configured_maximum() {
-        let style = ResultsView::table_style();
+        let style = ResultsView::table_style(&Theme::default());
         let width =
             column_width_from_parts(&column(&"x".repeat(500), &"y".repeat(500)), 5_000, &style);
         assert!((f32::from(width) - theme::MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn kind_color_maps_every_value_kind_to_its_named_color_role() {
+        let theme = Theme::default();
+        let colors = theme.colors;
+        assert_eq!(kind_color(ValueKind::Null, &theme), colors.value_null);
+        assert_eq!(kind_color(ValueKind::Bool, &theme), colors.value_bool);
+        assert_eq!(kind_color(ValueKind::Number, &theme), colors.value_number);
+        assert_eq!(kind_color(ValueKind::Text, &theme), colors.value_text);
+        assert_eq!(kind_color(ValueKind::Json, &theme), colors.value_json);
+        assert_eq!(
+            kind_color(ValueKind::Timestamp, &theme),
+            colors.value_timestamp
+        );
+        assert_eq!(kind_color(ValueKind::Bytes, &theme), colors.value_bytes);
+        assert_eq!(kind_color(ValueKind::Unknown, &theme), colors.value_unknown);
     }
 
     fn sample_result() -> ResultSet {
@@ -679,35 +721,51 @@ mod tests {
 
     #[test]
     fn status_indicator_maps_each_state_to_its_dot_color_and_label() {
+        let active_theme = Theme::default();
+        let colors = active_theme.colors;
         assert_eq!(
-            status_indicator(&SessionState::Empty, &LivenessState::Unknown),
-            (colors::FAINT, "Not connected")
+            status_indicator(&SessionState::Empty, &LivenessState::Unknown, &active_theme),
+            (colors.text_tertiary, "Not connected")
         );
         assert_eq!(
-            status_indicator(&SessionState::Connecting, &LivenessState::Unknown),
-            (theme::STATUS_CONNECTING, "Connecting…")
+            status_indicator(
+                &SessionState::Connecting,
+                &LivenessState::Unknown,
+                &active_theme
+            ),
+            (colors.status_warn, "Connecting…")
         );
         assert_eq!(
-            status_indicator(&SessionState::Connected, &LivenessState::Healthy),
-            (colors::TEAL, "Connected")
+            status_indicator(
+                &SessionState::Connected,
+                &LivenessState::Healthy,
+                &active_theme
+            ),
+            (colors.accent, "Connected")
         );
         assert_eq!(
-            status_indicator(&SessionState::Running, &LivenessState::Healthy),
-            (colors::TEAL, "Running…")
+            status_indicator(
+                &SessionState::Running,
+                &LivenessState::Healthy,
+                &active_theme
+            ),
+            (colors.accent, "Running…")
         );
         assert_eq!(
             status_indicator(
                 &SessionState::Results(Duration::from_millis(1)),
-                &LivenessState::Healthy
+                &LivenessState::Healthy,
+                &active_theme
             ),
-            (colors::TEAL, "Connected")
+            (colors.accent, "Connected")
         );
         assert_eq!(
             status_indicator(
                 &SessionState::Error("boom".to_owned()),
-                &LivenessState::Unknown
+                &LivenessState::Unknown,
+                &active_theme
             ),
-            (theme::STATUS_ERROR, "Error")
+            (colors.status_error, "Error")
         );
         let limited = status_indicator(
             &SessionState::Limited {
@@ -715,16 +773,17 @@ mod tests {
                 rows: 100,
             },
             &LivenessState::Healthy,
+            &active_theme,
         );
-        assert_eq!(limited, (theme::STATUS_LIMITED, "Limited"));
+        assert_eq!(limited, (colors.status_limited, "Limited"));
         assert_ne!(
             limited,
-            (colors::TEAL, "Connected"),
+            (colors.accent, "Connected"),
             "Limited must not be indistinguishable from a normal completed result"
         );
         assert_ne!(
             limited,
-            (theme::STATUS_ERROR, "Error"),
+            (colors.status_error, "Error"),
             "Limited must not be indistinguishable from a query error"
         );
     }
@@ -732,6 +791,7 @@ mod tests {
     #[test]
     fn status_indicator_shows_disconnected_regardless_of_session_state_when_liveness_is_unreachable()
      {
+        let active_theme = Theme::default();
         let unreachable = LivenessState::Unreachable("connection reset".to_owned());
         for state in [
             SessionState::Connected,
@@ -739,8 +799,8 @@ mod tests {
             SessionState::Results(Duration::from_millis(1)),
         ] {
             assert_eq!(
-                status_indicator(&state, &unreachable),
-                (theme::STATUS_DISCONNECTED, "Disconnected"),
+                status_indicator(&state, &unreachable, &active_theme),
+                (theme::status_disconnected(&active_theme), "Disconnected"),
                 "expected a Disconnected indicator regardless of state {state:?}"
             );
         }
@@ -748,9 +808,18 @@ mod tests {
 
     #[test]
     fn status_indicator_treats_a_healthy_or_unknown_liveness_as_no_override() {
+        let active_theme = Theme::default();
         assert_eq!(
-            status_indicator(&SessionState::Connected, &LivenessState::Healthy),
-            status_indicator(&SessionState::Connected, &LivenessState::Unknown),
+            status_indicator(
+                &SessionState::Connected,
+                &LivenessState::Healthy,
+                &active_theme
+            ),
+            status_indicator(
+                &SessionState::Connected,
+                &LivenessState::Unknown,
+                &active_theme
+            ),
             "Healthy and Unknown liveness must not change a state's own indicator"
         );
     }
