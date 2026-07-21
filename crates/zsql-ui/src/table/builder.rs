@@ -4,6 +4,7 @@
 //! reimplementing it.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     App, Context, Div, ElementId, Entity, FocusHandle, MouseButton, MouseDownEvent, Pixels, Render,
@@ -27,6 +28,20 @@ use super::style::TableStyle;
 type RowRenderer<V> =
     Box<dyn Fn(&mut V, Range<usize>, &mut Window, &mut Context<V>) -> Vec<TableRow>>;
 
+/// A caller's [`Table::on_cell_double_click`] callback, given the
+/// double-clicked cell's `(row, col)`.
+type CellDoubleClickHandler<V> = Rc<dyn Fn(&mut V, usize, usize, &mut Window, &mut Context<V>)>;
+/// A caller's [`Table::on_cell_right_click`] callback, given the
+/// right-clicked cell's `(row, col)` and the triggering event.
+type CellRightClickHandler<V> =
+    Rc<dyn Fn(&mut V, usize, usize, &MouseDownEvent, &mut Window, &mut Context<V>)>;
+/// A [`CellDoubleClickHandler`]/[`CellRightClickHandler`] once wrapped (via
+/// `Context::listener`) into a plain mouse-down handler that reads its
+/// target cell off [`TableState`] rather than closing over one -- see
+/// [`Table::render`], where one instance of each is built and cloned onto
+/// every selectable cell.
+type CellClickListener = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
+
 /// A two-pane virtualized table, built fresh every render. Owns no row or
 /// column data of its own -- [`TableState`] (frame-persistent, held by the
 /// caller) is the only piece of this abstraction that survives between
@@ -43,6 +58,8 @@ pub struct Table<V: Render> {
     vertical_sizing: TableSizing,
     focus_on_click: Option<FocusHandle>,
     selectable: bool,
+    on_cell_double_click: Option<CellDoubleClickHandler<V>>,
+    on_cell_right_click: Option<CellRightClickHandler<V>>,
 }
 
 /// How to size the table's vertical extent in its parent. Defaults to [`TableSizing::Fill`].
@@ -52,6 +69,56 @@ pub enum TableSizing {
     Fill,
     /// Let the table's height grow to fit all its rows, showing no vertical scrollbar.
     Fit,
+}
+
+/// Wrap `handler` (if given) into a [`CellClickListener`]: reading its
+/// target cell off `state` (already updated by the same click's own
+/// selection) rather than closing over one, so this single built-once
+/// listener can be cloned onto every selectable cell instead of
+/// monomorphizing a fresh closure per cell.
+fn build_double_click_listener<V: Render>(
+    handler: Option<CellDoubleClickHandler<V>>,
+    state: &Entity<TableState>,
+    cx: &mut Context<V>,
+) -> Option<CellClickListener> {
+    handler.map(|f| {
+        let state = state.clone();
+        let wrapped = cx.listener(
+            move |view: &mut V,
+                  _event: &MouseDownEvent,
+                  window: &mut Window,
+                  cx: &mut Context<V>| {
+                if let Some((row, col)) = state.read(cx).focused_cell() {
+                    f(view, row, col, window, cx);
+                }
+            },
+        );
+        Rc::new(wrapped) as CellClickListener
+    })
+}
+
+/// [`build_double_click_listener`]'s right-click counterpart: `handler`
+/// additionally receives the triggering [`MouseDownEvent`] (e.g. for a
+/// context menu's anchor position).
+fn build_right_click_listener<V: Render>(
+    handler: Option<CellRightClickHandler<V>>,
+    state: &Entity<TableState>,
+    cx: &mut Context<V>,
+) -> Option<CellClickListener> {
+    handler.map(|f| {
+        let state = state.clone();
+        let wrapped = cx.listener(
+            move |view: &mut V,
+                  event: &MouseDownEvent,
+                  window: &mut Window,
+                  cx: &mut Context<V>| {
+                if let Some((row, col)) = state.read(cx).focused_cell() {
+                    f(view, row, col, event, window, cx);
+                }
+            },
+        );
+        Rc::new(wrapped) as CellClickListener
+    })
 }
 
 impl<V: Render> Table<V> {
@@ -71,6 +138,8 @@ impl<V: Render> Table<V> {
             vertical_sizing: TableSizing::Fill,
             focus_on_click: None,
             selectable: false,
+            on_cell_double_click: None,
+            on_cell_right_click: None,
         }
     }
 
@@ -139,6 +208,34 @@ impl<V: Render> Table<V> {
         self
     }
 
+    /// Call `f` with the just-selected cell's `(row, col)` whenever the
+    /// second mouse-down of a double click lands on a data cell. Has no
+    /// effect unless [`Table::selectable`] is also called. `f` runs after
+    /// that click has already updated `TableState`'s focused cell, so it
+    /// always sees the cell that was actually double-clicked.
+    #[must_use]
+    pub fn on_cell_double_click(
+        mut self,
+        f: impl Fn(&mut V, usize, usize, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        self.on_cell_double_click = Some(Rc::new(f));
+        self
+    }
+
+    /// Call `f` with the just-selected cell's `(row, col)` and the
+    /// triggering event whenever a data cell is right-clicked. Has no effect
+    /// unless [`Table::selectable`] is also called. A right-click selects
+    /// the cell first (mirroring a left click), so `f` always sees the cell
+    /// that was actually right-clicked.
+    #[must_use]
+    pub fn on_cell_right_click(
+        mut self,
+        f: impl Fn(&mut V, usize, usize, &MouseDownEvent, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        self.on_cell_right_click = Some(Rc::new(f));
+        self
+    }
+
     /// The data pane's batch cell renderer, wired through `cx.processor` so
     /// it keeps `&mut V` access for building each visible range's cells.
     /// Each returned [`TableRow`] is expected to carry at most one cell per
@@ -173,10 +270,15 @@ impl<V: Render> Table<V> {
             vertical_sizing: table_height,
             focus_on_click,
             selectable,
+            on_cell_double_click,
+            on_cell_right_click,
         } = self;
         let rows = rows.unwrap_or_else(|| -> RowRenderer<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
         });
+
+        let double_click_listener = build_double_click_listener(on_cell_double_click, &state, cx);
+        let right_click_listener = build_right_click_listener(on_cell_right_click, &state, cx);
 
         let column_widths: Vec<Pixels> = columns.iter().map(|column| column.width).collect();
         let content_extent = px(content_extent_for_columns(&column_widths));
@@ -223,6 +325,8 @@ impl<V: Render> Table<V> {
             table_height,
             focus_on_click,
             selectable,
+            double_click_listener,
+            right_click_listener,
             focused_cell,
             &state,
             handles.row_scroll_handle.clone(),
@@ -272,6 +376,8 @@ fn build_data_list<V: Render>(
     table_height: TableSizing,
     focus_on_click: Option<FocusHandle>,
     selectable: bool,
+    double_click_listener: Option<CellClickListener>,
+    right_click_listener: Option<CellClickListener>,
     focused_cell: Option<(usize, usize)>,
     state: &Entity<TableState>,
     row_scroll_handle: UniformListScrollHandle,
@@ -295,6 +401,8 @@ fn build_data_list<V: Render>(
                     state: &body_tag_state,
                     focus_on_click: focus_on_click.as_ref(),
                     selectable,
+                    double_click_listener: double_click_listener.clone(),
+                    right_click_listener: right_click_listener.clone(),
                 };
                 rows(this, range, window, cx)
                     .into_iter()
@@ -525,6 +633,10 @@ struct BodyRowContext<'a> {
     /// highlight via [`Table::selectable`]. Off by default, so a table with
     /// no use for cell selection renders inert, unclickable body cells.
     selectable: bool,
+    /// Set via [`Table::on_cell_double_click`].
+    double_click_listener: Option<CellClickListener>,
+    /// Set via [`Table::on_cell_right_click`].
+    right_click_listener: Option<CellClickListener>,
 }
 
 /// [`build_body_row`] without its debug assertion: zips `row.cells` against
@@ -553,15 +665,27 @@ fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_
                 "zsql-ui-table-cell-{row_index}-{cell_index}-{}",
                 ctx.state.entity_id()
             ));
-            let interactive = shell.id(cell_id).on_mouse_down(
+            let mut interactive = shell.id(cell_id).on_mouse_down(
                 MouseButton::Left,
                 select_cell_on_click(
                     ctx.state,
                     row_index,
                     cell_index,
                     ctx.focus_on_click.cloned(),
+                    ctx.double_click_listener.clone(),
                 ),
             );
+            if let Some(right_click_listener) = ctx.right_click_listener.clone() {
+                interactive = interactive.on_mouse_down(
+                    MouseButton::Right,
+                    select_cell_on_right_click(
+                        ctx.state,
+                        row_index,
+                        cell_index,
+                        right_click_listener,
+                    ),
+                );
+            }
             let tagged = tag_first_body_cell(
                 interactive,
                 cell_index,
@@ -579,18 +703,20 @@ fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_
     row_div
 }
 
-/// A data cell's mouse-down handler: selects `(row_index, cell_index)` in
-/// `state` and, if given, focuses `focus_handle` so a caller's own key
-/// binding (e.g. a clipboard copy) captures the same click that just
-/// selected the cell.
+/// A data cell's left mouse-down handler: selects `(row_index, cell_index)`
+/// in `state`, focuses `focus_handle` if given (so a caller's own key
+/// binding, e.g. a clipboard copy, captures the same click that just
+/// selected the cell), then -- on the second mouse-down of a double click --
+/// runs `double_click_listener`, set via [`Table::on_cell_double_click`].
 fn select_cell_on_click(
     state: &Entity<TableState>,
     row_index: usize,
     cell_index: usize,
     focus_handle: Option<FocusHandle>,
+    double_click_listener: Option<CellClickListener>,
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
     let state = state.clone();
-    move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+    move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
         let _span =
             tracing::trace_span!("zsql_ui::table::select_cell", row_index, cell_index).entered();
         state.update(cx, |table_state, cx| {
@@ -600,6 +726,32 @@ fn select_cell_on_click(
         if let Some(handle) = &focus_handle {
             window.focus(handle);
         }
+        if event.click_count >= 2
+            && let Some(listener) = &double_click_listener
+        {
+            listener(event, window, cx);
+        }
+    }
+}
+
+/// A data cell's right mouse-down handler: selects `(row_index, cell_index)`
+/// in `state` (mirroring a left click) then runs `listener`, set via
+/// [`Table::on_cell_right_click`].
+fn select_cell_on_right_click(
+    state: &Entity<TableState>,
+    row_index: usize,
+    cell_index: usize,
+    listener: CellClickListener,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+    move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+        let _span = tracing::trace_span!("zsql_ui::table::right_click_cell", row_index, cell_index)
+            .entered();
+        state.update(cx, |table_state, cx| {
+            table_state.set_focused_cell(row_index, cell_index);
+            cx.notify();
+        });
+        listener(event, window, cx);
     }
 }
 
@@ -781,7 +933,7 @@ pub fn body_first_cell_debug_selector(state: &Entity<TableState>) -> &'static st
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use gpui::{
@@ -804,6 +956,9 @@ mod tests {
 
     const COLUMN_WIDTH: f32 = 300.0;
     const PANE_SIZE: f32 = 220.0;
+    /// The `(row, col)` cells a [`Harness`]'s double/right-click callback
+    /// recorded, for a test to assert against.
+    type ClickLog = Rc<RefCell<Vec<(usize, usize)>>>;
     /// Passed for `top_of_viewport` when a test has no interest in the
     /// first-cell tagging path, guaranteeing it never matches `row_index`.
     const NO_TAG: usize = usize::MAX;
@@ -842,6 +997,8 @@ mod tests {
                     state: &self.table_state,
                     focus_on_click: None,
                     selectable: false,
+                    double_click_listener: None,
+                    right_click_listener: None,
                 };
                 super::build_body_row_cells(row, 0, &row_ctx).on_children_prepainted(
                     move |bounds, _window, _app| {
@@ -898,6 +1055,8 @@ mod tests {
             state: &state,
             focus_on_click: None,
             selectable: false,
+            double_click_listener: None,
+            right_click_listener: None,
         };
         let _div = super::build_body_row(row, 0, &row_ctx);
     }
@@ -956,6 +1115,8 @@ mod tests {
         gutter: GutterPreset,
         omit_rows_callback: bool,
         selectable: bool,
+        double_click_log: Option<ClickLog>,
+        right_click_log: Option<ClickLog>,
     }
 
     impl Harness {
@@ -970,6 +1131,8 @@ mod tests {
                 gutter: GutterPreset::RowNumbers,
                 omit_rows_callback: false,
                 selectable: true,
+                double_click_log: None,
+                right_click_log: None,
             }
         }
 
@@ -1000,6 +1163,16 @@ mod tests {
 
         fn without_selectable(mut self) -> Self {
             self.selectable = false;
+            self
+        }
+
+        fn with_double_click_log(mut self, log: ClickLog) -> Self {
+            self.double_click_log = Some(log);
+            self
+        }
+
+        fn with_right_click_log(mut self, log: ClickLog) -> Self {
+            self.right_click_log = Some(log);
             self
         }
     }
@@ -1033,6 +1206,16 @@ mod tests {
                 .gutter(gutter);
             if self.selectable {
                 table = table.selectable();
+            }
+            if let Some(log) = self.double_click_log.clone() {
+                table = table.on_cell_double_click(move |_this, row, col, _window, _cx| {
+                    log.borrow_mut().push((row, col));
+                });
+            }
+            if let Some(log) = self.right_click_log.clone() {
+                table = table.on_cell_right_click(move |_this, row, col, _event, _window, _cx| {
+                    log.borrow_mut().push((row, col));
+                });
             }
             if !self.omit_rows_callback {
                 table = table.rows(move |_this: &mut Self, range, _window, _cx| {
@@ -2332,6 +2515,96 @@ mod tests {
             table_state.read_with(vcx, |s, _app| s.focused_cell()),
             None,
             "an empty table has no cell to select"
+        );
+    }
+
+    #[gpui::test]
+    fn on_cell_double_click_fires_for_the_double_clicked_cell_and_selects_it_first(
+        cx: &mut TestAppContext,
+    ) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let log_for_harness = log.clone();
+        let (harness, vcx) = cx.add_window_view(|_window, cx| {
+            Harness::new(2, 2, cx).with_double_click_log(log_for_harness)
+        });
+        vcx.run_until_parked();
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        let position = gpui::point(
+            cell_bounds.origin.x + px(5.0),
+            cell_bounds.origin.y + px(5.0),
+        );
+        let mouse_down = |click_count| MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count,
+            first_mouse: false,
+        };
+
+        vcx.simulate_event(mouse_down(1));
+        vcx.run_until_parked();
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "the first mouse-down of the double click must select the cell like a plain click"
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "a single click must not fire the double-click callback"
+        );
+
+        vcx.simulate_event(mouse_down(2));
+        vcx.run_until_parked();
+        assert_eq!(
+            log.borrow().as_slice(),
+            &[(0, 0)],
+            "the second mouse-down of the double click must fire the callback exactly once, \
+             naming the cell it landed on"
+        );
+    }
+
+    #[gpui::test]
+    fn on_cell_right_click_fires_for_the_right_clicked_cell_and_selects_it_first(
+        cx: &mut TestAppContext,
+    ) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let log_for_harness = log.clone();
+        let (harness, vcx) = cx.add_window_view(|_window, cx| {
+            Harness::new(2, 2, cx).with_right_click_log(log_for_harness)
+        });
+        vcx.run_until_parked();
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        let position = gpui::point(
+            cell_bounds.origin.x + px(5.0),
+            cell_bounds.origin.y + px(5.0),
+        );
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "a right click must select the cell, mirroring a left click"
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            &[(0, 0)],
+            "the right-click callback must fire exactly once, naming the cell it landed on"
         );
     }
 }

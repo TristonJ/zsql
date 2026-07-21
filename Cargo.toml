@@ -53,6 +53,11 @@ dirs = "5"
 # form's fields and the URL string it renders can never drift apart.
 url = "2"
 percent-encoding = "2"
+# Value panel Timestamp UTC mode (`zsql::ui::value_panel`): parses a driver's
+# ISO-8601 timestamp text and re-renders it normalized to UTC. Already in the
+# dependency graph via sqlx's `chrono` feature; declared directly here since
+# the zsql crate uses it independently of sqlx.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [workspace.lints.clippy]
 # Pedantic on from day 1 (priority -1 so targeted allows can override).

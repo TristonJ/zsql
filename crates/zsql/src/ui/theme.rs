@@ -246,6 +246,34 @@ pub const CONTEXT_MENU_SEPARATOR_HEIGHT: Pixels = px(1.0);
 /// Vertical margin around a context menu separator.
 pub const CONTEXT_MENU_SEPARATOR_MARGIN_Y: Pixels = px(5.0);
 
+// ---- results grid value panel ------------------------------------------
+
+/// Height of the value panel's header (column name + pin/expand/close).
+pub const VALUE_PANEL_HEADER_HEIGHT: Pixels = px(34.0);
+/// Height of the value panel's mode-switcher sub-bar.
+pub const VALUE_PANEL_SUBBAR_HEIGHT: Pixels = px(28.0);
+/// Height of the value panel's footer (JSON path / parse-failure message).
+pub const VALUE_PANEL_FOOTER_HEIGHT: Pixels = px(26.0);
+/// Horizontal padding inside the value panel's header/sub-bar/footer/body.
+pub const VALUE_PANEL_PADDING_X: Pixels = px(10.0);
+/// Text size of the value panel's body content.
+pub const VALUE_PANEL_TEXT_SIZE: f32 = 11.5;
+/// Text size of the value panel's header/sub-bar/footer labels.
+pub const VALUE_PANEL_LABEL_TEXT_SIZE: f32 = 10.5;
+/// Height of a mode-switcher/header toggle button.
+pub const VALUE_PANEL_BUTTON_HEIGHT: Pixels = px(20.0);
+/// Corner radius of a mode-switcher/header toggle button.
+pub const VALUE_PANEL_BUTTON_RADIUS: f32 = 5.0;
+/// Left indent added per nesting depth in the JSON tree.
+pub const VALUE_PANEL_TREE_INDENT: f32 = 14.0;
+
+/// Text color of a disabled mode-switcher button (JSON Tree/Pretty while a
+/// json/jsonb cell has failed to parse or has not been fully loaded yet).
+#[must_use]
+pub fn value_panel_disabled_button_text(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.text_tertiary, 0x80)
+}
+
 /// Padding around the schema tab's header meta strip.
 pub const SCHEMA_HEAD_PADDING_X: Pixels = px(16.0);
 /// Top padding of the schema tab's header meta strip.
