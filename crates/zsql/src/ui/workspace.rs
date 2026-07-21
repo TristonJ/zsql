@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
@@ -95,13 +96,17 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     /// Build a workspace over `session`, with pane sizes seeded from
     /// `layout`, `connection_store` backing the connection-manager modal,
-    /// and `tab_sessions_path` (typically [`crate::config::Config::tab_sessions_path`])
-    /// as where per-connection tab sessions are read from and saved to.
+    /// `probe_timeout` (typically [`crate::config::Config::liveness`]'s
+    /// `probe_timeout()`) bounding the connection-manager form's Test
+    /// button, and `tab_sessions_path` (typically
+    /// [`crate::config::Config::tab_sessions_path`]) as where per-connection
+    /// tab sessions are read from and saved to.
     #[must_use]
     pub fn new(
         session: Entity<Session>,
         layout: LayoutConfig,
         connection_store: ConnectionStore,
+        probe_timeout: Duration,
         tab_sessions_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -118,8 +123,9 @@ impl WorkspaceView {
             tabs.new_script_tab(cx);
         });
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), tabs.clone(), cx));
-        let connections =
-            cx.new(|cx| ConnectionManagerView::new(session.clone(), connection_store, cx));
+        let connections = cx.new(|cx| {
+            ConnectionManagerView::new(session.clone(), connection_store, probe_timeout, cx)
+        });
         let footer = cx.new(|cx| ConnectionFooterView::new(session, connections.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
@@ -945,6 +951,8 @@ mod resize_tests {
 
 #[cfg(test)]
 mod render_tests {
+    use std::time::Duration;
+
     use gpui::AppContext as _;
     use zsql_core::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 
@@ -1044,6 +1052,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1061,6 +1070,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1100,6 +1110,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1154,6 +1165,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1204,7 +1216,14 @@ mod render_tests {
         let expected_sidebar_width = layout.sidebar_default_width;
         let expected_editor_height = layout.editor_default_height;
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
-            WorkspaceView::new(session, layout, empty_store_for_test(), None, cx)
+            WorkspaceView::new(
+                session,
+                layout,
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                None,
+                cx,
+            )
         });
         workspace.read_with(vcx, |workspace, _cx| {
             assert_eq!(workspace.sidebar_width, expected_sidebar_width);
@@ -1230,6 +1249,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 store,
+                Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -1306,6 +1326,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 store,
+                Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -1411,6 +1432,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 store,
+                Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -1470,6 +1492,7 @@ mod render_tests {
                 session,
                 LayoutConfig::default(),
                 store,
+                Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -1515,6 +1538,7 @@ mod render_tests {
 #[cfg(test)]
 mod header_tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use gpui::{AppContext as _, Entity, TestAppContext};
@@ -1592,6 +1616,7 @@ mod header_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1628,6 +1653,7 @@ mod header_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1663,6 +1689,7 @@ mod header_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )
@@ -1699,6 +1726,7 @@ mod header_tests {
                 session,
                 LayoutConfig::default(),
                 empty_store_for_test(),
+                Duration::from_secs(2),
                 None,
                 cx,
             )

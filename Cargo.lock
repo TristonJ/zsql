@@ -7927,7 +7927,9 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "flume 0.11.1",
+ "percent-encoding",
  "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

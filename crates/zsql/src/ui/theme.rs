@@ -179,6 +179,51 @@ pub const MODAL_ADD_ICON_SIZE: Pixels = px(12.0);
 /// `group_hover` tint, so hovering anywhere in the row -- not just the
 /// icon's own small hitbox -- lightens the close glyph.
 pub const MODAL_CLOSE_HOVER_GROUP: &str = "connection-modal-close-hover";
+/// Size of a connection-list row's edit (pencil) icon.
+pub const MODAL_EDIT_ICON_SIZE: Pixels = px(13.0);
+
+// ---- connection form ---------------------------------------------------
+
+/// Text size of a connection-form field's caption label (e.g. "Host").
+pub const CONNECTION_FORM_LABEL_TEXT_SIZE: f32 = 10.0;
+/// Vertical gap between a connection-form field's label and its input.
+pub const CONNECTION_FORM_LABEL_GAP: Pixels = px(5.0);
+/// Vertical gap between successive fields/rows in the connection form.
+pub const CONNECTION_FORM_FIELD_GAP: Pixels = px(12.0);
+/// Horizontal gap between two fields sharing a row (Host/Port, User/Password).
+pub const CONNECTION_FORM_ROW_GAP: Pixels = px(10.0);
+/// Fixed width of the Port field, narrower than the Host field beside it.
+pub const CONNECTION_FORM_PORT_WIDTH: Pixels = px(96.0);
+/// Opacity applied to the driver-field section while the URL does not
+/// currently parse, distinct from full removal so the section's shape stays
+/// legible as it fades back in once the URL parses again.
+pub const CONNECTION_FORM_DIM_OPACITY: f32 = 0.45;
+/// Text size of the divider separating the URL from its driver-specific
+/// fields, and of the "extra query params" note beneath them.
+pub const CONNECTION_FORM_DIVIDER_TEXT_SIZE: f32 = 9.5;
+/// Text size of the password field's show/hide toggle and the URL field's
+/// detected-driver badge row.
+pub const CONNECTION_FORM_TOGGLE_TEXT_SIZE: f32 = 10.5;
+/// Text size of the Test button's inline pending/connected/error result.
+pub const CONNECTION_FORM_RESULT_TEXT_SIZE: f32 = 12.0;
+
+/// Background wash for the Test button's "connected" result banner.
+#[must_use]
+pub fn connection_test_ok_bg(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.accent, 0x1f)
+}
+
+/// Background wash for the Test button's failure result banner.
+#[must_use]
+pub fn connection_test_error_bg(theme: &Theme) -> u32 {
+    theme.colors.error_wash()
+}
+
+/// Background wash for the Test button's pending result banner.
+#[must_use]
+pub fn connection_test_pending_bg(theme: &Theme) -> u32 {
+    Colors::wash(theme.colors.status_warn, 0x1f)
+}
 
 // ---- schema tab / view -----------------------------------------------
 

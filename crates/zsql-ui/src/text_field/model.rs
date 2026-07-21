@@ -330,6 +330,34 @@ pub fn byte_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
     byte_offset_to_utf16(text, range.start)..byte_offset_to_utf16(text, range.end)
 }
 
+// -- masked-display offset conversion ------------------------------------
+//
+// A masked field (e.g. a password) shows one fixed-width placeholder glyph
+// per character rather than `content` itself. Since the placeholder is a
+// single ASCII byte per character, a masked display index equals the
+// content's *char* count up to a point, letting cursor/selection/mouse
+// offsets convert between "byte offset into `content`" and "index into the
+// masked display string" without assuming `content` itself is ASCII.
+
+/// The number of chars in `content` before byte offset `byte_offset` -- the
+/// masked display index a real content cursor/selection offset maps to.
+#[must_use]
+pub fn char_count_before(content: &str, byte_offset: usize) -> usize {
+    content[..byte_offset].chars().count()
+}
+
+/// The byte offset in `content` after `char_count` chars, clamped to
+/// `content`'s length -- the inverse of [`char_count_before`], used to map a
+/// masked display index (from a mouse hit test) back to a real content
+/// offset.
+#[must_use]
+pub fn byte_offset_for_char_count(content: &str, char_count: usize) -> usize {
+    content
+        .char_indices()
+        .nth(char_count)
+        .map_or(content.len(), |(idx, _)| idx)
+}
+
 // -- cursor blink --------------------------------------------------------
 
 /// Pure blink-visibility state machine, stepped by an interval timer on the
@@ -396,8 +424,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BlinkState, CURSOR_BLINK_RESUME_DELAY, FieldModel, byte_offset_from_utf16,
-        byte_offset_to_utf16, byte_range_from_utf16, byte_range_to_utf16, should_show_placeholder,
+        BlinkState, CURSOR_BLINK_RESUME_DELAY, FieldModel, byte_offset_for_char_count,
+        byte_offset_from_utf16, byte_offset_to_utf16, byte_range_from_utf16, byte_range_to_utf16,
+        char_count_before, should_show_placeholder,
     };
 
     // -- storage / accessors ------------------------------------------
@@ -737,6 +766,38 @@ mod tests {
         assert_eq!(byte_offset_to_utf16(text, 5), 3);
         assert_eq!(byte_range_to_utf16(text, 1..5), 1..3);
         assert_eq!(byte_range_from_utf16(text, 1..3), 1..5);
+    }
+
+    // -- masked-display offset conversion -------------------------------
+
+    #[test]
+    fn char_count_before_counts_ascii_chars_one_per_byte() {
+        assert_eq!(char_count_before("hello", 0), 0);
+        assert_eq!(char_count_before("hello", 3), 3);
+        assert_eq!(char_count_before("hello", 5), 5);
+    }
+
+    #[test]
+    fn char_count_before_counts_multi_byte_chars_as_one_char_each() {
+        // "p" + a-with-acute (2 bytes) + "ss": byte offset 3 sits just after
+        // the 2-byte char, which is the 2nd char.
+        let content = "p\u{e1}ss";
+        assert_eq!(char_count_before(content, 3), 2);
+        assert_eq!(char_count_before(content, content.len()), 4);
+    }
+
+    #[test]
+    fn byte_offset_for_char_count_is_the_inverse_of_char_count_before() {
+        let content = "p\u{e1}ss\u{e9}";
+        for byte_offset in content.char_indices().map(|(idx, _)| idx) {
+            let chars = char_count_before(content, byte_offset);
+            assert_eq!(byte_offset_for_char_count(content, chars), byte_offset);
+        }
+    }
+
+    #[test]
+    fn byte_offset_for_char_count_past_the_end_clamps_to_the_content_length() {
+        assert_eq!(byte_offset_for_char_count("abc", 99), 3);
     }
 
     // -- cursor blink --------------------------------------------------
