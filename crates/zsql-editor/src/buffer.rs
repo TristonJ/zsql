@@ -1,6 +1,9 @@
 //! The multiline text buffer, cursor, and selection model.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
+
+use crate::theme;
 
 /// A cursor or selection endpoint: a zero-based line index and a zero-based
 /// column measured in `char`s, not bytes, so a position never lands inside a
@@ -54,6 +57,35 @@ impl Selection {
     }
 }
 
+/// The kind of a buffer edit: text insertion or deletion. Consecutive
+/// single-unit edits only coalesce into one undo group when their kind matches;
+/// a change in kind starts a new group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Insert,
+    Delete,
+}
+
+/// Everything undo/redo must restore: the document text and the
+/// caret/selection state in effect at that point.
+#[derive(Clone)]
+struct HistoryEntry {
+    lines: Vec<String>,
+    cursor: Position,
+    anchor: Option<Position>,
+    desired_column: usize,
+}
+
+/// The undo group currently open to absorb more edits, if any.
+struct OpenGroup {
+    kind: EditKind,
+    /// Whether a further single-unit edit of the same kind may still merge
+    /// into this group. `false` for a group that is itself already a
+    /// multi-character insert, a newline, or a selection-replacing edit --
+    /// those always stand alone rather than seed a run.
+    coalescing: bool,
+}
+
 /// A multiline text buffer with a cursor and an optional selection.
 ///
 /// Storage: `lines` holds one `String` per line, none of which contain a
@@ -76,6 +108,13 @@ pub struct TextBuffer {
     /// shorter lines that force a clamp. Reset to the cursor's actual
     /// column by every horizontal movement.
     desired_column: usize,
+    /// Snapshots to restore to on `undo`, oldest first, capped at
+    /// [`theme::EDITOR_HISTORY_CAP`] groups.
+    undo_stack: VecDeque<HistoryEntry>,
+    /// Snapshots to restore to on `redo`. Cleared by any new edit.
+    redo_stack: Vec<HistoryEntry>,
+    /// The undo group still open to absorb more edits, if any.
+    open_group: Option<OpenGroup>,
 }
 
 impl Default for TextBuffer {
@@ -92,6 +131,9 @@ impl TextBuffer {
             cursor: Position::new(0, 0),
             anchor: None,
             desired_column: 0,
+            undo_stack: VecDeque::new(),
+            redo_stack: Vec::new(),
+            open_group: None,
         }
     }
 
@@ -105,6 +147,9 @@ impl TextBuffer {
             cursor: Position::new(0, 0),
             anchor: None,
             desired_column: 0,
+            undo_stack: VecDeque::new(),
+            redo_stack: Vec::new(),
+            open_group: None,
         }
     }
 
@@ -249,6 +294,7 @@ impl TextBuffer {
 
     /// Select the entire document, anchored at the start.
     pub fn select_all(&mut self) {
+        self.break_edit_group();
         self.anchor = Some(Position::new(0, 0));
         self.cursor = self.document_end();
         self.desired_column = self.cursor.column;
@@ -258,6 +304,7 @@ impl TextBuffer {
     /// the document. Used by input handling that sets the cursor directly
     /// (mouse clicks, IME) rather than via a movement action.
     pub fn set_cursor(&mut self, position: Position) {
+        self.break_edit_group();
         let clamped = self.clamp(position);
         self.cursor = clamped;
         self.anchor = None;
@@ -268,10 +315,22 @@ impl TextBuffer {
     /// document. Used by input handling that sets a selection directly
     /// (shift-click, IME, OS-driven range replacement) rather than via an
     /// extend-movement action.
+    ///
+    /// Only breaks the active undo group if this actually repositions the
+    /// caret or selection. OS text input re-asserts "the selection is right
+    /// here, at the cursor" ahead of every keystroke it replaces, even when
+    /// nothing has moved -- treating that as a break would defeat coalescing
+    /// for ordinary typing, which flows through this same path.
     pub fn set_selection(&mut self, anchor: Position, cursor: Position) {
-        self.anchor = Some(self.clamp(anchor));
-        self.cursor = self.clamp(cursor);
-        self.desired_column = self.cursor.column;
+        let clamped_anchor = self.clamp(anchor);
+        let clamped_cursor = self.clamp(cursor);
+        let previous_anchor = self.anchor.unwrap_or(self.cursor);
+        if previous_anchor != clamped_anchor || self.cursor != clamped_cursor {
+            self.break_edit_group();
+        }
+        self.anchor = Some(clamped_anchor);
+        self.cursor = clamped_cursor;
+        self.desired_column = clamped_cursor.column;
     }
 
     // -- position <-> offset conversions --------------------------------
@@ -319,8 +378,25 @@ impl TextBuffer {
 
     /// Insert `text` at the cursor, first deleting the active selection if
     /// there is one. `text` may itself contain `\n`, splitting across
-    /// lines.
+    /// lines. A run of single-character calls coalesces into one undo group.
     pub fn insert_text(&mut self, text: &str) {
+        let coalesces = !self.has_selection() && text != "\n" && text.chars().count() == 1;
+        self.insert_text_impl(text, coalesces);
+    }
+
+    /// Insert `text` at the cursor as its own undo group, even if it is a
+    /// single character. Used by paste and other bulk-insert entry points
+    /// whose result must not merge with an adjacent run of typed characters.
+    pub fn insert_pasted_text(&mut self, text: &str) {
+        self.insert_text_impl(text, false);
+    }
+
+    fn insert_text_impl(&mut self, text: &str, coalesces: bool) {
+        if text.is_empty() && !self.has_selection() {
+            return;
+        }
+        self.begin_edit(EditKind::Insert, coalesces);
+
         if self.has_selection() {
             self.delete_selection();
         }
@@ -359,8 +435,13 @@ impl TextBuffer {
 
     /// Delete the active selection, or the character before the cursor.
     /// Joins with the previous line if the cursor is at the start of a
-    /// non-first line.
+    /// non-first line. A no-op at the document start pushes no undo entry.
     pub fn backspace(&mut self) {
+        if !self.has_selection() && self.cursor == Position::new(0, 0) {
+            return;
+        }
+        self.begin_edit(EditKind::Delete, !self.has_selection());
+
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -386,8 +467,13 @@ impl TextBuffer {
 
     /// Delete the active selection, or the character after the cursor.
     /// Joins with the next line if the cursor is at the end of a non-last
-    /// line.
+    /// line. A no-op at the document end pushes no undo entry.
     pub fn delete_forward(&mut self) {
+        if !self.has_selection() && self.cursor == self.document_end() {
+            return;
+        }
+        self.begin_edit(EditKind::Delete, !self.has_selection());
+
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -406,6 +492,94 @@ impl TextBuffer {
 
         self.anchor = None;
         self.desired_column = self.cursor.column;
+    }
+
+    // -- undo/redo ---------------------------------------------------------
+
+    /// Undo the most recent edit group, restoring both the text and the
+    /// caret/selection exactly as they were immediately before that group's
+    /// first edit. Returns `false` and leaves the buffer untouched if there
+    /// is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(entry) = self.undo_stack.pop_back() else {
+            return false;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore(entry);
+        self.open_group = None;
+        tracing::info!(remaining_undos = self.undo_stack.len(), "buffer undo");
+        true
+    }
+
+    /// Redo the most recently undone edit group, restoring both the text
+    /// and the caret/selection exactly as they were immediately after that
+    /// group's last edit. Returns `false` and leaves the buffer untouched
+    /// if there is nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.push_undo_entry(self.snapshot());
+        self.restore(entry);
+        self.open_group = None;
+        tracing::info!(remaining_redos = self.redo_stack.len(), "buffer redo");
+        true
+    }
+
+    fn snapshot(&self) -> HistoryEntry {
+        HistoryEntry {
+            lines: self.lines.clone(),
+            cursor: self.cursor,
+            anchor: self.anchor,
+            desired_column: self.desired_column,
+        }
+    }
+
+    fn restore(&mut self, entry: HistoryEntry) {
+        self.lines = entry.lines;
+        self.cursor = entry.cursor;
+        self.anchor = entry.anchor;
+        self.desired_column = entry.desired_column;
+    }
+
+    /// Push `entry` as the most recent undo step, evicting the oldest step
+    /// if that would exceed [`theme::EDITOR_HISTORY_CAP`].
+    fn push_undo_entry(&mut self, entry: HistoryEntry) {
+        self.undo_stack.push_back(entry);
+        if self.undo_stack.len() > theme::EDITOR_HISTORY_CAP {
+            self.undo_stack.pop_front();
+        }
+    }
+
+    /// Record undo history for an about-to-happen edit of `kind`, before any
+    /// mutation. Continues the currently open group -- rather than starting
+    /// a new one -- when `coalesces` is set and the open group is itself
+    /// still open to coalescing and of the same kind, e.g. a run of
+    /// single-character insertions. Any edit clears the redo stack: it
+    /// discards whatever branch of history redo pointed at.
+    fn begin_edit(&mut self, kind: EditKind, coalesces: bool) {
+        self.redo_stack.clear();
+        let continues_open_group = coalesces
+            && self
+                .open_group
+                .as_ref()
+                .is_some_and(|group| group.coalescing && group.kind == kind);
+        if continues_open_group {
+            return;
+        }
+        let before = self.snapshot();
+        self.push_undo_entry(before);
+        self.open_group = Some(OpenGroup {
+            kind,
+            coalescing: coalesces,
+        });
+    }
+
+    /// Break the currently open undo group, if any, so the next edit starts
+    /// a fresh one instead of coalescing into it. Called by every operation
+    /// that moves the caret or selection independent of an edit.
+    fn break_edit_group(&mut self) {
+        self.open_group = None;
     }
 
     // -- internal helpers --------------------------------------------------
@@ -482,6 +656,7 @@ impl TextBuffer {
     }
 
     fn move_cursor_to_preserving_desired_column(&mut self, target: Position, extend: bool) {
+        self.break_edit_group();
         let target = self.clamp(target);
         if extend {
             if self.anchor.is_none() {
@@ -568,6 +743,7 @@ fn substring(line: &str, start_col: usize, end_col: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Position, TextBuffer};
+    use crate::theme::EDITOR_HISTORY_CAP;
 
     // -- storage / accessors ------------------------------------------
 
@@ -1222,5 +1398,419 @@ mod tests {
     fn position_for_char_offset_clamps_past_the_document_end() {
         let buffer = TextBuffer::from_text("ab\ncd");
         assert_eq!(buffer.position_for_char_offset(999), Position::new(1, 2));
+    }
+
+    // -- undo/redo -----------------------------------------------------
+
+    #[test]
+    fn undo_on_a_fresh_buffer_is_a_noop() {
+        let mut buffer = TextBuffer::from_text("hello");
+        assert!(!buffer.undo());
+        assert_eq!(buffer.text(), "hello");
+        assert_eq!(buffer.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn redo_with_nothing_undone_is_a_noop() {
+        let mut buffer = TextBuffer::from_text("hello");
+        buffer.move_document_end();
+        assert!(!buffer.redo());
+        assert_eq!(buffer.text(), "hello");
+        assert_eq!(buffer.cursor(), Position::new(0, 5));
+    }
+
+    #[test]
+    fn consecutive_single_char_insertions_coalesce_into_one_undo_group() {
+        let mut buffer = TextBuffer::new();
+        for ch in "hello".chars() {
+            buffer.insert_text(&ch.to_string());
+        }
+        assert_eq!(buffer.text(), "hello");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "",
+            "one undo should remove the whole typed word, not one character"
+        );
+        assert_eq!(buffer.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn caret_movement_between_typing_runs_breaks_the_undo_group() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.move_left();
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "acdb");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "ab",
+            "the second typing run alone should undo first"
+        );
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "",
+            "the first typing run should need its own, second undo"
+        );
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn home_end_movement_breaks_the_undo_group() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.move_line_start();
+        buffer.move_line_end();
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "abcd");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn set_cursor_breaks_the_undo_group() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.set_cursor(Position::new(0, 0));
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "cdab");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn set_selection_breaks_the_undo_group() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.set_selection(Position::new(0, 0), Position::new(0, 1));
+        buffer.insert_text("X");
+        assert_eq!(buffer.text(), "Xb");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn inserting_a_newline_breaks_the_undo_group_on_both_sides() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.insert_newline();
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "ab\ncd");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn switching_from_insert_to_delete_breaks_the_undo_group() {
+        let mut buffer = TextBuffer::from_text("xy");
+        buffer.move_document_end();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.backspace();
+        assert_eq!(buffer.text(), "xya");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "xyab",
+            "the backspace alone should undo first"
+        );
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "xy",
+            "the typing run needs its own, separate undo"
+        );
+    }
+
+    #[test]
+    fn consecutive_single_char_backspaces_coalesce_into_one_undo_group() {
+        let mut buffer = TextBuffer::from_text("hello");
+        buffer.move_document_end();
+        buffer.backspace();
+        buffer.backspace();
+        buffer.backspace();
+        assert_eq!(buffer.text(), "he");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hello");
+    }
+
+    #[test]
+    fn a_multi_char_insertion_forms_its_own_group_and_does_not_merge_with_adjacent_runs() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.insert_text("XYZ"); // a single multi-char insert, e.g. a paste
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "abXYZcd");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abXYZ", "the last typing run undoes alone");
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "ab",
+            "the pasted text undoes alone, separate from either run"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "", "the first typing run undoes last");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn a_single_char_paste_forms_its_own_group_and_does_not_merge_with_adjacent_typed_runs() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.insert_pasted_text("X"); // a single-character paste
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "abXcd");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abX", "the last typing run undoes alone");
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "ab",
+            "the single-char paste undoes alone, separate from either typing run"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "", "the first typing run undoes last");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn backspace_at_document_start_is_a_true_noop_and_pushes_no_undo_history() {
+        let mut buffer = TextBuffer::from_text("hello");
+        buffer.insert_text("x"); // gives undo/redo stacks something to lose if the bug regresses
+        buffer.undo();
+        let redo_available_before = buffer.redo();
+        assert!(redo_available_before, "sanity: redo was available");
+        buffer.undo(); // back to a clean slate with an empty undo/redo history
+
+        buffer.backspace();
+        assert_eq!(buffer.text(), "hello");
+        assert!(
+            !buffer.undo(),
+            "a no-op backspace at the document start must not push a phantom undo entry"
+        );
+    }
+
+    #[test]
+    fn delete_forward_at_document_end_is_a_true_noop_and_pushes_no_undo_history() {
+        let mut buffer = TextBuffer::from_text("hello");
+        buffer.move_document_end();
+
+        buffer.delete_forward();
+        assert_eq!(buffer.text(), "hello");
+        assert!(
+            !buffer.undo(),
+            "a no-op delete-forward at the document end must not push a phantom undo entry"
+        );
+    }
+
+    #[test]
+    fn inserting_empty_text_with_no_selection_is_a_noop_and_pushes_no_undo_history() {
+        let mut buffer = TextBuffer::from_text("hello");
+
+        buffer.insert_text("");
+        assert_eq!(buffer.text(), "hello");
+        assert!(
+            !buffer.undo(),
+            "an empty insert with no selection must not push a phantom undo entry"
+        );
+    }
+
+    #[test]
+    fn a_noop_edit_does_not_clear_an_existing_redo_stack() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+
+        buffer.backspace(); // no-op: already at the document start
+        assert_eq!(buffer.text(), "");
+
+        assert!(
+            buffer.redo(),
+            "a no-op edit must not clear a redo stack built by an earlier undo"
+        );
+        assert_eq!(buffer.text(), "a");
+    }
+
+    #[test]
+    fn undo_restores_the_caret_and_selection_from_before_the_group() {
+        let mut buffer = TextBuffer::from_text("select ");
+        buffer.move_document_end();
+        for _ in 0..4 {
+            buffer.extend_left();
+        }
+        let selection_before_edit = buffer.selection();
+        let cursor_before_edit = buffer.cursor();
+        assert_eq!(buffer.selected_text(), "ect ");
+
+        buffer.backspace(); // deletes the selection as one undo group
+        assert_eq!(buffer.text(), "sel");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.selection(),
+            selection_before_edit,
+            "undo restores the selection exactly as it was before the group's first edit"
+        );
+        assert_eq!(buffer.cursor(), cursor_before_edit);
+        assert_eq!(buffer.text(), "select ");
+    }
+
+    #[test]
+    fn undo_redo_round_trip_is_byte_for_byte_and_cursor_for_cursor_identical() {
+        let mut buffer = TextBuffer::new();
+        for ch in "hello".chars() {
+            buffer.insert_text(&ch.to_string());
+        }
+        let text_before_undo = buffer.text();
+        let cursor_before_undo = buffer.cursor();
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), text_before_undo);
+        assert_eq!(buffer.cursor(), cursor_before_undo);
+        assert!(
+            buffer.selection().is_none(),
+            "typing leaves no active selection"
+        );
+    }
+
+    #[test]
+    fn redo_restores_the_caret_and_selection_from_after_the_group() {
+        let mut buffer = TextBuffer::from_text("select ");
+        buffer.move_document_end();
+        for _ in 0..4 {
+            buffer.extend_left();
+        }
+        buffer.backspace(); // deletes the selection ("ect ") as one group
+        assert_eq!(buffer.text(), "sel");
+        let text_after_edit = buffer.text();
+        let cursor_after_edit = buffer.cursor();
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "select ");
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), text_after_edit, "redo re-applies the delete");
+        assert_eq!(buffer.cursor(), cursor_after_edit);
+        assert!(
+            buffer.selection().is_none(),
+            "redo restores the post-delete state, which has no selection"
+        );
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_clears_the_redo_stack() {
+        let mut buffer = TextBuffer::new();
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+
+        buffer.insert_text("x");
+        assert_eq!(buffer.text(), "x");
+
+        assert!(
+            !buffer.redo(),
+            "the discarded 'ab' branch must not be recoverable after a new edit"
+        );
+        assert_eq!(buffer.text(), "x");
+    }
+
+    #[test]
+    fn history_is_capped_and_evicts_the_oldest_group() {
+        let mut buffer = TextBuffer::new();
+        let groups = EDITOR_HISTORY_CAP + 10;
+        for i in 0..groups {
+            // A movement between each insertion forces every character into
+            // its own undo group, so `groups` characters produce `groups`
+            // separate groups (bounded by the cap).
+            buffer.insert_text(&(i % 10).to_string());
+            buffer.move_right();
+        }
+        assert_eq!(buffer.lines()[0].chars().count(), groups);
+
+        let mut undo_count = 0;
+        while buffer.undo() {
+            undo_count += 1;
+        }
+        assert_eq!(
+            undo_count, EDITOR_HISTORY_CAP,
+            "only the most recent EDITOR_HISTORY_CAP groups should remain undoable"
+        );
+        assert_eq!(
+            buffer.lines()[0].chars().count(),
+            groups - EDITOR_HISTORY_CAP,
+            "undoing every retained group should leave exactly the evicted, oldest characters"
+        );
+    }
+
+    #[test]
+    fn undo_across_a_multiline_edit_leaves_the_cursor_and_selection_within_bounds() {
+        let mut buffer = TextBuffer::from_text("one\ntwo\nthree");
+        buffer.move_right();
+        buffer.extend_down();
+        buffer.extend_down();
+        buffer.extend_right(); // selects "ne\ntwo\nth"
+        assert_eq!(buffer.selected_text(), "ne\ntwo\nth");
+        buffer.insert_text("X");
+        assert_eq!(buffer.text(), "oXree");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "one\ntwo\nthree");
+
+        let cursor = buffer.cursor();
+        assert!(cursor.line < buffer.lines().len());
+        assert!(cursor.column <= buffer.lines()[cursor.line].chars().count());
+
+        if let Some(selection) = buffer.selection() {
+            let (start, end) = selection.ordered();
+            assert!(start.line < buffer.lines().len());
+            assert!(end.line < buffer.lines().len());
+            assert!(start.column <= buffer.lines()[start.line].chars().count());
+            assert!(end.column <= buffer.lines()[end.line].chars().count());
+        }
     }
 }

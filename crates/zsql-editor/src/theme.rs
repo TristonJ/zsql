@@ -1,6 +1,6 @@
-//! Layout/color tokens for the SQL editor pane, matching the app's locked
-//! visual spec. Centralized here so no view code hardcodes a raw pixel or
-//! color literal inline.
+//! Layout, color, and limit tokens for the SQL editor pane, matching the
+//! app's locked visual spec. Centralized here so no view or buffer code
+//! hardcodes a raw pixel, color, or limit literal inline.
 
 use gpui::{Pixels, px};
 use zsql_ui::theme::Theme;
@@ -24,6 +24,10 @@ pub const EDITOR_CURSOR_WIDTH: Pixels = px(2.0);
 /// the selection's last line, so a selected line break reads as selected
 /// too instead of stopping abruptly at the last character.
 pub const EDITOR_SELECTION_EOL_PAD: f32 = 8.0;
+/// Maximum number of undo groups `TextBuffer` retains. The oldest group is
+/// evicted once a new one would exceed this, bounding memory growth across
+/// an arbitrarily long editing session.
+pub const EDITOR_HISTORY_CAP: usize = 200;
 
 /// The active selection highlight's background: the theme's accent wash.
 #[must_use]
