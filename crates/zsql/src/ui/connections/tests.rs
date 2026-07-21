@@ -3,6 +3,7 @@ use std::time::Duration;
 use gpui::{AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
 
 use super::active::host_label;
+use super::form::{ConnectionFormView, FormEvent, FormMode};
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, StoredConnection,
     TestOutcome, active_connection_for_url, footer_display,
@@ -47,6 +48,12 @@ fn new_manager(
     store: ConnectionStore,
 ) -> ConnectionManagerView {
     ConnectionManagerView::new(session, store, test_probe_timeout(), cx)
+}
+
+/// A standalone add-mode form, for tests that exercise form behavior with no
+/// manager involved.
+fn new_add_form(cx: &mut TestAppContext) -> Entity<ConnectionFormView> {
+    cx.new(|cx| ConnectionFormView::new(FormMode::Add, None, test_probe_timeout(), cx))
 }
 
 #[gpui::test]
@@ -111,9 +118,8 @@ fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) 
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.set_name_input("new db", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        view.add_connection(cx).expect("add must succeed");
+        view.add_connection("new db", "sqlite::memory:", cx)
+            .expect("add must succeed");
     });
 
     manager.read_with(cx, |view, _app| {
@@ -135,9 +141,7 @@ fn adding_a_connection_with_an_empty_name_is_rejected_without_persisting(cx: &mu
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.set_name_input("", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        view.add_connection(cx)
+        view.add_connection("", "sqlite::memory:", cx)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -153,9 +157,7 @@ fn adding_a_connection_with_an_empty_url_is_rejected_without_persisting(cx: &mut
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.set_name_input("new db", cx);
-        view.set_url_input("", cx);
-        view.add_connection(cx)
+        view.add_connection("new db", "", cx)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -173,9 +175,7 @@ fn adding_a_connection_with_an_unrecognized_scheme_is_rejected_without_persistin
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.set_name_input("mystery", cx);
-        view.set_url_input("cassandra://host/db", cx);
-        view.add_connection(cx)
+        view.add_connection("mystery", "cassandra://host/db", cx)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -319,14 +319,14 @@ fn show_add_form_then_cancel_returns_to_the_list_without_persisting(cx: &mut Tes
         view.show_add_form(cx);
         assert_eq!(view.current_view(), ManagerView::AddForm);
 
-        view.set_name_input("staging", cx);
-        view.set_url_input("postgres://host/db", cx);
-        view.cancel_form(cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_name_input("staging", cx);
+            form.set_url_input("postgres://host/db", cx);
+        });
+        view.close_form(cx);
 
         assert_eq!(view.current_view(), ManagerView::List);
         assert!(view.connections().is_empty());
-        assert!(view.name_field.read(cx).value().is_empty());
-        assert!(view.url_field.read(cx).value().is_empty());
     });
 
     let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
@@ -343,9 +343,8 @@ fn adding_a_connection_returns_the_modal_to_the_list_panel(cx: &mut TestAppConte
     manager.update(cx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        view.set_name_input("staging", cx);
-        view.set_url_input("postgres://host/db", cx);
-        view.add_connection(cx).expect("add must succeed");
+        view.add_connection("staging", "postgres://host/db", cx)
+            .expect("add must succeed");
 
         assert_eq!(view.current_view(), ManagerView::List);
         assert_eq!(view.connections().len(), 1);
@@ -410,20 +409,45 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
             ManagerView::EditForm { index: 0 },
             "edit form must be shown for the right row"
         );
-        assert_eq!(view.name_field.read(cx).value().as_ref(), "staging");
+        let form = view.form().expect("the edit form must be open").read(cx);
+        assert_eq!(form.name_field.read(cx).value().as_ref(), "staging");
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            form.url_field.read(cx).value().as_ref(),
+            "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_prefilled_form_populates_the_driver_fields_from_the_stored_url(cx: &mut TestAppContext) {
+    let stored = StoredConnection {
+        name: "staging".to_owned(),
+        url: "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require".to_owned(),
+    };
+    let form = cx.new(|cx| {
+        ConnectionFormView::new(
+            FormMode::Edit { index: 0 },
+            Some(&stored),
+            test_probe_timeout(),
+            cx,
+        )
+    });
+
+    form.read_with(cx, |form, cx| {
+        assert_eq!(form.name_field.read(cx).value().as_ref(), "staging");
+        assert_eq!(
+            form.url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require"
         );
         assert_eq!(
-            view.host_field.read(cx).value().as_ref(),
+            form.host_field.read(cx).value().as_ref(),
             "staging.internal"
         );
-        assert_eq!(view.port_field.read(cx).value().as_ref(), "5432");
-        assert_eq!(view.user_field.read(cx).value().as_ref(), "app");
-        assert_eq!(view.password_field.read(cx).value().as_ref(), "s3cr3t");
-        assert_eq!(view.database_field.read(cx).value().as_ref(), "app");
-        assert_eq!(view.tls_field.read(cx).value().as_ref(), "require");
+        assert_eq!(form.port_field.read(cx).value().as_ref(), "5432");
+        assert_eq!(form.user_field.read(cx).value().as_ref(), "app");
+        assert_eq!(form.password_field.read(cx).value().as_ref(), "s3cr3t");
+        assert_eq!(form.database_field.read(cx).value().as_ref(), "app");
+        assert_eq!(form.tls_field.read(cx).value().as_ref(), "require");
     });
 }
 
@@ -443,12 +467,13 @@ fn show_edit_form_for_a_sqlite_url_prefills_only_the_path_field(cx: &mut TestApp
 
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
-        assert_eq!(view.pending_driver_id(), Ok("sqlite"));
+        let form = view.form().expect("the edit form must be open").read(cx);
+        assert_eq!(form.pending_driver_id(), Ok("sqlite"));
         assert_eq!(
-            view.sqlite_path_field.read(cx).value().as_ref(),
+            form.sqlite_path_field.read(cx).value().as_ref(),
             "/tmp/reports.db"
         );
-        assert!(view.host_field.read(cx).value().is_empty());
+        assert!(form.host_field.read(cx).value().is_empty());
     });
 }
 
@@ -472,16 +497,23 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
     let session = cx.new(|_cx| session_with_no_url());
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        view.set_name_input("first renamed", cx);
-        view.host_field
+    manager.update(cx, |view, cx| view.show_edit_form(0, cx));
+    let form = manager.read_with(cx, |view, _app| {
+        view.form().expect("the edit form must be open").clone()
+    });
+    form.update(cx, |form, cx| {
+        form.set_name_input("first renamed", cx);
+        form.host_field
             .update(cx, |field, cx| field.set_value("otherhost", cx));
     });
+    // Submit through the form's event, the same path the Save button takes,
+    // so the manager's subscription is what persists the edit.
+    form.update(cx, |form, cx| {
+        let (name, url) = form.input_values(cx);
+        cx.emit(FormEvent::SaveRequested { name, url });
+    });
 
-    manager.update(cx, |view, cx| {
-        view.save_edit(0, cx).expect("save_edit must succeed");
-
+    manager.update(cx, |view, _cx| {
         assert_eq!(
             view.connections().len(),
             2,
@@ -509,28 +541,24 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
 
 #[gpui::test]
 fn editing_the_url_field_reparses_every_driver_field(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("url-to-fields");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input(
+    form.update(cx, |form, cx| {
+        form.set_url_input(
             "mssql://sa:pw@dbhost:1433/zsql?trustServerCertificate=true",
             cx,
         );
     });
 
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(view.pending_driver_id(), Ok("mssql"));
-        assert_eq!(view.host_field.read(cx).value().as_ref(), "dbhost");
-        assert_eq!(view.port_field.read(cx).value().as_ref(), "1433");
-        assert_eq!(view.user_field.read(cx).value().as_ref(), "sa");
-        assert_eq!(view.password_field.read(cx).value().as_ref(), "pw");
-        assert_eq!(view.database_field.read(cx).value().as_ref(), "zsql");
-        assert_eq!(view.tls_field.read(cx).value().as_ref(), "true");
-        assert!(view.dim_reason().is_none());
+    form.read_with(cx, |form, cx| {
+        assert_eq!(form.pending_driver_id(), Ok("mssql"));
+        assert_eq!(form.host_field.read(cx).value().as_ref(), "dbhost");
+        assert_eq!(form.port_field.read(cx).value().as_ref(), "1433");
+        assert_eq!(form.user_field.read(cx).value().as_ref(), "sa");
+        assert_eq!(form.password_field.read(cx).value().as_ref(), "pw");
+        assert_eq!(form.database_field.read(cx).value().as_ref(), "zsql");
+        assert_eq!(form.tls_field.read(cx).value().as_ref(), "true");
+        assert!(form.dim_reason().is_none());
     });
 }
 
@@ -538,33 +566,29 @@ fn editing_the_url_field_reparses_every_driver_field(cx: &mut TestAppContext) {
 fn an_unparseable_url_dims_the_field_section_with_a_reason_and_re_enables_once_valid(
     cx: &mut TestAppContext,
 ) {
-    let temp = TempStorePath::new("dim-reenable");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@", cx);
     });
-    manager.read_with(cx, |view, _cx| {
+    form.read_with(cx, |form, _cx| {
         assert!(
-            view.dim_reason().is_some(),
+            form.dim_reason().is_some(),
             "an incomplete URL must dim the field section"
         );
         // The scheme is still recognizable, so the layout stays Postgres-shaped.
-        assert_eq!(view.pending_driver_id(), Ok("postgres"));
+        assert_eq!(form.pending_driver_id(), Ok("postgres"));
     });
 
-    manager.update(cx, |view, cx| {
-        view.set_url_input("postgres://app@host:5432/db", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
     });
-    manager.read_with(cx, |view, cx| {
+    form.read_with(cx, |form, cx| {
         assert!(
-            view.dim_reason().is_none(),
+            form.dim_reason().is_none(),
             "a now-valid URL must clear the dim reason"
         );
-        assert_eq!(view.host_field.read(cx).value().as_ref(), "host");
+        assert_eq!(form.host_field.read(cx).value().as_ref(), "host");
     });
 }
 
@@ -572,22 +596,18 @@ fn an_unparseable_url_dims_the_field_section_with_a_reason_and_re_enables_once_v
 
 #[gpui::test]
 fn editing_the_port_field_changes_only_the_urls_port(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-port");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
-    manager.update(cx, |view, cx| {
-        view.port_field
+    form.update(cx, |form, cx| {
+        form.port_field
             .update(cx, |field, cx| field.set_value("6543", cx));
     });
-    manager.read_with(cx, |view, cx| {
+    form.read_with(cx, |form, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            form.url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@host:6543/app?sslmode=require",
             "only the port must change in the rebuilt URL"
         );
@@ -596,22 +616,18 @@ fn editing_the_port_field_changes_only_the_urls_port(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn editing_the_host_field_leaves_user_password_database_and_params_intact(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-host");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
-    manager.update(cx, |view, cx| {
-        view.host_field
+    form.update(cx, |form, cx| {
+        form.host_field
             .update(cx, |field, cx| field.set_value("otherhost", cx));
     });
-    manager.read_with(cx, |view, cx| {
+    form.read_with(cx, |form, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            form.url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@otherhost:5432/app?sslmode=require"
         );
     });
@@ -619,21 +635,17 @@ fn editing_the_host_field_leaves_user_password_database_and_params_intact(cx: &m
 
 #[gpui::test]
 fn clearing_the_tls_field_removes_the_param_instead_of_leaving_it_empty(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-tls-clear");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
-    manager.update(cx, |view, cx| {
-        view.tls_field
+    form.update(cx, |form, cx| {
+        form.tls_field
             .update(cx, |field, cx| field.set_value("", cx));
     });
-    manager.read_with(cx, |view, cx| {
-        let url = view.url_field.read(cx).value().to_string();
+    form.read_with(cx, |form, cx| {
+        let url = form.url_field.read(cx).value().to_string();
         assert_eq!(
             url, "postgres://app:s3cr3t@host:5432/app",
             "clearing the TLS field must drop sslmode entirely, not leave 'sslmode='"
@@ -644,22 +656,18 @@ fn clearing_the_tls_field_removes_the_param_instead_of_leaving_it_empty(cx: &mut
 
 #[gpui::test]
 fn editing_a_driver_field_rewrites_the_url_field_live(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-to-url-live");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@host:5432/orders", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/orders", cx);
     });
-    manager.update(cx, |view, cx| {
-        view.database_field
+    form.update(cx, |form, cx| {
+        form.database_field
             .update(cx, |field, cx| field.set_value("other_db", cx));
     });
-    manager.read_with(cx, |view, cx| {
+    form.read_with(cx, |form, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            form.url_field.read(cx).value().as_ref(),
             "postgres://app@host:5432/other_db",
             "URL rewritten"
         );
@@ -668,22 +676,18 @@ fn editing_a_driver_field_rewrites_the_url_field_live(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn editing_the_sqlite_path_field_rewrites_the_url(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-sqlite-path");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("sqlite::memory:", cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("sqlite::memory:", cx);
     });
-    manager.update(cx, |view, cx| {
-        view.sqlite_path_field
+    form.update(cx, |form, cx| {
+        form.sqlite_path_field
             .update(cx, |field, cx| field.set_value("/tmp/scratch.db", cx));
     });
-    manager.read_with(cx, |view, cx| {
+    form.read_with(cx, |form, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            form.url_field.read(cx).value().as_ref(),
             "sqlite:///tmp/scratch.db"
         );
     });
@@ -693,20 +697,17 @@ fn editing_the_sqlite_path_field_rewrites_the_url(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_password_field_starts_masked_and_the_toggle_reveals_it(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("password-mask");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let form = new_add_form(cx);
 
-    manager.read_with(cx, |view, cx| {
-        assert!(view.password_field.read(cx).is_masked());
+    form.read_with(cx, |form, cx| {
+        assert!(form.password_field.read(cx).is_masked());
     });
 
-    manager.update(cx, |view, cx| {
-        view.toggle_password_visible(cx);
+    form.update(cx, |form, cx| {
+        form.toggle_password_visible(cx);
     });
-    manager.read_with(cx, |view, cx| {
-        assert!(!view.password_field.read(cx).is_masked());
+    form.read_with(cx, |form, cx| {
+        assert!(!form.password_field.read(cx).is_masked());
     });
 }
 
@@ -807,11 +808,23 @@ async fn connect_unsaved_connects_without_persisting_and_closes_the_modal(cx: &m
 
     manager.update(cx, |view, cx| {
         view.show_add_form(cx);
-        view.set_name_input("scratch", cx);
-        view.set_url_input("sqlite::memory:", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_name_input("scratch", cx);
+            form.set_url_input("sqlite::memory:", cx);
+        });
     });
 
-    let task = manager.update(cx, ConnectionManagerView::connect_unsaved);
+    let task = manager.update(cx, |view, cx| {
+        let url = view
+            .form()
+            .expect("the add form must be open")
+            .read(cx)
+            .url_field
+            .read(cx)
+            .value()
+            .to_string();
+        view.connect_unsaved(url, cx)
+    });
     task.await;
 
     manager.read_with(cx, |view, _app| {
@@ -861,7 +874,7 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
 
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
-        view.cancel_form(cx);
+        view.close_form(cx);
         let _ = view.delete_index(1, cx);
     });
 
@@ -891,15 +904,22 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
 
     manager.update(cx, |view, cx| {
         view.show_add_form(cx);
-        view.set_name_input("scratch", cx);
-        view.set_url_input("sqlite::memory:", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_name_input("scratch", cx);
+            form.set_url_input("sqlite::memory:", cx);
+        });
     });
 
-    let task = manager.update(cx, ConnectionManagerView::run_test);
+    let task = manager.update(cx, |view, cx| {
+        view.form()
+            .expect("form exists")
+            .update(cx, ConnectionFormView::run_test)
+    });
     task.await;
 
-    manager.read_with(cx, |view, _app| {
-        match view.test_outcome() {
+    manager.read_with(cx, |view, app| {
+        let form = view.form().expect("the add form must be open").read(app);
+        match form.test_outcome() {
             Some(TestOutcome::Connected { .. }) => {}
             other => panic!("expected a successful Test outcome, got {other:?}"),
         }
@@ -929,18 +949,27 @@ async fn a_failed_test_reports_the_drivers_error_inline(cx: &mut TestAppContext)
 
     manager.update(cx, |view, cx| {
         view.show_add_form(cx);
-        view.set_url_input(
-            "postgres://nobody:nobody@zsql-test-unreachable.invalid:5432/db",
-            cx,
-        );
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input(
+                "postgres://nobody:nobody@zsql-test-unreachable.invalid:5432/db",
+                cx,
+            );
+        });
     });
 
-    let task = manager.update(cx, ConnectionManagerView::run_test);
+    let task = manager.update(cx, |view, cx| {
+        view.form()
+            .expect("form exists")
+            .update(cx, ConnectionFormView::run_test)
+    });
     task.await;
 
-    manager.read_with(cx, |view, _app| match view.test_outcome() {
-        Some(TestOutcome::Failed(message)) => assert!(!message.is_empty()),
-        other => panic!("expected a failed Test outcome, got {other:?}"),
+    manager.read_with(cx, |view, app| {
+        let form = view.form().expect("the add form must be open").read(app);
+        match form.test_outcome() {
+            Some(TestOutcome::Failed(message)) => assert!(!message.is_empty()),
+            other => panic!("expected a failed Test outcome, got {other:?}"),
+        }
     });
 }
 
@@ -970,7 +999,7 @@ fn the_closed_modal_renders_nothing_and_the_open_modal_renders_without_panicking
 
     manager.update(vcx, ConnectionManagerView::open);
     manager.update(vcx, ConnectionManagerView::show_add_form);
-    manager.update(vcx, ConnectionManagerView::cancel_form);
+    manager.update(vcx, ConnectionManagerView::close_form);
     vcx.run_until_parked();
 }
 
@@ -1005,12 +1034,15 @@ fn the_sqlite_field_section_renders_the_path_field_and_not_host_or_port(cx: &mut
     manager.update(vcx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        view.set_url_input("sqlite::memory:", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input("sqlite::memory:", cx);
+        });
     });
     vcx.run_until_parked();
 
-    manager.read_with(vcx, |view, _app| {
-        assert_eq!(view.pending_driver_id(), Ok("sqlite"));
+    manager.read_with(vcx, |view, app| {
+        let form = view.form().expect("the add form must be open").read(app);
+        assert_eq!(form.pending_driver_id(), Ok("sqlite"));
     });
 }
 
@@ -1026,19 +1058,25 @@ fn the_field_section_renders_dimmed_while_unparseable_and_undimmed_once_valid(
     manager.update(vcx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        view.set_url_input("postgres://app@", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input("postgres://app@", cx);
+        });
     });
     vcx.run_until_parked();
-    manager.read_with(vcx, |view, _app| {
-        assert!(view.dim_reason().is_some());
+    manager.read_with(vcx, |view, app| {
+        let form = view.form().expect("the add form must be open").read(app);
+        assert!(form.dim_reason().is_some());
     });
 
     manager.update(vcx, |view, cx| {
-        view.set_url_input("postgres://app@host/db", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input("postgres://app@host/db", cx);
+        });
     });
     vcx.run_until_parked();
-    manager.read_with(vcx, |view, _app| {
-        assert!(view.dim_reason().is_none());
+    manager.read_with(vcx, |view, app| {
+        let form = view.form().expect("the add form must be open").read(app);
+        assert!(form.dim_reason().is_none());
     });
 }
 
@@ -1058,7 +1096,9 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
     manager.update(vcx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        view.set_url_input(&long_url, cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input(&long_url, cx);
+        });
     });
     vcx.run_until_parked();
 
@@ -1084,11 +1124,18 @@ fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order(cx: &mut TestAp
     manager.update(vcx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        view.set_url_input("postgres://app@host:5432/db", cx);
+        view.form().expect("form exists").update(cx, |form, cx| {
+            form.set_url_input("postgres://app@host:5432/db", cx);
+        });
     });
     vcx.run_until_parked();
 
-    let expected_order = manager.update(vcx, |view, cx| view.focus_order(cx));
+    let expected_order = manager.read_with(vcx, |view, app| {
+        view.form()
+            .expect("the add form must be open")
+            .read(app)
+            .focus_order(app)
+    });
     assert!(
         expected_order.len() >= 3,
         "the add form over a parsed postgres URL must expose name, url, and driver fields"

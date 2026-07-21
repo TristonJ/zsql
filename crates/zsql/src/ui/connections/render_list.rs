@@ -1,6 +1,5 @@
 use gpui::{
-    ClickEvent, Context, Div, Focusable, KeyDownEvent, Stateful, Window, div, prelude::*, px, rgb,
-    rgba,
+    ClickEvent, Context, Div, KeyDownEvent, Stateful, Window, div, prelude::*, px, rgb, rgba,
 };
 use zsql_ui::button::secondary_button;
 use zsql_ui::grid;
@@ -46,7 +45,7 @@ impl ConnectionManagerView {
                     .text_color(rgb(colors.text_tertiary))
                     .child("<")
                     .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                        view.cancel_form(cx);
+                        view.close_form(cx);
                     })),
             );
         }
@@ -72,14 +71,15 @@ impl ConnectionManagerView {
                     .child(format!("{} saved", self.rows.len())),
             );
         }
-        if matches!(self.current_view(), ManagerView::EditForm { .. }) {
-            let name = self.name_field.read(cx).value().to_string();
+        if let ManagerView::EditForm { index } = self.current_view()
+            && let Some(row) = self.rows.get(index)
+        {
             head = head.child(
                 div()
                     .pl_2()
                     .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
-                    .child(name),
+                    .child(row.connection.name.clone()),
             );
         }
 
@@ -146,10 +146,8 @@ impl ConnectionManagerView {
                                     colors.accent,
                                 ))
                                 .child("Add connection")
-                                .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
+                                .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                     view.show_add_form(cx);
-                                    let handle = view.name_field.read(cx).focus_handle(cx);
-                                    window.focus(&handle);
                                 })),
                         )
                         .child(self.render_status(cx)),

@@ -1,10 +1,33 @@
-use gpui::{Context, Entity};
-use zsql_core::ConnectionUrl;
-use zsql_ui::text_field::TextFieldState;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use gpui::{App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Task, Window};
+use zsql_core::Connection;
+use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
+
+use crate::connections::StoredConnection;
 use crate::drivers;
+use crate::session::probe_connection;
 
-use super::{ConnectionManagerView, ManagerView};
+use super::TestOutcome;
+
+/// Whether the form is adding a new connection or editing a saved one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormMode {
+    Add,
+    Edit { index: usize },
+}
+
+/// What the form asks its host to do. The form never touches the store or
+/// the session itself.
+pub enum FormEvent {
+    /// Save was clicked, or Enter was pressed in the name/url field.
+    SaveRequested { name: String, url: String },
+    /// Connect was clicked (add form only): connect without saving.
+    ConnectRequested { url: String },
+    /// Cancel was clicked.
+    Cancelled,
+}
 
 /// Reject a would-be [`StoredConnection`] before it ever reaches
 /// [`ConnectionStore::add`]/[`ConnectionStore::update`]: an empty name, an
@@ -71,106 +94,149 @@ pub(super) fn tls_param_label(driver_id: &str) -> &'static str {
 fn set_field_value_if_changed(
     field: &Entity<TextFieldState>,
     value: &str,
-    cx: &mut Context<ConnectionManagerView>,
+    cx: &mut Context<ConnectionFormView>,
 ) {
     if field.read(cx).value().as_ref() != value {
         field.update(cx, |field, _cx| field.set_value_quiet(value));
     }
 }
 
-// ---- Form show/hide/input helpers -----------------------------------
+pub struct ConnectionFormView {
+    pub(super) mode: FormMode,
+    pub(super) name_field: Entity<TextFieldState>,
+    pub(super) url_field: Entity<TextFieldState>,
+    pub(super) host_field: Entity<TextFieldState>,
+    pub(super) port_field: Entity<TextFieldState>,
+    pub(super) user_field: Entity<TextFieldState>,
+    pub(super) password_field: Entity<TextFieldState>,
+    pub(super) database_field: Entity<TextFieldState>,
+    pub(super) tls_field: Entity<TextFieldState>,
+    pub(super) sqlite_path_field: Entity<TextFieldState>,
+    pub(super) parsed_url: Option<zsql_core::ConnectionUrl>,
+    pub(super) driver_id: Result<&'static str, String>,
+    pub(super) dim_reason: Option<String>,
+    pub(super) test_outcome: Option<TestOutcome>,
+    pub(super) probe_timeout: Duration,
+    pub(super) cancel_focus: FocusHandle,
+    pub(super) test_focus: FocusHandle,
+    pub(super) connect_focus: FocusHandle,
+    pub(super) save_focus: FocusHandle,
+}
 
-impl ConnectionManagerView {
-    /// Switch the open modal to the empty add-connection form.
-    pub fn show_add_form(&mut self, cx: &mut Context<Self>) {
-        self.view = ManagerView::AddForm;
-        self.clear_inputs(cx);
-        self.status = None;
-        self.test_outcome = None;
-        cx.notify();
+impl EventEmitter<FormEvent> for ConnectionFormView {}
+
+impl std::fmt::Debug for ConnectionFormView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionFormView").finish()
     }
+}
 
-    /// Switch the open modal to the edit form for the connection at `index`,
-    /// pre-filled from its stored name/url.
-    pub fn show_edit_form(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.rows.get(index) else {
-            tracing::warn!(index, "edit requested for an out-of-range row");
-            return;
+impl ConnectionFormView {
+    /// Create a new form for adding or editing a connection. If `prefill` is
+    /// `Some`, the fields are populated from the stored connection; otherwise
+    /// they start empty.
+    pub fn new(
+        mode: FormMode,
+        prefill: Option<&StoredConnection>,
+        probe_timeout: Duration,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_field = cx.new(|cx| TextFieldState::new("name", None, cx));
+        let url_field =
+            cx.new(|cx| TextFieldState::new("postgres://... or sqlite://...", None, cx));
+        let host_field = cx.new(|cx| TextFieldState::new("host", None, cx));
+        let port_field = cx.new(|cx| TextFieldState::new("port", None, cx));
+        let user_field = cx.new(|cx| TextFieldState::new("user", None, cx));
+        let password_field = cx.new(|cx| {
+            let mut field = TextFieldState::new("password", None, cx);
+            field.set_masked(true, cx);
+            field
+        });
+        let database_field = cx.new(|cx| TextFieldState::new("database", None, cx));
+        let tls_field = cx.new(|cx| TextFieldState::new("", None, cx));
+        let sqlite_path_field =
+            cx.new(|cx| TextFieldState::new("/path/to.db or :memory:", None, cx));
+
+        // Enter in the name/url fields emits SaveRequested.
+        cx.subscribe(&name_field, |form, _field, _event: &TextFieldEvent, cx| {
+            let (name, url) = form.input_values(cx);
+            cx.emit(FormEvent::SaveRequested { name, url });
+        })
+        .detach();
+        cx.subscribe(&url_field, |form, _field, _event: &TextFieldEvent, cx| {
+            let (name, url) = form.input_values(cx);
+            cx.emit(FormEvent::SaveRequested { name, url });
+        })
+        .detach();
+
+        cx.observe(&url_field, |form, _field, cx| form.on_url_field_changed(cx))
+            .detach();
+        cx.observe(&host_field, |form, _field, cx| {
+            form.on_host_field_changed(cx);
+        })
+        .detach();
+        cx.observe(&port_field, |form, _field, cx| {
+            form.on_port_field_changed(cx);
+        })
+        .detach();
+        cx.observe(&user_field, |form, _field, cx| {
+            form.on_user_field_changed(cx);
+        })
+        .detach();
+        cx.observe(&password_field, |form, _field, cx| {
+            form.on_password_field_changed(cx);
+        })
+        .detach();
+        cx.observe(&database_field, |form, _field, cx| {
+            form.on_database_field_changed(cx);
+        })
+        .detach();
+        cx.observe(&tls_field, |form, _field, cx| form.on_tls_field_changed(cx))
+            .detach();
+        cx.observe(&sqlite_path_field, |form, _field, cx| {
+            form.on_sqlite_path_field_changed(cx);
+        })
+        .detach();
+
+        let mut form = Self {
+            mode,
+            name_field,
+            url_field,
+            host_field,
+            port_field,
+            user_field,
+            password_field,
+            database_field,
+            tls_field,
+            sqlite_path_field,
+            parsed_url: None,
+            driver_id: Err("empty URL".to_owned()),
+            dim_reason: Some("empty URL".to_owned()),
+            test_outcome: None,
+            probe_timeout,
+            cancel_focus: cx.focus_handle(),
+            test_focus: cx.focus_handle(),
+            connect_focus: cx.focus_handle(),
+            save_focus: cx.focus_handle(),
         };
-        let name = row.connection.name.clone();
-        let url = row.connection.url.clone();
-        self.view = ManagerView::EditForm { index };
-        self.status = None;
-        self.test_outcome = None;
-        self.name_field
-            .update(cx, |field, _cx| field.set_value_quiet(name));
-        self.url_field
-            .update(cx, |field, _cx| field.set_value_quiet(url));
-        self.sync_fields_from_url(cx);
-        cx.notify();
-    }
 
-    /// Cancel out of the form back to the list, discarding whatever was
-    /// typed without saving anything.
-    pub fn cancel_form(&mut self, cx: &mut Context<Self>) {
-        self.view = ManagerView::List;
-        self.clear_inputs(cx);
-        self.status = None;
-        self.test_outcome = None;
-        cx.notify();
-    }
+        if let Some(connection) = prefill {
+            form.name_field
+                .update(cx, |field, _cx| field.set_value_quiet(&connection.name));
+            form.url_field
+                .update(cx, |field, _cx| field.set_value_quiet(&connection.url));
+            form.sync_fields_from_url(cx);
+        }
 
-    /// Empty every form field and reset the parsed-URL/driver-detection
-    /// state to the empty-URL baseline. Uses the quiet setter throughout
-    /// (see [`TextFieldState::set_value_quiet`]): this view's own
-    /// `cx.notify()` below is what repaints the fields with their new
-    /// (empty) content, and none of these resets is a "field edited by the
-    /// user" event that should feed back into the URL.
-    pub(super) fn clear_inputs(&mut self, cx: &mut Context<Self>) {
-        self.name_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.url_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.host_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.port_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.user_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.password_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.database_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.tls_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.sqlite_path_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.parsed_url = None;
-        self.driver_id = Err("empty URL".to_owned());
-        self.dim_reason = Some("empty URL".to_owned());
-        cx.notify();
+        form
     }
 
     /// The form's current name and URL values, read from the fields.
-    pub(super) fn input_values(&self, cx: &Context<Self>) -> (String, String) {
+    pub(super) fn input_values(&self, cx: &App) -> (String, String) {
         (
             self.name_field.read(cx).value().to_string(),
             self.url_field.read(cx).value().to_string(),
         )
-    }
-
-    /// `Enter` in the name/url fields: submits the add form, or saves an
-    /// edit, according to which panel is open.
-    pub(super) fn submit_form(&mut self, cx: &mut Context<Self>) {
-        match self.view {
-            ManagerView::AddForm => {
-                let _ = self.add_connection(cx);
-            }
-            ManagerView::EditForm { index } => {
-                let _ = self.save_edit(index, cx);
-            }
-            ManagerView::List => {}
-        }
     }
 
     /// Set the name field's content. Test helper: users type into the field
@@ -187,25 +253,17 @@ impl ConnectionManagerView {
         self.url_field
             .update(cx, |field, cx| field.set_value(url, cx));
     }
-}
 
-// ---- URL <-> fields sync -----------------------------------------------
-
-impl ConnectionManagerView {
     /// Recompute [`Self::driver_id`] (from the URL field's scheme alone) and
     /// [`Self::parsed_url`]/[`Self::dim_reason`] (from a full parse) from
     /// `url_field`'s current text, then refill every driver field the
     /// detected driver uses. The single entry point for the "URL edited ->
-    /// reparse the fields" direction, called both by `url_field`'s own
-    /// change observer and directly wherever this view sets `url_field`'s
-    /// value itself (`show_edit_form`, `clear_inputs`) so a test asserting
-    /// immediately after such a call sees fields already refilled rather
-    /// than depending on `gpui`'s effect-flush timing.
+    /// reparse the fields" direction.
     pub(super) fn sync_fields_from_url(&mut self, cx: &mut Context<Self>) {
         let url_text = self.url_field.read(cx).value().to_string();
         self.driver_id = detect_driver_id(&url_text);
 
-        match ConnectionUrl::parse(&url_text) {
+        match zsql_core::ConnectionUrl::parse(&url_text) {
             Ok(parsed) => {
                 self.dim_reason = None;
                 if let Ok(driver_id) = self.driver_id.clone() {
@@ -226,7 +284,7 @@ impl ConnectionManagerView {
     fn apply_parsed_url_to_fields(
         &mut self,
         driver_id: &str,
-        parsed: &ConnectionUrl,
+        parsed: &zsql_core::ConnectionUrl,
         cx: &mut Context<Self>,
     ) {
         if driver_id == "sqlite" {
@@ -357,5 +415,121 @@ impl ConnectionManagerView {
         self.password_field
             .update(cx, |field, cx| field.set_masked(!currently_masked, cx));
         cx.notify();
+    }
+
+    /// The driver id the form's current URL field detects, purely from its
+    /// scheme (see [`detect_driver_id`]) -- this is what picks the visible
+    /// field layout, independent of whether the full URL currently parses.
+    pub fn pending_driver_id(&self) -> Result<&'static str, String> {
+        self.driver_id.clone()
+    }
+
+    /// Why the driver-field section is currently dimmed, if it is.
+    #[must_use]
+    pub fn dim_reason(&self) -> Option<&str> {
+        self.dim_reason.as_deref()
+    }
+
+    /// The Test button's most recent (or in-flight) outcome, if any.
+    #[must_use]
+    pub fn test_outcome(&self) -> Option<&TestOutcome> {
+        self.test_outcome.as_ref()
+    }
+
+    /// Open a real connection to the form's current URL and ping it, on
+    /// [`Self::probe_timeout`], without saving anything or touching the
+    /// session's active connection. Updates [`Self::test_outcome`] with
+    /// `Pending` immediately, then the final result once the attempt
+    /// settles.
+    #[tracing::instrument(name = "form_test", skip_all)]
+    pub fn run_test(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let url = self.url_field.read(cx).value().to_string();
+        if let Err(reason) = detect_driver_id(&url) {
+            self.test_outcome = Some(TestOutcome::Failed(reason));
+            cx.notify();
+            return Task::ready(());
+        }
+        tracing::info!("form test starting");
+        self.test_outcome = Some(TestOutcome::Pending);
+        cx.notify();
+        let timeout = self.probe_timeout;
+
+        cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let connect_result = cx.background_spawn(drivers::connect(url)).await;
+            let outcome = match connect_result {
+                Ok(conn) => {
+                    let conn: Arc<dyn Connection> = Arc::from(conn);
+                    let executor = cx.background_executor().clone();
+                    let probe_result = cx
+                        .background_spawn(probe_connection(conn, timeout, executor))
+                        .await;
+                    match probe_result {
+                        Ok(()) => {
+                            let elapsed_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            TestOutcome::Connected { elapsed_ms }
+                        }
+                        Err(message) => TestOutcome::Failed(message),
+                    }
+                }
+                Err(err) => TestOutcome::Failed(err.to_string()),
+            };
+            tracing::info!(?outcome, "form test finished");
+            let _ = this.update(cx, |form, cx| {
+                form.test_outcome = Some(outcome);
+                cx.notify();
+            });
+        })
+    }
+
+    /// The focusable controls in the form, in visual top-to-bottom order:
+    /// Name, URL, then the driver-specific fields (whichever set the detected
+    /// driver picks), then the footer buttons left-to-right.
+    pub(super) fn focus_order(&self, cx: &App) -> Vec<FocusHandle> {
+        let mut order = vec![
+            self.name_field.read(cx).focus_handle(cx),
+            self.url_field.read(cx).focus_handle(cx),
+        ];
+        match self.driver_id.as_deref() {
+            Ok("sqlite") => order.push(self.sqlite_path_field.read(cx).focus_handle(cx)),
+            Ok("postgres" | "mssql") => {
+                order.push(self.host_field.read(cx).focus_handle(cx));
+                order.push(self.port_field.read(cx).focus_handle(cx));
+                order.push(self.user_field.read(cx).focus_handle(cx));
+                order.push(self.password_field.read(cx).focus_handle(cx));
+                order.push(self.database_field.read(cx).focus_handle(cx));
+                order.push(self.tls_field.read(cx).focus_handle(cx));
+            }
+            _ => {}
+        }
+        order.push(self.cancel_focus.clone());
+        order.push(self.test_focus.clone());
+        match self.mode {
+            FormMode::Add => {
+                order.push(self.connect_focus.clone());
+                order.push(self.save_focus.clone());
+            }
+            FormMode::Edit { .. } => order.push(self.save_focus.clone()),
+        }
+        order
+    }
+
+    /// Move focus to the next (or, if `backward`, previous) control in
+    /// [`Self::focus_order`], wrapping past either end. A no-op if nothing
+    /// in the form currently holds focus and the list to search is empty.
+    pub(super) fn move_focus(&self, backward: bool, window: &mut Window, cx: &Context<Self>) {
+        let order = self.focus_order(cx);
+        if order.is_empty() {
+            return;
+        }
+        let current = window.focused(cx);
+        let current_index = current.and_then(|handle| order.iter().position(|f| *f == handle));
+        let next_index = match current_index {
+            Some(index) if backward => (index + order.len() - 1) % order.len(),
+            Some(index) => (index + 1) % order.len(),
+            None => 0,
+        };
+        window.focus(&order[next_index]);
     }
 }

@@ -1,24 +1,15 @@
 //! The connection manager: a centered modal (opened from
 //! [`super::footer::ConnectionFooterView`]) that lists persisted
-//! connections and offers a sectioned add/edit form: the URL on top, its
-//! parsed-out driver-specific fields below, both always visible and kept in
-//! sync in both directions ([`ConnectionManagerView::sync_fields_from_url`]/
-//! the per-field `on_*_field_changed` handlers). The URL stays the single
-//! source of truth -- [`StoredConnection::url`] is the only thing persisted;
-//! the fields are a parse layer over it, built by [`zsql_core::ConnectionUrl`].
-//!
-//! Every text input uses the reusable [`zsql_ui::text_field::TextFieldState`]
-//! widget: a bordered field with a teal focus ring, blinking caret, muted
-//! placeholder, selection, clipboard, and IME. Each field is its own entity.
+//! connections and offers a sectioned add/edit form. The form is managed
+//! as a separate [`ConnectionFormView`] entity; the manager coordinates
+//! store operations, session interactions, and panel switching.
 
 use std::time::Duration;
 
 use gpui::{
-    ClickEvent, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Render, Window, div,
-    prelude::*, px, rgb, rgba,
+    ClickEvent, Context, Div, Entity, FocusHandle, KeyDownEvent, Render, Window, div, prelude::*,
+    px, rgb, rgba,
 };
-use zsql_core::ConnectionUrl;
-use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
 use zsql_ui::theme::ActiveTheme;
 
 use crate::connections::{ConnectionStore, StoredConnection};
@@ -29,6 +20,7 @@ mod active;
 pub use active::{ActiveConnection, FooterDisplay, active_connection_for_url, footer_display};
 
 mod form;
+pub use form::{ConnectionFormView, FormEvent, FormMode};
 
 mod actions;
 use actions::build_rows;
@@ -86,9 +78,8 @@ pub enum TestOutcome {
     Failed(String),
 }
 
-/// The connection-manager modal's state: a saved-connections list, an add/
-/// edit form (name/url plus driver-specific fields kept in sync with the
-/// URL), and whether the modal is currently open at all.
+/// The connection-manager modal's state: a saved-connections list, a form
+/// entity (when open), and whether the modal is currently open at all.
 pub struct ConnectionManagerView {
     session: Entity<Session>,
     store: ConnectionStore,
@@ -96,44 +87,12 @@ pub struct ConnectionManagerView {
     /// Per-row focus handles, rebuilt alongside `rows` so `Enter` on a
     /// focused row can connect-and-close the same as clicking it.
     row_focus_handles: Vec<FocusHandle>,
-    /// The form's name field.
-    name_field: Entity<TextFieldState>,
-    /// The form's URL field: the single source of truth every driver field
-    /// below is parsed from and reserialized into.
-    url_field: Entity<TextFieldState>,
-    host_field: Entity<TextFieldState>,
-    port_field: Entity<TextFieldState>,
-    user_field: Entity<TextFieldState>,
-    /// Masked by default; see [`ConnectionManagerView::toggle_password_visible`].
-    password_field: Entity<TextFieldState>,
-    database_field: Entity<TextFieldState>,
-    /// The driver's TLS query-parameter value (`sslmode` for postgres,
-    /// `trustServerCertificate` for mssql).
-    tls_field: Entity<TextFieldState>,
-    /// `SQLite`'s single field: a file path (or `:memory:`).
-    sqlite_path_field: Entity<TextFieldState>,
-    /// The URL field's current text, parsed -- `None` while it does not
-    /// parse, in which case [`Self::dim_reason`] carries why. The driver
-    /// fields mutate this in place and reserialize it back into `url_field`,
-    /// rather than each owning separate state.
-    parsed_url: Option<ConnectionUrl>,
-    /// The URL field's current text's detected driver id, from its scheme
-    /// alone (see [`detect_driver_id`]) -- this picks which field layout to
-    /// show even while [`Self::parsed_url`] is `None` (e.g. a partially
-    /// typed `postgres://` URL still shows the Postgres field shapes,
-    /// dimmed).
-    driver_id: Result<&'static str, String>,
-    /// Why the driver-field section is currently dimmed, if it is. `None`
-    /// once the URL parses and its scheme resolves to a registered driver.
-    dim_reason: Option<String>,
+    /// The form entity, if a form panel is currently open.
+    form: Option<Entity<ConnectionFormView>>,
     /// Focus target for the modal overlay itself, so an `Escape` keystroke
     /// reaches [`Self::handle_modal_key_down`] once the caller that opens
     /// the modal focuses it (see `ui::footer::ConnectionFooterView`).
     modal_focus: FocusHandle,
-    cancel_focus: FocusHandle,
-    test_focus: FocusHandle,
-    connect_focus: FocusHandle,
-    save_focus: FocusHandle,
     /// Whether the modal overlay is currently mounted/visible.
     open: bool,
     /// Which panel the open modal shows.
@@ -143,9 +102,6 @@ pub struct ConnectionManagerView {
     /// The most recent add/connect/delete/save attempt's outcome, shown
     /// inline.
     status: Option<String>,
-    /// The Test button's most recent (or in-flight) outcome, if any has run
-    /// since the form was last opened.
-    test_outcome: Option<TestOutcome>,
     /// Timeout a Test attempt's ping races against, taken from
     /// [`crate::config::Config::liveness`] so Test and the footer's live
     /// indicator agree on what "unreachable" means.
@@ -166,88 +122,17 @@ impl ConnectionManagerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let rows = build_rows(store.connections());
-        let name_field = cx.new(|cx| TextFieldState::new("name", None, cx));
-        let url_field =
-            cx.new(|cx| TextFieldState::new("postgres://... or sqlite://...", None, cx));
-        let host_field = cx.new(|cx| TextFieldState::new("host", None, cx));
-        let port_field = cx.new(|cx| TextFieldState::new("port", None, cx));
-        let user_field = cx.new(|cx| TextFieldState::new("user", None, cx));
-        let password_field = cx.new(|cx| {
-            let mut field = TextFieldState::new("password", None, cx);
-            field.set_masked(true, cx);
-            field
-        });
-        let database_field = cx.new(|cx| TextFieldState::new("database", None, cx));
-        let tls_field = cx.new(|cx| TextFieldState::new("", None, cx));
-        let sqlite_path_field =
-            cx.new(|cx| TextFieldState::new("/path/to.db or :memory:", None, cx));
-
-        // Enter in the name/url fields submits the form (add or save-edit).
-        cx.subscribe(&name_field, |view, _field, _event: &TextFieldEvent, cx| {
-            view.submit_form(cx);
-        })
-        .detach();
-        cx.subscribe(&url_field, |view, _field, _event: &TextFieldEvent, cx| {
-            view.submit_form(cx);
-        })
-        .detach();
-
-        cx.observe(&url_field, |view, _field, cx| view.on_url_field_changed(cx))
-            .detach();
-        cx.observe(&host_field, |view, _field, cx| {
-            view.on_host_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&port_field, |view, _field, cx| {
-            view.on_port_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&user_field, |view, _field, cx| {
-            view.on_user_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&password_field, |view, _field, cx| {
-            view.on_password_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&database_field, |view, _field, cx| {
-            view.on_database_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&tls_field, |view, _field, cx| view.on_tls_field_changed(cx))
-            .detach();
-        cx.observe(&sqlite_path_field, |view, _field, cx| {
-            view.on_sqlite_path_field_changed(cx);
-        })
-        .detach();
-
         Self {
             session,
             store,
             row_focus_handles: rows.iter().map(|_| cx.focus_handle()).collect(),
             rows,
-            name_field,
-            url_field,
-            host_field,
-            port_field,
-            user_field,
-            password_field,
-            database_field,
-            tls_field,
-            sqlite_path_field,
-            parsed_url: None,
-            driver_id: Err("empty URL".to_owned()),
-            dim_reason: Some("empty URL".to_owned()),
+            form: None,
             modal_focus: cx.focus_handle(),
-            cancel_focus: cx.focus_handle(),
-            test_focus: cx.focus_handle(),
-            connect_focus: cx.focus_handle(),
-            save_focus: cx.focus_handle(),
             open: false,
             view: ManagerView::List,
             active: None,
             status: None,
-            test_outcome: None,
             probe_timeout,
         }
     }
@@ -265,12 +150,6 @@ impl ConnectionManagerView {
         self.status.as_deref()
     }
 
-    /// The Test button's most recent (or in-flight) outcome, if any.
-    #[must_use]
-    pub fn test_outcome(&self) -> Option<&TestOutcome> {
-        self.test_outcome.as_ref()
-    }
-
     /// Whether the modal overlay is currently mounted/visible.
     #[must_use]
     pub fn is_open(&self) -> bool {
@@ -281,19 +160,6 @@ impl ConnectionManagerView {
     #[must_use]
     pub fn current_view(&self) -> ManagerView {
         self.view
-    }
-
-    /// The driver id the form's current URL field detects, purely from its
-    /// scheme (see [`detect_driver_id`]) -- this is what picks the visible
-    /// field layout, independent of whether the full URL currently parses.
-    pub fn pending_driver_id(&self) -> Result<&'static str, String> {
-        self.driver_id.clone()
-    }
-
-    /// Why the driver-field section is currently dimmed, if it is.
-    #[must_use]
-    pub fn dim_reason(&self) -> Option<&str> {
-        self.dim_reason.as_deref()
     }
 
     /// The connection currently tracked as active (the session's connected
@@ -331,6 +197,13 @@ impl ConnectionManagerView {
         self.modal_focus.clone()
     }
 
+    /// The form entity, if one is open, for tests that need to inspect or
+    /// drive the form directly.
+    #[cfg(test)]
+    pub(super) fn form(&self) -> Option<&Entity<ConnectionFormView>> {
+        self.form.as_ref()
+    }
+
     /// Open the modal on the list panel, clearing any stale status message
     /// from a previous session with it.
     pub fn open(&mut self, cx: &mut Context<Self>) {
@@ -347,10 +220,9 @@ impl ConnectionManagerView {
     }
 
     /// `Escape` closes the modal; `Tab`/`Shift-Tab` move focus through the
-    /// form and footer buttons in visual order (see [`Self::focus_order`]).
-    /// Every other key is ignored here (the text fields handle their own
-    /// keys, and an `Enter` in the name/url fields submits via their
-    /// `Submit` event).
+    /// form and footer buttons in visual order. Every other key is ignored
+    /// here (the text fields handle their own keys, and an `Enter` in the
+    /// name/url fields submits via their `Submit` event).
     pub fn handle_modal_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -359,64 +231,15 @@ impl ConnectionManagerView {
     ) {
         match event.keystroke.key.as_str() {
             "escape" => self.close(cx),
-            "tab" => self.move_focus(event.keystroke.modifiers.shift, window, cx),
-            _ => {}
-        }
-    }
-
-    /// The focusable controls in the currently-shown form, in visual
-    /// top-to-bottom order: Name, URL, then the driver-specific fields
-    /// (whichever set the detected driver picks), then the footer buttons
-    /// left-to-right. Empty on the list panel.
-    fn focus_order(&self, cx: &Context<Self>) -> Vec<FocusHandle> {
-        if matches!(self.view, ManagerView::List) {
-            return Vec::new();
-        }
-        let mut order = vec![
-            self.name_field.read(cx).focus_handle(cx),
-            self.url_field.read(cx).focus_handle(cx),
-        ];
-        match self.driver_id.as_deref() {
-            Ok("sqlite") => order.push(self.sqlite_path_field.read(cx).focus_handle(cx)),
-            Ok("postgres" | "mssql") => {
-                order.push(self.host_field.read(cx).focus_handle(cx));
-                order.push(self.port_field.read(cx).focus_handle(cx));
-                order.push(self.user_field.read(cx).focus_handle(cx));
-                order.push(self.password_field.read(cx).focus_handle(cx));
-                order.push(self.database_field.read(cx).focus_handle(cx));
-                order.push(self.tls_field.read(cx).focus_handle(cx));
+            "tab" => {
+                if let Some(form) = &self.form {
+                    form.update(cx, |form, cx| {
+                        form.move_focus(event.keystroke.modifiers.shift, window, cx);
+                    });
+                }
             }
             _ => {}
         }
-        order.push(self.cancel_focus.clone());
-        order.push(self.test_focus.clone());
-        match self.view {
-            ManagerView::AddForm => {
-                order.push(self.connect_focus.clone());
-                order.push(self.save_focus.clone());
-            }
-            ManagerView::EditForm { .. } => order.push(self.save_focus.clone()),
-            ManagerView::List => {}
-        }
-        order
-    }
-
-    /// Move focus to the next (or, if `backward`, previous) control in
-    /// [`Self::focus_order`], wrapping past either end. A no-op if nothing
-    /// in the form currently holds focus and the list to search is empty.
-    fn move_focus(&self, backward: bool, window: &mut Window, cx: &Context<Self>) {
-        let order = self.focus_order(cx);
-        if order.is_empty() {
-            return;
-        }
-        let current = window.focused(cx);
-        let current_index = current.and_then(|handle| order.iter().position(|f| *f == handle));
-        let next_index = match current_index {
-            Some(index) if backward => (index + order.len() - 1) % order.len(),
-            Some(index) => (index + 1) % order.len(),
-            None => 0,
-        };
-        window.focus(&order[next_index]);
     }
 
     /// Replace the tracked active connection, e.g. after a successful
@@ -426,6 +249,75 @@ impl ConnectionManagerView {
     pub fn set_active(&mut self, active: Option<ActiveConnection>, cx: &mut Context<Self>) {
         self.active = active;
         cx.notify();
+    }
+
+    /// Create and open the add-connection form.
+    pub fn show_add_form(&mut self, cx: &mut Context<Self>) {
+        self.view = ManagerView::AddForm;
+        let form =
+            cx.new(|cx| ConnectionFormView::new(FormMode::Add, None, self.probe_timeout, cx));
+        self.open_form(form, cx);
+    }
+
+    /// Create and open the edit-connection form for the connection at `index`,
+    /// pre-filled from its stored name/url.
+    pub fn show_edit_form(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.get(index) else {
+            tracing::warn!(index, "edit requested for an out-of-range row");
+            return;
+        };
+        let prefill = row.connection.clone();
+        self.view = ManagerView::EditForm { index };
+        let form = cx.new(|cx| {
+            ConnectionFormView::new(
+                FormMode::Edit { index },
+                Some(&prefill),
+                self.probe_timeout,
+                cx,
+            )
+        });
+        self.open_form(form, cx);
+    }
+
+    /// Wire a freshly created form's events into the store/session handlers
+    /// and show it, clearing any stale status from the previous panel.
+    fn open_form(&mut self, form: Entity<ConnectionFormView>, cx: &mut Context<Self>) {
+        self.status = None;
+        cx.subscribe(&form, |manager, _form, event: &FormEvent, cx| match event {
+            FormEvent::Cancelled => manager.close_form(cx),
+            FormEvent::SaveRequested { name, url } => match manager.view {
+                ManagerView::EditForm { index } => {
+                    let _ = manager.save_edit(index, name, url, cx);
+                }
+                _ => {
+                    let _ = manager.add_connection(name, url, cx);
+                }
+            },
+            FormEvent::ConnectRequested { url } => {
+                manager.connect_unsaved(url.clone(), cx).detach();
+            }
+        })
+        .detach();
+        self.form = Some(form);
+        cx.notify();
+    }
+
+    /// Close the open form, return to the list panel.
+    pub(super) fn close_form(&mut self, cx: &mut Context<Self>) {
+        self.view = ManagerView::List;
+        self.form = None;
+        cx.notify();
+    }
+
+    /// Render the status line at the bottom of the list panel.
+    pub(super) fn render_status(&self, cx: &Context<Self>) -> Div {
+        let text = self
+            .status()
+            .unwrap_or("click a row to connect\t•\tesc to close");
+        div()
+            .text_size(px(style::MODAL_ROW_URL_TEXT_SIZE))
+            .text_color(rgb(cx.theme().colors.text_tertiary))
+            .child(text.to_owned())
     }
 }
 
@@ -446,17 +338,12 @@ impl Render for ConnectionManagerView {
             .items_center()
             .justify_center()
             .bg(rgba(colors.scrim))
-            // Block mouse events from reaching the workspace behind the modal
-            // (notably the SQL editor): without this, a click on a field falls
-            // through to the editor's own mouse-down, which steals focus back.
             .occlude()
             .track_focus(&self.modal_focus)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 view.handle_modal_key_down(event, window, cx);
             }))
             .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
-                // This modal is a bit confusing if it closes due to outside
-                // click
                 cx.stop_propagation();
             }))
             .child(
@@ -469,10 +356,6 @@ impl Render for ConnectionManagerView {
                     .border_color(rgb(colors.border))
                     .rounded(px(style::MODAL_RADIUS))
                     .overflow_hidden()
-                    // Swallows the click before it reaches the scrim's
-                    // close-on-click handler above, so interacting with the
-                    // panel itself never closes the modal out from under
-                    // the user.
                     .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                     }))
@@ -480,7 +363,11 @@ impl Render for ConnectionManagerView {
                     .child(match self.current_view() {
                         ManagerView::List => self.render_modal_list(window, cx).into_any_element(),
                         ManagerView::AddForm | ManagerView::EditForm { .. } => {
-                            self.render_modal_form(window, cx).into_any_element()
+                            if let Some(form) = &self.form {
+                                form.clone().into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }
                         }
                     }),
             )
