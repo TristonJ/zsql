@@ -7988,6 +7988,8 @@ name = "zsql-ui"
 version = "0.0.0"
 dependencies = [
  "gpui",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

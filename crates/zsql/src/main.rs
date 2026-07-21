@@ -8,6 +8,7 @@ mod session;
 mod tab_session;
 #[cfg(test)]
 mod test_support;
+mod theme_resolve;
 mod ui;
 
 use config::Config;
@@ -46,7 +47,8 @@ fn main() -> anyhow::Result<()> {
     Application::new()
         .with_assets(zsql_ui::icon::IconAssetSource)
         .run(move |cx: &mut App| {
-            cx.set_global(zsql_ui::theme::Theme::default());
+            let theme = theme_resolve::resolve(&cfg.theme.name, Config::themes_dir().as_deref());
+            cx.set_global(theme);
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
 

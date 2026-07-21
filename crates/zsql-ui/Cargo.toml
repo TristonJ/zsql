@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 gpui = { workspace = true }
 tracing = { workspace = true }
+# `theme::Colors` derives `Deserialize` so a theme file on disk can override
+# individual color roles.
+serde = { workspace = true }
 
 [features]
 # Exposes scrollbar-thumb debug tagging (`VisualTestContext::debug_bounds`
@@ -23,6 +26,9 @@ test-support = []
 # dependency above via Cargo's resolver, so this only takes effect for
 # test/bench builds.
 gpui = { workspace = true, features = ["test-support"] }
+# Exercises `theme::Colors`'s `Deserialize` impl against real JSON text in
+# tests; the shipped crate never parses JSON itself.
+serde_json = { workspace = true }
 
 [[example]]
 name = "text_field_demo"
