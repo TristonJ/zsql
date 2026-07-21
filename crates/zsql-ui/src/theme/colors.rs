@@ -3,85 +3,148 @@
 //! so a re-themed base color always carries its washes and outlines along
 //! with it.
 
+use serde::Deserialize;
+
 /// The active theme's semantic color roles, plus alpha-blend/mix
 /// derivations computed from them.
 ///
 /// Every field is a plain `0xRRGGBB` (opaque) or `0xRRGGBBAA` (carrying its
 /// own alpha) literal, ready for `gpui::rgb`/`gpui::rgba`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deserializes from a JSON object whose keys are these field names and
+/// whose values are `#`-prefixed hex color strings -- 6 digits for an
+/// opaque role, 8 for a role that carries its own alpha. Every field is
+/// optional and falls back to [`Colors::default`]'s value for that field
+/// when absent, so a file overriding a single role is a valid theme. An
+/// unrecognized key is a deserialization error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Colors {
     /// Window/page background.
+    #[serde(default = "default_bg_app", deserialize_with = "parse_rgb_hex")]
     pub bg_app: u32,
     /// Bars (title bar, results header bar) background.
+    #[serde(default = "default_bg_panel", deserialize_with = "parse_rgb_hex")]
     pub bg_panel: u32,
     /// Raised surfaces: the column-header row background.
+    #[serde(default = "default_bg_raised", deserialize_with = "parse_rgb_hex")]
     pub bg_raised: u32,
     /// Overlay surfaces: context menus and other floating panels raised
     /// above [`Colors::bg_raised`].
+    #[serde(default = "default_bg_overlay", deserialize_with = "parse_rgb_hex")]
     pub bg_overlay: u32,
     /// Text-input field background.
+    #[serde(default = "default_bg_input", deserialize_with = "parse_rgb_hex")]
     pub bg_input: u32,
     /// Standard hairline border color.
+    #[serde(default = "default_border", deserialize_with = "parse_rgb_hex")]
     pub border: u32,
     /// A softer hairline, used between body cells and header columns.
+    #[serde(default = "default_border_soft", deserialize_with = "parse_rgb_hex")]
     pub border_soft: u32,
     /// Primary text color.
+    #[serde(default = "default_text_primary", deserialize_with = "parse_rgb_hex")]
     pub text_primary: u32,
     /// Secondary/muted text (labels, timestamps).
+    #[serde(default = "default_text_secondary", deserialize_with = "parse_rgb_hex")]
     pub text_secondary: u32,
     /// Faint text: NULLs, row numbers, disabled-ish labels.
+    #[serde(default = "default_text_tertiary", deserialize_with = "parse_rgb_hex")]
     pub text_tertiary: u32,
     /// Accent color: row counts, active affordances, the Run button.
+    #[serde(default = "default_accent", deserialize_with = "parse_rgb_hex")]
     pub accent: u32,
     /// Text color painted on top of a solid [`Colors::accent`] fill.
+    #[serde(
+        default = "default_accent_contrast",
+        deserialize_with = "parse_rgb_hex"
+    )]
     pub accent_contrast: u32,
     /// Boolean cell text.
+    #[serde(default = "default_value_bool", deserialize_with = "parse_rgb_hex")]
     pub value_bool: u32,
     /// Raw-bytes cell text.
+    #[serde(default = "default_value_bytes", deserialize_with = "parse_rgb_hex")]
     pub value_bytes: u32,
     /// JSON/JSONB cell text.
+    #[serde(default = "default_value_json", deserialize_with = "parse_rgb_hex")]
     pub value_json: u32,
     /// NULL cell text.
+    #[serde(default = "default_value_null", deserialize_with = "parse_rgb_hex")]
     pub value_null: u32,
     /// Numeric cell text.
+    #[serde(default = "default_value_number", deserialize_with = "parse_rgb_hex")]
     pub value_number: u32,
     /// Plain text cell text.
+    #[serde(default = "default_value_text", deserialize_with = "parse_rgb_hex")]
     pub value_text: u32,
     /// Timestamp cell text.
+    #[serde(
+        default = "default_value_timestamp",
+        deserialize_with = "parse_rgb_hex"
+    )]
     pub value_timestamp: u32,
     /// Fallback/attention color for values that do not map to a more
     /// specific kind (arrays, unmapped backend types).
+    #[serde(default = "default_value_unknown", deserialize_with = "parse_rgb_hex")]
     pub value_unknown: u32,
     /// Syntax highlight color for a keyword span.
+    #[serde(default = "default_syntax_keyword", deserialize_with = "parse_rgb_hex")]
     pub syntax_keyword: u32,
     /// Syntax highlight color for a string-literal span.
+    #[serde(default = "default_syntax_string", deserialize_with = "parse_rgb_hex")]
     pub syntax_string: u32,
     /// Status color: a connection attempt in flight, or a partial/degraded
     /// state.
+    #[serde(default = "default_status_warn", deserialize_with = "parse_rgb_hex")]
     pub status_warn: u32,
     /// Status color: a failed connection or query.
+    #[serde(default = "default_status_error", deserialize_with = "parse_rgb_hex")]
     pub status_error: u32,
     /// Status color: a query result truncated at the configured row limit.
+    #[serde(default = "default_status_limited", deserialize_with = "parse_rgb_hex")]
     pub status_limited: u32,
     /// View relation-kind tint.
+    #[serde(default = "default_kind_view", deserialize_with = "parse_rgb_hex")]
     pub kind_view: u32,
     /// Materialized-view relation-kind tint.
+    #[serde(default = "default_kind_matview", deserialize_with = "parse_rgb_hex")]
     pub kind_matview: u32,
     /// Partitioned-table relation-kind tint.
+    #[serde(
+        default = "default_kind_partitioned",
+        deserialize_with = "parse_rgb_hex"
+    )]
     pub kind_partitioned: u32,
     /// Foreign-key hue: the schema view's FK rail tick and link chip.
+    #[serde(default = "default_key_fk", deserialize_with = "parse_rgb_hex")]
     pub key_fk: u32,
     /// Faint wash painted under a hovered row.
+    #[serde(default = "default_hover_wash", deserialize_with = "parse_rgba_hex")]
     pub hover_wash: u32,
     /// Dimming scrim behind a modal.
+    #[serde(default = "default_scrim", deserialize_with = "parse_rgba_hex")]
     pub scrim: u32,
     /// Shadow color cast by a dialog/modal panel.
+    #[serde(default = "default_shadow_dialog", deserialize_with = "parse_rgba_hex")]
     pub shadow_dialog: u32,
     /// Shadow color cast by a floating overlay (e.g. a context menu).
+    #[serde(
+        default = "default_shadow_overlay",
+        deserialize_with = "parse_rgba_hex"
+    )]
     pub shadow_overlay: u32,
     /// Resting fill of a scrollbar thumb.
+    #[serde(
+        default = "default_scrollbar_thumb",
+        deserialize_with = "parse_rgba_hex"
+    )]
     pub scrollbar_thumb: u32,
     /// Hovered fill of a scrollbar thumb.
+    #[serde(
+        default = "default_scrollbar_thumb_hover",
+        deserialize_with = "parse_rgba_hex"
+    )]
     pub scrollbar_thumb_hover: u32,
 }
 
@@ -126,6 +189,104 @@ impl Default for Colors {
             scrollbar_thumb_hover: 0x59_60_6f_99,
         }
     }
+}
+
+/// Declares a zero-argument function `$fn_name` returning
+/// `Colors::default().$field`, used as that field's serde `default = "..."`
+/// so a theme file omitting the key falls back to just that one role's
+/// built-in value rather than the whole struct's.
+macro_rules! default_color_fn {
+    ($fn_name:ident, $field:ident) => {
+        fn $fn_name() -> u32 {
+            Colors::default().$field
+        }
+    };
+}
+
+default_color_fn!(default_bg_app, bg_app);
+default_color_fn!(default_bg_panel, bg_panel);
+default_color_fn!(default_bg_raised, bg_raised);
+default_color_fn!(default_bg_overlay, bg_overlay);
+default_color_fn!(default_bg_input, bg_input);
+default_color_fn!(default_border, border);
+default_color_fn!(default_border_soft, border_soft);
+default_color_fn!(default_text_primary, text_primary);
+default_color_fn!(default_text_secondary, text_secondary);
+default_color_fn!(default_text_tertiary, text_tertiary);
+default_color_fn!(default_accent, accent);
+default_color_fn!(default_accent_contrast, accent_contrast);
+default_color_fn!(default_value_bool, value_bool);
+default_color_fn!(default_value_bytes, value_bytes);
+default_color_fn!(default_value_json, value_json);
+default_color_fn!(default_value_null, value_null);
+default_color_fn!(default_value_number, value_number);
+default_color_fn!(default_value_text, value_text);
+default_color_fn!(default_value_timestamp, value_timestamp);
+default_color_fn!(default_value_unknown, value_unknown);
+default_color_fn!(default_syntax_keyword, syntax_keyword);
+default_color_fn!(default_syntax_string, syntax_string);
+default_color_fn!(default_status_warn, status_warn);
+default_color_fn!(default_status_error, status_error);
+default_color_fn!(default_status_limited, status_limited);
+default_color_fn!(default_kind_view, kind_view);
+default_color_fn!(default_kind_matview, kind_matview);
+default_color_fn!(default_kind_partitioned, kind_partitioned);
+default_color_fn!(default_key_fk, key_fk);
+default_color_fn!(default_hover_wash, hover_wash);
+default_color_fn!(default_scrim, scrim);
+default_color_fn!(default_shadow_dialog, shadow_dialog);
+default_color_fn!(default_shadow_overlay, shadow_overlay);
+default_color_fn!(default_scrollbar_thumb, scrollbar_thumb);
+default_color_fn!(default_scrollbar_thumb_hover, scrollbar_thumb_hover);
+
+/// Digit count of a `#`-prefixed opaque `RRGGBB` hex color string, the
+/// width every [`gpui::rgb`]-consumed [`Colors`] role parses from.
+const RGB_HEX_DIGITS: usize = 6;
+/// Digit count of a `#`-prefixed `RRGGBBAA` hex color string carrying its
+/// own alpha byte, the width every [`gpui::rgba`]-consumed [`Colors`] role
+/// parses from.
+const RGBA_HEX_DIGITS: usize = 8;
+
+/// Parses `text` as a `#`-prefixed hex color of exactly `expected_digits`
+/// hex digits, producing the literal `u32` `gpui::rgb`/`gpui::rgba` expects.
+/// Rejects a missing `#`, a wrong digit count, and any non-hex-digit
+/// character rather than substituting a default -- a malformed theme value
+/// is a loud parse error, not a silently wrong color.
+fn parse_hex_color(text: &str, expected_digits: usize) -> Result<u32, String> {
+    let Some(digits) = text.strip_prefix('#') else {
+        return Err(format!("color {text:?} must start with '#'"));
+    };
+    if digits.len() != expected_digits {
+        return Err(format!(
+            "color {text:?} must have exactly {expected_digits} hex digits after '#', found {}",
+            digits.len()
+        ));
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("color {text:?} contains a non-hex-digit character"));
+    }
+    u32::from_str_radix(digits, 16)
+        .map_err(|_err| format!("color {text:?} contains a non-hex-digit character"))
+}
+
+/// Deserializes a `#RRGGBB` string into the opaque `0xRRGGBB` a
+/// [`gpui::rgb`]-consumed role stores.
+fn parse_rgb_hex<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    parse_hex_color(&text, RGB_HEX_DIGITS).map_err(serde::de::Error::custom)
+}
+
+/// Deserializes a `#RRGGBBAA` string into the `0xRRGGBBAA` a
+/// [`gpui::rgba`]-consumed role stores.
+fn parse_rgba_hex<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    parse_hex_color(&text, RGBA_HEX_DIGITS).map_err(serde::de::Error::custom)
 }
 
 /// An opaque `0xRRGGBB` color's individual channels.
@@ -433,5 +594,88 @@ mod tests {
         assert_eq!(colors.accent_dim(), 0x28_82_78);
         // accent mixed 78% toward text_primary.
         assert_eq!(colors.accent_strong(), 0x58_c9_ba);
+    }
+
+    #[test]
+    fn six_digit_hex_parses_as_an_opaque_rrggbb() {
+        assert_eq!(super::parse_hex_color("#33c2ac", 6), Ok(0x33_c2_ac));
+    }
+
+    #[test]
+    fn eight_digit_hex_parses_as_rrggbbaa_with_its_own_alpha_byte() {
+        assert_eq!(super::parse_hex_color("#59606f66", 8), Ok(0x59_60_6f_66));
+    }
+
+    #[test]
+    fn hex_missing_the_leading_hash_is_a_parse_error() {
+        assert!(super::parse_hex_color("33c2ac", 6).is_err());
+    }
+
+    #[test]
+    fn hex_with_the_wrong_digit_count_is_a_parse_error() {
+        assert!(super::parse_hex_color("#33c2a", 6).is_err());
+        assert!(super::parse_hex_color("#33c2acff", 6).is_err());
+        assert!(super::parse_hex_color("#33c2ac", 8).is_err());
+    }
+
+    #[test]
+    fn hex_with_a_non_hex_character_is_a_parse_error() {
+        assert!(super::parse_hex_color("#33c2ag", 6).is_err());
+        assert!(super::parse_hex_color("#zzzzzz", 6).is_err());
+    }
+
+    #[test]
+    fn hex_with_a_leading_sign_character_is_a_parse_error() {
+        // u32::from_str_radix alone accepts a leading '+' or '-', which
+        // would otherwise let a malformed digit slip through as a shifted
+        // color instead of failing.
+        assert!(super::parse_hex_color("#+fffff", 6).is_err());
+        assert!(super::parse_hex_color("#-fffff", 6).is_err());
+    }
+
+    #[test]
+    fn a_theme_file_setting_only_one_field_matches_the_default_everywhere_else() {
+        let colors: Colors = serde_json::from_str("{\"accent\": \"#e0a33f\"}")
+            .expect("a single-field theme must parse");
+
+        let expected = Colors {
+            accent: 0xe0_a3_3f,
+            ..Colors::default()
+        };
+        assert_eq!(colors, expected);
+    }
+
+    #[test]
+    fn an_empty_theme_file_deserializes_to_the_default_palette() {
+        let colors: Colors = serde_json::from_str("{}").expect("an empty theme must parse");
+        assert_eq!(colors, Colors::default());
+    }
+
+    #[test]
+    fn a_theme_file_can_override_an_rgba_role_with_eight_hex_digits() {
+        let colors: Colors = serde_json::from_str("{\"scrim\": \"#11223344\"}")
+            .expect("an rgba-role override must parse");
+        assert_eq!(colors.scrim, 0x11_22_33_44);
+        assert_eq!(colors.bg_app, Colors::default().bg_app);
+    }
+
+    #[test]
+    fn an_rgb_role_given_eight_hex_digits_is_rejected() {
+        let err = serde_json::from_str::<Colors>("{\"accent\": \"#33c2acff\"}")
+            .expect_err("accent is an rgb-consumed role and must reject 8 digits");
+        assert!(
+            err.to_string().contains("hex digits"),
+            "error should explain the digit-count mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_fails_to_parse_and_names_the_offending_key() {
+        let err = serde_json::from_str::<Colors>("{\"accentt\": \"#e0a33f\"}")
+            .expect_err("a misspelled role name must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("accentt"),
+            "error should name the unknown key: {err}"
+        );
     }
 }

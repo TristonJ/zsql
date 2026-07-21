@@ -2,6 +2,7 @@
 //! literal, held as `gpui` global state so it can be swapped without touching
 //! a single call site.
 
+pub mod catppuccin;
 mod colors;
 
 pub use colors::Colors;
@@ -17,6 +18,13 @@ pub struct Theme {
 }
 
 impl gpui::Global for Theme {}
+
+/// The built-in [`Theme`] named `name` (one of the [`catppuccin`] flavor
+/// names), or `None` if `name` does not match a built-in.
+#[must_use]
+pub fn built_in_theme(name: &str) -> Option<Theme> {
+    catppuccin::built_in_by_name(name).map(|colors| Theme { colors })
+}
 
 /// Ergonomic access to the active [`Theme`]: any type that derefs to
 /// `gpui::App` (every `Context<T>` and `Window` context does) gets

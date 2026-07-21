@@ -18,6 +18,10 @@ const CONNECTIONS_FILE_NAME: &str = "connections.toml";
 /// File name of the persisted per-connection tab-session store, under
 /// `APP_CONFIG_DIR_NAME`. See [`crate::tab_session`].
 const TAB_SESSIONS_FILE_NAME: &str = "tab_sessions.json";
+/// Directory name under `APP_CONFIG_DIR_NAME` that holds user theme files,
+/// one JSON file per theme named after [`ThemeConfig::name`]. See
+/// [`crate::theme_resolve`].
+const THEMES_DIR_NAME: &str = "themes";
 
 /// Top-level application config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +194,14 @@ impl Config {
     #[must_use]
     pub fn tab_sessions_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(TAB_SESSIONS_FILE_NAME))
+    }
+
+    /// Directory holding user theme files
+    /// (`$XDG_CONFIG_HOME/zsql/themes/`), if resolvable. Lives alongside
+    /// [`Config::default_path`], under the same app config directory.
+    #[must_use]
+    pub fn themes_dir() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(THEMES_DIR_NAME))
     }
 
     /// Load config from `path`, falling back to defaults if it does not exist.
