@@ -10,9 +10,9 @@ use gpui::{
     point, prelude::*, px, rgb, rgba, uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
-use zsql_ui::colors;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
+use zsql_ui::theme::{ActiveTheme, Theme};
 // Imported by name rather than as `zsql_ui::tree::...`: this module already
 // uses `tree` as a local variable/parameter name for a `SchemaTree`, and
 // qualifying every call here would read as if it referred to that value.
@@ -276,7 +276,7 @@ impl SidebarView {
     }
 
     /// The "SCHEMA" header bar.
-    fn render_header() -> Div {
+    fn render_header(active_theme: &Theme) -> Div {
         div()
             .flex()
             .flex_row()
@@ -285,11 +285,11 @@ impl SidebarView {
             .h(theme::SIDEBAR_HEADER_HEIGHT)
             .px_3()
             .border_b_1()
-            .border_color(rgb(colors::LINE_SOFT))
+            .border_color(rgb(active_theme.colors.border_soft))
             .child(
                 div()
                     .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(active_theme.colors.text_tertiary))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("SCHEMA"),
             )
@@ -298,24 +298,26 @@ impl SidebarView {
     /// The main content area: the tree when a schema is loaded, or a
     /// centered prompt/status message for every other `SchemaState`.
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
         let placeholder = {
             let session = self.session.read(cx);
             match session.schema() {
                 SchemaState::NotLoaded => Some((
-                    colors::FAINT,
+                    colors.text_tertiary,
                     "No schema",
                     "Connect to a database to browse its schema.".to_owned(),
                 )),
                 SchemaState::Loading => Some((
-                    colors::FAINT,
+                    colors.text_tertiary,
                     "Loading schema...",
                     "Fetching catalogs, schemas, and relations.".to_owned(),
                 )),
                 SchemaState::Error(message) => {
-                    Some((theme::STATUS_ERROR, "Schema unavailable", message.clone()))
+                    Some((colors.status_error, "Schema unavailable", message.clone()))
                 }
                 SchemaState::Ready(tree) if tree.catalogs.is_empty() => Some((
-                    colors::FAINT,
+                    colors.text_tertiary,
                     "No catalogs",
                     "The connected database reported no catalogs.".to_owned(),
                 )),
@@ -325,7 +327,7 @@ impl SidebarView {
 
         match placeholder {
             Some((color, title, detail)) => {
-                Self::render_placeholder(color, title, &detail).into_any_element()
+                Self::render_placeholder(color, title, &detail, &active_theme).into_any_element()
             }
             None => self.render_tree(window, cx).into_any_element(),
         }
@@ -333,7 +335,12 @@ impl SidebarView {
 
     /// A centered title + detail message shown in place of the tree for any
     /// non-ready `SchemaState`.
-    fn render_placeholder(title_color: u32, title: &str, detail: &str) -> Div {
+    fn render_placeholder(
+        title_color: u32,
+        title: &str,
+        detail: &str,
+        active_theme: &Theme,
+    ) -> Div {
         div()
             .flex()
             .flex_col()
@@ -354,19 +361,20 @@ impl SidebarView {
             .child(
                 div()
                     .text_size(px(META_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(active_theme.colors.text_tertiary))
                     .child(detail.to_owned()),
             )
     }
 
-    /// The tree scrollbar's chrome, from the sidebar's own theme constants.
-    /// The track paints no background.
-    fn tree_scrollbar_style() -> ScrollbarStyle {
+    /// The tree scrollbar's chrome, from the sidebar's own theme constants
+    /// plus the active theme's scrollbar colors. The track paints no
+    /// background.
+    fn tree_scrollbar_style(active_theme: &Theme) -> ScrollbarStyle {
         ScrollbarStyle {
             track_width: f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH),
             track_color: None,
-            thumb_color: theme::SIDEBAR_SCROLLBAR_THUMB,
-            thumb_hover_color: Some(theme::SIDEBAR_SCROLLBAR_THUMB_HOVER),
+            thumb_color: active_theme.colors.scrollbar_thumb,
+            thumb_hover_color: Some(active_theme.colors.scrollbar_thumb_hover),
             radius: theme::SIDEBAR_SCROLLBAR_RADIUS,
             inset: f32::from(theme::SIDEBAR_SCROLLBAR_GAP),
             ..ScrollbarStyle::default()
@@ -378,6 +386,7 @@ impl SidebarView {
         let row_count = self.rows.len();
         let content_height = f32::from(sidebar_tree_content_height(row_count));
         let tree_scroll_handle = self.tree_scroll_handle.clone();
+        let active_theme = cx.theme();
 
         self.scroll.update(cx, |scroll, _cx| {
             scroll.vertical(Axis::new(
@@ -412,12 +421,13 @@ impl SidebarView {
                     .flex_1()
                     .min_h_0()
                     .child(list)
-                    .with_scrollbars(&self.scroll, Self::tree_scrollbar_style(), cx),
+                    .with_scrollbars(&self.scroll, Self::tree_scrollbar_style(&active_theme), cx),
             )
     }
 
     /// Render one flattened row, dispatching on its kind.
     fn render_row(&self, row: &SidebarRow, ix: usize, cx: &Context<Self>) -> Stateful<Div> {
+        let active_theme = cx.theme();
         match row {
             SidebarRow::Catalog {
                 name,
@@ -425,22 +435,22 @@ impl SidebarView {
                 schema_count,
             } => {
                 let name_owned = name.clone();
-                row_shell(theme::SIDEBAR_INDENT_L0)
+                row_shell(theme::SIDEBAR_INDENT_L0, &active_theme)
                     .id(ix)
                     .cursor_pointer()
-                    .hover(|this| this.bg(rgb(colors::RAISE)))
+                    .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_catalog(&name_owned, cx);
                     }))
-                    .child(disclosure_glyph(*expanded))
+                    .child(disclosure_glyph(*expanded, &active_theme))
                     .child(icon(
                         IconName::Database,
                         theme::SIDEBAR_ROW_ICON_SIZE,
-                        colors::FAINT,
+                        active_theme.colors.text_tertiary,
                     ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
-                        el.child(row_meta(format!("{schema_count} schemas")))
+                        el.child(row_meta(format!("{schema_count} schemas"), &active_theme))
                     })
             }
             SidebarRow::Schema {
@@ -451,22 +461,22 @@ impl SidebarView {
             } => {
                 let catalog_owned = catalog.clone();
                 let name_owned = name.clone();
-                row_shell(theme::SIDEBAR_INDENT_L1)
+                row_shell(theme::SIDEBAR_INDENT_L1, &active_theme)
                     .id(ix)
                     .cursor_pointer()
-                    .hover(|this| this.bg(rgb(colors::RAISE)))
+                    .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
                     .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                         view.toggle_schema(&catalog_owned, &name_owned, cx);
                     }))
-                    .child(disclosure_glyph(*expanded))
+                    .child(disclosure_glyph(*expanded, &active_theme))
                     .child(icon(
                         IconName::Schema,
                         theme::SIDEBAR_ROW_ICON_SIZE,
-                        colors::FAINT,
+                        active_theme.colors.text_tertiary,
                     ))
                     .child(row_label(name.clone()))
                     .when(!expanded, |el| {
-                        el.child(row_meta(format!("{relation_count} rel")))
+                        el.child(row_meta(format!("{relation_count} rel"), &active_theme))
                     })
             }
             SidebarRow::Relation {
@@ -490,6 +500,7 @@ impl SidebarView {
         column_count: usize,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        let active_theme = cx.theme();
         let schema_owned = schema.to_owned();
         let name_owned = name.to_owned();
         let schema_for_menu = schema.to_owned();
@@ -499,10 +510,10 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|(s, r)| s == schema && r == name);
 
-        let mut shell = row_shell(theme::SIDEBAR_INDENT_L2)
+        let mut shell = row_shell(theme::SIDEBAR_INDENT_L2, &active_theme)
             .id(ix)
             .cursor_pointer()
-            .hover(|this| this.bg(rgb(colors::RAISE)))
+            .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
             .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
                 view.preview(&schema_owned, &name_owned, window, cx);
             }))
@@ -524,17 +535,17 @@ impl SidebarView {
             .child(icon(
                 relation_icon_name(kind),
                 theme::SIDEBAR_RELATION_ICON_SIZE,
-                relation_tint(kind),
+                relation_tint(kind, &active_theme),
             ))
             // left-pad the row count so that the icons are always aligned (
             // assuming <9999 columns)
-            .child(row_count(format!("{column_count:>4} cols")));
+            .child(row_count(format!("{column_count:>4} cols"), &active_theme));
 
         if selected {
             shell = shell
-                .bg(rgba(theme::SIDEBAR_SELECTED_BG))
+                .bg(rgba(theme::sidebar_selected_bg(&active_theme)))
                 .border_l_2()
-                .border_color(rgb(colors::TEAL));
+                .border_color(rgb(active_theme.colors.accent));
         }
         shell
     }
@@ -548,6 +559,7 @@ impl SidebarView {
     /// as activating whatever sits beneath it. Renders nothing when no menu
     /// is open.
     fn render_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let active_theme = cx.theme();
         let menu = self.context_menu.clone()?;
         let schema = menu.schema.clone();
         let relation = menu.relation.clone();
@@ -566,9 +578,9 @@ impl SidebarView {
             .occlude()
             .w(theme::CONTEXT_MENU_WIDTH)
             .p(theme::CONTEXT_MENU_PADDING)
-            .bg(rgb(colors::RAISE))
+            .bg(rgb(active_theme.colors.bg_raised))
             .border_1()
-            .border_color(rgb(colors::LINE))
+            .border_color(rgb(active_theme.colors.border))
             .rounded(px(theme::CONTEXT_MENU_RADIUS))
             .child(context_menu_item(
                 cx,
@@ -586,7 +598,7 @@ impl SidebarView {
                     view.close_context_menu(cx);
                 },
             ))
-            .child(context_menu_separator())
+            .child(context_menu_separator(&active_theme))
             .child(context_menu_item(cx, "Copy Name", |view, _window, cx| {
                 view.copy_name(cx);
             }))
@@ -626,6 +638,7 @@ fn context_menu_item(
     label: &'static str,
     on_click: impl Fn(&mut SidebarView, &mut Window, &mut Context<SidebarView>) + 'static,
 ) -> Stateful<Div> {
+    let active_theme = cx.theme();
     div()
         .id(label)
         .flex()
@@ -636,8 +649,8 @@ fn context_menu_item(
         .rounded(px(theme::CONTEXT_MENU_ITEM_RADIUS))
         .cursor_pointer()
         .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
-        .text_color(rgb(colors::TEXT))
-        .hover(|el| el.bg(rgba(theme::SIDEBAR_SELECTED_BG)))
+        .text_color(rgb(active_theme.colors.text_primary))
+        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(&active_theme))))
         .child(label)
         .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
             on_click(view, window, cx);
@@ -645,11 +658,11 @@ fn context_menu_item(
 }
 
 /// A thin horizontal divider between context menu item groups.
-fn context_menu_separator() -> Div {
+fn context_menu_separator(active_theme: &Theme) -> Div {
     div()
         .h(theme::CONTEXT_MENU_SEPARATOR_HEIGHT)
         .my(theme::CONTEXT_MENU_SEPARATOR_MARGIN_Y)
-        .bg(rgb(colors::LINE_SOFT))
+        .bg(rgb(active_theme.colors.border_soft))
 }
 
 /// `schema.relation`, the text `Copy Qualified Name` writes to the
@@ -660,13 +673,14 @@ fn qualified_relation_name(schema: &str, relation: &str) -> String {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_theme = cx.theme();
         div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(colors::PANEL))
-            .child(Self::render_header())
+            .bg(rgb(active_theme.colors.bg_panel))
+            .child(Self::render_header(&active_theme))
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
     }
@@ -699,12 +713,12 @@ fn relation_icon_name(kind: RelationKind) -> IconName {
 }
 
 /// Map a [`RelationKind`] to the tint its sidebar row badge renders with.
-fn relation_tint(kind: RelationKind) -> u32 {
+fn relation_tint(kind: RelationKind, active_theme: &Theme) -> u32 {
     match kind {
-        RelationKind::Table => colors::TEAL,
-        RelationKind::View => colors::VIEW,
-        RelationKind::MatView => colors::MATVIEW,
-        RelationKind::Partitioned => colors::PARTITIONED,
+        RelationKind::Table => active_theme.colors.accent,
+        RelationKind::View => active_theme.colors.kind_view,
+        RelationKind::MatView => active_theme.colors.kind_matview,
+        RelationKind::Partitioned => active_theme.colors.kind_partitioned,
     }
 }
 
@@ -758,8 +772,8 @@ mod tests {
     use std::collections::HashSet;
 
     use zsql_core::{Catalog, ColumnMeta, Relation, RelationKind, SchemaNs, SchemaTree};
-    use zsql_ui::colors;
     use zsql_ui::icon::IconName;
+    use zsql_ui::theme::Theme;
     use zsql_ui::tree::ROW_HEIGHT;
 
     use super::{
@@ -839,12 +853,22 @@ mod tests {
 
     #[test]
     fn relation_tint_maps_every_relation_kind_to_a_named_color_constant() {
-        assert_eq!(relation_tint(RelationKind::Table), colors::TEAL);
-        assert_eq!(relation_tint(RelationKind::View), colors::VIEW);
-        assert_eq!(relation_tint(RelationKind::MatView), colors::MATVIEW);
+        let theme = Theme::default();
         assert_eq!(
-            relation_tint(RelationKind::Partitioned),
-            colors::PARTITIONED
+            relation_tint(RelationKind::Table, &theme),
+            theme.colors.accent
+        );
+        assert_eq!(
+            relation_tint(RelationKind::View, &theme),
+            theme.colors.kind_view
+        );
+        assert_eq!(
+            relation_tint(RelationKind::MatView, &theme),
+            theme.colors.kind_matview
+        );
+        assert_eq!(
+            relation_tint(RelationKind::Partitioned, &theme),
+            theme.colors.kind_partitioned
         );
     }
 
@@ -969,7 +993,8 @@ mod tests {
 
     #[test]
     fn tree_scrollbar_style_matches_every_one_of_the_sidebars_theme_constants() {
-        let style = SidebarView::tree_scrollbar_style();
+        let active_theme = Theme::default();
+        let style = SidebarView::tree_scrollbar_style(&active_theme);
         assert!(
             (style.track_width - f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH)).abs() < f32::EPSILON
         );
@@ -977,10 +1002,10 @@ mod tests {
             style.track_color, None,
             "the tree scrollbar's track paints no background"
         );
-        assert_eq!(style.thumb_color, theme::SIDEBAR_SCROLLBAR_THUMB);
+        assert_eq!(style.thumb_color, active_theme.colors.scrollbar_thumb);
         assert_eq!(
             style.thumb_hover_color,
-            Some(theme::SIDEBAR_SCROLLBAR_THUMB_HOVER)
+            Some(active_theme.colors.scrollbar_thumb_hover)
         );
         assert!((style.radius - theme::SIDEBAR_SCROLLBAR_RADIUS).abs() < f32::EPSILON);
         assert!((style.inset - f32::from(theme::SIDEBAR_SCROLLBAR_GAP)).abs() < f32::EPSILON);

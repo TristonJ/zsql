@@ -15,9 +15,10 @@ use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, Render, Stateful, Task,
     Window, div, prelude::*, px, rgb, rgba,
 };
+use zsql_ui::grid;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
-use zsql_ui::{colors, grid};
+use zsql_ui::theme::ActiveTheme;
 
 use super::theme;
 use crate::connections::{ConnectionStore, ConnectionStoreError, StoredConnection};
@@ -551,6 +552,7 @@ impl Render for ConnectionManagerView {
     /// mounting this entity in the first place, so `render` does not
     /// re-check `open` itself.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
         div()
             .id("connection-modal-scrim")
             .absolute()
@@ -558,7 +560,7 @@ impl Render for ConnectionManagerView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(theme::MODAL_BACKDROP))
+            .bg(rgba(colors.scrim))
             // Block mouse events from reaching the workspace behind the modal
             // (notably the SQL editor): without this, a click on a field falls
             // through to the editor's own mouse-down, which steals focus back.
@@ -574,9 +576,9 @@ impl Render for ConnectionManagerView {
                 div()
                     .id("connection-modal-panel")
                     .w(theme::MODAL_WIDTH)
-                    .bg(rgb(colors::PANEL))
+                    .bg(rgb(colors.bg_panel))
                     .border_1()
-                    .border_color(rgb(colors::LINE))
+                    .border_color(rgb(colors.border))
                     .rounded(px(theme::MODAL_RADIUS))
                     .overflow_hidden()
                     // Swallows the click before it reaches the scrim's
@@ -599,6 +601,7 @@ impl ConnectionManagerView {
     /// The modal's title bar: a back arrow on the add form, the panel
     /// title, a saved-count subtitle on the list, and a close (`x`) button.
     fn render_modal_head(&self, cx: &Context<Self>) -> Div {
+        let colors = cx.theme().colors;
         let mut head = div()
             .flex()
             .flex_row()
@@ -607,7 +610,7 @@ impl ConnectionManagerView {
             .h(theme::MODAL_HEAD_HEIGHT)
             .px_3()
             .border_b_1()
-            .border_color(rgb(colors::LINE_SOFT));
+            .border_color(rgb(colors.border_soft));
 
         if matches!(self.current_view(), ManagerView::AddForm) {
             head = head.child(
@@ -615,7 +618,7 @@ impl ConnectionManagerView {
                     .id("connection-form-back")
                     .cursor_pointer()
                     .pr_2()
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(colors.text_tertiary))
                     .child("<")
                     .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                         view.cancel_add(cx);
@@ -630,7 +633,7 @@ impl ConnectionManagerView {
         head = head.child(
             div()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(colors::TEXT))
+                .text_color(rgb(colors.text_primary))
                 .child(title),
         );
 
@@ -639,7 +642,7 @@ impl ConnectionManagerView {
                 div()
                     .pl_2()
                     .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(colors.text_tertiary))
                     .child(format!("{} saved", self.rows.len())),
             );
         }
@@ -651,10 +654,14 @@ impl ConnectionManagerView {
                 .ml_auto()
                 .cursor_pointer()
                 .child(
-                    icon(IconName::Close, theme::MODAL_CLOSE_ICON_SIZE, colors::FAINT)
-                        .group_hover(theme::MODAL_CLOSE_HOVER_GROUP, |style| {
-                            style.text_color(rgb(colors::TEXT))
-                        }),
+                    icon(
+                        IconName::Close,
+                        theme::MODAL_CLOSE_ICON_SIZE,
+                        colors.text_tertiary,
+                    )
+                    .group_hover(theme::MODAL_CLOSE_HOVER_GROUP, |style| {
+                        style.text_color(rgb(colors.text_primary))
+                    }),
                 )
                 .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                     view.close(cx);
@@ -665,6 +672,7 @@ impl ConnectionManagerView {
     /// The saved-connections list panel: every row plus the "Add
     /// connection" affordance and the inline status line.
     fn render_modal_list(&self, cx: &Context<Self>) -> Div {
+        let colors = cx.theme().colors;
         let mut list = div()
             .flex()
             .flex_col()
@@ -688,7 +696,7 @@ impl ConnectionManagerView {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(rgb(colors::LINE_SOFT))
+                    .border_color(rgb(colors.border_soft))
                     .child(
                         div()
                             .id("add-connection-button")
@@ -701,12 +709,12 @@ impl ConnectionManagerView {
                             .py_1()
                             .rounded(px(theme::MODAL_ROW_RADIUS))
                             .border_1()
-                            .border_color(rgb(colors::TEAL))
-                            .text_color(rgb(colors::TEXT))
+                            .border_color(rgb(colors.accent))
+                            .text_color(rgb(colors.text_primary))
                             .child(icon(
                                 IconName::Add,
                                 theme::MODAL_ADD_ICON_SIZE,
-                                colors::TEXT,
+                                colors.text_primary,
                             ))
                             .child("Add connection")
                             .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
@@ -716,7 +724,7 @@ impl ConnectionManagerView {
                             })),
                     ),
             )
-            .child(self.render_status())
+            .child(self.render_status(cx))
     }
 
     /// One connection-list row: status dot, name (+ "connected" label and
@@ -730,6 +738,8 @@ impl ConnectionManagerView {
         row: &ConnectionRow,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
         let driver_label = match &row.driver_id {
             Ok(id) => (*id).to_owned(),
             Err(_) => "unrecognized".to_owned(),
@@ -748,14 +758,14 @@ impl ConnectionManagerView {
             .py_2()
             .rounded(px(theme::MODAL_ROW_RADIUS))
             .cursor_pointer()
-            .hover(|el| el.bg(rgb(colors::RAISE)))
+            .hover(|el| el.bg(rgb(colors.bg_raised)))
             .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                 view.connect_index(index, cx).detach();
             }))
             .child(if is_active {
-                grid::status_dot(colors::TEAL)
+                grid::status_dot(colors.accent)
             } else {
-                grid::status_dot_outline(colors::FAINT)
+                grid::status_dot_outline(colors.text_tertiary)
             })
             .child(
                 div()
@@ -774,14 +784,14 @@ impl ConnectionManagerView {
                                 div()
                                     .text_size(px(theme::MODAL_ROW_NAME_TEXT_SIZE))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(colors::TEXT))
+                                    .text_color(rgb(colors.text_primary))
                                     .child(row.connection.name.clone()),
                             )
                             .when(is_active, |el| {
                                 el.child(
                                     div()
                                         .text_size(px(theme::MODAL_ROW_CONNECTED_LABEL_TEXT_SIZE))
-                                        .text_color(rgb(colors::TEAL))
+                                        .text_color(rgb(colors.accent))
                                         .child("connected"),
                                 )
                             }),
@@ -789,12 +799,12 @@ impl ConnectionManagerView {
                     .child(
                         div()
                             .text_size(px(theme::MODAL_ROW_URL_TEXT_SIZE))
-                            .text_color(rgb(colors::FAINT))
+                            .text_color(rgb(colors.text_tertiary))
                             .truncate()
                             .child(row.connection.url.clone()),
                     ),
             )
-            .child(grid::type_tag(&driver_label))
+            .child(grid::type_tag(&driver_label, &active_theme))
             .child({
                 let hover_group = format!("delete-connection-button-hover-{index}");
                 div()
@@ -812,16 +822,16 @@ impl ConnectionManagerView {
                         icon(
                             IconName::Delete,
                             theme::MODAL_DELETE_ICON_SIZE,
-                            colors::FAINT,
+                            colors.text_tertiary,
                         )
                         .group_hover(hover_group, |style| {
-                            style.text_color(rgb(theme::STATUS_ERROR))
+                            style.text_color(rgb(colors.status_error))
                         }),
                     )
             });
 
         if is_active {
-            item = item.bg(rgba(theme::MODAL_ROW_ACTIVE_BG));
+            item = item.bg(rgba(theme::modal_row_active_bg(&active_theme)));
         }
         item
     }
@@ -829,6 +839,8 @@ impl ConnectionManagerView {
     /// The "new connection" form panel: name/url fields, a detected-driver
     /// preview, and Cancel/Add actions.
     fn render_modal_add_form(&self, cx: &Context<Self>) -> Div {
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
         let url_is_empty = self.url_field.read(cx).value().is_empty();
         let driver_preview = match self.pending_driver_id(cx) {
             Ok(id) => id.to_owned(),
@@ -856,9 +868,9 @@ impl ConnectionManagerView {
                                 .items_center()
                                 .gap_2()
                                 .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                                .text_color(rgb(colors::FAINT))
+                                .text_color(rgb(colors.text_tertiary))
                                 .child("detected driver")
-                                .child(grid::type_tag(&driver_preview)),
+                                .child(grid::type_tag(&driver_preview, &active_theme)),
                         )
                     }),
             )
@@ -876,8 +888,8 @@ impl ConnectionManagerView {
                             .py_1()
                             .rounded(px(theme::MODAL_ROW_RADIUS))
                             .border_1()
-                            .border_color(rgb(colors::LINE))
-                            .text_color(rgb(colors::MUTED))
+                            .border_color(rgb(colors.border))
+                            .text_color(rgb(colors.text_secondary))
                             .child("Cancel")
                             .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                 view.cancel_add(cx);
@@ -890,23 +902,23 @@ impl ConnectionManagerView {
                             .px_3()
                             .py_1()
                             .rounded(px(theme::MODAL_ROW_RADIUS))
-                            .bg(rgb(colors::RAISE))
-                            .text_color(rgb(colors::TEXT))
+                            .bg(rgb(colors.bg_raised))
+                            .text_color(rgb(colors.text_primary))
                             .child("Add")
                             .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                 let _ = view.add_connection(cx);
                             })),
                     ),
             )
-            .child(self.render_status())
+            .child(self.render_status(cx))
     }
 
-    fn render_status(&self) -> Div {
+    fn render_status(&self, cx: &Context<Self>) -> Div {
         div()
             .px_3()
             .pb_2()
             .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-            .text_color(rgb(colors::FAINT))
+            .text_color(rgb(cx.theme().colors.text_tertiary))
             .child(self.status().unwrap_or_default().to_owned())
     }
 }

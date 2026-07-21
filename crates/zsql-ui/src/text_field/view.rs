@@ -14,12 +14,12 @@ use gpui::{
     rgb, rgba, size,
 };
 
-use crate::colors;
 use crate::text_field::model::{
     BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_to_utf16, byte_range_from_utf16,
     byte_range_to_utf16, should_show_placeholder,
 };
 use crate::text_field::theme;
+use crate::theme::ActiveTheme;
 
 /// Underline thickness for the IME marked-text (composition) span.
 const MARKED_TEXT_UNDERLINE_WIDTH: Pixels = px(1.0);
@@ -356,10 +356,11 @@ impl EventEmitter<TextFieldEvent> for TextFieldState {}
 impl Render for TextFieldState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focused = self.focus_handle.is_focused(window);
+        let colors = cx.theme().colors;
         let border_color = if self.focused {
-            colors::TEAL
+            colors.accent
         } else {
-            colors::LINE
+            colors.border
         };
 
         div()
@@ -379,9 +380,9 @@ impl Render for TextFieldState {
             .rounded(px(theme::FIELD_RADIUS))
             .border_1()
             .border_color(rgb(border_color))
-            .bg(rgb(colors::INK))
+            .bg(rgb(colors.bg_app))
             .text_size(px(theme::FIELD_TEXT_SIZE))
-            .text_color(rgb(colors::TEXT))
+            .text_color(rgb(colors.text_primary))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_home))
@@ -585,6 +586,7 @@ impl Element for TextFieldContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let theme_colors = cx.theme().colors;
         let field = self.field.read(cx);
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -598,7 +600,7 @@ impl Element for TextFieldContentElement {
             let run = TextRun {
                 len: text.len(),
                 font: font.clone(),
-                color: rgb(colors::MUTED).into(),
+                color: rgb(theme_colors.text_secondary).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -621,7 +623,7 @@ impl Element for TextFieldContentElement {
                     point(bounds.left() + x, bounds.top()),
                     size(theme::FIELD_CURSOR_WIDTH, theme::FIELD_LINE_HEIGHT),
                 ),
-                rgb(colors::TEAL),
+                rgb(theme_colors.accent),
             )
         });
 
@@ -636,7 +638,7 @@ impl Element for TextFieldContentElement {
                         bounds.top() + theme::FIELD_LINE_HEIGHT,
                     ),
                 ),
-                rgba(theme::FIELD_SELECTION_BG),
+                rgba(theme_colors.accent_wash_hover()),
             )
         });
 

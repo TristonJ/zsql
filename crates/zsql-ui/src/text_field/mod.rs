@@ -6,7 +6,9 @@
 //! app, driver, or session type.
 
 mod model;
-mod theme;
+// Crate-visible (not just module-private) so the shared theme's metric
+// defaults can assert they still match this field's own established radius.
+pub(crate) mod theme;
 mod view;
 
 pub use model::{BlinkState, CURSOR_BLINK_INTERVAL, CURSOR_BLINK_RESUME_DELAY, FieldModel};

@@ -5,8 +5,8 @@
 
 use gpui::{Div, SharedString, div, prelude::*, px, rgb};
 
-use crate::colors;
 use crate::icon::{IconName, icon};
+use crate::theme::Theme;
 
 /// Height of each row in a tree view.
 pub const ROW_HEIGHT: gpui::Pixels = px(26.0);
@@ -26,7 +26,7 @@ pub const KIND_TEXT_SIZE: f32 = 9.0;
 
 /// Shared chrome for a tree row: height, indent, gap, monospace text.
 #[must_use]
-pub fn row_shell(indent: f32) -> Div {
+pub fn row_shell(indent: f32, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_row()
@@ -39,7 +39,7 @@ pub fn row_shell(indent: f32) -> Div {
         .w_full()
         .font_family("monospace")
         .text_size(px(ROW_TEXT_SIZE))
-        .text_color(rgb(colors::TEXT))
+        .text_color(rgb(theme.colors.text_primary))
 }
 
 /// The icon a disclosure row shows for `expanded`: chevron-down when
@@ -54,14 +54,14 @@ fn disclosure_icon_name(expanded: bool) -> IconName {
 }
 
 /// The tree disclosure glyph: a chevron-down icon expanded, chevron-right
-/// collapsed, tinted [`colors::FAINT`] and sized to fill its
-/// [`DISCLOSURE_WIDTH`] slot.
+/// collapsed, tinted with the theme's tertiary text color and sized to fill
+/// its [`DISCLOSURE_WIDTH`] slot.
 #[must_use]
-pub fn disclosure_glyph(expanded: bool) -> Div {
+pub fn disclosure_glyph(expanded: bool, theme: &Theme) -> Div {
     div().flex_shrink_0().w(px(DISCLOSURE_WIDTH)).child(icon(
         disclosure_icon_name(expanded),
         px(DISCLOSURE_WIDTH),
-        colors::FAINT,
+        theme.colors.text_tertiary,
     ))
 }
 
@@ -80,38 +80,38 @@ pub fn row_label(text: impl Into<SharedString>) -> Div {
 
 /// A row's trailing affordance (e.g. a relation/column count).
 #[must_use]
-pub fn row_meta(text: impl Into<SharedString>) -> Div {
+pub fn row_meta(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .flex_shrink_0()
         .ml_auto()
         .pl_2()
         .text_size(px(META_TEXT_SIZE))
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(theme.colors.text_tertiary))
         .font_family("monospace")
         .child(text.into())
 }
 
 /// A row's kind label (e.g. table/view/matview/partitioned).
 #[must_use]
-pub fn row_kind(text: impl Into<SharedString>) -> Div {
+pub fn row_kind(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .flex_shrink_0()
         .ml_auto()
         .pl_2()
         .text_size(px(KIND_TEXT_SIZE))
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(theme.colors.text_tertiary))
         .font_family("monospace")
         .child(text.into())
 }
 
 /// A row's trailing count, following [`row_kind`] in normal flow.
 #[must_use]
-pub fn row_count(text: impl Into<SharedString>) -> Div {
+pub fn row_count(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .flex_shrink_0()
         .pl_2()
         .text_size(px(META_TEXT_SIZE))
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(theme.colors.text_tertiary))
         .font_family("monospace")
         .child(text.into())
 }
@@ -119,16 +119,17 @@ pub fn row_count(text: impl Into<SharedString>) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        disclosure_glyph, disclosure_icon_name, disclosure_spacer, row_count, row_kind, row_label,
-        row_meta, row_shell,
+        Theme, disclosure_glyph, disclosure_icon_name, disclosure_spacer, row_count, row_kind,
+        row_label, row_meta, row_shell,
     };
     use crate::icon::IconName;
 
     #[test]
     fn row_shell_and_disclosure_helpers_build_for_any_indent_or_state() {
-        let _shell = row_shell(24.0);
-        let _expanded = disclosure_glyph(true);
-        let _collapsed = disclosure_glyph(false);
+        let theme = Theme::default();
+        let _shell = row_shell(24.0, &theme);
+        let _expanded = disclosure_glyph(true, &theme);
+        let _collapsed = disclosure_glyph(false, &theme);
         let _spacer = disclosure_spacer();
     }
 
@@ -140,9 +141,10 @@ mod tests {
 
     #[test]
     fn label_meta_kind_and_count_helpers_build_for_text() {
+        let theme = Theme::default();
         let _label = row_label("orders");
-        let _meta = row_meta("4 cols");
-        let _kind = row_kind("table");
-        let _count = row_count("4 cols");
+        let _meta = row_meta("4 cols", &theme);
+        let _kind = row_kind("table", &theme);
+        let _count = row_count("4 cols", &theme);
     }
 }

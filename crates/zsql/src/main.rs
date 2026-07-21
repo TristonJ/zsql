@@ -46,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     Application::new()
         .with_assets(zsql_ui::icon::IconAssetSource)
         .run(move |cx: &mut App| {
+            cx.set_global(zsql_ui::theme::Theme::default());
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
 

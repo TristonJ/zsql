@@ -10,8 +10,8 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, canvas, div,
     prelude::*, px, rgb, rgba,
 };
-use zsql_ui::colors;
 use zsql_ui::icon::{IconName, icon};
+use zsql_ui::theme::ActiveTheme;
 
 use super::connections::{ActiveConnection, ConnectionManagerView};
 use super::footer::ConnectionFooterView;
@@ -419,14 +419,15 @@ impl WorkspaceView {
     /// The tab bar: one entry per open tab, in order, plus the trailing "+"
     /// affordance that opens a new script tab.
     fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let active_theme = cx.theme();
         let active_id = self.tabs.read(cx).active_id();
-        let mut bar = zsql_ui::tabs::tab_bar_shell();
+        let mut bar = zsql_ui::tabs::tab_bar_shell(&active_theme);
         for tab in self.tabs.read(cx).tabs() {
             let active = active_id == Some(tab.id());
             bar = bar.child(Self::render_tab(tab, active, cx));
         }
         bar.child(
-            zsql_ui::tabs::new_tab_glyph()
+            zsql_ui::tabs::new_tab_glyph(&active_theme)
                 .id("workspace-new-tab")
                 .cursor_pointer()
                 .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
@@ -440,8 +441,9 @@ impl WorkspaceView {
     /// active) a dashed underline; a `Script` tab gets a plain label with a
     /// trailing `*` while dirty, and (only while active) a solid underline.
     fn render_tab(tab: &Tab, active: bool, cx: &Context<Self>) -> impl IntoElement {
+        let active_theme = cx.theme();
         let id = tab.id();
-        let mut shell = zsql_ui::tabs::tab_shell(active).id(("workspace-tab", id));
+        let mut shell = zsql_ui::tabs::tab_shell(active, &active_theme).id(("workspace-tab", id));
 
         shell = match tab.kind() {
             TabKind::Generated { .. } => {
@@ -450,12 +452,12 @@ impl WorkspaceView {
                         div()
                             .flex_shrink_0()
                             .text_size(px(theme::TAB_ICON_TEXT_SIZE))
-                            .text_color(rgb(colors::TEAL))
+                            .text_color(rgb(active_theme.colors.accent))
                             .child("#"),
                     )
                     .child(div().italic().child(tab.title().to_owned()));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid());
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
                 }
                 shell
             }
@@ -466,7 +468,7 @@ impl WorkspaceView {
                 }
                 shell = shell.child(div().child(label));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid());
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
                 }
                 shell
             }
@@ -475,11 +477,11 @@ impl WorkspaceView {
                     .child(icon(
                         IconName::Table,
                         px(theme::TAB_ICON_TEXT_SIZE),
-                        colors::TEAL,
+                        active_theme.colors.accent,
                     ))
                     .child(div().child(tab.title().to_owned()));
                 if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid());
+                    shell = shell.child(zsql_ui::tabs::active_underline_solid(&active_theme));
                 }
                 shell
             }
@@ -491,7 +493,7 @@ impl WorkspaceView {
                 view.activate_tab(id, window, cx);
             }))
             .child(
-                zsql_ui::tabs::close_glyph()
+                zsql_ui::tabs::close_glyph(&active_theme)
                     .id(("workspace-tab-close", id))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
@@ -512,6 +514,8 @@ impl WorkspaceView {
         } else {
             "Ctrl+Enter"
         };
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
 
         div()
             .flex()
@@ -521,13 +525,13 @@ impl WorkspaceView {
             .justify_between()
             .h(theme::WORKSPACE_HEADER_HEIGHT)
             .px(px(theme::WORKSPACE_HEADER_PADDING_X))
-            .bg(rgb(colors::PANEL))
+            .bg(rgb(colors.bg_panel))
             .border_b_1()
-            .border_color(rgb(colors::LINE))
+            .border_color(rgb(colors.border))
             .child(
                 div()
                     .text_size(px(theme::WORKSPACE_HEADER_LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors::MUTED))
+                    .text_color(rgb(colors.text_secondary))
                     .child("SQL"),
             )
             .child(
@@ -540,17 +544,17 @@ impl WorkspaceView {
                     .h(theme::RUN_BUTTON_HEIGHT)
                     .px(px(theme::RUN_BUTTON_PADDING_X))
                     .rounded(px(theme::RUN_BUTTON_RADIUS))
-                    .bg(rgb(colors::TEAL))
-                    .text_color(rgb(colors::INK))
+                    .bg(rgb(colors.accent))
+                    .text_color(rgb(colors.bg_app))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::RUN_BUTTON_HOVER_BG)))
+                    .hover(|style| style.bg(rgb(theme::run_button_hover_bg(&active_theme))))
                     .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                         view.run_active_tab(cx);
                     }))
                     .child(icon(
                         IconName::Run,
                         theme::RUN_BUTTON_ICON_SIZE,
-                        colors::INK,
+                        colors.bg_app,
                     ))
                     .child(
                         div()
@@ -560,7 +564,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
-                            .text_color(rgba(theme::RUN_BUTTON_HINT))
+                            .text_color(rgba(theme::run_button_hint(&active_theme)))
                             .child(run_shortcut),
                     ),
             )
@@ -572,12 +576,13 @@ impl WorkspaceView {
     /// every tab has been closed. Never called for an active `Schema` tab --
     /// see [`Self::render_main_pane`].
     fn render_active_body(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let active_theme = cx.theme();
         let Some(active) = self.tabs.read(cx).active_tab() else {
             return div().flex_shrink_0().into_any_element();
         };
 
         if active.is_generated() {
-            Self::render_generated_strip(active).into_any_element()
+            Self::render_generated_strip(active, &active_theme).into_any_element()
         } else {
             div()
                 .flex_shrink_0()
@@ -620,7 +625,7 @@ impl WorkspaceView {
                 .w_full()
                 .h(self.layout.divider_thickness)
                 .cursor(CursorStyle::ResizeUpDown)
-                .bg(rgb(colors::LINE))
+                .bg(rgb(cx.theme().colors.border))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(Self::start_editor_results_drag),
@@ -634,10 +639,8 @@ impl WorkspaceView {
         ]
     }
 
-    /// The compact, single-line SQL strip a live `Generated` tab renders
-    /// instead of the full editor: a teal-tinted, left-accented row holding
-    /// the (compact-mode) editor plus a trailing "generated" tag and hint.
-    fn render_generated_strip(tab: &Tab) -> impl IntoElement {
+    /// The strip a live `Generated` tab renders instead of the full editor.
+    fn render_generated_strip(tab: &Tab, active_theme: &zsql_ui::theme::Theme) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
@@ -645,8 +648,8 @@ impl WorkspaceView {
             .flex_shrink_0()
             .w_full()
             .h(theme::GENERATED_STRIP_HEIGHT)
-            .bg(gpui::rgba(theme::GENERATED_STRIP_BG))
-            .border_color(rgb(theme::GENERATED_STRIP_ACCENT))
+            .bg(gpui::rgba(theme::generated_strip_bg(active_theme)))
+            .border_color(rgb(theme::generated_strip_accent(active_theme)))
             .child(
                 div()
                     .flex_1()
@@ -662,11 +665,11 @@ impl WorkspaceView {
                     .items_center()
                     .gap(px(theme::GENERATED_STRIP_TRAILING_GAP))
                     .px(px(theme::GENERATED_STRIP_TRAILING_PADDING_X))
-                    .child(zsql_ui::grid::type_tag("generated"))
+                    .child(zsql_ui::grid::type_tag("generated", active_theme))
                     .child(
                         div()
                             .text_size(px(theme::GENERATED_HINT_TEXT_SIZE))
-                            .text_color(rgb(colors::FAINT))
+                            .text_color(rgb(active_theme.colors.text_tertiary))
                             .child("edit to convert to a script"),
                     ),
             )
@@ -714,6 +717,7 @@ impl Render for WorkspaceView {
         let divider_thickness = self.layout.divider_thickness;
         let column_height = self.column_height.clone();
         let modal_open = self.connections.read(cx).is_open();
+        let colors = cx.theme().colors;
 
         div()
             .id("workspace-root")
@@ -721,7 +725,7 @@ impl Render for WorkspaceView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(colors::INK))
+            .bg(rgb(colors.bg_app))
             .child(
                 div()
                     .flex()
@@ -748,7 +752,7 @@ impl Render for WorkspaceView {
                             .w(divider_thickness)
                             .h_full()
                             .cursor(CursorStyle::ResizeLeftRight)
-                            .bg(rgb(colors::LINE))
+                            .bg(rgb(colors.border))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(Self::start_sidebar_drag),

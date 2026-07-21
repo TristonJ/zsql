@@ -6,7 +6,7 @@
 
 use gpui::{Div, div, prelude::*, px, rgb};
 
-use crate::colors;
+use crate::theme::Theme;
 
 /// Height of the tab bar and every tab within it.
 pub const TAB_BAR_HEIGHT: gpui::Pixels = px(36.0);
@@ -37,15 +37,15 @@ const DASH_SEGMENT_COUNT: usize = 48;
 /// The tab bar's own chrome: a fixed-height row with a bottom hairline,
 /// holding one child per tab plus a trailing new-tab affordance.
 #[must_use]
-pub fn tab_bar_shell() -> Div {
+pub fn tab_bar_shell(theme: &Theme) -> Div {
     div()
         .flex()
         .flex_row()
         .flex_shrink_0()
         .h(TAB_BAR_HEIGHT)
-        .bg(rgb(colors::PANEL))
+        .bg(rgb(theme.colors.bg_panel))
         .border_b_1()
-        .border_color(rgb(colors::LINE))
+        .border_color(rgb(theme.colors.border))
 }
 
 /// Shared chrome for one tab: height, padding, gap, a trailing hairline
@@ -54,7 +54,7 @@ pub fn tab_bar_shell() -> Div {
 /// [`active_underline_solid`] or [`active_underline_dashed`], since which
 /// (if either) applies depends on the tab's own kind.
 #[must_use]
-pub fn tab_shell(active: bool) -> Div {
+pub fn tab_shell(active: bool, theme: &Theme) -> Div {
     div()
         .relative()
         .flex()
@@ -65,23 +65,27 @@ pub fn tab_shell(active: bool) -> Div {
         .h_full()
         .px(px(TAB_PADDING_X))
         .border_r_1()
-        .border_color(rgb(colors::LINE_SOFT))
+        .border_color(rgb(theme.colors.border_soft))
         .text_size(px(TAB_TEXT_SIZE))
-        .text_color(rgb(if active { colors::TEXT } else { colors::MUTED }))
-        .when(active, |el| el.bg(rgb(colors::INK)))
+        .text_color(rgb(if active {
+            theme.colors.text_primary
+        } else {
+            theme.colors.text_secondary
+        }))
+        .when(active, |el| el.bg(rgb(theme.colors.bg_app)))
 }
 
 /// A solid teal underline pinned to a tab's bottom edge, marking a script
 /// tab active.
 #[must_use]
-pub fn active_underline_solid() -> Div {
+pub fn active_underline_solid(theme: &Theme) -> Div {
     div()
         .absolute()
         .left_0()
         .right_0()
         .bottom_0()
         .h(TAB_UNDERLINE_THICKNESS)
-        .bg(rgb(colors::TEAL))
+        .bg(rgb(theme.colors.accent))
 }
 
 /// A dashed teal underline pinned to a tab's bottom edge, marking an active
@@ -90,7 +94,7 @@ pub fn active_underline_solid() -> Div {
 /// small teal segments spaced by [`DASH_SEGMENT_GAP`], clipped to the tab's
 /// own width by `overflow_hidden`.
 #[must_use]
-pub fn active_underline_dashed() -> Div {
+pub fn active_underline_dashed(theme: &Theme) -> Div {
     let mut track = div()
         .absolute()
         .left_0()
@@ -107,7 +111,7 @@ pub fn active_underline_dashed() -> Div {
                 .flex_shrink_0()
                 .w(px(DASH_SEGMENT_WIDTH))
                 .h_full()
-                .bg(rgb(colors::TEAL)),
+                .bg(rgb(theme.colors.accent)),
         );
     }
     track
@@ -115,17 +119,17 @@ pub fn active_underline_dashed() -> Div {
 
 /// A tab's trailing close ("x") affordance.
 #[must_use]
-pub fn close_glyph() -> Div {
+pub fn close_glyph(theme: &Theme) -> Div {
     div()
         .flex_shrink_0()
         .text_size(px(TAB_CLOSE_TEXT_SIZE))
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(theme.colors.text_tertiary))
         .child("x")
 }
 
 /// The trailing "+" affordance that opens a new script tab.
 #[must_use]
-pub fn new_tab_glyph() -> Div {
+pub fn new_tab_glyph(theme: &Theme) -> Div {
     div()
         .flex()
         .items_center()
@@ -134,33 +138,36 @@ pub fn new_tab_glyph() -> Div {
         .w(NEW_TAB_WIDTH)
         .h_full()
         .text_size(px(NEW_TAB_TEXT_SIZE))
-        .text_color(rgb(colors::FAINT))
+        .text_color(rgb(theme.colors.text_tertiary))
         .child("+")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        active_underline_dashed, active_underline_solid, close_glyph, new_tab_glyph, tab_bar_shell,
-        tab_shell,
+        Theme, active_underline_dashed, active_underline_solid, close_glyph, new_tab_glyph,
+        tab_bar_shell, tab_shell,
     };
 
     #[test]
     fn tab_bar_and_tab_shells_build_for_either_active_state() {
-        let _bar = tab_bar_shell();
-        let _active = tab_shell(true);
-        let _inactive = tab_shell(false);
+        let theme = Theme::default();
+        let _bar = tab_bar_shell(&theme);
+        let _active = tab_shell(true, &theme);
+        let _inactive = tab_shell(false, &theme);
     }
 
     #[test]
     fn active_underline_variants_build() {
-        let _solid = active_underline_solid();
-        let _dashed = active_underline_dashed();
+        let theme = Theme::default();
+        let _solid = active_underline_solid(&theme);
+        let _dashed = active_underline_dashed(&theme);
     }
 
     #[test]
     fn close_and_new_tab_glyphs_build() {
-        let _close = close_glyph();
-        let _new_tab = new_tab_glyph();
+        let theme = Theme::default();
+        let _close = close_glyph(&theme);
+        let _new_tab = new_tab_glyph(&theme);
     }
 }

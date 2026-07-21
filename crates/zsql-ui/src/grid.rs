@@ -6,7 +6,7 @@
 
 use gpui::{Div, div, prelude::*, px, rgb, rgba};
 
-use crate::colors;
+use crate::theme::{Colors, Theme};
 
 /// Horizontal padding inside every grid cell.
 pub const CELL_PADDING_X: f32 = 11.0;
@@ -14,8 +14,6 @@ pub const CELL_PADDING_X: f32 = 11.0;
 pub const TYPE_TAG_TEXT_SIZE: f32 = 9.5;
 /// Horizontal padding inside a type-name badge.
 pub const TYPE_TAG_PADDING_X: f32 = 4.0;
-/// Type-tag badge border: teal at low opacity (`0x33c2ac` at ~28% alpha).
-pub const TYPE_TAG_BORDER: u32 = 0x33_c2_ac_47;
 /// Corner radius of a type-name badge.
 pub const TYPE_TAG_RADIUS: f32 = 4.0;
 /// Diameter of a status dot.
@@ -23,13 +21,13 @@ pub const STATUS_DOT_SIZE: f32 = 6.0;
 
 /// A small type-name badge, e.g. shown next to a column's name in a header.
 #[must_use]
-pub fn type_tag(type_name: &str) -> Div {
+pub fn type_tag(type_name: &str, theme: &Theme) -> Div {
     div()
         .text_size(px(TYPE_TAG_TEXT_SIZE))
-        .text_color(rgb(colors::TEAL))
-        .px(px(TYPE_TAG_PADDING_X))
+        .text_color(rgb(theme.colors.accent))
         .border_1()
-        .border_color(rgba(TYPE_TAG_BORDER))
+        .border_color(rgba(Colors::wash(theme.colors.accent, 0x47)))
+        .px(px(TYPE_TAG_PADDING_X))
         .rounded(px(TYPE_TAG_RADIUS))
         .child(type_name.to_owned())
 }
@@ -60,20 +58,23 @@ pub fn status_dot_outline(border_color: u32) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{colors, status_dot, status_dot_outline, type_tag};
+    use super::{Theme, status_dot, status_dot_outline, type_tag};
 
     #[test]
     fn type_tag_builds_for_a_type_name() {
-        let _tag = type_tag("int8");
+        let theme = Theme::default();
+        let _tag = type_tag("int8", &theme);
     }
 
     #[test]
     fn status_dot_builds_for_a_color() {
-        let _dot = status_dot(colors::TEAL);
+        let theme = Theme::default();
+        let _dot = status_dot(theme.colors.accent);
     }
 
     #[test]
     fn status_dot_outline_builds_for_a_border_color() {
-        let _dot = status_dot_outline(colors::FAINT);
+        let theme = Theme::default();
+        let _dot = status_dot_outline(theme.colors.text_tertiary);
     }
 }

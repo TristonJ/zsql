@@ -19,6 +19,3 @@ pub const FIELD_LINE_HEIGHT: Pixels = px(16.0);
 pub const FIELD_TEXT_SIZE: f32 = 13.0;
 /// Width of the blinking text cursor.
 pub const FIELD_CURSOR_WIDTH: Pixels = px(2.0);
-/// Background tint for the active selection highlight: teal at low opacity
-/// (`0x33c2ac` at ~20% alpha), matching the SQL editor's selection tint.
-pub const FIELD_SELECTION_BG: u32 = 0x33_c2_ac_33;

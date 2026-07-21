@@ -10,10 +10,11 @@ use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, KeyBadge, RelationKind,
     RelationSchema, RowCount,
 };
+use zsql_ui::grid;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollable::{ScrollView, ScrollbarStyle, vertical_scroll};
 use zsql_ui::table::{Table, TableColumn, TableRow, TableSizing, TableState, TableStyle};
-use zsql_ui::{colors, grid};
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::results::group_thousands;
 use super::theme;
@@ -132,7 +133,12 @@ impl SchemaTabView {
 
     /// A centered title/detail message, used for the loading and error
     /// states.
-    fn render_placeholder(color: u32, title: &str, detail: &str) -> impl IntoElement {
+    fn render_placeholder(
+        color: u32,
+        title: &str,
+        detail: &str,
+        active_theme: &Theme,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -150,14 +156,15 @@ impl SchemaTabView {
             .child(
                 div()
                     .text_size(px(theme::SCHEMA_STATS_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
+                    .text_color(rgb(active_theme.colors.text_tertiary))
                     .child(detail.to_owned()),
             )
     }
 
     /// The header meta strip: structure icon, qualified name, kind pill, and
     /// the four header counts.
-    fn render_head(&self, detail: &RelationSchema) -> impl IntoElement {
+    fn render_head(&self, detail: &RelationSchema, active_theme: &Theme) -> impl IntoElement {
+        let colors = active_theme.colors;
         div()
             .flex()
             .flex_row()
@@ -168,7 +175,7 @@ impl SchemaTabView {
             .pt(theme::SCHEMA_HEAD_PADDING_TOP)
             .pb(theme::SCHEMA_HEAD_PADDING_BOTTOM)
             .border_b_1()
-            .border_color(rgb(colors::LINE))
+            .border_color(rgb(colors.border))
             .font_family("monospace")
             .child(
                 div()
@@ -179,18 +186,18 @@ impl SchemaTabView {
                     .child(icon(
                         IconName::Table,
                         px(theme::SCHEMA_TITLE_TEXT_SIZE),
-                        colors::TEAL,
+                        colors.accent,
                     ))
                     .child(
                         div()
                             .text_size(px(theme::SCHEMA_TITLE_TEXT_SIZE))
-                            .text_color(rgb(colors::FAINT))
+                            .text_color(rgb(colors.text_tertiary))
                             .child(format!("{}.", self.schema)),
                     )
                     .child(
                         div()
                             .text_size(px(theme::SCHEMA_TITLE_TEXT_SIZE))
-                            .text_color(rgb(colors::TEXT))
+                            .text_color(rgb(colors.text_primary))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(self.relation.clone()),
                     ),
@@ -198,9 +205,9 @@ impl SchemaTabView {
             .child(
                 div()
                     .text_size(px(theme::SCHEMA_KIND_PILL_TEXT_SIZE))
-                    .text_color(rgb(colors::TEAL))
+                    .text_color(rgb(colors.accent))
                     .border_1()
-                    .border_color(rgba(theme::SCHEMA_KIND_PILL_BORDER))
+                    .border_color(rgba(colors.accent_outline()))
                     .rounded(px(theme::SCHEMA_KIND_PILL_RADIUS))
                     .px(theme::SCHEMA_KIND_PILL_PADDING_X)
                     .child(relation_kind_pill_text(self.kind)),
@@ -212,13 +219,26 @@ impl SchemaTabView {
                     .ml_auto()
                     .gap(theme::SCHEMA_STATS_GAP)
                     .text_size(px(theme::SCHEMA_STATS_TEXT_SIZE))
-                    .text_color(rgb(colors::FAINT))
-                    .child(stat_label(&format_row_count_stat(self.row_count), "rows"))
-                    .child(stat_label(&detail.columns.len().to_string(), "columns"))
-                    .child(stat_label(&detail.indexes.len().to_string(), "indexes"))
+                    .text_color(rgb(colors.text_tertiary))
+                    .child(stat_label(
+                        &format_row_count_stat(self.row_count),
+                        "rows",
+                        active_theme,
+                    ))
+                    .child(stat_label(
+                        &detail.columns.len().to_string(),
+                        "columns",
+                        active_theme,
+                    ))
+                    .child(stat_label(
+                        &detail.indexes.len().to_string(),
+                        "indexes",
+                        active_theme,
+                    ))
                     .child(stat_label(
                         &detail.constraints.len().to_string(),
                         "constraints",
+                        active_theme,
                     )),
             )
     }
@@ -229,12 +249,16 @@ impl SchemaTabView {
         cx: &mut Context<Self>,
         detail: &RelationSchema,
     ) -> impl IntoElement {
+        let active_theme = cx.theme();
         let widths = theme::SCHEMA_COLUMNS_WIDTHS;
         let columns = ["Column", "Type", "Null", "Default", "Keys"]
             .iter()
             .zip(widths.iter())
             .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string()).px(cell_x_padding()))
+                TableColumn::new(
+                    width,
+                    header_cell(column.to_string(), &active_theme).px(cell_x_padding()),
+                )
             })
             .collect();
 
@@ -244,13 +268,14 @@ impl SchemaTabView {
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
-                    ..Default::default()
+                    ..TableStyle::themed(&active_theme)
                 })
                 .columns(columns)
                 .row_count(detail.columns.len())
                 .rows(Self::render_columns_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
+            active_theme,
         )
     }
 
@@ -258,8 +283,9 @@ impl SchemaTabView {
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
+        let active_theme = cx.theme();
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -275,7 +301,7 @@ impl SchemaTabView {
                 };
                 let cells = vec![
                     div()
-                        .when_some(rail_color(column), |el, color| {
+                        .when_some(rail_color(column, &active_theme), |el, color| {
                             el.child(
                                 div()
                                     .absolute()
@@ -288,7 +314,7 @@ impl SchemaTabView {
                         })
                         .child(
                             div()
-                                .text_color(rgb(colors::TEXT))
+                                .text_color(rgb(active_theme.colors.text_primary))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(column.name.clone()),
                         )
@@ -297,20 +323,20 @@ impl SchemaTabView {
                     div()
                         .px(cell_x_padding())
                         .child(
-                            grid::type_tag(&column.type_name)
+                            grid::type_tag(&column.type_name, &active_theme)
                                 .flex_shrink_0()
                                 .into_any_element(),
                         )
                         .into_any_element(),
-                    null_label(column.nullable)
+                    null_label(column.nullable, &active_theme)
                         .px(cell_x_padding())
                         .into_any_element(),
-                    render_default_cell(column.default.as_deref())
+                    render_default_cell(column.default.as_deref(), &active_theme)
                         .px(cell_x_padding())
                         .into_any_element(),
                     div()
                         .px(cell_x_padding())
-                        .child(render_keys_cell(column, &schema.constraints))
+                        .child(render_keys_cell(column, &schema.constraints, &active_theme))
                         .into_any_element(),
                 ];
 
@@ -325,11 +351,14 @@ impl SchemaTabView {
         cx: &mut Context<Self>,
         detail: &RelationSchema,
     ) -> impl IntoElement {
+        let active_theme = cx.theme();
         let widths = theme::SCHEMA_INDEXES_WIDTHS;
         let columns = ["Name", "Method", "Unique", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| TableColumn::new(width, header_cell(column.to_string())))
+            .map(|(column, &width)| {
+                TableColumn::new(width, header_cell(column.to_string(), &active_theme))
+            })
             .collect();
 
         section(
@@ -341,6 +370,7 @@ impl SchemaTabView {
                 .rows(Self::render_index_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
+            active_theme,
         )
     }
 
@@ -348,8 +378,9 @@ impl SchemaTabView {
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
+        let colors = cx.theme().colors;
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -365,27 +396,27 @@ impl SchemaTabView {
                 };
                 let cells = vec![
                     div()
-                        .text_color(rgb(colors::TEXT))
+                        .text_color(rgb(colors.text_primary))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(index.name.clone())
                         .into_any_element(),
                     div()
-                        .text_color(rgb(colors::MUTED))
+                        .text_color(rgb(colors.text_secondary))
                         .child(index.method.clone())
                         .into_any_element(),
                     if index.unique {
                         div()
-                            .text_color(rgb(colors::BOOL))
+                            .text_color(rgb(colors.value_bool))
                             .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
                             .into_any_element()
                     } else {
                         div()
-                            .text_color(rgb(colors::FAINT))
+                            .text_color(rgb(colors.text_tertiary))
                             .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
                             .into_any_element()
                     },
                     div()
-                        .text_color(rgb(colors::MUTED))
+                        .text_color(rgb(colors.text_secondary))
                         .child(index.definition.clone())
                         .into_any_element(),
                 ];
@@ -401,11 +432,14 @@ impl SchemaTabView {
         cx: &mut Context<Self>,
         detail: &RelationSchema,
     ) -> impl IntoElement {
+        let active_theme = cx.theme();
         let widths = theme::SCHEMA_CONSTRAINTS_WIDTHS;
         let columns = ["Name", "Method", "Unique", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| TableColumn::new(width, header_cell(column.to_string())))
+            .map(|(column, &width)| {
+                TableColumn::new(width, header_cell(column.to_string(), &active_theme))
+            })
             .collect();
 
         section(
@@ -417,6 +451,7 @@ impl SchemaTabView {
                 .rows(Self::render_constraints_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
                 .render(cx),
+            active_theme,
         )
     }
 
@@ -424,8 +459,10 @@ impl SchemaTabView {
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
+        let active_theme = cx.theme();
+        let colors = active_theme.colors;
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -439,16 +476,17 @@ impl SchemaTabView {
                 let Some(constraint) = schema.constraints.get(ix) else {
                     return TableRow::new(vec![]);
                 };
-                let (kind_label, kind_color) = constraint_kind_badge(constraint.kind);
+                let (kind_label, kind_color) =
+                    constraint_kind_badge(constraint.kind, &active_theme);
                 let cells = vec![
                     div()
-                        .text_color(rgb(colors::TEXT))
+                        .text_color(rgb(colors.text_primary))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(constraint.name.clone())
                         .into_any_element(),
-                    key_badge(kind_label, kind_color, colors::LINE).into_any_element(),
+                    key_badge(kind_label, kind_color, colors.border).into_any_element(),
                     div()
-                        .text_color(rgb(colors::MUTED))
+                        .text_color(rgb(colors.text_secondary))
                         .child(constraint.definition.clone())
                         .into_any_element(),
                 ];
@@ -461,15 +499,22 @@ impl SchemaTabView {
 
 impl Render for SchemaTabView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_theme = cx.theme();
         let body: gpui::AnyElement = match &self.state {
-            FetchState::Loading => {
-                Self::render_placeholder(colors::FAINT, "Loading schema...", "Fetching structure.")
-                    .into_any_element()
-            }
-            FetchState::Error(message) => {
-                Self::render_placeholder(theme::STATUS_ERROR, "Schema unavailable", message)
-                    .into_any_element()
-            }
+            FetchState::Loading => Self::render_placeholder(
+                active_theme.colors.text_tertiary,
+                "Loading schema...",
+                "Fetching structure.",
+                &active_theme,
+            )
+            .into_any_element(),
+            FetchState::Error(message) => Self::render_placeholder(
+                active_theme.colors.status_error,
+                "Schema unavailable",
+                message,
+                &active_theme,
+            )
+            .into_any_element(),
             FetchState::Ready(detail) => {
                 // The scrolled content: a single non-shrinking column of the
                 // three tables. `flex_shrink_0` keeps it at its natural
@@ -496,7 +541,7 @@ impl Render for SchemaTabView {
                     .flex_col()
                     .min_h_0()
                     .flex_1()
-                    .child(self.render_head(detail))
+                    .child(self.render_head(detail, &active_theme))
                     .child(page)
                     .into_any_element()
             }
@@ -507,22 +552,32 @@ impl Render for SchemaTabView {
             .flex_col()
             .min_h_0()
             .flex_1()
-            .bg(rgb(colors::INK))
+            .bg(rgb(active_theme.colors.bg_app))
             .child(body)
     }
 }
 
 /// One header stat, e.g. `~1,240` bolded followed by a faint ` rows` label.
-fn stat_label(value: &str, label: &str) -> impl IntoElement {
+fn stat_label(value: &str, label: &str, active_theme: &Theme) -> impl IntoElement {
     div()
         .child(format!("{value} "))
-        .text_color(rgb(colors::MUTED))
-        .child(div().text_color(rgb(colors::FAINT)).child(label.to_owned()))
+        .text_color(rgb(active_theme.colors.text_secondary))
+        .child(
+            div()
+                .text_color(rgb(active_theme.colors.text_tertiary))
+                .child(label.to_owned()),
+        )
 }
 
 /// A section: an uppercase label with a trailing count pill, followed by
 /// `table`.
-fn section(label: &str, count: usize, table: impl IntoElement) -> impl IntoElement {
+fn section(
+    label: &str,
+    count: usize,
+    table: impl IntoElement,
+    active_theme: Theme,
+) -> impl IntoElement {
+    let colors = active_theme.colors;
     div()
         .flex()
         .flex_col()
@@ -534,14 +589,14 @@ fn section(label: &str, count: usize, table: impl IntoElement) -> impl IntoEleme
                 .gap_2()
                 .mb(theme::SCHEMA_SECTION_LABEL_MARGIN_BOTTOM)
                 .text_size(px(theme::SCHEMA_SECTION_LABEL_TEXT_SIZE))
-                .text_color(rgb(colors::FAINT))
+                .text_color(rgb(colors.text_tertiary))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(label.to_uppercase())
                 .child(
                     div()
-                        .text_color(rgb(colors::MUTED))
+                        .text_color(rgb(colors.text_secondary))
                         .border_1()
-                        .border_color(rgb(colors::LINE))
+                        .border_color(rgb(colors.border))
                         .rounded(px(theme::SCHEMA_SECTION_COUNT_PILL_RADIUS))
                         .px(theme::SCHEMA_SECTION_COUNT_PILL_PADDING_X)
                         .child(count.to_string()),
@@ -555,61 +610,73 @@ fn cell_x_padding() -> gpui::Pixels {
     px(grid::CELL_PADDING_X)
 }
 
-fn header_cell(text: String) -> gpui::Div {
-    div().text_color(rgb(colors::TEXT)).child(text)
+fn header_cell(text: String, active_theme: &Theme) -> gpui::Div {
+    div()
+        .text_color(rgb(active_theme.colors.text_primary))
+        .child(text)
 }
 
 /// The Null cell's text and color for `nullable`.
-fn null_label(nullable: bool) -> gpui::Div {
+fn null_label(nullable: bool, active_theme: &Theme) -> gpui::Div {
     if nullable {
         div()
             .italic()
-            .text_color(rgb(colors::FAINT))
+            .text_color(rgb(active_theme.colors.text_tertiary))
             .child(theme::SCHEMA_NULLABLE_LABEL)
     } else {
         div()
-            .text_color(rgb(colors::MUTED))
+            .text_color(rgb(active_theme.colors.text_secondary))
             .child(theme::SCHEMA_NOT_NULL_LABEL)
     }
 }
 
 /// The Default cell: violet for a function call, amber for a literal, a
 /// faint dash placeholder for none.
-fn render_default_cell(default: Option<&str>) -> gpui::Div {
+fn render_default_cell(default: Option<&str>, active_theme: &Theme) -> gpui::Div {
+    let colors = active_theme.colors;
     match classify_default(default) {
         DefaultKind::None => div()
-            .text_color(rgb(colors::FAINT))
+            .text_color(rgb(colors.text_tertiary))
             .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER),
         DefaultKind::Literal => div()
-            .text_color(rgb(colors::BOOL))
+            .text_color(rgb(colors.value_bool))
             .child(default.unwrap_or_default().to_owned()),
         DefaultKind::Function => div()
-            .text_color(rgb(colors::NUMBER))
+            .text_color(rgb(colors.value_number))
             .child(default.unwrap_or_default().to_owned()),
     }
 }
 
 /// The Keys cell: a PK/unique/check badge, an FK link chip, or nothing.
-fn render_keys_cell(column: &ColumnDetail, constraints: &[ConstraintInfo]) -> gpui::AnyElement {
+fn render_keys_cell(
+    column: &ColumnDetail,
+    constraints: &[ConstraintInfo],
+    active_theme: &Theme,
+) -> gpui::AnyElement {
+    let colors = active_theme.colors;
     match key_cell_badge(column, constraints) {
         None => div().into_any_element(),
         Some(KeyCellBadge::Primary) => key_badge(
             theme::SCHEMA_BADGE_PK_LABEL,
-            colors::TEAL,
-            theme::SCHEMA_BADGE_PK_BORDER,
+            colors.accent,
+            theme::schema_badge_pk_border(active_theme),
         )
         .into_any_element(),
         Some(KeyCellBadge::Unique) => key_badge(
             theme::SCHEMA_BADGE_UNIQUE_LABEL,
-            colors::BOOL,
-            theme::SCHEMA_BADGE_UNIQUE_BORDER,
+            colors.value_bool,
+            colors.warn_outline(),
         )
         .into_any_element(),
-        Some(KeyCellBadge::Check) => {
-            key_badge(theme::SCHEMA_BADGE_CHECK_LABEL, colors::MUTED, colors::LINE)
-                .into_any_element()
+        Some(KeyCellBadge::Check) => key_badge(
+            theme::SCHEMA_BADGE_CHECK_LABEL,
+            colors.text_secondary,
+            colors.border,
+        )
+        .into_any_element(),
+        Some(KeyCellBadge::Foreign(target)) => {
+            fk_link_chip(&target, active_theme).into_any_element()
         }
-        Some(KeyCellBadge::Foreign(target)) => fk_link_chip(&target).into_any_element(),
     }
 }
 
@@ -626,7 +693,8 @@ fn key_badge(label: &str, text_color: u32, border_color: u32) -> gpui::Div {
 }
 
 /// The `-> target.column` foreign-key link chip.
-fn fk_link_chip(target: &str) -> gpui::Div {
+fn fk_link_chip(target: &str, active_theme: &Theme) -> gpui::Div {
+    let colors = active_theme.colors;
     div()
         .flex()
         .flex_row()
@@ -634,10 +702,10 @@ fn fk_link_chip(target: &str) -> gpui::Div {
         .gap_1()
         .text_size(px(theme::SCHEMA_FK_CHIP_TEXT_SIZE))
         .font_family("monospace")
-        .text_color(rgb(colors::LINK))
-        .bg(rgba(theme::SCHEMA_BADGE_LINK_BG))
+        .text_color(rgb(colors.key_fk))
+        .bg(rgba(colors.fk_wash()))
         .border_1()
-        .border_color(rgba(theme::SCHEMA_BADGE_LINK_BORDER))
+        .border_color(rgba(colors.fk_outline()))
         .rounded(px(theme::SCHEMA_FK_CHIP_RADIUS))
         .px(theme::SCHEMA_BADGE_PADDING_X)
         .child(theme::SCHEMA_FK_ARROW)
@@ -646,12 +714,13 @@ fn fk_link_chip(target: &str) -> gpui::Div {
 
 /// The label and text color a [`ConstraintKind`] renders its type badge
 /// with.
-fn constraint_kind_badge(kind: ConstraintKind) -> (&'static str, u32) {
+fn constraint_kind_badge(kind: ConstraintKind, active_theme: &Theme) -> (&'static str, u32) {
+    let colors = active_theme.colors;
     match kind {
-        ConstraintKind::PrimaryKey => ("PRIMARY KEY", colors::TEAL),
-        ConstraintKind::ForeignKey => ("FOREIGN KEY", colors::LINK),
-        ConstraintKind::Unique => ("UNIQUE", colors::BOOL),
-        ConstraintKind::Check => ("CHECK", colors::MUTED),
+        ConstraintKind::PrimaryKey => ("PRIMARY KEY", colors.accent),
+        ConstraintKind::ForeignKey => ("FOREIGN KEY", colors.key_fk),
+        ConstraintKind::Unique => ("UNIQUE", colors.value_bool),
+        ConstraintKind::Check => ("CHECK", colors.text_secondary),
     }
 }
 
@@ -772,11 +841,11 @@ fn definition_mentions_column(definition: &str, column_name: &str) -> bool {
 
 /// The left key-rail tick color for `column`: teal for a primary key, the
 /// link hue for a foreign key, or none.
-fn rail_color(column: &ColumnDetail) -> Option<u32> {
+fn rail_color(column: &ColumnDetail, active_theme: &Theme) -> Option<u32> {
     if column.is_primary_key {
-        Some(colors::TEAL)
+        Some(active_theme.colors.accent)
     } else if column.foreign_key.is_some() {
-        Some(colors::LINK)
+        Some(active_theme.colors.key_fk)
     } else {
         None
     }
@@ -790,6 +859,7 @@ mod tests {
         DefaultKind, KeyCellBadge, classify_default, column_has_check, foreign_key_target,
         key_cell_badge, rail_color, relation_kind_pill_text,
     };
+    use zsql_ui::theme::Theme;
 
     fn plain_column() -> ColumnDetail {
         ColumnDetail {
@@ -943,7 +1013,8 @@ mod tests {
             }),
             ..plain_column()
         };
-        assert_eq!(rail_color(&column), Some(zsql_ui::colors::TEAL));
+        let theme = Theme::default();
+        assert_eq!(rail_color(&column, &theme), Some(theme.colors.accent));
     }
 
     #[test]
@@ -956,12 +1027,13 @@ mod tests {
             }),
             ..plain_column()
         };
-        assert_eq!(rail_color(&column), Some(zsql_ui::colors::LINK));
+        let theme = Theme::default();
+        assert_eq!(rail_color(&column, &theme), Some(theme.colors.key_fk));
     }
 
     #[test]
     fn rail_color_is_none_for_a_plain_column() {
-        assert_eq!(rail_color(&plain_column()), None);
+        assert_eq!(rail_color(&plain_column(), &Theme::default()), None);
     }
 
     #[test]
