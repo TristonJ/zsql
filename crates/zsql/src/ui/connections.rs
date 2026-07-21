@@ -1245,7 +1245,9 @@ impl Render for ConnectionManagerView {
                 view.handle_modal_key_down(event, window, cx);
             }))
             .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                view.close(cx);
+                // This modal is a bit confusing if it closes due to outside
+                // click
+                cx.stop_propagation();
             }))
             .child(
                 div()
@@ -1869,8 +1871,8 @@ impl ConnectionManagerView {
             .bg(rgba(bg))
             .text_size(px(theme::CONNECTION_FORM_RESULT_TEXT_SIZE))
             .text_color(rgb(dot_color))
-            .child(grid::status_dot(dot_color))
-            .child(text)
+            .overflow_hidden()
+            .child(div().min_w_0().child(text))
     }
 
     /// The form's footer: Cancel, Test, and (add form) Connect + Save, or
