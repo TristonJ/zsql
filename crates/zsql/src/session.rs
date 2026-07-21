@@ -27,10 +27,12 @@ pub enum SessionState {
     Running,
     /// The most recent query completed successfully
     Results(Duration),
-    /// The most recent query was cancelled after its accumulated row count
-    /// reached the configured limit (`Config.query.max_result_rows`). The
-    /// rows streamed up to that point remain in [`Session::result`]
-    Limited { elapsed: Duration, rows: u64 },
+    /// The most recent query has hit its accumulated row limit but is still
+    /// running
+    Truncating { rows: u64 },
+    /// The most recent query completed successfully but was truncated at
+    /// the configured row limit
+    Truncated { elapsed: Duration, rows: u64 },
     /// Connecting or running a query failed. The message is safe to show
     /// directly in the UI
     Error(String),
@@ -433,7 +435,7 @@ impl Session {
                         session.state,
                         SessionState::Results(..)
                             | SessionState::Error(_)
-                            | SessionState::Limited { .. }
+                            | SessionState::Truncated { .. }
                     )
                 });
                 match reached_terminal_state {
@@ -602,9 +604,6 @@ impl Session {
     /// the cancel took effect, and those must not resurrect rows or state
     /// the truncation already settled.
     fn apply_query_event(&mut self, event: Result<QueryEvent, CoreError>) {
-        if matches!(self.state, SessionState::Limited { .. }) {
-            return;
-        }
         match event {
             Ok(QueryEvent::Columns(columns)) => {
                 // Each Columns event begins a fresh result set. A run of
@@ -631,7 +630,10 @@ impl Session {
                     elapsed_ms = elapsed.as_millis(),
                     "session query completed"
                 );
-                self.state = SessionState::Results(elapsed);
+                self.state = match self.state {
+                    SessionState::Truncating { rows } => SessionState::Truncated { elapsed, rows },
+                    _ => SessionState::Results(elapsed),
+                };
                 self.active_query = None;
             }
             Err(err) => {
@@ -650,15 +652,22 @@ impl Session {
     /// never the whole batch followed by a truncation of the vector, which
     /// would momentarily overshoot the limit.
     ///
-    /// The moment the cap is reached, the query is cancelled through the
-    /// existing [`zsql_core::QueryHandle`] cancellation path (the same one
-    /// that drives cooperative-drop and server-side `pg_cancel_backend`
-    /// cancellation) and `state` moves to [`SessionState::Limited`].
+    /// The moment the cap is reached, the state moves to [`SessionState::Truncating`]
+    /// to signal the UI to show a truncation warning, and the active query is
+    /// still running.
     fn append_batch_capped(&mut self, batch: zsql_core::RowBatch) {
+        if let SessionState::Truncating { rows } = self.state {
+            self.state = SessionState::Truncating {
+                rows: rows + batch.rows.len() as u64,
+            };
+            return;
+        }
+
         let limit = self.max_result_rows;
         let accumulated = row_count(&self.accumulating);
         let remaining = limit.saturating_sub(accumulated);
         let take = usize::try_from(remaining).unwrap_or(usize::MAX);
+        let total_accumulated = accumulated.saturating_add(batch.rows.len() as u64);
         self.accumulating
             .rows
             .extend(batch.rows.into_iter().take(take));
@@ -679,13 +688,9 @@ impl Session {
             elapsed_ms = elapsed.as_millis(),
             "session query result truncated at the configured row limit"
         );
-        self.state = SessionState::Limited {
-            elapsed,
-            rows: accumulated,
+        self.state = SessionState::Truncating {
+            rows: total_accumulated,
         };
-        if let Some(handle) = self.active_query.take() {
-            handle.cancel();
-        }
     }
 }
 
@@ -1086,13 +1091,13 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_crossing_the_limit_is_capped_exactly_and_cancels_the_query() {
+    fn a_batch_crossing_the_limit_is_capped_exactly_and_does_not_cancel() {
         let mut cfg = Config::default();
         cfg.query.max_result_rows = 5;
         let mut session = Session::new(&cfg);
         session.state = SessionState::Running;
 
-        let (cancel_tx, cancel_rx) = flume::unbounded();
+        let (cancel_tx, _cancel_rx) = flume::unbounded();
         session.active_query = Some(zsql_core::QueryHandle::new(cancel_tx));
 
         session.apply_query_event(Ok(QueryEvent::Columns(vec![ColumnMeta {
@@ -1122,20 +1127,10 @@ mod tests {
             "rows must be capped at exactly the configured limit, never overshot"
         );
         match session.state() {
-            SessionState::Limited { rows, .. } => assert_eq!(*rows, 5),
-            other => panic!("expected SessionState::Limited, got {other:?}"),
+            SessionState::Truncating { rows, .. } => assert_eq!(*rows, 8),
+            other => panic!("expected SessionState::Truncating, got {other:?}"),
         }
-        assert!(
-            session.active_query.is_none(),
-            "active_query must be cleared once the limit is reached, as on Done/Error"
-        );
-        assert!(
-            cancel_rx.try_recv().is_ok(),
-            "the existing QueryHandle cancellation path must have been invoked"
-        );
 
-        // Events already queued for this generation when cancellation fired
-        // must be ignored, not resurrect rows or flip state away from Limited.
         session.apply_query_event(Ok(QueryEvent::Batch(RowBatch {
             rows: vec![Row(vec![Value::Int(99)])],
         })));
@@ -1144,11 +1139,12 @@ mod tests {
             5,
             "a late batch after truncation must not grow the capped result"
         );
+
         session.apply_query_event(Ok(QueryEvent::Done { affected: None }));
-        assert!(
-            matches!(session.state(), SessionState::Limited { .. }),
-            "a late Done after truncation must not flip state away from Limited"
-        );
+        match session.state() {
+            SessionState::Truncated { rows, .. } => assert_eq!(*rows, 9),
+            other => panic!("expected SessionState::Truncated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1168,7 +1164,7 @@ mod tests {
         })));
 
         assert_eq!(session.result().rows.len(), 4);
-        assert!(matches!(session.state(), SessionState::Limited { .. }));
+        assert!(matches!(session.state(), SessionState::Truncating { .. }));
     }
 }
 
@@ -2018,7 +2014,7 @@ mod gpui_tests {
 
         session.read_with(cx, |session, _app| {
             assert!(
-                !matches!(session.state(), SessionState::Limited { .. }),
+                !matches!(session.state(), SessionState::Truncated { .. }),
                 "a stale over-limit batch from a superseded query must not truncate \
                  the current query, got {:?}",
                 session.state()
@@ -2643,15 +2639,8 @@ mod live_tests {
         });
     }
 
-    /// A query producing far more rows than the configured
-    /// `max_result_rows` must be cancelled the moment the limit is reached:
-    /// the session's `run_query` task itself stops awaiting further events
-    /// as soon as `state` becomes `Limited` (its terminal-state check now
-    /// includes it), so `run_task.await` below returns promptly instead of
-    /// waiting for `generate_series` to actually finish producing 100,000
-    /// rows.
     #[gpui::test]
-    async fn a_runaway_result_is_cancelled_and_capped_at_the_configured_limit_when_configured(
+    async fn a_runaway_result_is_capped_at_the_configured_limit_when_configured(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -2690,14 +2679,14 @@ mod live_tests {
 
         session.read_with(cx, |session, _app| {
             match session.state() {
-                SessionState::Limited { rows, .. } => {
+                SessionState::Truncated { rows, .. } => {
                     assert_eq!(
-                        *rows, 100,
+                        *rows, 100_000,
                         "the truncated state must report exactly the configured limit"
                     );
                 }
                 other => panic!(
-                    "expected SessionState::Limited after exceeding the configured limit, \
+                    "expected SessionState::Truncated after exceeding the configured limit, \
                      got {other:?} (the query must not stream all 100,000 rows nor stay \
                      Running indefinitely)"
                 ),

@@ -187,9 +187,13 @@ impl ResultsView {
     fn render_bar(&self, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let count_text = match self.effective_state(cx) {
-            SessionState::Results(_) | SessionState::Running | SessionState::Limited { .. } => {
+            SessionState::Results(_) | SessionState::Running => {
                 self.effective_result(cx).rows.len().to_string()
             }
+            SessionState::Truncating { rows } | SessionState::Truncated { rows, .. } => format!(
+                "{rows} (truncated at {})",
+                self.effective_result(cx).rows.len()
+            ),
             SessionState::Empty
             | SessionState::Connecting
             | SessionState::Connected
@@ -244,9 +248,9 @@ impl ResultsView {
         let has_columns = !self.effective_result(cx).columns.is_empty();
 
         match state {
-            // The rows streamed before truncation stay visible, exactly
-            // like a normal completed result.
-            SessionState::Results(_) | SessionState::Limited { .. } => self.render_grid(cx),
+            SessionState::Results(_)
+            | SessionState::Truncating { .. }
+            | SessionState::Truncated { .. } => self.render_grid(cx),
             // Once the streaming query's `Columns` event has arrived there
             // is a real (if partial) result set to paint, so switch to the
             // grid immediately rather than waiting for `Done`
@@ -515,7 +519,8 @@ fn status_indicator(
         SessionState::Connecting => (colors.status_warn, "Connecting…"),
         SessionState::Connected | SessionState::Results(_) => (colors.accent, "Connected"),
         SessionState::Running => (colors.accent, "Running…"),
-        SessionState::Limited { .. } => (colors.status_limited, "Limited"),
+        SessionState::Truncating { .. } => (colors.status_limited, "Running… (truncated)"),
+        SessionState::Truncated { .. } => (colors.status_limited, "Truncated"),
         SessionState::Error(_) => (colors.status_error, "Error"),
     }
 }
@@ -529,8 +534,8 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
             format!("{row_count} rows"),
             format!("{} ms", elapsed.as_millis()),
         )),
-        SessionState::Limited { elapsed, rows } => Some((
-            format!("Result limited to {rows} rows"),
+        SessionState::Truncated { elapsed, rows } => Some((
+            format!("Result limited to {row_count} rows ({rows} total)"),
             format!("{} ms", elapsed.as_millis()),
         )),
         _ => None,
@@ -768,14 +773,14 @@ mod tests {
             (colors.status_error, "Error")
         );
         let limited = status_indicator(
-            &SessionState::Limited {
+            &SessionState::Truncated {
                 elapsed: Duration::from_millis(1),
                 rows: 100,
             },
             &LivenessState::Healthy,
             &active_theme,
         );
-        assert_eq!(limited, (colors.status_limited, "Limited"));
+        assert_eq!(limited, (colors.status_limited, "Truncated"));
         assert_ne!(
             limited,
             (colors.accent, "Connected"),
@@ -849,15 +854,17 @@ mod tests {
 
     #[test]
     fn status_metrics_reads_as_truncated_for_a_limited_result() {
-        let state = SessionState::Limited {
+        let state = SessionState::Truncated {
             elapsed: Duration::from_millis(7),
-            rows: 100,
+            rows: 5_000,
         };
         assert_eq!(
-            status_metrics(&state, 5_000),
-            Some(("Result limited to 100 rows".to_owned(), "7 ms".to_owned())),
-            "the row count shown must come from the capped Limited state, not the raw \
-             (ignored) row_count argument"
+            status_metrics(&state, 100),
+            Some((
+                "Result limited to 100 rows (5000 total)".to_owned(),
+                "7 ms".to_owned()
+            )),
+            "the row count shown must be the actual number streamed, with the limit accurate"
         );
     }
 
@@ -987,7 +994,7 @@ mod tests {
     fn renders_the_grid_for_a_limited_result_keeping_rows_visible(cx: &mut gpui::TestAppContext) {
         let mut result = sample_result();
         result.rows.truncate(1);
-        let state = SessionState::Limited {
+        let state = SessionState::Truncated {
             elapsed: Duration::from_millis(5),
             rows: 1,
         };
