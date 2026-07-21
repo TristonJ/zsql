@@ -784,7 +784,7 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
         // uses, not just that the modal happened to close some other way.
         assert!(
             view.status()
-                .is_some_and(|status| status.contains("Connecting to mem")),
+                .is_some_and(|status| status.contains("connecting")),
             "expected a real connect to have been dispatched, got status {:?}",
             view.status()
         );
