@@ -19,6 +19,7 @@ use gpui::{
     Window, div, prelude::*, px, rgb, rgba,
 };
 use zsql_core::{Connection, ConnectionUrl};
+use zsql_ui::button::{primary_button, secondary_button};
 use zsql_ui::grid;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
@@ -924,13 +925,13 @@ impl ConnectionManagerView {
                 self.rebuild_rows(cx);
                 self.view = ManagerView::List;
                 self.clear_inputs(cx);
-                self.status = Some("Connection saved.".to_owned());
+                self.status = Some("connection saved".to_owned());
                 cx.notify();
                 Ok(())
             }
             Err(err) => {
                 tracing::warn!(error = %err, "failed to save connection");
-                self.status = Some(format!("Failed to save: {err}"));
+                self.status = Some(format!("{err}"));
                 cx.notify();
                 Err(err)
             }
@@ -967,13 +968,13 @@ impl ConnectionManagerView {
                 self.rebuild_rows(cx);
                 self.view = ManagerView::List;
                 self.clear_inputs(cx);
-                self.status = Some("Connection saved.".to_owned());
+                self.status = Some("sonnection saved".to_owned());
                 cx.notify();
                 Ok(())
             }
             Err(err) => {
                 tracing::warn!(error = %err, "failed to save connection edit");
-                self.status = Some(format!("Failed to save: {err}"));
+                self.status = Some(format!("{err}"));
                 cx.notify();
                 Err(err)
             }
@@ -1013,13 +1014,13 @@ impl ConnectionManagerView {
                 {
                     self.active = None;
                 }
-                self.status = Some(format!("Deleted {}.", deleted.name));
+                self.status = Some("connection deleted".to_string());
                 cx.notify();
                 Ok(())
             }
             Err(err) => {
                 tracing::warn!(error = %err, "failed to delete connection");
-                self.status = Some(format!("Failed to delete: {err}"));
+                self.status = Some(format!("{err}"));
                 cx.notify();
                 Err(err)
             }
@@ -1054,7 +1055,7 @@ impl ConnectionManagerView {
         let name = row.connection.name.clone();
         let url = row.connection.url.clone();
         tracing::info!(name = %name, driver = ?row.driver_id, "connecting to saved connection");
-        self.status = Some(format!("Connecting to {name}..."));
+        self.status = Some("connecting...".to_string());
         cx.notify();
 
         let session = self.session.clone();
@@ -1226,7 +1227,7 @@ impl Render for ConnectionManagerView {
     /// (`ui::workspace::WorkspaceView`) is responsible for conditionally
     /// mounting this entity in the first place, so `render` does not
     /// re-check `open` itself.
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         div()
             .id("connection-modal-scrim")
@@ -1268,9 +1269,9 @@ impl Render for ConnectionManagerView {
                     }))
                     .child(self.render_modal_head(cx))
                     .child(match self.current_view() {
-                        ManagerView::List => self.render_modal_list(cx).into_any_element(),
+                        ManagerView::List => self.render_modal_list(window, cx).into_any_element(),
                         ManagerView::AddForm | ManagerView::EditForm { .. } => {
-                            self.render_modal_form(cx).into_any_element()
+                            self.render_modal_form(window, cx).into_any_element()
                         }
                     }),
             )
@@ -1363,7 +1364,7 @@ impl ConnectionManagerView {
 
     /// The saved-connections list panel: every row plus the "Add
     /// connection" affordance and the inline status line.
-    fn render_modal_list(&self, cx: &Context<Self>) -> Div {
+    fn render_modal_list(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let mut list = div()
             .flex()
@@ -1376,47 +1377,43 @@ impl ConnectionManagerView {
             list = list.child(self.render_modal_row(index, row, cx));
         }
 
-        div()
-            .flex()
-            .flex_col()
-            .child(list)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(rgb(colors.border_soft))
-                    .child(
-                        div()
-                            .id("add-connection-button")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .px_3()
-                            .py_1()
-                            .rounded(px(theme::MODAL_ROW_RADIUS))
-                            .border_1()
-                            .border_color(rgb(colors.accent))
-                            .text_color(rgb(colors.text_primary))
-                            .child(icon(
-                                IconName::Add,
-                                theme::MODAL_ADD_ICON_SIZE,
-                                colors.text_primary,
-                            ))
-                            .child("Add connection")
-                            .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
-                                view.show_add_form(cx);
-                                let handle = view.name_field.read(cx).focus_handle(cx);
-                                window.focus(&handle);
-                            })),
-                    ),
-            )
-            .child(self.render_status(cx))
+        div().flex().flex_col().child(list).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(rgb(colors.border_soft))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .w_full()
+                        .child(
+                            secondary_button("add-connection-button", window, cx)
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(icon(
+                                    IconName::Add,
+                                    theme::MODAL_ADD_ICON_SIZE,
+                                    colors.accent,
+                                ))
+                                .child("Add connection")
+                                .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
+                                    view.show_add_form(cx);
+                                    let handle = view.name_field.read(cx).focus_handle(cx);
+                                    window.focus(&handle);
+                                })),
+                        )
+                        .child(self.render_status(cx)),
+                ),
+        )
     }
 
     /// One connection-list row: status dot, name (+ "connected" label and
@@ -1474,7 +1471,7 @@ impl ConnectionManagerView {
                 grid::status_dot_outline(colors.text_tertiary)
             })
             .child(Self::render_row_meta(row, is_active, colors))
-            .child(grid::type_tag(&driver_label, &active_theme))
+            .child(grid::type_tag(&driver_label, active_theme))
             .child(Self::row_icon_button(
                 cx,
                 RowIconButton {
@@ -1528,6 +1525,8 @@ impl ConnectionManagerView {
                     .gap_2()
                     .child(
                         div()
+                            .overflow_x_hidden()
+                            .text_ellipsis()
                             .text_size(px(theme::MODAL_ROW_NAME_TEXT_SIZE))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(colors.text_primary))
@@ -1578,13 +1577,15 @@ impl ConnectionManagerView {
             )
     }
 
-    /// A field's caption label, in the small uppercase-weight style every
-    /// field in the form shares.
+    /// A field's caption label, in the small uppercase style every field in
+    /// the form shares: tertiary color, semibold, letters upper-cased (gpui
+    /// has no letter-spacing, so the tracking in the design is dropped).
     fn field_label(text: impl Into<String>, colors: zsql_ui::theme::Colors) -> Div {
         div()
             .text_size(px(theme::CONNECTION_FORM_LABEL_TEXT_SIZE))
             .text_color(rgb(colors.text_tertiary))
-            .child(text.into())
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(text.into().to_uppercase())
     }
 
     /// A labeled field: a caption above the given input entity.
@@ -1606,7 +1607,7 @@ impl ConnectionManagerView {
     /// driver-specific field section (dimmed with an inline reason while
     /// the URL does not parse), the Test result banner, and the footer
     /// buttons.
-    fn render_modal_form(&self, cx: &Context<Self>) -> Div {
+    fn render_modal_form(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let active_theme = cx.theme();
         let colors = active_theme.colors;
         let url_is_empty = self.url_field.read(cx).value().is_empty();
@@ -1653,13 +1654,12 @@ impl ConnectionManagerView {
 
         body = body.child(self.render_driver_field_section(&driver_label, cx));
         body = body.child(self.render_test_outcome(cx));
-        body = body.child(self.render_status(cx));
 
         div()
             .flex()
             .flex_col()
             .child(body)
-            .child(self.render_form_footer(cx))
+            .child(self.render_form_footer(window, cx))
     }
 
     /// The divider + driver-specific fields, or a plain hint when the URL's
@@ -1682,7 +1682,8 @@ impl ConnectionManagerView {
                 div()
                     .text_size(px(theme::CONNECTION_FORM_DIVIDER_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
-                    .child(driver_label.to_owned()),
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(driver_label.to_uppercase()),
             )
             .child(div().flex_1().h(px(1.0)).bg(rgb(colors.border_soft)));
 
@@ -1845,17 +1846,17 @@ impl ConnectionManagerView {
         };
         let (bg, dot_color, text) = match outcome {
             TestOutcome::Pending => (
-                theme::connection_test_pending_bg(&active_theme),
+                theme::connection_test_pending_bg(active_theme),
                 colors.status_warn,
                 "Testing...".to_owned(),
             ),
             TestOutcome::Connected { elapsed_ms } => (
-                theme::connection_test_ok_bg(&active_theme),
+                theme::connection_test_ok_bg(active_theme),
                 colors.accent,
                 format!("Connected - {elapsed_ms} ms"),
             ),
             TestOutcome::Failed(message) => (
-                theme::connection_test_error_bg(&active_theme),
+                theme::connection_test_error_bg(active_theme),
                 colors.status_error,
                 message.clone(),
             ),
@@ -1877,33 +1878,8 @@ impl ConnectionManagerView {
 
     /// The form's footer: Cancel, Test, and (add form) Connect + Save, or
     /// (edit form) Save changes only.
-    fn render_form_footer(&self, cx: &Context<Self>) -> Div {
+    fn render_form_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let ghost_button = |id: &'static str, focus: FocusHandle, label: &'static str| {
-            div()
-                .id(id)
-                .track_focus(&focus)
-                .cursor_pointer()
-                .px_3()
-                .py_1()
-                .rounded(px(theme::MODAL_ROW_RADIUS))
-                .border_1()
-                .border_color(rgb(colors.border))
-                .text_color(rgb(colors.text_secondary))
-                .child(label)
-        };
-        let primary_button = |id: &'static str, focus: FocusHandle, label: &'static str| {
-            div()
-                .id(id)
-                .track_focus(&focus)
-                .cursor_pointer()
-                .px_3()
-                .py_1()
-                .rounded(px(theme::MODAL_ROW_RADIUS))
-                .bg(rgb(colors.bg_raised))
-                .text_color(rgb(colors.text_primary))
-                .child(label)
-        };
 
         let mut footer = div()
             .flex()
@@ -1915,21 +1891,20 @@ impl ConnectionManagerView {
             .border_t_1()
             .border_color(rgb(colors.border_soft))
             .child(
-                ghost_button(
-                    "connection-form-cancel",
-                    self.cancel_focus.clone(),
-                    "Cancel",
-                )
-                .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                    view.cancel_form(cx);
-                })),
+                secondary_button("connection-form-cancel", window, cx)
+                    .track_focus(&self.cancel_focus)
+                    .child("Cancel")
+                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                        view.cancel_form(cx);
+                    })),
             )
             .child(
-                ghost_button("connection-form-test", self.test_focus.clone(), "Test").on_click(
-                    cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                secondary_button("connection-form-test", window, cx)
+                    .track_focus(&self.test_focus)
+                    .child("Test")
+                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                         view.run_test(cx).detach();
-                    }),
-                ),
+                    })),
             )
             .child(div().flex_1());
 
@@ -1937,19 +1912,17 @@ impl ConnectionManagerView {
             ManagerView::AddForm => {
                 footer = footer
                     .child(
-                        ghost_button(
-                            "connection-form-connect",
-                            self.connect_focus.clone(),
-                            "Connect",
-                        )
-                        .on_click(cx.listener(
-                            |view, _event: &ClickEvent, _window, cx| {
+                        secondary_button("connection-form-connect", window, cx)
+                            .track_focus(&self.connect_focus)
+                            .child("Connect")
+                            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                 view.connect_unsaved(cx).detach();
-                            },
-                        )),
+                            })),
                     )
                     .child(
-                        primary_button("connection-form-save", self.save_focus.clone(), "Save")
+                        primary_button("connection-form-save", window, cx)
+                            .track_focus(&self.save_focus)
+                            .child("Save")
                             .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                 let _ = view.add_connection(cx);
                             })),
@@ -1957,16 +1930,12 @@ impl ConnectionManagerView {
             }
             ManagerView::EditForm { index } => {
                 footer = footer.child(
-                    primary_button(
-                        "connection-form-save",
-                        self.save_focus.clone(),
-                        "Save changes",
-                    )
-                    .on_click(cx.listener(
-                        move |view, _event: &ClickEvent, _window, cx| {
+                    primary_button("connection-form-save", window, cx)
+                        .track_focus(&self.save_focus)
+                        .child("Save changes")
+                        .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
                             let _ = view.save_edit(index, cx);
-                        },
-                    )),
+                        })),
                 );
             }
             ManagerView::List => {}
@@ -1976,12 +1945,13 @@ impl ConnectionManagerView {
     }
 
     fn render_status(&self, cx: &Context<Self>) -> Div {
+        let text = self
+            .status()
+            .unwrap_or("click a row to connect\t•\tesc to close");
         div()
-            .px_3()
-            .pb_2()
             .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
             .text_color(rgb(cx.theme().colors.text_tertiary))
-            .child(self.status().unwrap_or_default().to_owned())
+            .child(text.to_owned())
     }
 }
 
