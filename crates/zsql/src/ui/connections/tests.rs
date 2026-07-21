@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
 
+use super::active::host_label;
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, StoredConnection,
-    TestOutcome, active_connection_for_url, footer_display, host_label,
+    TestOutcome, active_connection_for_url, footer_display,
 };
 use crate::session::{Session, SessionState};
 
@@ -1066,7 +1067,7 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
         .expect("the modal panel must be tagged and painted");
     assert_eq!(
         bounds.size.width,
-        super::theme::MODAL_WIDTH,
+        super::style::MODAL_WIDTH,
         "a long URL must never widen the modal panel"
     );
 }
