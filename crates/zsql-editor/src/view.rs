@@ -68,6 +68,8 @@ actions!(
         Copy,
         Cut,
         Paste,
+        Undo,
+        Redo,
     ]
 );
 
@@ -105,6 +107,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-v", Paste, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
+        KeyBinding::new("secondary-z", Undo, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-secondary-z", Redo, Some(KEY_CONTEXT)),
+        // Ctrl-Y is a common redo shortcut in its own right, distinct from
+        // secondary-y's cross-platform cmd-y -- both are bound explicitly,
+        // the same dual-bind pattern cmd-enter/ctrl-enter use above.
+        KeyBinding::new("secondary-y", Redo, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-y", Redo, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -371,6 +380,20 @@ impl EditorView {
         self.notify_edit(cx);
     }
 
+    // -- undo/redo -------------------------------------------------------
+
+    fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.buffer.undo() {
+            self.notify_edit(cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.buffer.redo() {
+            self.notify_edit(cx);
+        }
+    }
+
     // -- clipboard -----------------------------------------------------
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
@@ -389,7 +412,7 @@ impl EditorView {
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.buffer.insert_text(&text);
+            self.buffer.insert_pasted_text(&text);
             self.notify_edit(cx);
         }
     }
@@ -584,6 +607,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::run_query))
             .child(
                 div()
@@ -1241,8 +1266,9 @@ mod tests {
     use super::{
         Backspace, Copy, Cut, DeleteForward, EditorView, MoveDocumentEnd, MoveDocumentStart,
         MoveDown, MoveLeft, MoveLineEnd, MoveLineStart, MoveRight, MoveUp, Newline, Paste,
-        Position, QueryRunner, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart,
-        SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp, build_runs,
+        Position, QueryRunner, Redo, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart,
+        SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp, Undo,
+        build_runs,
     };
     use crate::HighlightKind;
     use crate::theme::syntax_color;
@@ -2237,5 +2263,143 @@ mod tests {
             assert!(view.is_compact());
         });
         vcx.run_until_parked();
+    }
+
+    // -- undo/redo -------------------------------------------------------
+
+    #[gpui::test]
+    fn undo_action_reverts_the_last_edit_and_resyncs_the_highlighter(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness
+            .editor
+            .update(vcx, |view, _cx| view.set_on_edit(listener));
+
+        vcx.simulate_input("SELECT");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "SELECT");
+            assert!(
+                !view.highlighter.spans_for_line(0).is_empty(),
+                "SELECT should be highlighted as a keyword before the undo"
+            );
+        });
+
+        vcx.dispatch_action(Undo);
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(
+                view.buffer_for_test().text(),
+                "",
+                "undo should revert the coalesced typing run"
+            );
+            assert!(
+                view.highlighter.spans_for_line(0).is_empty(),
+                "the highlighter must resync to the emptied, restored text"
+            );
+        });
+        assert!(
+            *count.lock().expect("edit count lock poisoned") > 0,
+            "undo goes through the same notify_edit path as other mutating actions"
+        );
+    }
+
+    #[gpui::test]
+    fn redo_action_reapplies_the_undone_edit(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        vcx.simulate_input("SELECT");
+
+        vcx.dispatch_action(Undo);
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "");
+        });
+
+        vcx.dispatch_action(Redo);
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "SELECT");
+            assert_eq!(view.buffer_for_test().cursor(), Position::new(0, 6));
+        });
+    }
+
+    #[gpui::test]
+    fn undo_on_a_fresh_editor_is_a_noop_and_does_not_fire_the_edit_listener(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = build_harness(cx);
+        let (listener, count) = counting_edit_listener();
+        harness
+            .editor
+            .update(vcx, |view, _cx| view.set_on_edit(listener));
+
+        vcx.dispatch_action(Undo);
+        vcx.dispatch_action(Redo);
+
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "");
+        });
+        assert_eq!(
+            *count.lock().expect("edit count lock poisoned"),
+            0,
+            "a no-op undo/redo must not fire the edit listener or resync anything"
+        );
+    }
+
+    #[gpui::test]
+    fn secondary_z_keystroke_dispatches_undo(cx: &mut TestAppContext) {
+        cx.update(super::init);
+        let (harness, vcx) = build_harness(cx);
+        vcx.simulate_input("ab");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "ab");
+        });
+
+        vcx.simulate_keystrokes("secondary-z");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(
+                view.buffer_for_test().text(),
+                "",
+                "secondary-z should dispatch Undo"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn shift_secondary_z_secondary_y_and_ctrl_y_keystrokes_all_dispatch_redo(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(super::init);
+        let (harness, vcx) = build_harness(cx);
+        vcx.simulate_input("ab");
+        vcx.dispatch_action(Undo);
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().text(), "");
+        });
+
+        vcx.simulate_keystrokes("shift-secondary-z");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(
+                view.buffer_for_test().text(),
+                "ab",
+                "shift-secondary-z should dispatch Redo"
+            );
+        });
+
+        vcx.dispatch_action(Undo);
+        vcx.simulate_keystrokes("secondary-y");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(
+                view.buffer_for_test().text(),
+                "ab",
+                "secondary-y should also dispatch Redo"
+            );
+        });
+
+        vcx.dispatch_action(Undo);
+        vcx.simulate_keystrokes("ctrl-y");
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(
+                view.buffer_for_test().text(),
+                "ab",
+                "ctrl-y should also dispatch Redo"
+            );
+        });
     }
 }
