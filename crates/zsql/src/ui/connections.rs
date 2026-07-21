@@ -1244,7 +1244,7 @@ impl Render for ConnectionManagerView {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 view.handle_modal_key_down(event, window, cx);
             }))
-            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+            .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
                 // This modal is a bit confusing if it closes due to outside
                 // click
                 cx.stop_propagation();
