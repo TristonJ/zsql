@@ -1,6 +1,7 @@
 //! Reusable, layout-agnostic `gpui` building blocks shared across zsql's
 //! views
 
+pub mod button;
 pub mod grid;
 pub mod icon;
 pub mod scrollable;

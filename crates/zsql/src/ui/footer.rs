@@ -135,6 +135,7 @@ mod tests {
                 ConnectionManagerView::new(
                     session_for_connections,
                     empty_store_for_test("render"),
+                    crate::config::Config::default().liveness.probe_timeout(),
                     cx,
                 )
             });

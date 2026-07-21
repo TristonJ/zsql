@@ -131,6 +131,33 @@ impl ConnectionStore {
         Ok(())
     }
 
+    /// Replace the connection at `index` with `connection` in place (same
+    /// position, no append) and persist the updated list immediately.
+    /// Mirrors [`Self::add`]/[`Self::remove`]'s rollback-on-save-failure
+    /// discipline: on a write failure the original entry is restored and an
+    /// `Err` is returned. An out-of-range `index` is a no-op that returns
+    /// `Ok(())`.
+    ///
+    /// # Errors
+    /// Returns [`ConnectionStoreError`] if the store cannot be written.
+    #[tracing::instrument(name = "connection_store_update", skip_all, fields(index))]
+    pub fn update(
+        &mut self,
+        index: usize,
+        connection: StoredConnection,
+    ) -> Result<(), ConnectionStoreError> {
+        let Some(slot) = self.connections.get_mut(index) else {
+            tracing::warn!(index, "update requested for an out-of-range index");
+            return Ok(());
+        };
+        let previous = std::mem::replace(slot, connection);
+        if let Err(err) = self.save() {
+            self.connections[index] = previous;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Remove the connection at `index` and persist the updated list
     /// immediately. Mirrors [`Self::add`]'s rollback-on-save-failure
     /// discipline: on a write failure the removed entry is reinserted at its
@@ -354,6 +381,107 @@ mod tests {
         // Restore permissions so the temp dir can be cleaned up.
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
             .expect("teardown: restore base dir permissions");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn updating_a_connection_replaces_it_in_place_without_changing_the_list_length() {
+        let temp = TempStorePath::new("update");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        let first = StoredConnection {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        };
+        let second = StoredConnection {
+            name: "second".to_owned(),
+            url: "sqlite:///tmp/b.db".to_owned(),
+        };
+        store.add(first).expect("add first");
+        store.add(second.clone()).expect("add second");
+
+        let updated_first = StoredConnection {
+            name: "first renamed".to_owned(),
+            url: "postgres://host/other".to_owned(),
+        };
+        store
+            .update(0, updated_first.clone())
+            .expect("update must succeed");
+
+        assert_eq!(
+            store.connections(),
+            &[updated_first.clone(), second.clone()],
+            "only index 0 must change; the list length must stay the same"
+        );
+
+        let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+        assert_eq!(reloaded.connections(), &[updated_first, second]);
+    }
+
+    #[test]
+    fn updating_an_out_of_range_index_is_a_no_op() {
+        let temp = TempStorePath::new("update-out-of-range");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+        store.add(sample()).expect("add must succeed");
+
+        store
+            .update(
+                5,
+                StoredConnection {
+                    name: "nope".to_owned(),
+                    url: "postgres://host/db".to_owned(),
+                },
+            )
+            .expect("an out-of-range update must not error");
+
+        assert_eq!(
+            store.connections(),
+            &[sample()],
+            "an out-of-range update must not change the list"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_on_update_restores_the_original_entry_in_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "zsql-connections-test-update-unwritable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("setup: create base dir");
+
+        let path = base.join("connections.toml");
+        let mut store = ConnectionStore::load(&path).expect("initial load must succeed");
+        store
+            .add(sample())
+            .expect("add must succeed: dir is writable at this point");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("setup: make store file read-only");
+
+        let result = store.update(
+            0,
+            StoredConnection {
+                name: "renamed".to_owned(),
+                url: "postgres://host/renamed".to_owned(),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "update must fail when the store file cannot be overwritten"
+        );
+        assert_eq!(
+            store.connections(),
+            &[sample()],
+            "a failed save must restore the original entry in memory: {:?}",
+            store.connections()
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("teardown: restore file permissions");
         let _ = std::fs::remove_dir_all(&base);
     }
 

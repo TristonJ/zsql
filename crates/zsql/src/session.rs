@@ -822,7 +822,7 @@ async fn describe_relation_via(
 /// under `TestAppContext`) rather than a runtime timeout helper, since no
 /// tokio runtime is available here.
 #[tracing::instrument(name = "session_liveness_probe", skip_all)]
-async fn probe_connection(
+pub(crate) async fn probe_connection(
     connection: Arc<dyn Connection>,
     timeout: Duration,
     executor: BackgroundExecutor,

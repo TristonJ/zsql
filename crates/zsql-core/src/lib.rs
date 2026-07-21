@@ -2,6 +2,7 @@
 //! contract
 
 pub mod config;
+pub mod connection_url;
 pub mod driver;
 pub mod error;
 pub mod registry;
@@ -12,6 +13,7 @@ pub mod sql;
 pub mod value;
 
 pub use config::ConnConfig;
+pub use connection_url::ConnectionUrl;
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
 pub use registry::select_driver;

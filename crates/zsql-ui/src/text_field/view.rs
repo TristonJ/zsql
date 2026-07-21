@@ -15,14 +15,22 @@ use gpui::{
 };
 
 use crate::text_field::model::{
-    BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_to_utf16, byte_range_from_utf16,
-    byte_range_to_utf16, should_show_placeholder,
+    BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_for_char_count,
+    byte_offset_to_utf16, byte_range_from_utf16, byte_range_to_utf16, char_count_before,
+    should_show_placeholder,
 };
 use crate::text_field::theme;
 use crate::theme::ActiveTheme;
 
 /// Underline thickness for the IME marked-text (composition) span.
 const MARKED_TEXT_UNDERLINE_WIDTH: Pixels = px(1.0);
+
+/// The single-byte ASCII glyph a masked field (e.g. a password) shows once
+/// per character instead of the real content -- one byte per char keeps the
+/// masked display index numerically equal to the content's char count, so
+/// [`char_count_before`]/[`byte_offset_for_char_count`] convert between the
+/// two without any extra bookkeeping.
+const MASK_GLYPH: char = '*';
 
 /// The key context the field's own key bindings are scoped to, so they only
 /// fire while a `TextField` is focused. Distinct from `zsql_editor`'s
@@ -95,6 +103,10 @@ pub struct TextFieldState {
     marked_range: Option<Range<usize>>,
     /// Whether a mouse-down is currently dragging out a selection.
     is_selecting: bool,
+    /// Whether this field's content displays as [`MASK_GLYPH`] repeated
+    /// (e.g. a password) rather than as itself. Editing, selection, and
+    /// clipboard all still operate on the real content underneath.
+    masked: bool,
     blink: BlinkState,
     /// Whether the field held focus as of the most recent render. The blink
     /// loop reads this to skip ticking (and repainting) an unfocused field,
@@ -124,6 +136,7 @@ impl TextFieldState {
             focus_handle: cx.focus_handle(),
             marked_range: None,
             is_selecting: false,
+            masked: false,
             blink: BlinkState::new(),
             focused: false,
             last_line: None,
@@ -144,6 +157,32 @@ impl TextFieldState {
     pub fn set_value(&mut self, value: impl AsRef<str>, cx: &mut Context<Self>) {
         self.model = FieldModel::from_text(value.as_ref());
         self.marked_range = None;
+        cx.notify();
+    }
+
+    /// Replace the field's content exactly like [`Self::set_value`], but
+    /// without notifying this field's own observers -- for a caller that
+    /// owns some other authoritative state this field merely mirrors (e.g.
+    /// a parsed-URL field derived from a sibling URL field's text) and is
+    /// about to notify on its own behalf, so a repaint still happens but a
+    /// redundant "this field changed" reaction does not fire and treat the
+    /// refresh as a fresh edit in its own right.
+    pub fn set_value_quiet(&mut self, value: impl AsRef<str>) {
+        self.model = FieldModel::from_text(value.as_ref());
+        self.marked_range = None;
+    }
+
+    /// Whether this field currently displays its content masked.
+    #[must_use]
+    pub fn is_masked(&self) -> bool {
+        self.masked
+    }
+
+    /// Show ([`MASK_GLYPH`] repeated) or reveal this field's content, e.g. a
+    /// password field's "show" toggle. Editing keeps working on the real
+    /// content underneath either way.
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.masked = masked;
         cx.notify();
     }
 
@@ -319,13 +358,21 @@ impl TextFieldState {
         }
     }
 
-    /// The byte offset under `point`, using the most recent paint's shaped
-    /// line and bounds. `None` before the first paint.
+    /// The byte offset into the real content under `point`, using the most
+    /// recent paint's shaped line and bounds. `None` before the first paint.
+    /// When masked, the shaped line is the masked display string, so its
+    /// hit-tested index is converted back to a content byte offset via
+    /// [`byte_offset_for_char_count`].
     fn byte_offset_for_point(&self, point: Point<Pixels>) -> Option<usize> {
         let bounds = self.last_bounds?;
         let line = self.last_line.as_ref()?;
         let x = (point.x - bounds.left()).max(Pixels::ZERO);
-        Some(line.closest_index_for_x(x))
+        let display_index = line.closest_index_for_x(x);
+        Some(if self.masked {
+            byte_offset_for_char_count(self.model.text(), display_index)
+        } else {
+            display_index
+        })
     }
 
     /// The flat byte range a `replace_text_in_range`-style call should
@@ -375,6 +422,15 @@ impl Render for TextFieldState {
             .flex()
             .items_center()
             .w_full()
+            // A field placed in a flex row/column defaults to a min-width
+            // equal to its content's natural (unwrapped) size, which lets a
+            // long value push every ancestor up to a fixed-width container
+            // wider than intended -- `min_w_0` lets this field shrink to its
+            // parent's available width instead, and `overflow_hidden` then
+            // clips whatever no longer fits rather than painting it outside
+            // the field's own box.
+            .min_w_0()
+            .overflow_hidden()
             .h(theme::FIELD_HEIGHT)
             .px(px(theme::FIELD_PADDING_X))
             .rounded(px(theme::FIELD_RADIUS))
@@ -606,10 +662,32 @@ impl Element for TextFieldContentElement {
                 strikethrough: None,
             };
             (text, vec![run])
+        } else if field.masked {
+            let text = SharedString::from(MASK_GLYPH.to_string().repeat(content.chars().count()));
+            let run = TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: text_style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            (text, vec![run])
         } else {
             let text = SharedString::from(content.to_owned());
             let runs = build_runs(field, &text, &font, text_style.color);
             (text, runs)
+        };
+
+        // The display index into `display_text`, which is `content` itself
+        // unless masked (in which case it is content's char count, since
+        // `MASK_GLYPH` is one ASCII byte per char -- see `char_count_before`).
+        let display_index = |byte_offset: usize| {
+            if field.masked {
+                char_count_before(content, byte_offset)
+            } else {
+                byte_offset
+            }
         };
 
         let line = window
@@ -617,7 +695,7 @@ impl Element for TextFieldContentElement {
             .shape_line(display_text, font_size, &runs, None);
 
         let cursor = (field.focus_handle.is_focused(window) && field.blink.visible()).then(|| {
-            let x = line.x_for_index(field.model.cursor());
+            let x = line.x_for_index(display_index(field.model.cursor()));
             fill(
                 Bounds::new(
                     point(bounds.left() + x, bounds.top()),
@@ -628,8 +706,8 @@ impl Element for TextFieldContentElement {
         });
 
         let selection = field.model.selection().map(|range| {
-            let start_x = line.x_for_index(range.start);
-            let end_x = line.x_for_index(range.end);
+            let start_x = line.x_for_index(display_index(range.start));
+            let end_x = line.x_for_index(display_index(range.end));
             fill(
                 Bounds::from_corners(
                     point(bounds.left() + start_x, bounds.top()),
@@ -804,12 +882,83 @@ mod tests {
         vcx.run_until_parked();
     }
 
+    // -- masking -----------------------------------------------------------
+
+    #[gpui::test]
+    fn a_masked_field_renders_without_panicking_and_keeps_its_real_value(cx: &mut TestAppContext) {
+        let (field, vcx) = build_field(cx, Some("hunter2"));
+        field.update(vcx, |field, cx| field.set_masked(true, cx));
+        vcx.run_until_parked();
+
+        field.read_with(vcx, |field, _cx| {
+            assert!(field.is_masked());
+            assert_eq!(field.value().as_ref(), "hunter2");
+        });
+    }
+
+    #[gpui::test]
+    fn revealing_a_masked_field_clears_the_masked_flag_and_keeps_the_value(
+        cx: &mut TestAppContext,
+    ) {
+        let (field, vcx) = build_field(cx, Some("s3cret"));
+        field.update(vcx, |field, cx| field.set_masked(true, cx));
+        field.update(vcx, |field, cx| field.set_masked(false, cx));
+        vcx.run_until_parked();
+
+        field.read_with(vcx, |field, _cx| {
+            assert!(!field.is_masked());
+            assert_eq!(field.value().as_ref(), "s3cret");
+        });
+    }
+
+    #[gpui::test]
+    fn typing_into_a_masked_field_edits_the_real_content(cx: &mut TestAppContext) {
+        let (field, vcx) = build_field(cx, None);
+        field.update(vcx, |field, cx| field.set_masked(true, cx));
+        vcx.simulate_input("pw");
+        field.read_with(vcx, |field, _cx| {
+            assert_eq!(field.value().as_ref(), "pw");
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_a_masked_field_places_the_cursor_at_the_content_offset_not_the_mask_glyph_offset(
+        cx: &mut TestAppContext,
+    ) {
+        // "p\u{e9}ss" mixes a multi-byte char in with ASCII so a masked click
+        // that naively used the mask's display index (== char count) instead
+        // of converting back to a content byte offset would land in the
+        // wrong place.
+        let (field, vcx) = build_field(cx, Some("p\u{e9}ss"));
+        field.update(vcx, |field, cx| field.set_masked(true, cx));
+        vcx.run_until_parked();
+
+        // Third mask glyph -> third char -> byte offset 4 (after the 2-byte
+        // 'e9').
+        let click_point = field.read_with(vcx, |field, _cx| field.point_for_offset_for_test(3));
+        vcx.simulate_click(click_point, Modifiers::default());
+        vcx.run_until_parked();
+
+        field.read_with(vcx, |field, _cx| {
+            assert_eq!(field.model.cursor(), 4);
+        });
+    }
+
     // -- value / round-trip ----------------------------------------------
 
     #[gpui::test]
     fn value_after_set_value_round_trips(cx: &mut TestAppContext) {
         let (field, vcx) = build_field(cx, Some("initial"));
         field.update(vcx, |field, cx| field.set_value("replaced", cx));
+        field.read_with(vcx, |field, _cx| {
+            assert_eq!(field.value().as_ref(), "replaced");
+        });
+    }
+
+    #[gpui::test]
+    fn set_value_quiet_updates_the_value_the_same_as_set_value(cx: &mut TestAppContext) {
+        let (field, vcx) = build_field(cx, Some("initial"));
+        field.update(vcx, |field, _cx| field.set_value_quiet("replaced"));
         field.read_with(vcx, |field, _cx| {
             assert_eq!(field.value().as_ref(), "replaced");
         });

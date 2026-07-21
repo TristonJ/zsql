@@ -42,12 +42,14 @@ pub enum IconName {
     /// Manually refresh a view. Vendored for a future affordance; no call
     /// site uses it yet.
     Refresh,
+    /// Edit an existing item.
+    Edit,
 }
 
 impl IconName {
     /// Every registered icon, in declaration order. Used to build the asset
     /// source's directory listing and to iterate every icon in tests.
-    pub const ALL: [IconName; 13] = [
+    pub const ALL: [IconName; 14] = [
         IconName::ChevronRight,
         IconName::ChevronDown,
         IconName::Database,
@@ -61,6 +63,7 @@ impl IconName {
         IconName::Delete,
         IconName::Add,
         IconName::Refresh,
+        IconName::Edit,
     ];
 
     /// The logical asset path this icon resolves to, exactly as passed to
@@ -81,6 +84,7 @@ impl IconName {
             IconName::Delete => "icons/delete.svg",
             IconName::Add => "icons/add.svg",
             IconName::Refresh => "icons/refresh.svg",
+            IconName::Edit => "icons/edit.svg",
         }
     }
 
@@ -107,6 +111,7 @@ impl IconName {
             IconName::Delete => include_bytes!("../assets/icons/delete.svg") as &[u8],
             IconName::Add => include_bytes!("../assets/icons/add.svg") as &[u8],
             IconName::Refresh => include_bytes!("../assets/icons/refresh.svg") as &[u8],
+            IconName::Edit => include_bytes!("../assets/icons/edit.svg") as &[u8],
         }
     }
 

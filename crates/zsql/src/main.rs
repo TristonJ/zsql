@@ -73,12 +73,14 @@ fn main() -> anyhow::Result<()> {
 
                     let workspace_session = session.clone();
                     let workspace_layout = cfg.layout.clone();
+                    let probe_timeout = cfg.liveness.probe_timeout();
                     let tab_sessions_path = Config::tab_sessions_path();
                     let workspace = cx.new(|cx| {
                         WorkspaceView::new(
                             workspace_session,
                             workspace_layout,
                             connection_store,
+                            probe_timeout,
                             tab_sessions_path,
                             cx,
                         )
