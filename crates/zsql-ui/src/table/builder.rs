@@ -6,8 +6,9 @@
 use std::ops::Range;
 
 use gpui::{
-    Context, Div, ElementId, Entity, Pixels, Render, SharedString, Window, div, prelude::*, px,
-    rgb, uniform_list,
+    App, Context, Div, ElementId, Entity, FocusHandle, MouseButton, MouseDownEvent, Pixels, Render,
+    SharedString, UniformList, UniformListScrollHandle, Window, div, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
 
 use crate::scrollable::restrict_wheel_to_own_axis;
@@ -40,6 +41,8 @@ pub struct Table<V: Render> {
     gutter: Gutter<V>,
     rows: Option<RowRenderer<V>>,
     vertical_sizing: TableSizing,
+    focus_on_click: Option<FocusHandle>,
+    selectable: bool,
 }
 
 /// How to size the table's vertical extent in its parent. Defaults to [`TableSizing::Fill`].
@@ -66,6 +69,8 @@ impl<V: Render> Table<V> {
             gutter: Gutter::None,
             rows: None,
             vertical_sizing: TableSizing::Fill,
+            focus_on_click: None,
+            selectable: false,
         }
     }
 
@@ -112,6 +117,28 @@ impl<V: Render> Table<V> {
         self
     }
 
+    /// Focus `handle` whenever a data cell is clicked, so a caller's own key
+    /// binding (e.g. a clipboard copy) captures the same click that just
+    /// selected the cell. Has no effect unless [`Table::selectable`] is
+    /// also called: with no cell selection wired up, there is no click to
+    /// focus on.
+    #[must_use]
+    pub fn focus_on_cell_click(mut self, handle: FocusHandle) -> Self {
+        self.focus_on_click = Some(handle);
+        self
+    }
+
+    /// Enables click-to-select on this table's data cells: a click sets
+    /// `TableState`'s focused cell and the matching cell paints a themed
+    /// highlight. Off by default, so a table with no use for cell selection
+    /// (e.g. a plain read-only browser) renders its body cells as inert
+    /// content with no per-cell element id, click handler, or highlight.
+    #[must_use]
+    pub fn selectable(mut self) -> Self {
+        self.selectable = true;
+        self
+    }
+
     /// The data pane's batch cell renderer, wired through `cx.processor` so
     /// it keeps `&mut V` access for building each visible range's cells.
     /// Each returned [`TableRow`] is expected to carry at most one cell per
@@ -144,6 +171,8 @@ impl<V: Render> Table<V> {
             gutter,
             rows,
             vertical_sizing: table_height,
+            focus_on_click,
+            selectable,
         } = self;
         let rows = rows.unwrap_or_else(|| -> RowRenderer<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
@@ -152,13 +181,16 @@ impl<V: Render> Table<V> {
         let column_widths: Vec<Pixels> = columns.iter().map(|column| column.width).collect();
         let content_extent = px(content_extent_for_columns(&column_widths));
 
-        let handles = {
+        let (handles, focused_cell) = {
             let table_state = state.read(cx);
-            TableScrollHandles {
-                scroll: table_state.scroll.clone(),
-                row_scroll_handle: table_state.row_scroll_handle.clone(),
-                col_scroll_handle: table_state.col_scroll_handle.clone(),
-            }
+            (
+                TableScrollHandles {
+                    scroll: table_state.scroll.clone(),
+                    row_scroll_handle: table_state.row_scroll_handle.clone(),
+                    col_scroll_handle: table_state.col_scroll_handle.clone(),
+                },
+                table_state.focused_cell(),
+            )
         };
 
         sync_scroll_axes(
@@ -182,38 +214,20 @@ impl<V: Render> Table<V> {
         );
         let header_row = build_header_row(columns, &style, content_extent, &state);
 
-        let data_list_id = SharedString::from(format!("{id}-data"));
-        let body_tag_state = state.clone();
-        let data_list = restrict_wheel_to_own_axis(
-            uniform_list(
-                data_list_id,
-                row_count,
-                cx.processor(move |this, range: Range<usize>, window, cx| {
-                    let top_of_viewport = range.start;
-                    let indices = range.clone();
-                    rows(this, range, window, cx)
-                        .into_iter()
-                        .zip(indices)
-                        .map(|(row, row_index)| {
-                            build_body_row(
-                                row,
-                                &column_widths,
-                                &style,
-                                row_index,
-                                top_of_viewport,
-                                &body_tag_state,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .flex_1()
-            .min_w(content_extent)
-            .with_sizing_behavior(match table_height {
-                TableSizing::Fill => gpui::ListSizingBehavior::Auto,
-                TableSizing::Fit => gpui::ListSizingBehavior::Infer,
-            })
-            .track_scroll(handles.row_scroll_handle.clone()),
+        let data_list = build_data_list(
+            &id,
+            row_count,
+            column_widths,
+            style,
+            content_extent,
+            table_height,
+            focus_on_click,
+            selectable,
+            focused_cell,
+            &state,
+            handles.row_scroll_handle.clone(),
+            rows,
+            cx,
         );
 
         let h_scroll_id = SharedString::from(format!("{id}-h-scroll"));
@@ -243,6 +257,60 @@ impl<V: Render> Table<V> {
         }
         root.child(scrollable_data_pane)
     }
+}
+
+/// The data pane's virtualized body: `row_count` rows batch-rendered
+/// through `rows` and shaped into cells via [`build_body_row`], restricted
+/// to its own scroll axis and sized per `table_height`.
+#[allow(clippy::too_many_arguments)]
+fn build_data_list<V: Render>(
+    id: &ElementId,
+    row_count: usize,
+    column_widths: Vec<Pixels>,
+    style: TableStyle,
+    content_extent: Pixels,
+    table_height: TableSizing,
+    focus_on_click: Option<FocusHandle>,
+    selectable: bool,
+    focused_cell: Option<(usize, usize)>,
+    state: &Entity<TableState>,
+    row_scroll_handle: UniformListScrollHandle,
+    rows: RowRenderer<V>,
+    cx: &mut Context<V>,
+) -> UniformList {
+    let data_list_id = SharedString::from(format!("{id}-data"));
+    let body_tag_state = state.clone();
+    restrict_wheel_to_own_axis(
+        uniform_list(
+            data_list_id,
+            row_count,
+            cx.processor(move |this, range: Range<usize>, window, cx| {
+                let top_of_viewport = range.start;
+                let indices = range.clone();
+                let row_ctx = BodyRowContext {
+                    column_widths: &column_widths,
+                    style: &style,
+                    top_of_viewport,
+                    focused_cell,
+                    state: &body_tag_state,
+                    focus_on_click: focus_on_click.as_ref(),
+                    selectable,
+                };
+                rows(this, range, window, cx)
+                    .into_iter()
+                    .zip(indices)
+                    .map(|(row, row_index)| build_body_row(row, row_index, &row_ctx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_w(content_extent)
+        .with_sizing_behavior(match table_height {
+            TableSizing::Fill => gpui::ListSizingBehavior::Auto,
+            TableSizing::Fit => gpui::ListSizingBehavior::Infer,
+        })
+        .track_scroll(row_scroll_handle),
+    )
 }
 
 /// The three scroll handles a table drives, grouped so they travel together
@@ -426,48 +494,113 @@ fn build_header_row(
 /// [`Table::rows`] for the cell-count contract this enforces in debug
 /// builds.
 ///
-/// `row_index` is this row's position in the data source; `top_of_viewport`
+/// `row_index` is this row's position in the data source; `ctx.top_of_viewport`
 /// is the row index currently at the top of the data pane's visible range.
-fn build_body_row(
-    row: TableRow,
-    column_widths: &[Pixels],
-    style: &TableStyle,
-    row_index: usize,
-    top_of_viewport: usize,
-    state: &Entity<TableState>,
-) -> Div {
+fn build_body_row(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> Div {
     debug_assert!(
-        row.cells.len() <= column_widths.len(),
+        row.cells.len() <= ctx.column_widths.len(),
         "table row was given {} cells but the table only has {} columns; a release build \
          truncates the extra {} cell(s) instead of panicking",
         row.cells.len(),
-        column_widths.len(),
-        row.cells.len() - column_widths.len(),
+        ctx.column_widths.len(),
+        row.cells.len() - ctx.column_widths.len(),
     );
-    build_body_row_cells(row, column_widths, style, row_index, top_of_viewport, state)
+    build_body_row_cells(row, row_index, ctx)
+}
+
+/// Everything one data-pane body row needs beyond its own [`TableRow`] and
+/// position: column sizing/chrome, the current selection, the table's
+/// mechanical state, and an optional focus target for a cell click.
+/// Grouped into one struct so row-building functions take a single context
+/// argument instead of a long, easily-transposed positional parameter list.
+struct BodyRowContext<'a> {
+    column_widths: &'a [Pixels],
+    style: &'a TableStyle,
+    /// The row index currently at the top of the data pane's visible range.
+    top_of_viewport: usize,
+    focused_cell: Option<(usize, usize)>,
+    state: &'a Entity<TableState>,
+    focus_on_click: Option<&'a FocusHandle>,
+    /// Whether this table opted into click-to-select and the matching
+    /// highlight via [`Table::selectable`]. Off by default, so a table with
+    /// no use for cell selection renders inert, unclickable body cells.
+    selectable: bool,
 }
 
 /// [`build_body_row`] without its debug assertion: zips `row.cells` against
-/// `column_widths`, truncating to the shorter of the two.
-fn build_body_row_cells(
-    row: TableRow,
-    column_widths: &[Pixels],
-    style: &TableStyle,
-    row_index: usize,
-    top_of_viewport: usize,
-    state: &Entity<TableState>,
-) -> Div {
+/// `ctx.column_widths`, truncating to the shorter of the two.
+fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> Div {
+    let style = ctx.style;
     let mut row_div = div().flex().flex_row().items_center().h(style.row_height);
     if style.borders.row {
         row_div = row_div.border_b_1().border_color(rgb(style.row_border));
     }
-    for (cell_index, (cell, &width)) in row.cells.into_iter().zip(column_widths.iter()).enumerate()
+    for (cell_index, (cell, &width)) in row
+        .cells
+        .into_iter()
+        .zip(ctx.column_widths.iter())
+        .enumerate()
     {
-        let built = cell_shell(width, style).child(cell);
-        let built = tag_first_body_cell(built, cell_index, row_index, top_of_viewport, state);
-        row_div = row_div.child(built);
+        let mut shell = cell_shell(width, style).child(cell);
+        if ctx.selectable {
+            if ctx.focused_cell == Some((row_index, cell_index)) {
+                shell = shell
+                    .bg(rgba(style.selection_wash))
+                    .border_1()
+                    .border_color(rgba(style.selection_ring));
+            }
+            let cell_id = SharedString::from(format!(
+                "zsql-ui-table-cell-{row_index}-{cell_index}-{}",
+                ctx.state.entity_id()
+            ));
+            let interactive = shell.id(cell_id).on_mouse_down(
+                MouseButton::Left,
+                select_cell_on_click(
+                    ctx.state,
+                    row_index,
+                    cell_index,
+                    ctx.focus_on_click.cloned(),
+                ),
+            );
+            let tagged = tag_first_body_cell(
+                interactive,
+                cell_index,
+                row_index,
+                ctx.top_of_viewport,
+                ctx.state,
+            );
+            row_div = row_div.child(tagged);
+        } else {
+            let tagged =
+                tag_first_body_cell(shell, cell_index, row_index, ctx.top_of_viewport, ctx.state);
+            row_div = row_div.child(tagged);
+        }
     }
     row_div
+}
+
+/// A data cell's mouse-down handler: selects `(row_index, cell_index)` in
+/// `state` and, if given, focuses `focus_handle` so a caller's own key
+/// binding (e.g. a clipboard copy) captures the same click that just
+/// selected the cell.
+fn select_cell_on_click(
+    state: &Entity<TableState>,
+    row_index: usize,
+    cell_index: usize,
+    focus_handle: Option<FocusHandle>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+    move |_event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+        let _span =
+            tracing::trace_span!("zsql_ui::table::select_cell", row_index, cell_index).entered();
+        state.update(cx, |table_state, cx| {
+            table_state.set_focused_cell(row_index, cell_index);
+            cx.notify();
+        });
+        if let Some(handle) = &focus_handle {
+            window.focus(handle);
+        }
+    }
 }
 
 /// A data-pane cell's chrome, shared by header and body.
@@ -578,13 +711,13 @@ fn tag_header_cell(cell: Div, _index: usize, _state: &Entity<TableState>) -> Div
 /// checking that a shared scroll handle's offset changed. Every other cell
 /// passes through unchanged.
 #[cfg(any(test, feature = "test-support"))]
-fn tag_first_body_cell(
-    cell: Div,
+fn tag_first_body_cell<E: InteractiveElement>(
+    cell: E,
     cell_index: usize,
     row_index: usize,
     top_of_viewport: usize,
     state: &Entity<TableState>,
-) -> Div {
+) -> E {
     if cell_index == 0 && row_index == top_of_viewport {
         let selector = body_first_cell_id(state).to_string();
         cell.debug_selector(move || selector.clone())
@@ -595,13 +728,13 @@ fn tag_first_body_cell(
 
 /// A no-op outside test builds.
 #[cfg(not(any(test, feature = "test-support")))]
-fn tag_first_body_cell(
-    cell: Div,
+fn tag_first_body_cell<E>(
+    cell: E,
     _cell_index: usize,
     _row_index: usize,
     _top_of_viewport: usize,
     _state: &Entity<TableState>,
-) -> Div {
+) -> E {
     cell
 }
 
@@ -701,10 +834,20 @@ mod tests {
                 };
                 let style = TableStyle::default();
                 let count = self.painted_count.clone();
-                super::build_body_row_cells(row, &self.widths, &style, 0, NO_TAG, &self.table_state)
-                    .on_children_prepainted(move |bounds, _window, _app| {
+                let row_ctx = super::BodyRowContext {
+                    column_widths: &self.widths,
+                    style: &style,
+                    top_of_viewport: NO_TAG,
+                    focused_cell: None,
+                    state: &self.table_state,
+                    focus_on_click: None,
+                    selectable: false,
+                };
+                super::build_body_row_cells(row, 0, &row_ctx).on_children_prepainted(
+                    move |bounds, _window, _app| {
                         count.set(Some(bounds.len()));
-                    })
+                    },
+                )
             }
         }
 
@@ -747,7 +890,16 @@ mod tests {
         // A row with more cells than the table has columns is a caller bug
         // (data that can never reach the screen), so the debug assertion
         // must fire in this (debug-assertions-enabled) test build.
-        let _div = super::build_body_row(row, &widths, &style, 0, NO_TAG, &state);
+        let row_ctx = super::BodyRowContext {
+            column_widths: &widths,
+            style: &style,
+            top_of_viewport: NO_TAG,
+            focused_cell: None,
+            state: &state,
+            focus_on_click: None,
+            selectable: false,
+        };
+        let _div = super::build_body_row(row, 0, &row_ctx);
     }
 
     #[gpui::test]
@@ -803,6 +955,7 @@ mod tests {
         scrollbar_style: ScrollbarStyle,
         gutter: GutterPreset,
         omit_rows_callback: bool,
+        selectable: bool,
     }
 
     impl Harness {
@@ -816,6 +969,7 @@ mod tests {
                 scrollbar_style: ScrollbarStyle::default(),
                 gutter: GutterPreset::RowNumbers,
                 omit_rows_callback: false,
+                selectable: true,
             }
         }
 
@@ -841,6 +995,11 @@ mod tests {
 
         fn without_rows_callback(mut self) -> Self {
             self.omit_rows_callback = true;
+            self
+        }
+
+        fn without_selectable(mut self) -> Self {
+            self.selectable = false;
             self
         }
     }
@@ -872,6 +1031,9 @@ mod tests {
                 .columns(columns)
                 .row_count(self.row_count)
                 .gutter(gutter);
+            if self.selectable {
+                table = table.selectable();
+            }
             if !self.omit_rows_callback {
                 table = table.rows(move |_this: &mut Self, range, _window, _cx| {
                     range
@@ -1846,5 +2008,330 @@ mod tests {
         let (_harness, vcx) =
             cx.add_window_view(|_window, cx| Harness::new(50, 3, cx).without_rows_callback());
         vcx.run_until_parked();
+    }
+
+    // -- cell selection ------------------------------------------------
+
+    fn click_at(vcx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>) {
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_table_that_never_opted_into_selectable_ignores_clicks_on_its_cells(
+        cx: &mut TestAppContext,
+    ) {
+        // A table that never calls `Table::selectable` must render its body
+        // cells as inert content: no per-cell click handler and no
+        // highlight, so a caller that only wants a read-only grid (e.g. a
+        // schema browser) is unaffected by another caller's use of cell
+        // selection.
+        let (harness, vcx) =
+            cx.add_window_view(|_window, cx| Harness::new(50, 3, cx).without_selectable());
+        vcx.run_until_parked();
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must still be painted even when unselectable");
+        click_at(
+            vcx,
+            gpui::point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            ),
+        );
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "clicking a cell in a non-selectable table must not select it"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_data_cell_selects_it_in_table_state(cx: &mut TestAppContext) {
+        let (harness, vcx) = cx.add_window_view(|_window, cx| Harness::new(50, 3, cx));
+        vcx.run_until_parked();
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "nothing must be selected before any click"
+        );
+
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        // The cell's own layout box is wider than the pane (this harness's
+        // columns overflow it by design, for the scrollbar tests above), so
+        // its *center* can fall outside the clipped visible viewport; a
+        // point near its top-left corner stays inside both.
+        click_at(
+            vcx,
+            gpui::point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            ),
+        );
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "clicking the top-of-viewport body cell must select row 0, column 0"
+        );
+    }
+
+    #[gpui::test]
+    fn gutter_and_header_cells_remain_unclickable_in_a_selectable_table(cx: &mut TestAppContext) {
+        // AC #7: row-number gutter and header cells stay unclickable for
+        // selection even when the table IS selectable (unlike body cells,
+        // which do accept clicks to select when the table is selectable).
+        let (harness, vcx) = cx.add_window_view(|_window, cx| Harness::new(50, 3, cx));
+        vcx.run_until_parked();
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "nothing must be selected before any click"
+        );
+
+        // Click on the gutter cell (row-number gutter, first row).
+        let gutter_bounds = vcx
+            .debug_bounds(gutter_first_cell_debug_selector(&table_state))
+            .expect("the row-number gutter's first cell must be painted");
+        click_at(
+            vcx,
+            gpui::point(
+                gutter_bounds.origin.x + px(5.0),
+                gutter_bounds.origin.y + px(5.0),
+            ),
+        );
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "clicking the gutter cell must not select it"
+        );
+
+        // Click on the header cell.
+        let header_bounds = vcx
+            .debug_bounds(header_first_cell_debug_selector(&table_state))
+            .expect("the header row's first cell must be painted");
+        click_at(
+            vcx,
+            gpui::point(
+                header_bounds.origin.x + px(5.0),
+                header_bounds.origin.y + px(5.0),
+            ),
+        );
+
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "clicking the header cell must not select it"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_second_cell_moves_the_selection_away_from_the_first(cx: &mut TestAppContext) {
+        // Narrow enough that both columns fit inside `PANE_SIZE` (unlike
+        // `COLUMN_WIDTH`, used elsewhere to force horizontal overflow), so a
+        // click at either cell's own bounds lands inside the pane's clipped
+        // visible viewport rather than being clipped away.
+        const CELL_WIDTH: f32 = 80.0;
+        const CELL_00_SELECTOR: &str = "zsql-ui-table-test-select-cell-0-0";
+        const CELL_11_SELECTOR: &str = "zsql-ui-table-test-select-cell-1-1";
+
+        struct Probe {
+            table_state: Entity<TableState>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let columns = vec![
+                    TableColumn::new(px(CELL_WIDTH), div().child("c0")),
+                    TableColumn::new(px(CELL_WIDTH), div().child("c1")),
+                ];
+                let table = Table::new("probe-table", &self.table_state)
+                    .columns(columns)
+                    .row_count(2)
+                    .selectable()
+                    .rows(|_this: &mut Self, range, _window, _cx| {
+                        range
+                            .map(|row| {
+                                let cells: Vec<AnyElement> = (0..2)
+                                    .map(|col| {
+                                        let content =
+                                            div().size_full().child(format!("r{row}c{col}"));
+                                        if row == 0 && col == 0 {
+                                            content
+                                                .debug_selector(|| CELL_00_SELECTOR.to_string())
+                                                .into_any_element()
+                                        } else if row == 1 && col == 1 {
+                                            content
+                                                .debug_selector(|| CELL_11_SELECTOR.to_string())
+                                                .into_any_element()
+                                        } else {
+                                            content.into_any_element()
+                                        }
+                                    })
+                                    .collect();
+                                TableRow::new(cells)
+                            })
+                            .collect()
+                    })
+                    .render(cx);
+                div()
+                    .w(px(PANE_SIZE))
+                    .h(px(PANE_SIZE))
+                    .flex()
+                    .flex_col()
+                    .child(table)
+            }
+        }
+
+        let (probe, vcx) = cx.add_window_view(|_window, cx| Probe {
+            table_state: cx.new(TableState::new),
+        });
+        vcx.run_until_parked();
+        let table_state = probe.read_with(vcx, |p, _app| p.table_state.clone());
+
+        let cell_00 = vcx
+            .debug_bounds(CELL_00_SELECTOR)
+            .expect("cell (0,0)'s content must be painted");
+        click_at(vcx, cell_00.center());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "clicking cell (0,0) must select it"
+        );
+
+        let cell_11 = vcx
+            .debug_bounds(CELL_11_SELECTOR)
+            .expect("cell (1,1)'s content must be painted");
+        click_at(vcx, cell_11.center());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((1, 1)),
+            "clicking a different cell must move the selection to it, away from (0, 0), so \
+             exactly one cell is ever the selected cell at once"
+        );
+    }
+
+    /// A focused cell's selection ring borders every edge, unlike an
+    /// unfocused cell's own right-only column hairline, so a full-size
+    /// child's painted content box shrinks -- the same geometry-based proof
+    /// [`probe_column_border_child_width`] uses, since a painted color
+    /// cannot be asserted from bounds alone.
+    fn probe_focus_ring_child_size(select_it: bool, cx: &mut TestAppContext) -> (Pixels, Pixels) {
+        const CHILD_SELECTOR: &str = "zsql-ui-table-test-focus-ring-child";
+
+        struct Probe {
+            table_state: Entity<TableState>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let table = Table::new("probe-table", &self.table_state)
+                    .columns(vec![TableColumn::new(px(COLUMN_WIDTH), div().child("c"))])
+                    .row_count(1)
+                    .selectable()
+                    .rows(|_this: &mut Self, range, _window, _cx| {
+                        range
+                            .map(|_ix| {
+                                let child = div()
+                                    .size_full()
+                                    .debug_selector(|| CHILD_SELECTOR.to_string());
+                                TableRow::new(vec![child.into_any_element()])
+                            })
+                            .collect()
+                    })
+                    .render(cx);
+                div()
+                    .w(px(PANE_SIZE))
+                    .h(px(PANE_SIZE))
+                    .flex()
+                    .flex_col()
+                    .child(table)
+            }
+        }
+
+        let (_probe, vcx) = cx.add_window_view(|_window, cx| Probe {
+            table_state: cx.new(|cx| {
+                let mut state = TableState::new(cx);
+                if select_it {
+                    state.set_focused_cell(0, 0);
+                }
+                state
+            }),
+        });
+        vcx.run_until_parked();
+        let bounds = vcx
+            .debug_bounds(CHILD_SELECTOR)
+            .expect("the tagged child must be painted");
+        (bounds.size.width, bounds.size.height)
+    }
+
+    #[gpui::test]
+    fn a_focused_cell_paints_a_smaller_content_box_than_an_unfocused_cell(cx: &mut TestAppContext) {
+        let (unfocused_width, unfocused_height) = probe_focus_ring_child_size(false, cx);
+        let (focused_width, focused_height) = probe_focus_ring_child_size(true, cx);
+
+        assert!(
+            focused_width < unfocused_width,
+            "a focused cell's ring must add a left border an unfocused cell lacks, shrinking a \
+             full-width child: unfocused {unfocused_width:?}, focused {focused_width:?}"
+        );
+        assert!(
+            focused_height < unfocused_height,
+            "a focused cell's ring must add top/bottom borders an unfocused cell lacks, \
+             shrinking a full-height child: unfocused {unfocused_height:?}, focused \
+             {focused_height:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_stale_selection_outside_a_smaller_table_highlights_nothing_and_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        // A selection recorded against a larger result must not crash the
+        // render path once the table shrinks underneath it -- `TableState`
+        // only compares indices, so an out-of-range selection simply never
+        // matches any painted cell rather than panicking or indexing past
+        // the smaller table's own rows/columns.
+        let (_harness, vcx) = cx.add_window_view(|_window, cx| {
+            let harness = Harness::new(2, 1, cx);
+            harness
+                .table_state
+                .update(cx, |state, _cx| state.set_focused_cell(50, 3));
+            harness
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn an_empty_table_renders_without_panicking_and_selects_nothing_on_click(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, vcx) = cx.add_window_view(|_window, cx| Harness::new(0, 0, cx));
+        vcx.run_until_parked();
+
+        // No column exists to click through to a data cell, so a click over
+        // the empty pane must not select anything.
+        click_at(vcx, gpui::point(px(10.0), px(10.0)));
+
+        let table_state = harness.read_with(vcx, |h, _app| h.table_state.clone());
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            None,
+            "an empty table has no cell to select"
+        );
     }
 }

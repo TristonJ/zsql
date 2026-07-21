@@ -59,6 +59,12 @@ pub struct TableStyle {
     pub row_border: u32,
     /// Text color of a [`super::Gutter::RowNumbers`] pane's numbers.
     pub row_number_color: u32,
+    /// Background of a data cell holding the table's currently selected
+    /// cell.
+    pub selection_wash: u32,
+    /// Border color of a data cell holding the table's currently selected
+    /// cell.
+    pub selection_ring: u32,
 }
 
 impl Default for TableStyle {
@@ -83,6 +89,8 @@ impl TableStyle {
             header_border: theme.colors.border,
             row_border: theme.colors.border_soft,
             row_number_color: theme.colors.text_tertiary,
+            selection_wash: theme.colors.accent_wash(),
+            selection_ring: theme.colors.accent_ring(),
         }
     }
 }
@@ -109,6 +117,8 @@ mod tests {
         assert_eq!(style.header_border, theme.colors.border);
         assert_eq!(style.row_border, theme.colors.border_soft);
         assert_eq!(style.row_number_color, theme.colors.text_tertiary);
+        assert_eq!(style.selection_wash, theme.colors.accent_wash());
+        assert_eq!(style.selection_ring, theme.colors.accent_ring());
         assert_eq!(style.borders, TableBorders::default());
     }
 
