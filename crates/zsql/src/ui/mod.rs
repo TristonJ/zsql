@@ -9,4 +9,5 @@ pub mod schema_view;
 pub mod sidebar;
 pub mod tabs;
 pub mod theme;
+pub mod value_panel;
 pub mod workspace;

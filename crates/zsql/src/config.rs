@@ -38,6 +38,8 @@ pub struct Config {
     pub liveness: LivenessConfig,
     /// Sizing bounds for the resizable workspace panes.
     pub layout: LayoutConfig,
+    /// Thresholds and layout tunables for the results grid's value panel.
+    pub value_panel: ValuePanelConfig,
 }
 
 /// Font settings
@@ -120,6 +122,58 @@ pub struct LayoutConfig {
     pub results_min_height: Pixels,
     /// Hit-target thickness of a draggable divider between two panes.
     pub divider_thickness: Pixels,
+    /// Layout options for the value panel
+    pub value_panel: ValuePanelLayout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
+pub struct ValuePanelLayout {
+    /// Value panel width when it first opens.
+    pub default_width: Pixels,
+    /// Narrowest the value panel can be dragged to.
+    pub min_width: Pixels,
+    /// Widest the value panel can be dragged to.
+    pub max_width: Pixels,
+}
+
+/// Thresholds and layout tunables for the results grid's value panel (see
+/// `crate::ui::value_panel`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValuePanelConfig {
+    /// Largest a JSON value's source text may be for the panel to parse it
+    /// eagerly into the Tree/Pretty views on open. Past this, the panel opens
+    /// in Raw with only the first `json_oversized_preview_bytes` shown, plus
+    /// a "Load full value" action that parses the rest off the render path.
+    pub json_eager_parse_threshold_bytes: usize,
+    /// How many bytes of an oversized JSON value's source text the panel
+    /// shows in Raw mode before the value has been fully loaded.
+    pub json_oversized_preview_bytes: usize,
+    /// Bytes shown per row in the Bytes renderer's hex dump.
+    pub hex_bytes_per_row: usize,
+}
+
+/// Default [`ValuePanelConfig::json_eager_parse_threshold_bytes`]: large
+/// enough that an ordinary JSON cell always parses eagerly, small enough that
+/// a pathological value cannot block a render on a multi-megabyte parse.
+const DEFAULT_JSON_EAGER_PARSE_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
+/// Default [`ValuePanelConfig::json_oversized_preview_bytes`]: enough text to
+/// orient the user in an oversized value's shape without holding a
+/// multi-megabyte string in the preview itself.
+const DEFAULT_JSON_OVERSIZED_PREVIEW_BYTES: usize = 64 * 1024;
+/// Default [`ValuePanelConfig::hex_bytes_per_row`]: the conventional `hexdump`/
+/// `xxd` row width.
+const DEFAULT_HEX_BYTES_PER_ROW: usize = 16;
+
+impl Default for ValuePanelConfig {
+    fn default() -> Self {
+        Self {
+            json_eager_parse_threshold_bytes: DEFAULT_JSON_EAGER_PARSE_THRESHOLD_BYTES,
+            json_oversized_preview_bytes: DEFAULT_JSON_OVERSIZED_PREVIEW_BYTES,
+            hex_bytes_per_row: DEFAULT_HEX_BYTES_PER_ROW,
+        }
+    }
 }
 
 impl Default for LayoutConfig {
@@ -132,6 +186,17 @@ impl Default for LayoutConfig {
             editor_min_height: px(120.0),
             results_min_height: px(120.0),
             divider_thickness: px(4.0),
+            value_panel: ValuePanelLayout::default(),
+        }
+    }
+}
+
+impl Default for ValuePanelLayout {
+    fn default() -> Self {
+        Self {
+            default_width: px(360.0),
+            min_width: px(240.0),
+            max_width: px(720.0),
         }
     }
 }
@@ -375,6 +440,58 @@ mod tests {
         assert_eq!(
             parsed.layout.editor_default_height,
             Config::default().layout.editor_default_height
+        );
+    }
+
+    #[test]
+    fn value_panel_layout_defaults_are_ordered_min_default_max() {
+        let cfg = Config::default();
+        assert!(cfg.layout.value_panel.min_width <= cfg.layout.value_panel.default_width);
+        assert!(cfg.layout.value_panel.max_width >= cfg.layout.value_panel.default_width);
+    }
+
+    #[test]
+    fn value_panel_config_defaults_are_all_positive() {
+        let cfg = Config::default();
+        assert!(cfg.value_panel.json_eager_parse_threshold_bytes > 0);
+        assert!(cfg.value_panel.json_oversized_preview_bytes > 0);
+        assert!(cfg.value_panel.hex_bytes_per_row > 0);
+        assert!(
+            cfg.value_panel.json_oversized_preview_bytes
+                < cfg.value_panel.json_eager_parse_threshold_bytes,
+            "the oversized preview must be smaller than the threshold that triggers it"
+        );
+    }
+
+    #[test]
+    fn value_panel_config_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.layout.value_panel.default_width = gpui::px(400.0);
+        cfg.layout.value_panel.min_width = gpui::px(260.0);
+        cfg.layout.value_panel.max_width = gpui::px(800.0);
+        cfg.value_panel.json_eager_parse_threshold_bytes = 1_000;
+        cfg.value_panel.json_oversized_preview_bytes = 100;
+        cfg.value_panel.hex_bytes_per_row = 8;
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.layout.value_panel.default_width, gpui::px(400.0));
+        assert_eq!(parsed.layout.value_panel.min_width, gpui::px(260.0));
+        assert_eq!(parsed.layout.value_panel.max_width, gpui::px(800.0));
+        assert_eq!(parsed.value_panel.json_eager_parse_threshold_bytes, 1_000);
+        assert_eq!(parsed.value_panel.json_oversized_preview_bytes, 100);
+        assert_eq!(parsed.value_panel.hex_bytes_per_row, 8);
+    }
+
+    #[test]
+    fn value_panel_section_is_optional_in_toml_and_falls_back_to_defaults() {
+        let parsed: Config =
+            toml::from_str("[connection]\ndefault_url = \"postgres://localhost/db\"\n")
+                .expect("config without a [value_panel] section must still parse");
+        assert_eq!(
+            parsed.value_panel.hex_bytes_per_row,
+            Config::default().value_panel.hex_bytes_per_row
         );
     }
 }

@@ -4,17 +4,22 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
-    Pixels, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, Stateful, Window, actions, anchored, deferred, div, prelude::*, px, rgb, rgba,
 };
-use zsql_core::{ColumnMeta, ResultSet, RowCount, Value};
+use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::format::{ValueKind, format_value};
 use super::theme;
+use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{LivenessState, Session, SessionState};
+use crate::ui::format::{self, format_value_for_clipboard, group_thousands};
+use crate::ui::value_panel::data::ValuePanelContent;
+use crate::ui::value_panel::{self, ValuePanel};
 
 /// The key context the results grid's own key bindings are scoped to, so
 /// they only fire while the grid is focused.
@@ -22,11 +27,20 @@ pub const KEY_CONTEXT: &str = "ResultsGrid";
 
 actions!(
     zsql_results_grid,
-    [Copy, CellUp, CellDown, CellLeft, CellRight]
+    [
+        Copy,
+        CellUp,
+        CellDown,
+        CellLeft,
+        CellRight,
+        ToggleValuePanel,
+        CloseValuePanel,
+        FocusValuePanel,
+    ]
 );
 
-/// Register the results grid's key bindings. Call once at startup, before
-/// any window that hosts a [`ResultsView`] is opened.
+/// Register the results grid's and value panel's key bindings. Call once at
+/// startup, before any window that hosts a [`ResultsView`] is opened.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-c", Copy, Some(KEY_CONTEXT)),
@@ -34,7 +48,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", CellDown, Some(KEY_CONTEXT)),
         KeyBinding::new("left", CellLeft, Some(KEY_CONTEXT)),
         KeyBinding::new("right", CellRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("space", ToggleValuePanel, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", CloseValuePanel, Some(KEY_CONTEXT)),
+        KeyBinding::new("tab", FocusValuePanel, Some(KEY_CONTEXT)),
     ]);
+    value_panel::init(cx);
 }
 
 /// A tab's captured query outcome: the label, lifecycle state, and result
@@ -72,6 +90,33 @@ pub struct ResultsView {
     /// Focus target for the grid, so a click on a data cell can focus it and
     /// a subsequent Cmd/Ctrl-C is captured by [`ResultsView::copy_focused_cell`].
     focus_handle: FocusHandle,
+    /// The right-click cell context menu, if one is open.
+    cell_context_menu: Option<CellContextMenuState>,
+    /// The value panel
+    value_panel: Entity<ValuePanel>,
+    /// The panel's current dock width, draggable between
+    /// `value_panel_min_width`/`value_panel_max_width`.
+    value_panel_width: Pixels,
+    value_panel_min_width: Pixels,
+    value_panel_max_width: Pixels,
+    /// Width of the panel's own resize divider, from
+    /// [`LayoutConfig::divider_thickness`] -- the same tunable the sidebar
+    /// and editor/results dividers use, so no dock in the app hardcodes its
+    /// own divider width.
+    value_panel_divider_thickness: Pixels,
+    /// `Some` while the panel's resize divider is being dragged: the
+    /// pointer's x position and the panel's own width when the drag began.
+    value_panel_drag: Option<(Pixels, Pixels)>,
+}
+
+/// A results grid cell's open right-click context menu: the triggering
+/// click position it anchors to. Which cell it targets is not tracked here
+/// -- opening the menu already selects that cell (see
+/// [`ResultsView::open_cell_context_menu`]), so every menu item acts on the
+/// grid's own focused cell, the same target `Copy` (Cmd/Ctrl-C) uses.
+#[derive(Debug, Clone)]
+struct CellContextMenuState {
+    position: Point<Pixels>,
 }
 
 impl ResultsView {
@@ -90,6 +135,10 @@ impl ResultsView {
         })
         .detach();
 
+        let focus_handle = cx.focus_handle();
+        let value_panel =
+            cx.new(|cx| ValuePanel::new(focus_handle.clone(), ValuePanelConfig::default(), cx));
+
         let mut view = Self {
             session,
             source_label: source_label.into(),
@@ -98,10 +147,43 @@ impl ResultsView {
             column_max_body_chars: Vec::new(),
             folded_row_count: 0,
             table_state: cx.new(TableState::new),
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            cell_context_menu: None,
+            value_panel,
+            // A view built without `configure_value_panel` (any caller other
+            // than `WorkspaceView::new`, e.g. a test) still opens to a
+            // sensible dock size/threshold set rather than zero-sized panes,
+            // by seeding from `LayoutConfig`/`ValuePanelConfig`'s own
+            // documented defaults instead of duplicating their numbers here.
+            value_panel_width: LayoutConfig::default().value_panel.default_width,
+            value_panel_min_width: LayoutConfig::default().value_panel.min_width,
+            value_panel_max_width: LayoutConfig::default().value_panel.max_width,
+            value_panel_divider_thickness: LayoutConfig::default().divider_thickness,
+            value_panel_drag: None,
+            // value_panel_json: None,
         };
         view.sync_dimensions(cx);
         view
+    }
+
+    /// Size the value panel dock from `layout` and configure its parse
+    /// thresholds/hex layout from `cfg`. Called once by
+    /// [`crate::ui::workspace::WorkspaceView::new`] right after
+    /// construction; a view built directly (e.g. in a test) keeps the
+    /// built-in defaults until this is called.
+    pub fn configure_value_panel(
+        &mut self,
+        cx: &mut Context<Self>,
+        layout: &LayoutConfig,
+        cfg: ValuePanelConfig,
+    ) {
+        self.value_panel.update(cx, move |p, _cx| {
+            p.set_config(cfg);
+        });
+        self.value_panel_width = layout.value_panel.default_width;
+        self.value_panel_min_width = layout.value_panel.min_width;
+        self.value_panel_max_width = layout.value_panel.max_width;
+        self.value_panel_divider_thickness = layout.divider_thickness;
     }
 
     /// Follow `session`'s state/result live under `source_label`, e.g. for
@@ -300,7 +382,7 @@ impl ResultsView {
         let state = self.effective_state(cx).clone();
         let has_columns = !self.effective_result(cx).columns.is_empty();
 
-        match state {
+        let inner = match state {
             SessionState::Results(_)
             | SessionState::Truncating { .. }
             | SessionState::Truncated { .. } => self.render_grid(cx),
@@ -338,7 +420,84 @@ impl ResultsView {
                 &message,
                 active_theme,
             ),
+        };
+
+        let value_panel = self.value_panel.read(cx);
+        if !value_panel.is_open() {
+            return inner;
         }
+        let cell = self.table_state.read(cx).focused_cell();
+        self.sync_value_panel_content(cx, cell);
+
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(inner.flex_1().min_w_0())
+            .child(self.render_value_panel_divider(cx))
+            .child(
+                div()
+                    .flex()
+                    .h_full()
+                    .w(self.value_panel_width)
+                    .child(self.value_panel.clone()),
+            )
+    }
+
+    /// The value panel's resize divider: a draggable strip on the panel's
+    /// left edge, clamped between `value_panel_min_width`/`max_width`.
+    fn render_value_panel_divider(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let colors = cx.theme().colors;
+        div()
+            .id("value-panel-divider")
+            .debug_selector(|| "value-panel-divider".to_owned())
+            .flex_shrink_0()
+            .w(self.value_panel_divider_thickness)
+            .h_full()
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .bg(rgb(colors.border))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_value_panel_drag))
+    }
+
+    fn start_value_panel_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.value_panel_drag = Some((event.position.x, self.value_panel_width));
+        cx.notify();
+    }
+
+    fn end_value_panel_drag(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.value_panel_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Resize the panel while its divider is being dragged: moving the
+    /// pointer left (toward the grid) grows it, since it docks on the right
+    /// edge -- clamped to `value_panel_min_width`/`max_width`, a no-op if no
+    /// drag is in progress.
+    fn value_panel_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((origin_x, start_width)) = self.value_panel_drag else {
+            return;
+        };
+        let delta = origin_x - event.position.x;
+        self.value_panel_width =
+            (start_width + delta).clamp(self.value_panel_min_width, self.value_panel_max_width);
+        cx.notify();
     }
 
     /// A centered title + detail message shown in place of the grid for any
@@ -390,6 +549,10 @@ impl ResultsView {
             .rows(Self::render_data_row_cells)
             .selectable()
             .focus_on_cell_click(self.focus_handle.clone())
+            .on_cell_double_click(Self::open_value_panel_for)
+            .on_cell_right_click(|view, row, col, event, _window, cx| {
+                view.open_cell_context_menu(row, col, event.position, cx);
+            })
             .render(cx)
     }
 
@@ -435,7 +598,7 @@ impl ResultsView {
                                 let formatted = format_value(value);
                                 let is_null = formatted.kind == ValueKind::Null;
                                 div()
-                                    .text_color(rgb(kind_color(formatted.kind, active_theme)))
+                                    .text_color(rgb(formatted.kind.color(active_theme)))
                                     .when(is_null, gpui::prelude::Styled::italic)
                                     .child(formatted.text)
                                     .into_any_element()
@@ -509,11 +672,254 @@ impl ResultsView {
         bar
     }
 
-    /// Copy the selected cell's full formatted value to the system
-    /// clipboard. A NULL value copies as an empty string rather than the
-    /// literal "NULL" the grid displays, so pasting a NULL cell elsewhere
-    /// never inserts visible placeholder text. A no-op while nothing is
+    // ---- cell context menu -----------------------------------------
+
+    /// Open the right-click context menu for `(row, col)`, anchored at
+    /// `position` (the triggering click, in window coordinates), and select
+    /// that cell -- so the menu's `Copy value`/`Copy row as JSON`/`Copy
+    /// column name` items, which all act on the focused cell, target the
+    /// cell that was actually right-clicked.
+    fn open_cell_context_menu(
+        &mut self,
+        row: usize,
+        col: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_state.update(cx, |state, cx| {
+            state.set_focused_cell(row, col);
+            cx.notify();
+        });
+        self.cell_context_menu = Some(CellContextMenuState { position });
+        cx.notify();
+    }
+
+    fn close_cell_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.cell_context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// `View value`: open the value panel for the context menu's cell (the
+    /// cell was already selected when the menu was opened, see
+    /// [`ResultsView::open_cell_context_menu`]), then close the menu.
+    #[tracing::instrument(name = "results_view_value_from_menu", skip_all)]
+    fn view_value_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.value_panel.update(cx, ValuePanel::open);
+        let cell = self.table_state.read(cx).focused_cell();
+        tracing::debug!(?cell, "opened the value panel from the cell context menu");
+        self.close_cell_context_menu(cx);
+        cx.notify();
+    }
+
+    /// `Copy row as JSON`: serialize every cell of the focused row, each via
+    /// its own [`Value`]'s JSON representation (not `format_value`'s display
+    /// text) keyed by column name, and write it to the clipboard. A no-op
+    /// while nothing is selected.
+    #[tracing::instrument(name = "results_copy_row_as_json", skip_all)]
+    fn copy_row_as_json(&mut self, cx: &mut Context<Self>) {
+        let Some((row, _col)) = self.table_state.read(cx).focused_cell() else {
+            tracing::trace!(
+                "copy-row-as-json invoked with no results grid selection; nothing to do"
+            );
+            return;
+        };
+        let result = self.effective_result(cx);
+        let Some(row_data) = result.rows.get(row) else {
+            return;
+        };
+        let text = format::row_as_json_string(row_data, &result.columns);
+        tracing::debug!(row, "copied a results grid row as JSON to the clipboard");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// `Copy column name`: write the focused column's exact
+    /// [`ColumnMeta::name`] to the clipboard. A no-op while nothing is
     /// selected.
+    #[tracing::instrument(name = "results_copy_column_name", skip_all)]
+    fn copy_column_name(&mut self, cx: &mut Context<Self>) {
+        let Some((_row, col)) = self.table_state.read(cx).focused_cell() else {
+            tracing::trace!(
+                "copy-column-name invoked with no results grid selection; nothing to do"
+            );
+            return;
+        };
+        let Some(name) = self
+            .effective_result(cx)
+            .columns
+            .get(col)
+            .map(|column| column.name.clone())
+        else {
+            return;
+        };
+        tracing::debug!(col, "copied a results grid column name to the clipboard");
+        cx.write_to_clipboard(ClipboardItem::new_string(name));
+    }
+
+    /// The right-click cell context menu overlay: `View value`, `Copy
+    /// value`, `Copy row as JSON`, a separator, then `Copy column name`,
+    /// anchored at the triggering click. A full-window backdrop behind it
+    /// absorbs off-menu clicks, mirroring the sidebar's relation-row context
+    /// menu. Renders nothing when no menu is open.
+    fn render_cell_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let active_theme = cx.theme();
+        let menu = self.cell_context_menu.clone()?;
+
+        let content = div()
+            .id("results-cell-context-menu")
+            .occlude()
+            .w(theme::CONTEXT_MENU_WIDTH)
+            .p(theme::CONTEXT_MENU_PADDING)
+            .bg(rgb(active_theme.colors.bg_raised))
+            .border_1()
+            .border_color(rgb(active_theme.colors.border))
+            .rounded(px(theme::CONTEXT_MENU_RADIUS))
+            .child(context_menu_item(cx, "View value", |view, _window, cx| {
+                view.view_value_from_menu(cx);
+            }))
+            .child(context_menu_item(cx, "Copy value", |view, window, cx| {
+                view.copy_focused_cell(&Copy, window, cx);
+                view.close_cell_context_menu(cx);
+            }))
+            .child(context_menu_item(
+                cx,
+                "Copy row as JSON",
+                |view, _window, cx| {
+                    view.copy_row_as_json(cx);
+                    view.close_cell_context_menu(cx);
+                },
+            ))
+            .child(context_menu_separator(active_theme))
+            .child(context_menu_item(
+                cx,
+                "Copy column name",
+                |view, _window, cx| {
+                    view.copy_column_name(cx);
+                    view.close_cell_context_menu(cx);
+                },
+            ));
+
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_cell_context_menu(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
+                    view.close_cell_context_menu(cx);
+                }),
+            )
+            .child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(content),
+            );
+
+        Some(deferred(backdrop).with_priority(1).into_any_element())
+    }
+
+    // ---- value panel: open/close/pin/follow-selection ----------------
+
+    /// Toggle the value panel for the focused cell (the grid's `space`
+    /// binding). A no-op while nothing is selected.
+    #[tracing::instrument(name = "results_toggle_value_panel", skip_all)]
+    fn toggle_value_panel(
+        &mut self,
+        _: &ToggleValuePanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cell) = self.table_state.read(cx).focused_cell() else {
+            return;
+        };
+        self.value_panel.update(cx, ValuePanel::toggle);
+        self.sync_value_panel_content(cx, Some(cell));
+        cx.notify();
+    }
+
+    /// `esc` while the grid has focus: close the panel, leaving grid focus
+    /// (and the focused cell) untouched.
+    fn close_value_panel(
+        &mut self,
+        _: &CloseValuePanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.value_panel.update(cx, |p, cx| {
+            if p.is_open() {
+                p.close(cx);
+            }
+        });
+    }
+
+    /// `tab` while the grid has focus: move keyboard focus onto the panel,
+    /// if it is open.
+    fn focus_value_panel(
+        &mut self,
+        _: &FocusValuePanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.value_panel.read(cx);
+        if panel.is_open() {
+            window.focus(panel.focus_handle());
+        }
+    }
+
+    /// Double-click on a data cell (see [`ResultsView::render_data_row_cells`]):
+    /// select it and open the value panel directly.
+    #[tracing::instrument(name = "results_open_value_panel_for", skip_all)]
+    fn open_value_panel_for(
+        &mut self,
+        row: usize,
+        col: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_state.update(cx, |state, cx| {
+            state.set_focused_cell(row, col);
+            cx.notify();
+        });
+        self.value_panel.update(cx, ValuePanel::open);
+        tracing::debug!(row, col, "opened the value panel via double-click");
+        cx.notify();
+    }
+
+    /// Bring `value_panel_json` up to date with the provided cell
+    fn sync_value_panel_content(&mut self, cx: &mut Context<Self>, cell: Option<(usize, usize)>) {
+        let content = cell.and_then(|(row, col)| {
+            let id = 31 * row + col;
+            let value = self
+                .effective_result(cx)
+                .rows
+                .get(row)
+                .and_then(|r| r.0.get(col))?;
+            let column = self.effective_result(cx).columns.get(col)?;
+            Some((id, value, column))
+        });
+        if !self
+            .value_panel
+            .read(cx)
+            .would_update_content(content.map(|c| c.0))
+        {
+            return;
+        }
+
+        let content = content
+            .map(|(id, value, column)| ValuePanelContent::new(id, value.clone(), column.clone()));
+        self.value_panel
+            .update(cx, |p, _cx| p.update_content(content));
+    }
+
+    /// Copy the selected cell's full formatted value to the system
+    /// clipboard. A no-op while nothing is selected.
     #[tracing::instrument(name = "results_copy_focused_cell", skip_all)]
     fn copy_focused_cell(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((row, col)) = self.table_state.read(cx).focused_cell() else {
@@ -528,10 +934,7 @@ impl ResultsView {
         else {
             return;
         };
-        let text = match value {
-            Value::Null => String::new(),
-            other => format_value(other).text,
-        };
+        let text = format_value_for_clipboard(value);
         tracing::debug!(row, col, "copied a results grid cell to the clipboard");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
@@ -615,6 +1018,7 @@ impl Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("results-grid-pane")
+            .relative()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::copy_focused_cell))
@@ -622,6 +1026,12 @@ impl Render for ResultsView {
             .on_action(cx.listener(Self::cell_down))
             .on_action(cx.listener(Self::cell_left))
             .on_action(cx.listener(Self::cell_right))
+            .on_action(cx.listener(Self::toggle_value_panel))
+            .on_action(cx.listener(Self::close_value_panel))
+            .on_action(cx.listener(Self::focus_value_panel))
+            .on_mouse_move(cx.listener(Self::value_panel_drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
             .flex()
             .flex_col()
             .size_full()
@@ -629,7 +1039,43 @@ impl Render for ResultsView {
             .child(self.render_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
+            .children(self.render_cell_context_menu(cx))
     }
+}
+
+/// One results grid context menu row, mirroring `sidebar.rs`'s
+/// `context_menu_item`/`ContextMenuState` pattern for the sidebar's
+/// relation-row context menu.
+fn context_menu_item(
+    cx: &Context<ResultsView>,
+    label: &'static str,
+    on_click: impl Fn(&mut ResultsView, &mut Window, &mut Context<ResultsView>) + 'static,
+) -> Stateful<Div> {
+    let active_theme = cx.theme();
+    div()
+        .id(label)
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(theme::CONTEXT_MENU_ITEM_HEIGHT)
+        .px(theme::CONTEXT_MENU_ITEM_PADDING_X)
+        .rounded(px(theme::CONTEXT_MENU_ITEM_RADIUS))
+        .cursor_pointer()
+        .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
+        .text_color(rgb(active_theme.colors.text_primary))
+        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(active_theme))))
+        .child(label)
+        .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+            on_click(view, window, cx);
+        }))
+}
+
+/// A thin horizontal divider between context menu item groups.
+fn context_menu_separator(active_theme: &Theme) -> Div {
+    div()
+        .h(theme::CONTEXT_MENU_SEPARATOR_HEIGHT)
+        .my(theme::CONTEXT_MENU_SEPARATOR_MARGIN_Y)
+        .bg(rgb(active_theme.colors.border_soft))
 }
 
 /// A data column's header content: its name plus a type-name badge.
@@ -691,10 +1137,6 @@ fn status_metrics(state: &SessionState, row_count: usize) -> Option<(String, Str
     }
 }
 
-/// Groups digits every three places when rendering a total row count in the
-/// status bar.
-pub(crate) const THOUSANDS_SEPARATOR: char = ',';
-
 /// Appended after the number when a total row count is a planner estimate
 /// rather than an exact count, so the distinction reads clearly even without
 /// color.
@@ -722,35 +1164,6 @@ fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
     } else {
         format!("{grouped}{TOTAL_ROW_COUNT_LABEL}")
     })
-}
-
-/// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
-/// the right, e.g. `1234567` -> `"1,234,567"`.
-pub(crate) fn group_thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, ch) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            grouped.push(THOUSANDS_SEPARATOR);
-        }
-        grouped.push(ch);
-    }
-    grouped.chars().rev().collect()
-}
-
-/// The text color for a formatted cell's semantic kind.
-fn kind_color(kind: ValueKind, active_theme: &Theme) -> u32 {
-    let colors = active_theme.colors;
-    match kind {
-        ValueKind::Null => colors.value_null,
-        ValueKind::Bool => colors.value_bool,
-        ValueKind::Number => colors.value_number,
-        ValueKind::Text => colors.value_text,
-        ValueKind::Json => colors.value_json,
-        ValueKind::Timestamp => colors.value_timestamp,
-        ValueKind::Bytes => colors.value_bytes,
-        ValueKind::Unknown => colors.value_unknown,
-    }
 }
 
 /// Estimate a column's pixel width from its header (name + type tag) and
@@ -783,9 +1196,8 @@ mod tests {
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
-        CellDown, CellLeft, CellRight, CellUp, Copy, ResultsView, SessionState, ValueKind,
-        column_width_from_parts, format_total_row_count, kind_color, status_indicator,
-        status_metrics,
+        CellDown, CellLeft, CellRight, CellUp, Copy, ResultsView, SessionState,
+        column_width_from_parts, format_total_row_count, status_indicator, status_metrics,
     };
 
     use crate::session::{LivenessState, Session};
@@ -830,23 +1242,6 @@ mod tests {
         let width =
             column_width_from_parts(&column(&"x".repeat(500), &"y".repeat(500)), 5_000, &style);
         assert!((f32::from(width) - theme::MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn kind_color_maps_every_value_kind_to_its_named_color_role() {
-        let theme = Theme::default();
-        let colors = theme.colors;
-        assert_eq!(kind_color(ValueKind::Null, &theme), colors.value_null);
-        assert_eq!(kind_color(ValueKind::Bool, &theme), colors.value_bool);
-        assert_eq!(kind_color(ValueKind::Number, &theme), colors.value_number);
-        assert_eq!(kind_color(ValueKind::Text, &theme), colors.value_text);
-        assert_eq!(kind_color(ValueKind::Json, &theme), colors.value_json);
-        assert_eq!(
-            kind_color(ValueKind::Timestamp, &theme),
-            colors.value_timestamp
-        );
-        assert_eq!(kind_color(ValueKind::Bytes, &theme), colors.value_bytes);
-        assert_eq!(kind_color(ValueKind::Unknown, &theme), colors.value_unknown);
     }
 
     fn sample_result() -> ResultSet {
@@ -1608,6 +2003,762 @@ mod tests {
             Some((1, 1)),
             "moving past the last row/column must clamp at the bounds rather than wrap or \
              go out of range"
+        );
+    }
+}
+
+#[cfg(test)]
+mod value_panel_view_tests {
+    use std::time::Duration;
+
+    use gpui::{
+        AppContext as _, Focusable as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, point, px,
+    };
+    use zsql_core::{ColumnMeta, ResultSet, Row, Value};
+    use zsql_ui::table::body_first_cell_debug_selector;
+
+    use super::{
+        CloseValuePanel, FocusValuePanel, ResultsView, SessionState, ToggleValuePanel, ValuePanel,
+    };
+    use crate::session::Session;
+    use crate::ui::value_panel::data::{JsonLoad, PathSegment};
+    use crate::ui::value_panel::view::{
+        CopyTreeNodePath, CopyTreeNodeValue, FocusGridFromPanel, TreeCollapse, TreeDown,
+        TreeExpand, TreeUp,
+    };
+
+    fn column(name: &str, type_name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: true,
+        }
+    }
+
+    fn json_result() -> ResultSet {
+        ResultSet {
+            columns: vec![
+                column("id", "int8"),
+                column("payload", "jsonb"),
+                column("note", "text"),
+            ],
+            rows: vec![
+                Row(vec![
+                    Value::Int(1),
+                    Value::Json(r#"{"items":[{"sku":"A1"}]}"#.to_owned()),
+                    Value::Text("hi".to_owned()),
+                ]),
+                Row(vec![
+                    Value::Int(2),
+                    Value::Json(r#"{"items":[{"sku":"B2"}]}"#.to_owned()),
+                    Value::Null,
+                ]),
+            ],
+            affected: None,
+            notices: Vec::new(),
+        }
+    }
+
+    fn view_with_results(
+        cx: &mut gpui::TestAppContext,
+        result: ResultSet,
+    ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
+        let state = SessionState::Results(Duration::from_millis(1));
+        let session = cx.new(|_cx| Session::new_for_render_test(state, result));
+        cx.add_window_view(|window, cx| {
+            let view = ResultsView::new(session, "public.orders", cx);
+            window.focus(&view.focus_handle(cx));
+            view
+        })
+    }
+
+    #[gpui::test]
+    fn space_toggles_the_panel_open_then_closed(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(0, 0));
+        });
+
+        vcx.dispatch_action(ToggleValuePanel);
+        assert!(view.read_with(vcx, |v, app| v.value_panel.read(app).is_open()));
+
+        vcx.dispatch_action(ToggleValuePanel);
+        assert!(!view.read_with(vcx, |v, app| v.value_panel.read(app).is_open()));
+    }
+
+    #[gpui::test]
+    fn esc_closes_the_panel_and_leaves_the_focused_cell_untouched(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(1, 0));
+            view.value_panel.update(cx, ValuePanel::open);
+        });
+
+        vcx.dispatch_action(CloseValuePanel);
+
+        view.read_with(vcx, |v, app| {
+            assert!(!v.value_panel.read(app).is_open());
+            assert_eq!(v.table_state.read(app).focused_cell(), Some((1, 0)));
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_opens_the_panel_for_the_clicked_cell(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        let position = point(
+            cell_bounds.origin.x + px(5.0),
+            cell_bounds.origin.y + px(5.0),
+        );
+        let mouse_down = |click_count| MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count,
+            first_mouse: false,
+        };
+        vcx.simulate_event(mouse_down(1));
+        vcx.run_until_parked();
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "the first mouse-down of the double click must select the cell, same as a plain click"
+        );
+
+        vcx.simulate_event(mouse_down(2));
+        vcx.run_until_parked();
+
+        assert!(view.read_with(vcx, |v, app| v.value_panel.read(app).is_open()));
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0))
+        );
+    }
+
+    #[gpui::test]
+    fn opening_the_panel_leaves_the_focused_cell_selection_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(0, 1));
+        });
+
+        vcx.dispatch_action(ToggleValuePanel);
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |v, app| {
+            assert!(v.value_panel.read(app).is_open());
+            assert_eq!(v.table_state.read(app).focused_cell(), Some((0, 1)));
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_actions_operate_on_the_right_clicked_cell(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(1, 0, point(px(10.0), px(10.0)), cx);
+        });
+        view.read_with(vcx, |v, app| {
+            assert_eq!(v.table_state.read(app).focused_cell(), Some((1, 0)));
+            assert!(v.cell_context_menu.is_some());
+        });
+
+        view.update(vcx, |view, cx| {
+            view.copy_column_name(cx);
+        });
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("id"));
+
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(1, 1, point(px(10.0), px(10.0)), cx);
+            view.copy_row_as_json(cx);
+        });
+        let copied = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&copied).unwrap();
+        assert_eq!(parsed["id"], serde_json::json!(2));
+        assert_eq!(
+            parsed["payload"],
+            serde_json::json!({"items": [{"sku": "B2"}]})
+        );
+        assert_eq!(parsed["note"], serde_json::Value::Null);
+    }
+
+    #[gpui::test]
+    fn view_value_from_the_context_menu_opens_the_panel_and_closes_the_menu(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(1, 1, point(px(10.0), px(10.0)), cx);
+            view.view_value_from_menu(cx);
+        });
+
+        view.read_with(vcx, |v, app| {
+            assert!(v.value_panel.read(app).is_open());
+            assert!(v.cell_context_menu.is_none());
+            assert_eq!(v.table_state.read(app).focused_cell(), Some((1, 1)));
+        });
+    }
+
+    #[gpui::test]
+    fn unpinned_panel_follows_focus_and_pinned_panel_freezes_on_its_cell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The results view keys panel content by `31 * row + col` (see
+        // `sync_value_panel_content`): (0, 0) -> 0, (1, 0) -> 31.
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 0);
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked(); // a render pass syncs the panel's content
+
+        view.read_with(vcx, |v, app| {
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .content()
+                    .map(|c| c.id),
+                Some(0),
+                "an open unpinned panel must target the focused cell"
+            );
+        });
+
+        // Unpinned: moving the grid's selection re-targets the panel.
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(1, 0);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, app| {
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .content()
+                    .map(|c| c.id),
+                Some(31),
+                "an unpinned panel must follow the grid's live selection"
+            );
+        });
+
+        // Pin, then move the grid: the panel must keep its pinned content.
+        view.update(vcx, |view, cx| {
+            view.value_panel
+                .update(cx, |p, _cx| p.state_mut_for_test().pin());
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 0);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, app| {
+            assert!(
+                v.value_panel.read(app).is_pinned(),
+                "the panel must report itself pinned"
+            );
+            assert_eq!(
+                v.table_state.read(app).focused_cell(),
+                Some((0, 0)),
+                "the grid's own selection must keep moving normally"
+            );
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .content()
+                    .map(|c| c.id),
+                Some(31),
+                "a pinned panel must keep showing its pinned content despite the grid \
+                 selection moving"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn tab_moves_focus_between_the_grid_and_the_panel(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 1);
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let panel_focus =
+            view.read_with(vcx, |v, app| v.value_panel.read(app).focus_handle().clone());
+        // `FocusGridFromPanel` returns focus to the grid pane the panel tabbed
+        // in from: the panel's parent handle is the view's own focus handle.
+        let grid_focus = view.read_with(vcx, ResultsView::focus_handle);
+
+        vcx.dispatch_action(FocusValuePanel);
+        vcx.update(|window, cx| {
+            assert_eq!(window.focused(cx).as_ref(), Some(&panel_focus));
+        });
+
+        vcx.dispatch_action(FocusGridFromPanel);
+        vcx.update(|window, cx| {
+            assert_eq!(window.focused(cx).as_ref(), Some(&grid_focus));
+        });
+    }
+
+    #[gpui::test]
+    fn copy_tree_node_value_and_path_target_the_selected_nested_node(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 1); // the "payload" jsonb column
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked(); // a render pass parses the cell's JSON
+
+        view.update(vcx, |view, cx| {
+            view.value_panel.update(cx, |p, _cx| {
+                p.state_mut_for_test().select_tree_path(vec![
+                    PathSegment::Key("items".to_owned()),
+                    PathSegment::Index(0),
+                    PathSegment::Key("sku".to_owned()),
+                ]);
+            });
+        });
+
+        vcx.dispatch_action(FocusValuePanel);
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied_value = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied_value.as_deref(),
+            Some("\"A1\""),
+            "Cmd/Ctrl-C must copy the selected node's own value, not the whole document"
+        );
+
+        vcx.dispatch_action(CopyTreeNodePath);
+        let copied_path = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied_path.as_deref(), Some("$.items[0].sku"));
+    }
+
+    /// Cmd/Ctrl-C with the panel focused over a non-JSON cell (no parsed
+    /// tree to copy a node from) must still copy the panel's own target
+    /// cell -- the same text `Copy value`/`copy_focused_cell` produce --
+    /// rather than silently doing nothing.
+    #[gpui::test]
+    fn copy_with_the_panel_focused_over_a_non_json_cell_copies_the_cells_value(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 2); // the "note" text column
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(FocusValuePanel);
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some("hi"),
+            "with no parsed JSON tree to copy a node from, Cmd/Ctrl-C must fall back to the \
+             panel's own target cell value"
+        );
+    }
+
+    #[gpui::test]
+    fn null_and_empty_text_cells_render_as_distinguishable_panel_states(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let result = ResultSet {
+            columns: vec![column("a", "text"), column("b", "text")],
+            rows: vec![Row(vec![Value::Null, Value::Text(String::new())])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        for col in [0usize, 1usize] {
+            view.update(vcx, |view, cx| {
+                view.table_state.update(cx, |state, cx| {
+                    state.set_focused_cell(0, col);
+                    cx.notify();
+                });
+                view.value_panel.update(cx, ValuePanel::open);
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        view.read_with(vcx, |v, app| {
+            let result = v.effective_result(app);
+            assert_eq!(
+                super::value_panel::data::renderer_for(
+                    &result.rows[0].0[0],
+                    &result.columns[0].type_name
+                ),
+                super::value_panel::data::RendererKind::Null,
+                "a Null cell must render the explicit NULL state, not the Text renderer"
+            );
+            assert_eq!(
+                super::value_panel::data::renderer_for(
+                    &result.rows[0].0[1],
+                    &result.columns[1].type_name
+                ),
+                super::value_panel::data::RendererKind::Text,
+                "an empty-string cell must still render as Text, not Null"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn tree_keyboard_actions_move_selection_and_expand_collapse_nodes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 1); // the "payload" jsonb column
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked(); // a render pass parses the cell's JSON
+        view.read_with(vcx, |v, app| {
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .selected_tree_path(),
+                &[] as &[PathSegment]
+            );
+        });
+
+        vcx.dispatch_action(FocusValuePanel);
+
+        vcx.dispatch_action(TreeExpand);
+        view.read_with(vcx, |v, app| {
+            assert!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .is_tree_node_expanded(&[] as &[PathSegment]),
+                "TreeExpand on the root object must expand it"
+            );
+        });
+
+        vcx.dispatch_action(TreeDown);
+        view.read_with(vcx, |v, app| {
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .selected_tree_path(),
+                [PathSegment::Key("items".to_owned())],
+                "TreeDown must move selection to the root's first revealed child"
+            );
+        });
+
+        vcx.dispatch_action(TreeExpand);
+        view.read_with(vcx, |v, app| {
+            assert!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .is_tree_node_expanded(&[PathSegment::Key("items".to_owned())])
+            );
+        });
+
+        vcx.dispatch_action(TreeCollapse);
+        view.read_with(vcx, |v, app| {
+            assert!(
+                !v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .is_tree_node_expanded(&[PathSegment::Key("items".to_owned())]),
+                "TreeCollapse must collapse the selected node"
+            );
+        });
+
+        vcx.dispatch_action(TreeUp);
+        view.read_with(vcx, |v, app| {
+            assert_eq!(
+                v.value_panel
+                    .read(app)
+                    .state_for_test()
+                    .selected_tree_path(),
+                &[] as &[PathSegment],
+                "TreeUp must move selection back to the previous visible row"
+            );
+        });
+    }
+
+    /// A JSON cell's panel renders in every mode without panicking, covering
+    /// the JSON tree/pretty/raw paths, the oversized-preview path, and the
+    /// invalid-JSON fallback path together in one render smoke test.
+    #[gpui::test]
+    fn renders_the_panel_for_every_json_state_without_panicking(cx: &mut gpui::TestAppContext) {
+        let result = ResultSet {
+            columns: vec![column("payload", "jsonb"), column("bad", "jsonb")],
+            rows: vec![Row(vec![
+                Value::Json(r#"{"items":[{"sku":"A1"},{"sku":"B2"}]}"#.to_owned()),
+                Value::Json("not json".to_owned()),
+            ])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        for mode in super::value_panel::data::JSON_MODES {
+            view.update(vcx, |view, cx| {
+                view.table_state.update(cx, |state, cx| {
+                    state.set_focused_cell(0, 0);
+                    cx.notify();
+                });
+                view.value_panel.update(cx, ValuePanel::open);
+                view.value_panel
+                    .update(cx, |p, _cx| p.state_mut_for_test().set_json_mode(mode));
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        // The second column's `Value::Json` fails to parse: the panel must
+        // still render (Raw fallback) rather than panicking.
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 1);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |v, app| {
+            assert!(matches!(
+                v.value_panel.read(app).json_load_for_test(),
+                Some(JsonLoad::Invalid(_))
+            ));
+        });
+    }
+
+    /// A results grid panel for the non-JSON renderers (Bytes, Timestamp,
+    /// Bool, Unknown) renders in every mode without panicking, mirroring
+    /// [`renders_the_panel_for_every_json_state_without_panicking`]'s
+    /// coverage of the JSON renderer.
+    #[gpui::test]
+    fn renders_the_panel_for_bytes_timestamp_bool_and_unknown_cells_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let result = ResultSet {
+            columns: vec![
+                column("blob", "bytea"),
+                column("seen_at", "timestamptz"),
+                column("active", "bool"),
+                column("location", "point"),
+            ],
+            rows: vec![Row(vec![
+                Value::Bytes(vec![0x00, 0x41, 0xff, 0x10]),
+                Value::Timestamp("2026-07-14T09:12:31+02:00".to_owned()),
+                Value::Bool(true),
+                Value::Unknown("(1,2)".to_owned()),
+            ])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let (view, vcx) = view_with_results(cx, result);
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 0);
+                cx.notify();
+            });
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        for mode in super::value_panel::data::BYTES_MODES {
+            view.update(vcx, |view, cx| {
+                view.value_panel
+                    .update(cx, |p, _cx| p.state_mut_for_test().set_bytes_mode(mode));
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 1);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        for mode in super::value_panel::data::TIMESTAMP_MODES {
+            view.update(vcx, |view, cx| {
+                view.value_panel
+                    .update(cx, |p, _cx| p.state_mut_for_test().set_timestamp_mode(mode));
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 2);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        view.update(vcx, |view, cx| {
+            view.table_state.update(cx, |state, cx| {
+                state.set_focused_cell(0, 3);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn dragging_the_divider_resizes_the_panel_clamped_to_configured_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, json_result());
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.table_state
+                .update(cx, |state, _cx| state.set_focused_cell(0, 0));
+            view.value_panel.update(cx, ValuePanel::open);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let (min_width, max_width, start_width) = view.read_with(vcx, |v, _app| {
+            (
+                v.value_panel_min_width,
+                v.value_panel_max_width,
+                v.value_panel_width,
+            )
+        });
+
+        let divider_bounds = vcx
+            .debug_bounds("value-panel-divider")
+            .expect("the resize divider must be painted while the panel is docked open");
+        let origin = divider_bounds.origin;
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: origin,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.value_panel_width),
+            start_width,
+            "pressing down on the divider must not itself resize the panel"
+        );
+
+        // `on_mouse_move` only fires while the pointer sits inside the
+        // dragged element's own hitbox, so the drag stays within the test
+        // window's bounds (1920x1080) rather than moving off-screen: the
+        // panel docks on the right edge, so dragging to the window's left
+        // edge grows it (clamped at the configured maximum) and dragging to
+        // its right edge shrinks it (clamped at the configured minimum).
+        let window_left = px(0.0);
+        let window_right = px(1_900.0);
+
+        vcx.simulate_event(MouseMoveEvent {
+            position: point(window_left, origin.y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.value_panel_width),
+            max_width,
+            "dragging to the window's left edge must clamp the panel at its configured maximum \
+             width"
+        );
+
+        vcx.simulate_event(MouseMoveEvent {
+            position: point(window_right, origin.y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.value_panel_width),
+            min_width,
+            "dragging to the window's right edge must clamp the panel at its configured \
+             minimum width"
+        );
+
+        vcx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(window_right, origin.y),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+
+        // Releasing ends the drag: a further move must not resize the panel.
+        vcx.simulate_event(MouseMoveEvent {
+            position: origin,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.value_panel_width),
+            min_width,
+            "moving the mouse after mouse-up must not resume resizing the panel"
         );
     }
 }

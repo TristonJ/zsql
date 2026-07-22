@@ -16,9 +16,9 @@ use zsql_ui::scrollable::{ScrollView, ScrollbarStyle, vertical_scroll};
 use zsql_ui::table::{Table, TableColumn, TableRow, TableSizing, TableState, TableStyle};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
-use super::results::group_thousands;
 use super::theme;
 use crate::session::Session;
+use crate::ui::format::group_thousands;
 
 /// What a schema tab currently has to render.
 enum FetchState {

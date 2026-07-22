@@ -4,7 +4,8 @@
 
 use std::fmt::Write as _;
 
-use zsql_core::Value;
+use zsql_core::{ColumnMeta, Row, Value};
+use zsql_ui::theme::Theme;
 
 /// Semantic category of a formatted cell, used to select a per-kind text
 /// color/style in the results grid.
@@ -26,6 +27,22 @@ pub enum ValueKind {
     Bytes,
     /// Anything that doesn't map to a more specific kind
     Unknown,
+}
+
+impl ValueKind {
+    pub fn color(self, theme: &Theme) -> u32 {
+        let colors = &theme.colors;
+        match self {
+            ValueKind::Null => colors.value_null,
+            ValueKind::Bool => colors.value_bool,
+            ValueKind::Number => colors.value_number,
+            ValueKind::Text => colors.value_text,
+            ValueKind::Json => colors.value_json,
+            ValueKind::Timestamp => colors.value_timestamp,
+            ValueKind::Bytes => colors.value_bytes,
+            ValueKind::Unknown => colors.value_unknown,
+        }
+    }
 }
 
 /// A formatted cell: display text paired with the semantic kind the grid
@@ -89,6 +106,19 @@ pub fn format_value(value: &Value) -> FormattedValue {
     }
 }
 
+/// Groups digits every three places when rendering a total row count in the
+/// status bar.
+pub const THOUSANDS_SEPARATOR: char = ',';
+
+/// Format a single value for the clipboard
+#[must_use]
+pub fn format_value_for_clipboard(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        other => format_value(other).text,
+    }
+}
+
 /// Render a float without a trailing-zero ambiguity
 fn format_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
@@ -117,11 +147,102 @@ fn format_array(items: &[Value]) -> String {
     format!("{{{}}}", rendered.join(","))
 }
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard (RFC 4648, padded) base64 encoding of `bytes`. Hand-rolled
+/// rather than a dependency: the panel's only user of base64, and small
+/// enough to keep self-contained and fully covered by its own tests.
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
+/// the right, e.g. `1234567` -> `"1,234,567"`.
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(THOUSANDS_SEPARATOR);
+        }
+        grouped.push(ch);
+    }
+    grouped.chars().rev().collect()
+}
+
+/// `row`'s cells as a single JSON object keyed by `columns`' names, each
+/// value serialized via [`value_to_json`]
+#[must_use]
+pub fn row_as_json(row: &Row, columns: &[ColumnMeta]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(row.0.iter()) {
+        map.insert(column.name.clone(), value_to_json(value));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// [`row_as_json`], serialized to the compact JSON text
+#[must_use]
+pub fn row_as_json_string(row: &Row, columns: &[ColumnMeta]) -> String {
+    serde_json::to_string(&row_as_json(row, columns)).unwrap_or_default()
+}
+
+/// `value`'s own JSON representation
+#[must_use]
+pub fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::Numeric(text) | Value::Text(text) | Value::Uuid(text) | Value::Timestamp(text) => {
+            serde_json::Value::String(text.clone())
+        }
+        Value::Bytes(bytes) => serde_json::Value::String(base64_encode(bytes)),
+        Value::Json(text) => {
+            serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.clone()))
+        }
+        Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Unknown(text) => serde_json::Value::String(text.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use zsql_core::Value;
+    use zsql_core::{ColumnMeta, Row, Value};
+    use zsql_ui::theme::Theme;
 
-    use super::{ValueKind, format_value};
+    use super::{ValueKind, base64_encode, format_value, row_as_json, value_to_json};
+
+    fn column(name: &str, type_name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: true,
+        }
+    }
 
     #[test]
     fn null_renders_as_literal_and_its_own_kind() {
@@ -238,5 +359,116 @@ mod tests {
         let formatted = format_value(&Value::Unknown("(1,2)".to_owned()));
         assert_eq!(formatted.text, "(1,2)");
         assert_eq!(formatted.kind, ValueKind::Unknown);
+    }
+
+    #[test]
+    fn value_kind_color_maps_every_value_kind_to_its_named_color_role() {
+        let theme = Theme::default();
+        let colors = theme.colors;
+        assert_eq!(ValueKind::Null.color(&theme), colors.value_null);
+        assert_eq!(ValueKind::Bool.color(&theme), colors.value_bool);
+        assert_eq!(ValueKind::Number.color(&theme), colors.value_number);
+        assert_eq!(ValueKind::Text.color(&theme), colors.value_text);
+        assert_eq!(ValueKind::Json.color(&theme), colors.value_json);
+        assert_eq!(ValueKind::Timestamp.color(&theme), colors.value_timestamp);
+        assert_eq!(ValueKind::Bytes.color(&theme), colors.value_bytes);
+        assert_eq!(ValueKind::Unknown.color(&theme), colors.value_unknown);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn row_as_json_covers_null_number_text_and_json_cells() {
+        let columns = vec![
+            column("id", "int8"),
+            column("note", "text"),
+            column("deleted_at", "timestamptz"),
+            column("payload", "jsonb"),
+        ];
+        let row = Row(vec![
+            Value::Int(7),
+            Value::Text("hi".to_owned()),
+            Value::Null,
+            Value::Json(r#"{"a":1}"#.to_owned()),
+        ]);
+        let json = row_as_json(&row, &columns);
+        assert_eq!(json["id"], serde_json::json!(7));
+        assert_eq!(json["note"], serde_json::json!("hi"));
+        assert_eq!(json["deleted_at"], serde_json::Value::Null);
+        assert_eq!(json["payload"], serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn row_as_json_falls_back_to_a_string_for_a_json_cell_that_fails_to_parse() {
+        let columns = vec![column("payload", "jsonb")];
+        let row = Row(vec![Value::Json("not json".to_owned())]);
+        let json = row_as_json(&row, &columns);
+        assert_eq!(json["payload"], serde_json::json!("not json"));
+    }
+
+    #[test]
+    fn value_to_json_encodes_bytes_as_base64() {
+        let json = value_to_json(&Value::Bytes(b"foo".to_vec()));
+        assert_eq!(json, serde_json::json!("Zm9v"));
+    }
+
+    #[test]
+    fn value_to_json_recurses_into_array_elements() {
+        let json = value_to_json(&Value::Array(vec![
+            Value::Int(1),
+            Value::Text("two".to_owned()),
+            Value::Null,
+        ]));
+        assert_eq!(json, serde_json::json!([1, "two", null]));
+    }
+
+    #[test]
+    fn value_to_json_maps_a_non_finite_float_to_null() {
+        assert_eq!(
+            value_to_json(&Value::Float(f64::NAN)),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value_to_json(&Value::Float(f64::INFINITY)),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn value_to_json_maps_bool_numeric_timestamp_uuid_and_unknown() {
+        assert_eq!(value_to_json(&Value::Bool(true)), serde_json::json!(true));
+        assert_eq!(value_to_json(&Value::Bool(false)), serde_json::json!(false));
+
+        // Numeric's exact source digits, longer than any float can hold
+        // safely, must survive as a JSON string rather than a lossy number.
+        let exact = "123456789012345678901234567890.123456789012345";
+        assert_eq!(
+            value_to_json(&Value::Numeric(exact.to_owned())),
+            serde_json::json!(exact)
+        );
+
+        assert_eq!(
+            value_to_json(&Value::Timestamp("2026-07-14T09:12:31+00:00".to_owned())),
+            serde_json::json!("2026-07-14T09:12:31+00:00")
+        );
+
+        assert_eq!(
+            value_to_json(&Value::Uuid(
+                "550e8400-e29b-41d4-a716-446655440000".to_owned()
+            )),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000")
+        );
+
+        assert_eq!(
+            value_to_json(&Value::Unknown("(1,2)".to_owned())),
+            serde_json::json!("(1,2)")
+        );
     }
 }

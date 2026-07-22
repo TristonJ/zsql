@@ -20,7 +20,7 @@ use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use super::tabs::{Tab, TabId, TabKind, TabModel};
 use super::theme;
-use crate::config::LayoutConfig;
+use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::connections::ConnectionStore;
 use crate::session::Session;
 use crate::tab_session::{self, ConnectionKey, TabSessionSnapshot};
@@ -95,7 +95,9 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     /// Build a workspace over `session`, with pane sizes seeded from
-    /// `layout`, `connection_store` backing the connection-manager modal,
+    /// `layout` (also sizing the results grid's value panel dock),
+    /// `value_panel` configuring that panel's parse thresholds and hex-dump
+    /// layout, `connection_store` backing the connection-manager modal,
     /// `probe_timeout` (typically [`crate::config::Config::liveness`]'s
     /// `probe_timeout()`) bounding the connection-manager form's Test
     /// button, and `tab_sessions_path` (typically
@@ -105,12 +107,16 @@ impl WorkspaceView {
     pub fn new(
         session: Entity<Session>,
         layout: LayoutConfig,
+        value_panel: ValuePanelConfig,
         connection_store: ConnectionStore,
         probe_timeout: Duration,
         tab_sessions_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
+        results.update(cx, |results, cx| {
+            results.configure_value_panel(cx, &layout, value_panel);
+        });
         let tabs = cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx));
         // Every workspace opens with one empty script tab so the editor
         // pane is never blank; `TabModel::new` itself stays tab-less so its
@@ -957,7 +963,7 @@ mod render_tests {
     use zsql_core::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 
     use super::WorkspaceView;
-    use crate::config::LayoutConfig;
+    use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::{ConnectionStore, StoredConnection};
     use crate::session::{SchemaState, Session};
     use crate::tab_session::{self, ConnectionKey};
@@ -1051,6 +1057,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1069,6 +1076,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1109,6 +1117,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1164,6 +1173,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1219,6 +1229,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 layout,
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1248,6 +1259,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
@@ -1325,6 +1337,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
@@ -1431,6 +1444,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
@@ -1491,6 +1505,7 @@ mod render_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
                 Some(paths.tab_sessions.clone()),
@@ -1545,7 +1560,7 @@ mod header_tests {
     use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, RowCount, SchemaTree};
 
     use super::WorkspaceView;
-    use crate::config::LayoutConfig;
+    use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::ConnectionStore;
     use crate::session::Session;
 
@@ -1615,6 +1630,7 @@ mod header_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1652,6 +1668,7 @@ mod header_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1688,6 +1705,7 @@ mod header_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
@@ -1725,6 +1743,7 @@ mod header_tests {
             WorkspaceView::new(
                 session,
                 LayoutConfig::default(),
+                ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 None,
