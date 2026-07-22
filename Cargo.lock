@@ -7917,6 +7917,7 @@ dependencies = [
  "zsql-core",
  "zsql-editor",
  "zsql-mssql",
+ "zsql-mysql",
  "zsql-postgres",
  "zsql-sqlite",
  "zsql-ui",
@@ -7955,6 +7956,19 @@ dependencies = [
  "flume 0.11.1",
  "futures",
  "tiberius",
+ "tracing",
+ "zsql-core",
+]
+
+[[package]]
+name = "zsql-mysql"
+version = "0.0.0"
+dependencies = [
+ "async-global-executor",
+ "async-trait",
+ "flume 0.11.1",
+ "futures",
+ "sqlx",
  "tracing",
  "zsql-core",
 ]

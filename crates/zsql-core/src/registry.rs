@@ -21,6 +21,9 @@ fn driver_id_for_scheme(scheme: &str) -> Option<&'static str> {
         "postgres" | "postgresql" => Some("postgres"),
         "sqlite" | "file" => Some("sqlite"),
         "mssql" | "sqlserver" => Some("mssql"),
+        // One driver serves both: sqlx has no separate MariaDB backend, and
+        // MariaDB speaks the MySQL wire protocol.
+        "mysql" | "mariadb" => Some("mysql"),
         _ => None,
     }
 }
@@ -95,6 +98,7 @@ mod tests {
             Arc::new(FakeDriver("postgres")),
             Arc::new(FakeDriver("sqlite")),
             Arc::new(FakeDriver("mssql")),
+            Arc::new(FakeDriver("mysql")),
         ]
     }
 
@@ -126,6 +130,15 @@ mod tests {
         for url in ["mssql://user@host/db", "sqlserver://user@host/db"] {
             let driver = select_driver(&drivers, url).expect("scheme should resolve");
             assert_eq!(driver.id(), "mssql");
+        }
+    }
+
+    #[test]
+    fn mysql_and_mariadb_schemes_select_the_same_registered_mysql_driver() {
+        let drivers = registry();
+        for url in ["mysql://root@host/db", "mariadb://root@host/db"] {
+            let driver = select_driver(&drivers, url).expect("scheme should resolve");
+            assert_eq!(driver.id(), "mysql");
         }
     }
 

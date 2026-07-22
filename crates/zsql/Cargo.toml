@@ -18,6 +18,7 @@ zsql-core = { path = "../zsql-core" }
 zsql-postgres = { path = "../zsql-postgres" }
 zsql-sqlite = { path = "../zsql-sqlite" }
 zsql-mssql = { path = "../zsql-mssql" }
+zsql-mysql = { path = "../zsql-mysql" }
 zsql-ui = { path = "../zsql-ui" }
 zsql-editor = { path = "../zsql-editor" }
 anyhow = { workspace = true }
