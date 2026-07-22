@@ -476,9 +476,10 @@ impl ConnectionManagerView {
             self.name_field.read(cx).focus_handle(cx),
             self.url_field.read(cx).focus_handle(cx),
         ];
-        match self.driver_id.as_deref() {
-            Ok("sqlite") => order.push(self.sqlite_path_field.read(cx).focus_handle(cx)),
-            Ok("postgres" | "mssql") => {
+        if let Ok(driver_id) = self.driver_id.as_deref() {
+            if driver_id == "sqlite" {
+                order.push(self.sqlite_path_field.read(cx).focus_handle(cx));
+            } else {
                 order.push(self.host_field.read(cx).focus_handle(cx));
                 order.push(self.port_field.read(cx).focus_handle(cx));
                 order.push(self.user_field.read(cx).focus_handle(cx));
@@ -486,7 +487,6 @@ impl ConnectionManagerView {
                 order.push(self.database_field.read(cx).focus_handle(cx));
                 order.push(self.tls_field.read(cx).focus_handle(cx));
             }
-            _ => {}
         }
         order.push(self.cancel_focus.clone());
         order.push(self.test_focus.clone());
@@ -1728,7 +1728,7 @@ impl ConnectionManagerView {
     }
 
     /// The Host/Port, User/Password, Database, and TLS-param fields shared
-    /// by the network drivers (postgres, mssql), appended onto `section`.
+    /// by the non-sqlite network drivers, appended onto `section`.
     fn render_network_fields(
         &self,
         section: Div,

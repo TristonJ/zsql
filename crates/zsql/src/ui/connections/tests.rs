@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
+use gpui::{
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, Keystroke,
+    Modifiers, TestAppContext, VisualTestContext,
+};
 
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, StoredConnection,
@@ -1117,6 +1120,274 @@ fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order(cx: &mut TestAp
         assert_eq!(
             window.focused(cx).as_ref(),
             Some(&expected_order[expected_order.len() - 1])
+        );
+    });
+}
+
+/// [`tab_and_shift_tab_move_focus_through_the_form_in_visual_order`]'s
+/// scenario, parameterized over `url`: opens the add form on `url`, then
+/// checks the form's own `focus_order()` round-trips through Tab and
+/// Shift-Tab, including wrap-around at both ends.
+fn assert_focus_order_round_trips_through_tab_and_shift_tab(cx: &mut TestAppContext, url: &str) {
+    let temp = TempStorePath::new("tab-order-round-trip");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update(vcx, |view, cx| {
+        view.open(cx);
+        view.show_add_form(cx);
+        view.set_url_input(url, cx);
+    });
+    vcx.run_until_parked();
+
+    let expected_order = manager.update(vcx, |view, cx| view.focus_order(cx));
+    assert!(
+        expected_order.len() >= 3,
+        "the add form over a parsed url must expose name, url, and driver fields"
+    );
+
+    assert_tab_cycles_through_in_order(vcx, &expected_order);
+}
+
+#[gpui::test]
+fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order_for_an_mssql_url(
+    cx: &mut TestAppContext,
+) {
+    assert_focus_order_round_trips_through_tab_and_shift_tab(cx, "mssql://sa:pw@dbhost:1433/db");
+}
+
+#[gpui::test]
+fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order_for_a_sqlite_url(
+    cx: &mut TestAppContext,
+) {
+    assert_focus_order_round_trips_through_tab_and_shift_tab(cx, "sqlite::memory:");
+}
+
+/// Tab forward through every handle in `order` starting from `order[0]`,
+/// asserting each keystroke lands on the next concrete handle, then checks
+/// wrap-around in both directions: Tab from the last control back to the
+/// first, and Shift-Tab from the first back to the last.
+fn assert_tab_cycles_through_in_order(vcx: &mut VisualTestContext, order: &[FocusHandle]) {
+    assert!(
+        order.len() >= 2,
+        "need at least two controls to cycle through"
+    );
+    vcx.update(|window, _cx| window.focus(&order[0]));
+    vcx.run_until_parked();
+
+    for expected in order.iter().skip(1) {
+        vcx.simulate_keystrokes("tab");
+        vcx.update(|window, cx| {
+            assert_eq!(window.focused(cx).as_ref(), Some(expected));
+        });
+    }
+
+    vcx.simulate_keystrokes("tab");
+    vcx.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx).as_ref(),
+            Some(&order[0]),
+            "Tab from the last control must wrap to the first"
+        );
+    });
+
+    vcx.simulate_keystrokes("shift-tab");
+    vcx.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx).as_ref(),
+            Some(&order[order.len() - 1]),
+            "Shift-Tab from the first control must wrap to the last"
+        );
+    });
+}
+
+/// The add form's full concrete focus chain over a parsed, non-sqlite URL:
+/// name, url, every network field, then the footer buttons in visual order.
+fn add_form_network_focus_chain(
+    view: &ConnectionManagerView,
+    cx: &Context<ConnectionManagerView>,
+) -> Vec<FocusHandle> {
+    vec![
+        view.name_field.read(cx).focus_handle(cx),
+        view.url_field.read(cx).focus_handle(cx),
+        view.host_field.read(cx).focus_handle(cx),
+        view.port_field.read(cx).focus_handle(cx),
+        view.user_field.read(cx).focus_handle(cx),
+        view.password_field.read(cx).focus_handle(cx),
+        view.database_field.read(cx).focus_handle(cx),
+        view.tls_field.read(cx).focus_handle(cx),
+        view.cancel_focus.clone(),
+        view.test_focus.clone(),
+        view.connect_focus.clone(),
+        view.save_focus.clone(),
+    ]
+}
+
+/// The edit form's equivalent of [`add_form_network_focus_chain`] (no
+/// Connect button).
+fn edit_form_network_focus_chain(
+    view: &ConnectionManagerView,
+    cx: &Context<ConnectionManagerView>,
+) -> Vec<FocusHandle> {
+    vec![
+        view.name_field.read(cx).focus_handle(cx),
+        view.url_field.read(cx).focus_handle(cx),
+        view.host_field.read(cx).focus_handle(cx),
+        view.port_field.read(cx).focus_handle(cx),
+        view.user_field.read(cx).focus_handle(cx),
+        view.password_field.read(cx).focus_handle(cx),
+        view.database_field.read(cx).focus_handle(cx),
+        view.tls_field.read(cx).focus_handle(cx),
+        view.cancel_focus.clone(),
+        view.test_focus.clone(),
+        view.save_focus.clone(),
+    ]
+}
+
+/// For the add form over `url` (expected to resolve to the `mysql` driver,
+/// whether via a `mysql://` or `mariadb://` scheme), Tab from the URL field
+/// must advance through host, port, user, password, database, and tls
+/// before reaching the footer buttons, and the whole chain must wrap in
+/// both directions. Asserts against each field's own focus handle, not a
+/// re-derived `focus_order()` list, so the assertion cannot pass merely
+/// because `focus_order()` and the test agree on the same (possibly wrong)
+/// derivation.
+fn assert_add_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url: &str) {
+    let temp = TempStorePath::new("tab-order-network-add");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update(vcx, |view, cx| {
+        view.open(cx);
+        view.show_add_form(cx);
+        view.set_url_input(url, cx);
+    });
+    vcx.run_until_parked();
+
+    manager.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.pending_driver_id(),
+            Ok("mysql"),
+            "url {url} must resolve to the registered mysql driver"
+        );
+    });
+
+    let order = manager.update(vcx, |view, cx| add_form_network_focus_chain(view, cx));
+    assert_tab_cycles_through_in_order(vcx, &order);
+}
+
+/// [`assert_add_form_tab_order_covers_network_fields`]'s edit-form
+/// equivalent: the row at index 0 is pre-loaded from `url` and the form is
+/// opened via [`ConnectionManagerView::show_edit_form`].
+fn assert_edit_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url: &str) {
+    let temp = TempStorePath::new("tab-order-network-edit");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(StoredConnection {
+            name: "db".to_owned(),
+            url: url.to_owned(),
+        })
+        .expect("add must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update(vcx, |view, cx| {
+        view.open(cx);
+        view.show_edit_form(0, cx);
+    });
+    vcx.run_until_parked();
+
+    manager.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.pending_driver_id(),
+            Ok("mysql"),
+            "url {url} must resolve to the registered mysql driver"
+        );
+    });
+
+    let order = manager.update(vcx, |view, cx| edit_form_network_focus_chain(view, cx));
+    assert_tab_cycles_through_in_order(vcx, &order);
+}
+
+#[gpui::test]
+fn tab_order_for_the_add_form_covers_network_fields_for_a_mysql_url(cx: &mut TestAppContext) {
+    assert_add_form_tab_order_covers_network_fields(cx, "mysql://app:pw@dbhost:3306/orders");
+}
+
+#[gpui::test]
+fn tab_order_for_the_add_form_covers_network_fields_for_a_mariadb_url(cx: &mut TestAppContext) {
+    assert_add_form_tab_order_covers_network_fields(cx, "mariadb://app:pw@dbhost:3306/orders");
+}
+
+#[gpui::test]
+fn tab_order_for_the_edit_form_covers_network_fields_for_a_mysql_url(cx: &mut TestAppContext) {
+    assert_edit_form_tab_order_covers_network_fields(cx, "mysql://app:pw@dbhost:3306/orders");
+}
+
+#[gpui::test]
+fn tab_order_for_the_edit_form_covers_network_fields_for_a_mariadb_url(cx: &mut TestAppContext) {
+    assert_edit_form_tab_order_covers_network_fields(cx, "mariadb://app:pw@dbhost:3306/orders");
+}
+
+#[gpui::test]
+fn focus_order_for_an_empty_url_contains_only_name_url_and_footer_buttons(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("tab-order-empty-url");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+    });
+
+    manager.update(cx, |view, cx| {
+        assert!(view.pending_driver_id().is_err());
+        let order = view.focus_order(cx);
+        let expected = vec![
+            view.name_field.read(cx).focus_handle(cx),
+            view.url_field.read(cx).focus_handle(cx),
+            view.cancel_focus.clone(),
+            view.test_focus.clone(),
+            view.connect_focus.clone(),
+            view.save_focus.clone(),
+        ];
+        assert_eq!(
+            order, expected,
+            "an empty URL must expose no driver fields at all"
+        );
+    });
+}
+
+#[gpui::test]
+fn focus_order_for_an_unrecognized_scheme_contains_only_name_url_and_footer_buttons(
+    cx: &mut TestAppContext,
+) {
+    let temp = TempStorePath::new("tab-order-unrecognized-scheme");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_url_input("cassandra://host/db", cx);
+    });
+
+    manager.update(cx, |view, cx| {
+        assert!(view.pending_driver_id().is_err());
+        let order = view.focus_order(cx);
+        let expected = vec![
+            view.name_field.read(cx).focus_handle(cx),
+            view.url_field.read(cx).focus_handle(cx),
+            view.cancel_focus.clone(),
+            view.test_focus.clone(),
+            view.connect_focus.clone(),
+            view.save_focus.clone(),
+        ];
+        assert_eq!(
+            order, expected,
+            "an unrecognized scheme must expose no driver fields, not even a stale sqlite path field"
         );
     });
 }
