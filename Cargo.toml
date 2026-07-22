@@ -5,6 +5,7 @@ members = [
     "crates/zsql-postgres",
     "crates/zsql-sqlite",
     "crates/zsql-mssql",
+    "crates/zsql-mysql",
     "crates/zsql-ui",
     "crates/zsql-editor",
     "crates/zsql",
@@ -21,6 +22,7 @@ gpui = "=0.2.2"
 # DB: sqlx on the smol runtime so its futures await on gpui's executor (no tokio).
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
+    "mysql",
     "runtime-smol",
     "tls-rustls",
     "chrono",

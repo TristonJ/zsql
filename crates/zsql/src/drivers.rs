@@ -2,14 +2,15 @@
 //! a connection URL to one of them via [`zsql_core::select_driver`].
 //!
 //! This is the only module in the `zsql` binary that names
-//! `zsql-postgres`, `zsql-sqlite`, and `zsql-mssql`; everything downstream
-//! (`session.rs`, the connection-manager UI) goes through [`connect`] and
-//! never picks a driver directly.
+//! `zsql-postgres`, `zsql-sqlite`, `zsql-mssql`, and `zsql-mysql`;
+//! everything downstream (`session.rs`, the connection-manager UI) goes
+//! through [`connect`] and never picks a driver directly.
 
 use std::sync::Arc;
 
 use zsql_core::{Connection, CoreError, Driver};
 use zsql_mssql::MssqlDriver;
+use zsql_mysql::MysqlDriver;
 use zsql_postgres::PostgresDriver;
 use zsql_sqlite::SqliteDriver;
 
@@ -20,6 +21,7 @@ pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
         Arc::new(PostgresDriver),
         Arc::new(SqliteDriver),
         Arc::new(MssqlDriver),
+        Arc::new(MysqlDriver),
     ]
 }
 
@@ -53,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_drivers_include_postgres_and_sqlite() {
+    fn registered_drivers_include_postgres_sqlite_mssql_and_mysql() {
         let ids: Vec<&str> = registered_drivers().iter().map(|d| d.id()).collect();
         assert!(
             ids.contains(&"postgres"),
@@ -67,6 +69,10 @@ mod tests {
             ids.contains(&"mssql"),
             "expected a registered mssql driver: {ids:?}"
         );
+        assert!(
+            ids.contains(&"mysql"),
+            "expected a registered mysql driver: {ids:?}"
+        );
     }
 
     #[test]
@@ -75,6 +81,23 @@ mod tests {
         let conn = block_on(connect("sqlite::memory:".to_owned()))
             .expect("sqlite connect through selection should succeed");
         drop(conn);
+    }
+
+    #[test]
+    fn connect_routes_a_mariadb_scheme_to_the_registered_mysql_driver() {
+        // An unreachable host still proves routing: a `CoreError::Url`
+        // would mean `mariadb://` never resolved to a registered driver at
+        // all, whereas a `CoreError::Connection` means it resolved (to the
+        // `mysql` driver, the only one registered for that scheme) and then
+        // failed to actually reach the host.
+        let result = block_on(connect(
+            "mariadb://user:pass@zsql-test-nonexistent-host.invalid/db".to_owned(),
+        ));
+        match result {
+            Err(zsql_core::CoreError::Connection(_)) => {}
+            Err(other) => panic!("expected a CoreError::Connection, got {other:?}"),
+            Ok(_) => panic!("connecting to an unreachable host must fail"),
+        }
     }
 
     #[test]

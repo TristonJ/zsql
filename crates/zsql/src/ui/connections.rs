@@ -669,6 +669,8 @@ fn driver_display_label(driver_id: &str) -> &'static str {
         "postgres" => "PostgreSQL",
         "mssql" => "MSSQL",
         "sqlite" => "SQLite",
+        "mysql" => "MySQL",
+        "mariadb" => "MariaDB",
         _ => "unrecognized",
     }
 }
