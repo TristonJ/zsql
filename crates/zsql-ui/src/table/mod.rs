@@ -20,7 +20,7 @@ mod style;
 
 pub use builder::{Table, TableSizing};
 pub use column::TableColumn;
-pub use gutter::{Gutter, RowNumberStyle};
+pub use gutter::{Gutter, RowNumberStyle, row_number_cell_shell};
 pub use row::TableRow;
 pub use state::TableState;
 pub use style::{TableBorders, TableStyle};

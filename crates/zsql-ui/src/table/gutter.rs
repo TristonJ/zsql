@@ -91,7 +91,11 @@ pub(super) fn gutter_cell_shell(width: Pixels, style: &TableStyle) -> Div {
 }
 
 /// [`gutter_header_shell`] plus [`Gutter::RowNumbers`]' own right-alignment
-/// and faint text color.
+/// and faint text color. Crate-visible only: the table builder is the sole
+/// caller with a header row to build with it, unlike
+/// [`row_number_cell_shell`], which a caller building its own non-table
+/// row-numbered pane (e.g. a document viewer) also needs.
+#[must_use]
 pub(super) fn row_number_header_shell(style: &TableStyle) -> Div {
     gutter_header_shell(style)
         .justify_end()
@@ -99,8 +103,10 @@ pub(super) fn row_number_header_shell(style: &TableStyle) -> Div {
 }
 
 /// [`gutter_cell_shell`] plus [`Gutter::RowNumbers`]' own right-alignment
-/// and faint text color.
-pub(super) fn row_number_cell_shell(width: Pixels, style: &TableStyle) -> Div {
+/// and faint text color. Public for the same reason as
+/// [`row_number_header_shell`].
+#[must_use]
+pub fn row_number_cell_shell(width: Pixels, style: &TableStyle) -> Div {
     gutter_cell_shell(width, style)
         .justify_end()
         .text_color(rgb(style.row_number_color))

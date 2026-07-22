@@ -113,6 +113,51 @@ pub const RESULTS_META_TEXT_SIZE: f32 = 11.0;
 /// Text size of the bottom connection/status bar.
 pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
 
+// ---- results pane: Text view -------------------------------------------
+
+/// Height of one line row in the Text view's document body and gutter.
+pub const TEXT_VIEW_LINE_HEIGHT: Pixels = px(21.0);
+/// Font size of the Text view's document body and gutter line numbers.
+pub const TEXT_VIEW_FONT_SIZE: f32 = 12.5;
+/// Horizontal gap between the results bar's trailing copy/wrap buttons and
+/// the Grid|Text view switch.
+pub const RESULTS_BAR_RIGHT_GAP: Pixels = px(9.0);
+/// Extra horizontal room reserved past the Text view's longest line when
+/// wrap is off, so its virtualized body list's horizontal scroll extent
+/// leaves the last character clear of the scrollable edge.
+pub const TEXT_VIEW_CONTENT_EXTENT_SLACK: Pixels = px(24.0);
+
+/// Horizontal padding inside the results bar's copy/wrap icon buttons.
+pub const RESULTS_ICON_BUTTON_PADDING_X: Pixels = px(5.0);
+/// Vertical padding inside the results bar's copy/wrap icon buttons.
+pub const RESULTS_ICON_BUTTON_PADDING_Y: Pixels = px(3.0);
+/// Corner radius of the results bar's copy/wrap icon buttons.
+pub const RESULTS_ICON_BUTTON_RADIUS: f32 = 5.0;
+/// Text size of the results bar's copy/wrap icon buttons.
+pub const RESULTS_ICON_BUTTON_TEXT_SIZE: f32 = 11.0;
+
+/// Background of the Grid|Text view switch's active segment, and of the
+/// wrap toggle when wrap is on: the accent wash used elsewhere for a
+/// selected/active control.
+#[must_use]
+pub fn view_switch_active_bg(theme: &Theme) -> u32 {
+    theme.colors.accent_wash()
+}
+
+/// Text color of the Grid|Text view switch's active segment, and of the
+/// wrap toggle when wrap is on.
+#[must_use]
+pub fn view_switch_active_text(theme: &Theme) -> u32 {
+    theme.colors.accent_strong()
+}
+
+/// Background of the Text view's selected-line highlight: the same accent
+/// wash the SQL editor pane uses for its own text selection.
+#[must_use]
+pub fn text_selection_bg(theme: &Theme) -> u32 {
+    theme.colors.accent_wash_hover()
+}
+
 /// Height of a `Generated` tab's compact SQL strip, tall enough for one line
 /// of monospace text plus the editor's own vertical padding.
 pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
