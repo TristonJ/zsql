@@ -265,6 +265,11 @@ impl Session {
     fn connect_url(&mut self, url: String, cx: &mut Context<Self>) -> Task<()> {
         self.state = SessionState::Connecting;
         self.liveness = LivenessState::Unknown;
+        // Every connect attempt targets a different (or not-yet-known)
+        // database, so whatever schema tree belongs to the connection this
+        // attempt is replacing must stop being shown as current immediately,
+        // not only once (or if) the attempt succeeds.
+        self.set_schema(SchemaState::NotLoaded);
         // A fresh connect attempt invalidates any liveness probe loop tied
         // to whatever connection preceded it, even if this attempt goes on
         // to fail: that prior loop's next tick (or in-flight probe) must
@@ -742,6 +747,12 @@ impl Session {
         self.row_count = row_count;
     }
 
+    /// Set the exposed liveness state directly, simulating a completed
+    /// probe result without waiting for the recurring probe to tick.
+    pub(crate) fn set_liveness_for_test(&mut self, liveness: LivenessState) {
+        self.liveness = liveness;
+    }
+
     /// Build a session already holding `schema` as its introspected schema
     /// state, connected but idle, with no result set
     pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {
@@ -1163,7 +1174,7 @@ mod gpui_tests {
     use gpui::{AppContext as _, TestAppContext};
     use zsql_core::{
         BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
-        RelationKind, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
+        RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
     };
 
     use super::{Config, LivenessState, SchemaState, Session, SessionState};
@@ -1381,6 +1392,115 @@ mod gpui_tests {
             ),
             other => panic!("expected a not-connected error, got {other:?}"),
         });
+    }
+
+    /// `connect_to` must reset the schema tree to `NotLoaded` synchronously,
+    /// in the same call that dispatches the connect attempt, regardless of
+    /// what the schema was showing before -- so a caller never sees a stale
+    /// tree while a switch is in flight, whether or not it ever succeeds.
+    #[gpui::test]
+    async fn connect_to_resets_schema_to_not_loaded_synchronously_regardless_of_prior_state(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        for prior in [
+            SchemaState::NotLoaded,
+            SchemaState::Loading,
+            SchemaState::Ready(SchemaTree::default()),
+            SchemaState::Error("boom".to_owned()),
+        ] {
+            let prior_label = format!("{prior:?}");
+            let session = cx.new(|_cx| Session::new_for_schema_test(prior));
+            let generation_before =
+                session.read_with(cx, |session, _app| session.schema_generation());
+
+            let task = session.update(cx, |session, cx| {
+                let task = session.connect_to("sqlite::memory:", cx);
+                assert!(
+                    matches!(session.schema(), SchemaState::NotLoaded),
+                    "expected NotLoaded synchronously right after connect_to \
+                     (prior state was {prior_label}), got {:?}",
+                    session.schema()
+                );
+                assert!(
+                    session.schema_generation() > generation_before,
+                    "expected schema_generation to bump in the same call \
+                     (prior state was {prior_label})"
+                );
+                task
+            });
+
+            task.await;
+        }
+    }
+
+    /// A failed connection switch must not resurrect the connection it was
+    /// replacing: the schema stays `NotLoaded` rather than reverting to
+    /// whatever tree the previous, superseded connection had introspected.
+    #[gpui::test]
+    async fn a_failed_connect_switch_leaves_schema_not_loaded_rather_than_reverting(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(SchemaTree::default())));
+
+        session
+            .update(cx, |session, cx| {
+                session.connect_to("cassandra://host/db", cx)
+            })
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected Error after a failed switch, got {:?}",
+                session.state()
+            );
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "a failed switch must not resurrect the previous connection's \
+                 schema, got {:?}",
+                session.schema()
+            );
+        });
+    }
+
+    /// A switch initiated while a query is actively streaming for the
+    /// previous connection must still reset the session immediately: there
+    /// is no special-casing that delays or blocks the reset for an
+    /// in-flight query.
+    #[gpui::test]
+    async fn connect_to_resets_synchronously_even_while_a_query_is_running(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let session =
+            cx.new(|_cx| Session::new_for_render_test(SessionState::Running, ResultSet::default()));
+
+        let task = session.update(cx, |session, cx| {
+            let task = session.connect_to("sqlite::memory:", cx);
+            assert!(
+                matches!(session.state(), SessionState::Connecting),
+                "expected the switch to move state to Connecting even with a \
+                 query running, got {:?}",
+                session.state()
+            );
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "expected the schema to reset even with a query running, got {:?}",
+                session.schema()
+            );
+            task
+        });
+
+        task.await;
     }
 
     /// What [`FakeConnection::introspect`] returns
