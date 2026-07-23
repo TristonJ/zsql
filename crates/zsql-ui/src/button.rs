@@ -8,7 +8,7 @@ use crate::theme::ActiveTheme;
 /// A common base for all buttons, which handles hover state and basic styling.
 /// Hover state is manually implemented because GPUI does not support (currently)
 /// updating text styles on hover.
-fn button_base<T>(
+pub(crate) fn button_base<T>(
     id: impl Into<ElementId>,
     window: &mut Window,
     cx: &mut Context<T>,

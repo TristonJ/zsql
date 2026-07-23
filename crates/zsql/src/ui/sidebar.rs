@@ -11,6 +11,7 @@ use gpui::{
 };
 use zsql_core::{RelationKind, SchemaTree};
 use zsql_ui::icon::{IconName, icon};
+use zsql_ui::icon_button::icon_button_secondary;
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
 use zsql_ui::theme::{ActiveTheme, Theme};
 // Imported by name rather than as `zsql_ui::tree::...`: this module already
@@ -275,23 +276,38 @@ impl SidebarView {
         -self.tree_scroll_handle.0.borrow().base_handle.offset().y
     }
 
+    /// Re-introspect the live connection so the tree picks up schema changes
+    /// made since it was last loaded. A no-op while disconnected: there is no
+    /// catalog to refresh, and introspecting without a connection would
+    /// replace the "connect to browse" prompt with an error.
+    fn refresh_schema(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).is_connected() {
+            self.session.update(cx, Session::introspect).detach();
+        }
+    }
+
     /// The "SCHEMA" header bar.
-    fn render_header(active_theme: &Theme) -> Div {
+    fn render_header(window: &mut Window, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .flex_row()
             .items_center()
+            .justify_between()
             .flex_shrink_0()
             .h(theme::SIDEBAR_HEADER_HEIGHT)
             .px_3()
             .border_b_1()
-            .border_color(rgb(active_theme.colors.border_soft))
+            .border_color(rgb(cx.theme().colors.border_soft))
             .child(
                 div()
                     .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                    .text_color(rgb(active_theme.colors.text_tertiary))
+                    .text_color(rgb(cx.theme().colors.text_tertiary))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("SCHEMA"),
+            )
+            .child(
+                icon_button_secondary("sidebar-refresh-schema", window, cx, IconName::Refresh)
+                    .on_click(cx.listener(|view, _evt, _window, cx| view.refresh_schema(cx))),
             )
     }
 
@@ -679,7 +695,7 @@ impl Render for SidebarView {
             .flex_col()
             .size_full()
             .bg(rgb(active_theme.colors.bg_panel))
-            .child(Self::render_header(active_theme))
+            .child(Self::render_header(window, cx))
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
     }
@@ -1013,13 +1029,66 @@ mod tests {
 
 #[cfg(test)]
 mod render_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
     use gpui::AppContext as _;
-    use zsql_core::{Catalog, ColumnMeta, Relation, RelationKind, SchemaNs, SchemaTree};
+    use zsql_core::{
+        BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryHandle, RelationSchema,
+        RowCount, SchemaNs, SchemaTree,
+    };
+    use zsql_core::{Relation, RelationKind};
 
     use super::{SidebarView, qualified_relation_name};
     use crate::session::{SchemaState, Session};
     use crate::ui::results::ResultsView;
     use crate::ui::tabs::TabModel;
+
+    /// A `Connection` double whose `introspect` hands back a fixed,
+    /// distinctively-named tree, so a test can tell a fresh introspection
+    /// apart from whatever schema the session held beforehand. Its other
+    /// methods are inert -- these tests only exercise the refresh path.
+    struct RefreshingConnection;
+
+    /// The catalog name [`RefreshingConnection::introspect`] returns, chosen
+    /// so it cannot be confused with any other fixture tree in this module.
+    const REFRESHED_CATALOG: &str = "refreshed_catalog";
+
+    #[async_trait]
+    impl Connection for RefreshingConnection {
+        fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            Ok(SchemaTree {
+                catalogs: vec![Catalog {
+                    name: REFRESHED_CATALOG.to_owned(),
+                    schemas: vec![SchemaNs {
+                        name: "public".to_owned(),
+                        tables: vec![],
+                    }],
+                }],
+            })
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+            Ok(RowCount::Exact(0))
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<RelationSchema, CoreError> {
+            Ok(RelationSchema::default())
+        }
+    }
 
     /// A `TabModel` over a fresh `ResultsView`, for tests that only care
     /// about the sidebar's own state and do not inspect results/tabs
@@ -1446,6 +1515,62 @@ mod render_tests {
         sidebar.update(vcx, |view, _cx| {
             assert_eq!(view.rows.len(), expanded);
             assert!(view.collapsed_schemas.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn refreshing_a_connected_session_re_introspects_and_replaces_the_tree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Start Ready with a stale tree, then refresh: the connection's own
+        // introspection must overwrite it with the freshly-fetched catalog.
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_query_test(Arc::new(RefreshingConnection));
+            session.set_schema_for_test(SchemaState::Ready(sample_schema_tree()));
+            session
+        });
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, SidebarView::refresh_schema);
+        vcx.run_until_parked();
+
+        session.read_with(vcx, |session, _app| match session.schema() {
+            SchemaState::Ready(tree) => {
+                assert_eq!(
+                    tree.catalogs
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![REFRESHED_CATALOG],
+                    "refresh must replace the stale tree with the re-introspected one"
+                );
+            }
+            other => panic!("expected a Ready schema after refresh, got {other:?}"),
+        });
+    }
+
+    #[gpui::test]
+    fn refreshing_while_disconnected_leaves_the_schema_untouched(cx: &mut gpui::TestAppContext) {
+        // With no live connection there is nothing to introspect, so refresh
+        // must be a no-op rather than flipping the "connect to browse" prompt
+        // into a "not connected" error.
+        let session = cx.new(|_cx| Session::new_for_schema_test(SchemaState::NotLoaded));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, SidebarView::refresh_schema);
+        vcx.run_until_parked();
+
+        session.read_with(vcx, |session, _app| {
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "refreshing without a connection must not change the schema state"
+            );
         });
     }
 }

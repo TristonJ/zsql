@@ -753,6 +753,13 @@ impl Session {
         self.liveness = liveness;
     }
 
+    /// Set the exposed schema state directly, letting a test stand up a
+    /// session that already holds a given schema without going through a
+    /// real introspection.
+    pub(crate) fn set_schema_for_test(&mut self, schema: SchemaState) {
+        self.set_schema(schema);
+    }
+
     /// Build a session already holding `schema` as its introspected schema
     /// state, connected but idle, with no result set
     pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {
