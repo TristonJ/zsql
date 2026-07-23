@@ -449,7 +449,11 @@ impl EditorView {
         window.focus(&self.focus_handle);
         self.is_selecting = true;
         if let Some(position) = self.position_for_point(event.position) {
-            if event.modifiers.shift {
+            if event.click_count >= 3 {
+                self.buffer.select_line(position.line);
+            } else if event.click_count == 2 {
+                self.buffer.select_word(position);
+            } else if event.modifiers.shift {
                 let anchor = self
                     .buffer
                     .selection()
@@ -2161,6 +2165,79 @@ mod tests {
         });
         harness.editor.update(vcx, |view, _cx| {
             assert!(!view.is_selecting, "mouse-up should end the drag");
+        });
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_word_selects_exactly_that_word(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, cx| {
+            view.set_text_for_test("select 1\nfrom orders\nwhere id = 1");
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        // Double-click in the middle of "orders", not at either end.
+        let click_target = Position::new(1, 8);
+        let click_point = harness.editor.read_with(vcx, |view, _cx| {
+            view.point_for_position_for_test(click_target)
+        });
+        vcx.update(|window, cx| {
+            harness.editor.update(cx, |view, cx| {
+                view.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: click_point,
+                        modifiers: Modifiers::default(),
+                        click_count: 2,
+                        first_mouse: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        harness.editor.update(vcx, |view, _cx| {
+            assert_eq!(view.buffer_for_test().selected_text(), "orders");
+        });
+    }
+
+    #[gpui::test]
+    fn triple_clicking_selects_the_whole_line_regardless_of_click_column(cx: &mut TestAppContext) {
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, cx| {
+            view.set_text_for_test("select 1\nfrom orders\nwhere id = 1");
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        // Triple-click in the middle of "orders", not at either end.
+        let click_target = Position::new(1, 8);
+        let click_point = harness.editor.read_with(vcx, |view, _cx| {
+            view.point_for_position_for_test(click_target)
+        });
+        vcx.update(|window, cx| {
+            harness.editor.update(cx, |view, cx| {
+                view.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: click_point,
+                        modifiers: Modifiers::default(),
+                        click_count: 3,
+                        first_mouse: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        harness.editor.update(vcx, |view, _cx| {
+            let line_len = "from orders".chars().count();
+            assert_eq!(view.buffer_for_test().selected_text(), "from orders");
+            assert_eq!(
+                view.buffer_for_test().selection().unwrap().ordered(),
+                (Position::new(1, 0), Position::new(1, line_len))
+            );
         });
     }
 
