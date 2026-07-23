@@ -5,6 +5,7 @@ use gpui::{
     Modifiers, TestAppContext, VisualTestContext,
 };
 
+use super::form::ConnectionFormEvent;
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, TestOutcome,
     footer_display, host_label,
@@ -13,6 +14,7 @@ use crate::{
     connections::ConnectionArgs,
     session::{LivenessState, Session, SessionState},
 };
+use zsql_ui::text_field::TextFieldEvent;
 
 /// The liveness probe timeout every test builds its manager with, unless a
 /// test specifically cares about the value itself.
@@ -400,7 +402,7 @@ fn show_add_form_then_cancel_returns_to_the_list_without_persisting(cx: &mut Tes
     manager.update(cx, |view, cx| {
         view.open(cx);
         view.show_add_form(cx);
-        assert_eq!(view.current_view(), ManagerView::AddForm);
+        assert_eq!(view.current_view(), ManagerView::Form);
 
         view.set_name_input("staging", cx);
         view.set_url_input("postgres://host/db", cx);
@@ -408,8 +410,8 @@ fn show_add_form_then_cancel_returns_to_the_list_without_persisting(cx: &mut Tes
 
         assert_eq!(view.current_view(), ManagerView::List);
         assert!(view.connections().is_empty());
-        assert!(view.name_field.read(cx).value().is_empty());
-        assert!(view.url_field.read(cx).value().is_empty());
+        assert!(view.form.read(cx).name_field.read(cx).value().is_empty());
+        assert!(view.form.read(cx).url_field.read(cx).value().is_empty());
     });
 
     let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
@@ -492,23 +494,46 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
         let id = view.connections()[0].connection.id;
         assert_eq!(
             view.current_view(),
-            ManagerView::EditForm { id },
+            ManagerView::Form,
+            "edit form must be shown"
+        );
+        assert_eq!(
+            view.form.read(cx).edit_id(),
+            Some(id),
             "edit form must be shown for the right row"
         );
-        assert_eq!(view.name_field.read(cx).value().as_ref(), "staging");
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            view.form.read(cx).name_field.read(cx).value().as_ref(),
+            "staging"
+        );
+        assert_eq!(
+            view.form.read(cx).url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require"
         );
         assert_eq!(
-            view.host_field.read(cx).value().as_ref(),
+            view.form.read(cx).host_field.read(cx).value().as_ref(),
             "staging.internal"
         );
-        assert_eq!(view.port_field.read(cx).value().as_ref(), "5432");
-        assert_eq!(view.user_field.read(cx).value().as_ref(), "app");
-        assert_eq!(view.password_field.read(cx).value().as_ref(), "s3cr3t");
-        assert_eq!(view.database_field.read(cx).value().as_ref(), "app");
-        assert_eq!(view.tls_field.read(cx).value().as_ref(), "require");
+        assert_eq!(
+            view.form.read(cx).port_field.read(cx).value().as_ref(),
+            "5432"
+        );
+        assert_eq!(
+            view.form.read(cx).user_field.read(cx).value().as_ref(),
+            "app"
+        );
+        assert_eq!(
+            view.form.read(cx).password_field.read(cx).value().as_ref(),
+            "s3cr3t"
+        );
+        assert_eq!(
+            view.form.read(cx).database_field.read(cx).value().as_ref(),
+            "app"
+        );
+        assert_eq!(
+            view.form.read(cx).tls_field.read(cx).value().as_ref(),
+            "require"
+        );
     });
 }
 
@@ -528,12 +553,17 @@ fn show_edit_form_for_a_sqlite_url_prefills_only_the_path_field(cx: &mut TestApp
 
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
-        assert_eq!(view.pending_driver_id(), Ok("sqlite"));
+        assert_eq!(view.pending_driver_id(cx), Ok("sqlite"));
         assert_eq!(
-            view.sqlite_path_field.read(cx).value().as_ref(),
+            view.form
+                .read(cx)
+                .sqlite_path_field
+                .read(cx)
+                .value()
+                .as_ref(),
             "/tmp/reports.db"
         );
-        assert!(view.host_field.read(cx).value().is_empty());
+        assert!(view.form.read(cx).host_field.read(cx).value().is_empty());
     });
 }
 
@@ -560,8 +590,8 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
         view.set_name_input("first renamed", cx);
-        view.host_field
-            .update(cx, |field, cx| field.set_value("otherhost", cx));
+        let host_field = view.form.read(cx).host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("otherhost", cx));
     });
 
     manager.update(cx, |view, cx| {
@@ -609,14 +639,32 @@ fn editing_the_url_field_reparses_every_driver_field(cx: &mut TestAppContext) {
     });
 
     manager.read_with(cx, |view, cx| {
-        assert_eq!(view.pending_driver_id(), Ok("mssql"));
-        assert_eq!(view.host_field.read(cx).value().as_ref(), "dbhost");
-        assert_eq!(view.port_field.read(cx).value().as_ref(), "1433");
-        assert_eq!(view.user_field.read(cx).value().as_ref(), "sa");
-        assert_eq!(view.password_field.read(cx).value().as_ref(), "pw");
-        assert_eq!(view.database_field.read(cx).value().as_ref(), "zsql");
-        assert_eq!(view.tls_field.read(cx).value().as_ref(), "true");
-        assert!(view.dim_reason().is_none());
+        assert_eq!(view.pending_driver_id(cx), Ok("mssql"));
+        assert_eq!(
+            view.form.read(cx).host_field.read(cx).value().as_ref(),
+            "dbhost"
+        );
+        assert_eq!(
+            view.form.read(cx).port_field.read(cx).value().as_ref(),
+            "1433"
+        );
+        assert_eq!(
+            view.form.read(cx).user_field.read(cx).value().as_ref(),
+            "sa"
+        );
+        assert_eq!(
+            view.form.read(cx).password_field.read(cx).value().as_ref(),
+            "pw"
+        );
+        assert_eq!(
+            view.form.read(cx).database_field.read(cx).value().as_ref(),
+            "zsql"
+        );
+        assert_eq!(
+            view.form.read(cx).tls_field.read(cx).value().as_ref(),
+            "true"
+        );
+        assert!(view.form.read(cx).dim_reason().is_none());
     });
 }
 
@@ -633,13 +681,13 @@ fn an_unparseable_url_dims_the_field_section_with_a_reason_and_re_enables_once_v
         view.show_add_form(cx);
         view.set_url_input("postgres://app@", cx);
     });
-    manager.read_with(cx, |view, _cx| {
+    manager.read_with(cx, |view, cx| {
         assert!(
-            view.dim_reason().is_some(),
+            view.form.read(cx).dim_reason().is_some(),
             "an incomplete URL must dim the field section"
         );
         // The scheme is still recognizable, so the layout stays Postgres-shaped.
-        assert_eq!(view.pending_driver_id(), Ok("postgres"));
+        assert_eq!(view.pending_driver_id(cx), Ok("postgres"));
     });
 
     manager.update(cx, |view, cx| {
@@ -647,10 +695,13 @@ fn an_unparseable_url_dims_the_field_section_with_a_reason_and_re_enables_once_v
     });
     manager.read_with(cx, |view, cx| {
         assert!(
-            view.dim_reason().is_none(),
+            view.form.read(cx).dim_reason().is_none(),
             "a now-valid URL must clear the dim reason"
         );
-        assert_eq!(view.host_field.read(cx).value().as_ref(), "host");
+        assert_eq!(
+            view.form.read(cx).host_field.read(cx).value().as_ref(),
+            "host"
+        );
     });
 }
 
@@ -668,12 +719,12 @@ fn editing_the_port_field_changes_only_the_urls_port(cx: &mut TestAppContext) {
         view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
     manager.update(cx, |view, cx| {
-        view.port_field
-            .update(cx, |field, cx| field.set_value("6543", cx));
+        let port_field = view.form.read(cx).port_field.clone();
+        port_field.update(cx, |field, cx| field.set_value("6543", cx));
     });
     manager.read_with(cx, |view, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            view.form.read(cx).url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@host:6543/app?sslmode=require",
             "only the port must change in the rebuilt URL"
         );
@@ -692,12 +743,12 @@ fn editing_the_host_field_leaves_user_password_database_and_params_intact(cx: &m
         view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
     manager.update(cx, |view, cx| {
-        view.host_field
-            .update(cx, |field, cx| field.set_value("otherhost", cx));
+        let host_field = view.form.read(cx).host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("otherhost", cx));
     });
     manager.read_with(cx, |view, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            view.form.read(cx).url_field.read(cx).value().as_ref(),
             "postgres://app:s3cr3t@otherhost:5432/app?sslmode=require"
         );
     });
@@ -715,11 +766,11 @@ fn clearing_the_tls_field_removes_the_param_instead_of_leaving_it_empty(cx: &mut
         view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
     manager.update(cx, |view, cx| {
-        view.tls_field
-            .update(cx, |field, cx| field.set_value("", cx));
+        let tls_field = view.form.read(cx).tls_field.clone();
+        tls_field.update(cx, |field, cx| field.set_value("", cx));
     });
     manager.read_with(cx, |view, cx| {
-        let url = view.url_field.read(cx).value().to_string();
+        let url = view.form.read(cx).url_field.read(cx).value().to_string();
         assert_eq!(
             url, "postgres://app:s3cr3t@host:5432/app",
             "clearing the TLS field must drop sslmode entirely, not leave 'sslmode='"
@@ -740,12 +791,12 @@ fn editing_a_driver_field_rewrites_the_url_field_live(cx: &mut TestAppContext) {
         view.set_url_input("postgres://app@host:5432/orders", cx);
     });
     manager.update(cx, |view, cx| {
-        view.database_field
-            .update(cx, |field, cx| field.set_value("other_db", cx));
+        let database_field = view.form.read(cx).database_field.clone();
+        database_field.update(cx, |field, cx| field.set_value("other_db", cx));
     });
     manager.read_with(cx, |view, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            view.form.read(cx).url_field.read(cx).value().as_ref(),
             "postgres://app@host:5432/other_db",
             "URL rewritten"
         );
@@ -764,12 +815,12 @@ fn editing_the_sqlite_path_field_rewrites_the_url(cx: &mut TestAppContext) {
         view.set_url_input("sqlite::memory:", cx);
     });
     manager.update(cx, |view, cx| {
-        view.sqlite_path_field
-            .update(cx, |field, cx| field.set_value("/tmp/scratch.db", cx));
+        let sqlite_path_field = view.form.read(cx).sqlite_path_field.clone();
+        sqlite_path_field.update(cx, |field, cx| field.set_value("/tmp/scratch.db", cx));
     });
     manager.read_with(cx, |view, cx| {
         assert_eq!(
-            view.url_field.read(cx).value().as_ref(),
+            view.form.read(cx).url_field.read(cx).value().as_ref(),
             "sqlite:///tmp/scratch.db"
         );
     });
@@ -785,14 +836,15 @@ fn the_password_field_starts_masked_and_the_toggle_reveals_it(cx: &mut TestAppCo
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.read_with(cx, |view, cx| {
-        assert!(view.password_field.read(cx).is_masked());
+        assert!(view.form.read(cx).password_field.read(cx).is_masked());
     });
 
     manager.update(cx, |view, cx| {
-        view.toggle_password_visible(cx);
+        view.form
+            .update(cx, super::form::ConnectionForm::toggle_password_visible);
     });
     manager.read_with(cx, |view, cx| {
-        assert!(!view.password_field.read(cx).is_masked());
+        assert!(!view.form.read(cx).password_field.read(cx).is_masked());
     });
 }
 
@@ -1184,8 +1236,8 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
     let task = manager.update(cx, ConnectionManagerView::run_test);
     task.await;
 
-    manager.read_with(cx, |view, _app| {
-        match view.test_outcome() {
+    manager.read_with(cx, |view, app| {
+        match view.test_outcome(app) {
             Some(TestOutcome::Connected { .. }) => {}
             other => panic!("expected a successful Test outcome, got {other:?}"),
         }
@@ -1224,7 +1276,7 @@ async fn a_failed_test_reports_the_drivers_error_inline(cx: &mut TestAppContext)
     let task = manager.update(cx, ConnectionManagerView::run_test);
     task.await;
 
-    manager.read_with(cx, |view, _app| match view.test_outcome() {
+    manager.read_with(cx, |view, app| match view.test_outcome(app) {
         Some(TestOutcome::Failed(message)) => assert!(!message.is_empty()),
         other => panic!("expected a failed Test outcome, got {other:?}"),
     });
@@ -1295,8 +1347,8 @@ fn the_sqlite_field_section_renders_the_path_field_and_not_host_or_port(cx: &mut
     });
     vcx.run_until_parked();
 
-    manager.read_with(vcx, |view, _app| {
-        assert_eq!(view.pending_driver_id(), Ok("sqlite"));
+    manager.read_with(vcx, |view, app| {
+        assert_eq!(view.pending_driver_id(app), Ok("sqlite"));
     });
 }
 
@@ -1315,16 +1367,16 @@ fn the_field_section_renders_dimmed_while_unparseable_and_undimmed_once_valid(
         view.set_url_input("postgres://app@", cx);
     });
     vcx.run_until_parked();
-    manager.read_with(vcx, |view, _app| {
-        assert!(view.dim_reason().is_some());
+    manager.read_with(vcx, |view, app| {
+        assert!(view.form.read(app).dim_reason().is_some());
     });
 
     manager.update(vcx, |view, cx| {
         view.set_url_input("postgres://app@host/db", cx);
     });
     vcx.run_until_parked();
-    manager.read_with(vcx, |view, _app| {
-        assert!(view.dim_reason().is_none());
+    manager.read_with(vcx, |view, app| {
+        assert!(view.form.read(app).dim_reason().is_none());
     });
 }
 
@@ -1353,7 +1405,7 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
         .expect("the modal panel must be tagged and painted");
     assert_eq!(
         bounds.size.width,
-        super::theme::MODAL_WIDTH,
+        crate::ui::theme::MODAL_WIDTH,
         "a long URL must never widen the modal panel"
     );
 }
@@ -1492,19 +1544,20 @@ fn add_form_network_focus_chain(
     view: &ConnectionManagerView,
     cx: &Context<ConnectionManagerView>,
 ) -> Vec<FocusHandle> {
+    let form = view.form.read(cx);
     vec![
-        view.name_field.read(cx).focus_handle(cx),
-        view.url_field.read(cx).focus_handle(cx),
-        view.host_field.read(cx).focus_handle(cx),
-        view.port_field.read(cx).focus_handle(cx),
-        view.user_field.read(cx).focus_handle(cx),
-        view.password_field.read(cx).focus_handle(cx),
-        view.database_field.read(cx).focus_handle(cx),
-        view.tls_field.read(cx).focus_handle(cx),
-        view.cancel_focus.clone(),
-        view.test_focus.clone(),
-        view.connect_focus.clone(),
-        view.save_focus.clone(),
+        form.name_field.read(cx).focus_handle(cx),
+        form.url_field.read(cx).focus_handle(cx),
+        form.host_field.read(cx).focus_handle(cx),
+        form.port_field.read(cx).focus_handle(cx),
+        form.user_field.read(cx).focus_handle(cx),
+        form.password_field.read(cx).focus_handle(cx),
+        form.database_field.read(cx).focus_handle(cx),
+        form.tls_field.read(cx).focus_handle(cx),
+        form.cancel_focus.clone(),
+        form.test_focus.clone(),
+        form.connect_focus.clone(),
+        form.save_focus.clone(),
     ]
 }
 
@@ -1514,18 +1567,19 @@ fn edit_form_network_focus_chain(
     view: &ConnectionManagerView,
     cx: &Context<ConnectionManagerView>,
 ) -> Vec<FocusHandle> {
+    let form = view.form.read(cx);
     vec![
-        view.name_field.read(cx).focus_handle(cx),
-        view.url_field.read(cx).focus_handle(cx),
-        view.host_field.read(cx).focus_handle(cx),
-        view.port_field.read(cx).focus_handle(cx),
-        view.user_field.read(cx).focus_handle(cx),
-        view.password_field.read(cx).focus_handle(cx),
-        view.database_field.read(cx).focus_handle(cx),
-        view.tls_field.read(cx).focus_handle(cx),
-        view.cancel_focus.clone(),
-        view.test_focus.clone(),
-        view.save_focus.clone(),
+        form.name_field.read(cx).focus_handle(cx),
+        form.url_field.read(cx).focus_handle(cx),
+        form.host_field.read(cx).focus_handle(cx),
+        form.port_field.read(cx).focus_handle(cx),
+        form.user_field.read(cx).focus_handle(cx),
+        form.password_field.read(cx).focus_handle(cx),
+        form.database_field.read(cx).focus_handle(cx),
+        form.tls_field.read(cx).focus_handle(cx),
+        form.cancel_focus.clone(),
+        form.test_focus.clone(),
+        form.save_focus.clone(),
     ]
 }
 
@@ -1550,9 +1604,9 @@ fn assert_add_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url:
     });
     vcx.run_until_parked();
 
-    manager.read_with(vcx, |view, _app| {
+    manager.read_with(vcx, |view, app| {
         assert_eq!(
-            view.pending_driver_id(),
+            view.pending_driver_id(app),
             Ok("mysql"),
             "url {url} must resolve to the registered mysql driver"
         );
@@ -1583,9 +1637,9 @@ fn assert_edit_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url
     });
     vcx.run_until_parked();
 
-    manager.read_with(vcx, |view, _app| {
+    manager.read_with(vcx, |view, app| {
         assert_eq!(
-            view.pending_driver_id(),
+            view.pending_driver_id(app),
             Ok("mysql"),
             "url {url} must resolve to the registered mysql driver"
         );
@@ -1627,15 +1681,16 @@ fn focus_order_for_an_empty_url_contains_only_name_url_and_footer_buttons(cx: &m
     });
 
     manager.update(cx, |view, cx| {
-        assert!(view.pending_driver_id().is_err());
+        assert!(view.pending_driver_id(cx).is_err());
         let order = view.focus_order(cx);
+        let form = view.form.read(cx);
         let expected = vec![
-            view.name_field.read(cx).focus_handle(cx),
-            view.url_field.read(cx).focus_handle(cx),
-            view.cancel_focus.clone(),
-            view.test_focus.clone(),
-            view.connect_focus.clone(),
-            view.save_focus.clone(),
+            form.name_field.read(cx).focus_handle(cx),
+            form.url_field.read(cx).focus_handle(cx),
+            form.cancel_focus.clone(),
+            form.test_focus.clone(),
+            form.connect_focus.clone(),
+            form.save_focus.clone(),
         ];
         assert_eq!(
             order, expected,
@@ -1659,19 +1714,297 @@ fn focus_order_for_an_unrecognized_scheme_contains_only_name_url_and_footer_butt
     });
 
     manager.update(cx, |view, cx| {
-        assert!(view.pending_driver_id().is_err());
+        assert!(view.pending_driver_id(cx).is_err());
         let order = view.focus_order(cx);
+        let form = view.form.read(cx);
         let expected = vec![
-            view.name_field.read(cx).focus_handle(cx),
-            view.url_field.read(cx).focus_handle(cx),
-            view.cancel_focus.clone(),
-            view.test_focus.clone(),
-            view.connect_focus.clone(),
-            view.save_focus.clone(),
+            form.name_field.read(cx).focus_handle(cx),
+            form.url_field.read(cx).focus_handle(cx),
+            form.cancel_focus.clone(),
+            form.test_focus.clone(),
+            form.connect_focus.clone(),
+            form.save_focus.clone(),
         ];
         assert_eq!(
             order, expected,
             "an unrecognized scheme must expose no driver fields, not even a stale sqlite path field"
         );
+    });
+}
+
+// ---- on_form_event router (footer button wiring) -------------------------
+
+#[gpui::test]
+fn a_cancel_event_from_the_form_returns_the_modal_to_the_list(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("form-event-cancel");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.open(cx);
+        view.show_add_form(cx);
+        view.set_name_input("staging", cx);
+        view.form
+            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Cancel));
+    });
+
+    manager.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.current_view(),
+            ManagerView::List,
+            "a Cancel event emitted by the form must route through on_form_event to cancel_form"
+        );
+        assert!(view.form.read(cx).name_field.read(cx).value().is_empty());
+    });
+}
+
+#[gpui::test]
+fn an_add_event_from_the_form_persists_a_new_connection(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("form-event-add");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_name_input("from-footer", cx);
+        view.set_url_input("sqlite::memory:", cx);
+        view.form
+            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Add));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "an Add event emitted by the form must route through on_form_event to add_connection"
+        );
+        assert_eq!(view.connections()[0].connection.name, "from-footer");
+        assert_eq!(view.current_view(), ManagerView::List);
+    });
+}
+
+#[gpui::test]
+fn an_edit_event_from_the_form_updates_the_row_in_place(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("form-event-edit");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_edit_form(0, cx);
+        view.set_name_input("renamed via footer", cx);
+        let id = view.connections()[0].connection.id;
+        view.form
+            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Edit { id }));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "an Edit event must update the row in place, not append a duplicate"
+        );
+        assert_eq!(view.connections()[0].connection.name, "renamed via footer");
+        assert_eq!(
+            view.current_view(),
+            ManagerView::List,
+            "an Edit event emitted by the form must route through on_form_event to save_edit"
+        );
+    });
+}
+
+/// [`ConnectionManagerView::run_test`]'s spawned probe is real I/O the
+/// manager never awaits synchronously; the routing this test pins is
+/// [`super::ConnectionManagerView::on_form_event`] reaching `run_test` at
+/// all, which is already visible in the `Pending` outcome `run_test` sets
+/// before it ever spawns the probe -- the probe's own eventual result is
+/// covered by [`running_test_never_mutates_the_sessions_active_connection_or_persists`].
+#[gpui::test]
+fn a_test_event_from_the_form_starts_a_probe_via_run_test(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("form-event-test");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_url_input("sqlite::memory:", cx);
+        view.form
+            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Test));
+    });
+
+    manager.read_with(cx, |view, app| {
+        assert_eq!(
+            view.test_outcome(app),
+            Some(&TestOutcome::Pending),
+            "a Test event emitted by the form must route through on_form_event to run_test"
+        );
+    });
+}
+
+/// [`ConnectionManagerView::connect_unsaved`]'s equivalent of
+/// [`a_test_event_from_the_form_starts_a_probe_via_run_test`]'s doc comment:
+/// pins the routing through its synchronous, pre-await side effects (`active`
+/// and `status` updated before the connect itself resolves), the same
+/// contract [`connect_unsaved_updates_active_synchronously_before_the_connect_resolves`]
+/// asserts when calling `connect_unsaved` directly.
+#[gpui::test]
+fn a_connect_event_from_the_form_dispatches_a_connect_via_connect_unsaved(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("form-event-connect");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_name_input("via-footer", cx);
+        view.set_url_input("sqlite::memory:", cx);
+        view.form
+            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Connect));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("via-footer"),
+            "a Connect event emitted by the form must route through on_form_event to \
+             connect_unsaved"
+        );
+        assert!(
+            view.status()
+                .is_some_and(|status| status.contains("Connecting")),
+            "expected the connecting status connect_unsaved sets synchronously, got {:?}",
+            view.status()
+        );
+    });
+}
+
+// ---- Enter-to-submit (name/url TextFieldEvent::Submit) --------------------
+
+#[gpui::test]
+fn submitting_the_name_field_in_add_mode_persists_a_new_connection(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("submit-name-add");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_name_input("enter-submitted", cx);
+        view.set_url_input("sqlite::memory:", cx);
+        let name_field = view.form.read(cx).name_field.clone();
+        name_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "Enter in the name field must submit the add form, the same as clicking Save"
+        );
+        assert_eq!(view.connections()[0].connection.name, "enter-submitted");
+        assert_eq!(view.current_view(), ManagerView::List);
+    });
+}
+
+#[gpui::test]
+fn submitting_the_url_field_in_add_mode_persists_a_new_connection(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("submit-url-add");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_name_input("enter-submitted-url", cx);
+        view.set_url_input("sqlite::memory:", cx);
+        let url_field = view.form.read(cx).url_field.clone();
+        url_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "Enter in the url field must submit the add form, the same as clicking Save"
+        );
+        assert_eq!(view.connections()[0].connection.name, "enter-submitted-url");
+        assert_eq!(view.current_view(), ManagerView::List);
+    });
+}
+
+#[gpui::test]
+fn submitting_the_name_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("submit-name-edit");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_edit_form(0, cx);
+        view.set_name_input("edited via enter", cx);
+        let name_field = view.form.read(cx).name_field.clone();
+        name_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "Enter in edit mode must update the row in place, not append a duplicate"
+        );
+        assert_eq!(view.connections()[0].connection.name, "edited via enter");
+        assert_eq!(view.current_view(), ManagerView::List);
+    });
+}
+
+#[gpui::test]
+fn submitting_the_url_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("submit-url-edit");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_edit_form(0, cx);
+        view.set_name_input("edited via enter url", cx);
+        let url_field = view.form.read(cx).url_field.clone();
+        url_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
+    });
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.connections().len(),
+            1,
+            "Enter in edit mode must update the row in place, not append a duplicate"
+        );
+        assert_eq!(
+            view.connections()[0].connection.name,
+            "edited via enter url"
+        );
+        assert_eq!(view.current_view(), ManagerView::List);
     });
 }
