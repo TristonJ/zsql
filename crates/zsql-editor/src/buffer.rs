@@ -300,6 +300,51 @@ impl TextBuffer {
         self.desired_column = self.cursor.column;
     }
 
+    /// Select an entire line, from its start to its end, regardless of where
+    /// on that line the caller's originating click landed. `line` clamps to
+    /// the document's last line index.
+    pub fn select_line(&mut self, line: usize) {
+        self.break_edit_group();
+        let line = line.min(self.lines.len() - 1);
+        self.anchor = Some(Position::new(line, 0));
+        self.cursor = self.line_end(line);
+        self.desired_column = self.cursor.column;
+    }
+
+    /// Select the run of same-class characters touching `at`, e.g. the word
+    /// under a double-click. A run of alphanumeric/underscore characters is
+    /// one class, a run of whitespace is another, and every other character
+    /// forms a run of its own class with its punctuation neighbors. `at`
+    /// clamps to the document as [`TextBuffer::set_cursor`] does; a clamped
+    /// column at or past its line's end (including an empty line) selects
+    /// nothing, placing the cursor there instead.
+    pub fn select_word(&mut self, at: Position) {
+        self.break_edit_group();
+        let clamped = self.clamp(at);
+        let chars: Vec<char> = self.lines[clamped.line].chars().collect();
+
+        let Some(&clicked) = chars.get(clamped.column) else {
+            self.cursor = clamped;
+            self.anchor = None;
+            self.desired_column = clamped.column;
+            return;
+        };
+
+        let class = CharClass::of(clicked);
+        let mut start = clamped.column;
+        while start > 0 && CharClass::of(chars[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = clamped.column;
+        while end < chars.len() && CharClass::of(chars[end]) == class {
+            end += 1;
+        }
+
+        self.anchor = Some(Position::new(clamped.line, start));
+        self.cursor = Position::new(clamped.line, end);
+        self.desired_column = self.cursor.column;
+    }
+
     /// Move the cursor to `position` with no active selection, clamped to
     /// the document. Used by input handling that sets the cursor directly
     /// (mouse clicks, IME) rather than via a movement action.
@@ -720,6 +765,27 @@ impl TextBuffer {
     }
 }
 
+/// The class of character a double-click word-selection expands over: a run
+/// of the same class is treated as one "word" to select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+impl CharClass {
+    fn of(ch: char) -> Self {
+        if ch.is_alphanumeric() || ch == '_' {
+            Self::Word
+        } else if ch.is_whitespace() {
+            Self::Whitespace
+        } else {
+            Self::Punctuation
+        }
+    }
+}
+
 fn char_len(line: &str) -> usize {
     line.chars().count()
 }
@@ -980,6 +1046,204 @@ mod tests {
         assert_eq!(buffer.selected_text(), "select 1;\nfrom dual;");
         assert_eq!(buffer.selection().unwrap().anchor, Position::new(0, 0));
         assert_eq!(buffer.cursor(), Position::new(1, 10));
+    }
+
+    #[test]
+    fn select_line_on_the_first_line_selects_its_full_text() {
+        let mut buffer = TextBuffer::from_text("select 1;\nfrom dual;\nwhere 1=1;");
+        buffer.select_line(0);
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 0));
+        assert_eq!(end, Position::new(0, "select 1;".chars().count()));
+        assert_eq!(buffer.selected_text(), "select 1;");
+    }
+
+    #[test]
+    fn select_line_on_a_middle_line_selects_only_that_line() {
+        let mut buffer = TextBuffer::from_text("select 1;\nfrom dual;\nwhere 1=1;");
+        buffer.select_line(1);
+        assert_eq!(buffer.selected_text(), "from dual;");
+        assert_eq!(
+            buffer.cursor(),
+            Position::new(1, "from dual;".chars().count())
+        );
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(1, 0));
+        assert_eq!(end, Position::new(1, "from dual;".chars().count()));
+        assert_eq!(buffer.text(), "select 1;\nfrom dual;\nwhere 1=1;");
+    }
+
+    #[test]
+    fn select_line_on_an_empty_line_places_the_cursor_with_no_visible_selection() {
+        let mut buffer = TextBuffer::from_text("a\nb\n");
+        buffer.select_line(2);
+        assert!(buffer.selection().is_none());
+        assert_eq!(buffer.cursor(), Position::new(2, 0));
+
+        let mut empty_buffer = TextBuffer::from_text("");
+        empty_buffer.select_line(0);
+        assert!(empty_buffer.selection().is_none());
+        assert_eq!(empty_buffer.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn select_line_on_the_last_line_without_a_trailing_newline_selects_to_its_end() {
+        let mut buffer = TextBuffer::from_text("one\ntwo");
+        buffer.select_line(1);
+        assert_eq!(buffer.selected_text(), "two");
+        assert_eq!(buffer.cursor(), Position::new(1, 3));
+    }
+
+    #[test]
+    fn select_line_clamps_an_out_of_range_line_to_the_last_line() {
+        let mut buffer = TextBuffer::from_text("one\ntwo\nthree");
+        buffer.select_line(999);
+        assert_eq!(buffer.selected_text(), "three");
+        assert_eq!(buffer.cursor(), Position::new(2, 5));
+    }
+
+    #[test]
+    fn select_line_ignores_any_prior_cursor_column() {
+        let mut early_cursor = TextBuffer::from_text("select 1;\nfrom dual;");
+        early_cursor.set_cursor(Position::new(0, 0));
+        early_cursor.select_line(1);
+
+        let mut late_cursor = TextBuffer::from_text("select 1;\nfrom dual;");
+        late_cursor.move_document_end();
+        late_cursor.select_line(1);
+
+        assert_eq!(early_cursor.selection(), late_cursor.selection());
+        assert_eq!(early_cursor.cursor(), late_cursor.cursor());
+    }
+
+    #[test]
+    fn select_line_breaks_the_undo_group() {
+        // Selects an empty line so select_line leaves no selection to
+        // replace, isolating the undo-group break from insert_text's
+        // separate selection-replacement behavior.
+        let mut buffer = TextBuffer::from_text("\n");
+        buffer.insert_text("a");
+        buffer.insert_text("b");
+        buffer.select_line(1);
+        buffer.insert_text("c");
+        buffer.insert_text("d");
+        assert_eq!(buffer.text(), "ab\ncd");
+
+        assert!(buffer.undo());
+        assert_eq!(
+            buffer.text(),
+            "ab\n",
+            "the second typing run alone should undo first"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "\n");
+        assert!(!buffer.undo());
+    }
+
+    // -- select_word --------------------------------------------------------
+
+    #[test]
+    fn select_word_in_the_middle_of_a_word_selects_the_whole_word() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.select_word(Position::new(0, 2));
+        assert_eq!(buffer.selected_text(), "hello");
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 0));
+        assert_eq!(end, Position::new(0, 5));
+    }
+
+    #[test]
+    fn select_word_at_a_words_first_char_selects_the_whole_word() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.select_word(Position::new(0, 0));
+        assert_eq!(buffer.selected_text(), "hello");
+    }
+
+    #[test]
+    fn select_word_at_a_words_last_char_selects_the_whole_word() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.select_word(Position::new(0, 4));
+        assert_eq!(buffer.selected_text(), "hello");
+    }
+
+    #[test]
+    fn select_word_on_a_word_starting_at_line_start_selects_from_column_zero() {
+        let mut buffer = TextBuffer::from_text("start middle end");
+        buffer.select_word(Position::new(0, 1));
+        assert_eq!(buffer.selected_text(), "start");
+        let (start, _) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 0));
+    }
+
+    #[test]
+    fn select_word_on_a_word_ending_at_line_end_selects_through_the_line_end() {
+        let mut buffer = TextBuffer::from_text("hello world");
+        buffer.select_word(Position::new(0, 10));
+        assert_eq!(buffer.selected_text(), "world");
+        let (_, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(end, Position::new(0, 11));
+    }
+
+    #[test]
+    fn select_word_on_whitespace_between_words_selects_only_the_whitespace_run() {
+        let mut buffer = TextBuffer::from_text("foo   bar");
+        buffer.select_word(Position::new(0, 4));
+        assert_eq!(buffer.selected_text(), "   ");
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 3));
+        assert_eq!(end, Position::new(0, 6));
+    }
+
+    #[test]
+    fn select_word_on_a_punctuation_run_selects_only_that_run() {
+        let mut buffer = TextBuffer::from_text("foo...bar");
+        buffer.select_word(Position::new(0, 4));
+        assert_eq!(buffer.selected_text(), "...");
+
+        let mut operators = TextBuffer::from_text("a =<> b");
+        operators.select_word(Position::new(0, 3));
+        assert_eq!(operators.selected_text(), "=<>");
+    }
+
+    #[test]
+    fn select_word_on_an_empty_line_selects_nothing() {
+        let mut buffer = TextBuffer::from_text("a\n\nb");
+        buffer.select_word(Position::new(1, 0));
+        assert!(buffer.selection().is_none());
+        assert_eq!(buffer.cursor(), Position::new(1, 0));
+
+        let mut empty_buffer = TextBuffer::from_text("");
+        empty_buffer.select_word(Position::new(0, 0));
+        assert!(empty_buffer.selection().is_none());
+        assert_eq!(empty_buffer.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn select_word_at_or_past_the_line_end_selects_nothing() {
+        let mut buffer = TextBuffer::from_text("hello");
+        buffer.select_word(Position::new(0, 5));
+        assert!(buffer.selection().is_none());
+        assert_eq!(buffer.cursor(), Position::new(0, 5));
+    }
+
+    #[test]
+    fn select_word_handles_accented_word_chars_by_char_column_not_byte_offset() {
+        let mut buffer = TextBuffer::from_text("caf\u{e9} tea");
+        buffer.select_word(Position::new(0, 3));
+        assert_eq!(buffer.selected_text(), "caf\u{e9}");
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 0));
+        assert_eq!(end, Position::new(0, 4));
+    }
+
+    #[test]
+    fn select_word_handles_cjk_word_chars_by_char_column() {
+        let mut buffer = TextBuffer::from_text("\u{4e2d}\u{6587} select");
+        buffer.select_word(Position::new(0, 1));
+        assert_eq!(buffer.selected_text(), "\u{4e2d}\u{6587}");
+        let (start, end) = buffer.selection().unwrap().ordered();
+        assert_eq!(start, Position::new(0, 0));
+        assert_eq!(end, Position::new(0, 2));
     }
 
     #[test]
