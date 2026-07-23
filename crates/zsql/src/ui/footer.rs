@@ -49,8 +49,11 @@ impl ConnectionFooterView {
 
 impl Render for ConnectionFooterView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = self.session.read(cx);
         let display = footer_display(
-            self.session.read(cx).is_connected(),
+            session.state(),
+            session.liveness(),
+            session.is_connected(),
             self.connections.read(cx).active(),
         );
         let colors = cx.theme().colors;
@@ -91,6 +94,12 @@ impl Render for ConnectionFooterView {
                         .text_color(rgb(colors.text_tertiary))
                         .child(host),
                 ),
+            FooterDisplay::Connecting => row.child(grid::status_dot(colors.status_warn)).child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(colors.text_secondary))
+                    .child("Connecting…"),
+            ),
             FooterDisplay::Disconnected => row
                 .child(grid::status_dot_outline(colors.text_tertiary))
                 .child(
@@ -135,6 +144,29 @@ mod tests {
                 ConnectionManagerView::new(
                     session_for_connections,
                     empty_store_for_test("render"),
+                    crate::config::Config::default().liveness.probe_timeout(),
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, cx)
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn renders_without_panicking_when_connecting(cx: &mut TestAppContext) {
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                crate::session::SessionState::Connecting,
+                zsql_core::ResultSet::default(),
+            )
+        });
+        let session_for_connections = session.clone();
+        let (_footer, vcx) = cx.add_window_view(|_window, cx| {
+            let connections = cx.new(|cx| {
+                ConnectionManagerView::new(
+                    session_for_connections,
+                    empty_store_for_test("render-connecting"),
                     crate::config::Config::default().liveness.probe_timeout(),
                     cx,
                 )

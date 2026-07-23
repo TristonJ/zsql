@@ -29,7 +29,7 @@ use zsql_ui::theme::ActiveTheme;
 use super::theme;
 use crate::connections::{ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection};
 use crate::drivers::{self, detect_driver_id};
-use crate::session::{Session, SessionState, probe_connection};
+use crate::session::{LivenessState, Session, SessionState, probe_connection};
 use crate::tab_session::ConnectionKey;
 use crate::ui::format::host_label;
 
@@ -77,27 +77,50 @@ pub enum FooterDisplay {
         /// URL.
         host: String,
     },
+    /// Show a "Connecting..." status while a connect attempt is in flight.
+    Connecting,
     /// Show the "not connected, click to connect" prompt with a hollow dot.
     Disconnected,
 }
 
-/// The connection footer's display, given whether a live connection is
-/// currently held (see [`Session::is_connected`]) and whichever connection
-/// is tracked as active. Connected only counts when both hold: the session
-/// actually holds a live connection *and* an active connection is tracked --
-/// a connected session with no tracked active connection (which should not
-/// normally happen, since every connect path threads one through) still
-/// falls back to the disconnected prompt rather than showing a blank name.
+/// The connection footer's display, given the session's real lifecycle
+/// state and connection liveness, whether a live connection is currently
+/// held (see [`Session::is_connected`]), and whichever connection is
+/// tracked as active. Applies the same three-way Connecting/Connected/
+/// Disconnected distinction the results status bar uses (see
+/// `crate::ui::results`'s `status_indicator`), in this precedence order:
 ///
-/// Deliberately takes connection liveness rather than [`SessionState`]
-/// itself: a query error moves `state` to [`SessionState::Error`] without
-/// dropping the underlying connection, and the footer must keep showing the
-/// still-connected database through that, not fall back to "Not connected".
+/// 1. [`LivenessState::Unreachable`] always overrides to [`FooterDisplay::Disconnected`],
+///    regardless of `state`.
+/// 2. [`SessionState::Connecting`] always renders [`FooterDisplay::Connecting`], even if
+///    `session_is_connected` is still `true` -- mid-switch, the prior
+///    connection's `Arc` is still held until the new connect resolves, and
+///    that stale "still connected" read must not win over the connect
+///    attempt actually in flight.
+/// 3. Otherwise, `session_is_connected` together with a tracked `active`
+///    connection renders [`FooterDisplay::Connected`].
+/// 4. Everything else (no URL configured, an errored connect with no live
+///    connection, or a connected session with no active connection
+///    tracked, which should not normally happen since every connect path
+///    threads one through) falls back to [`FooterDisplay::Disconnected`].
+///
+/// Note that a query error (as opposed to a connect failure) moves `state`
+/// to [`SessionState::Error`] without dropping the underlying connection,
+/// so rule 3 still applies and the footer keeps showing the still-connected
+/// database rather than falling back to "Not connected".
 #[must_use]
 pub fn footer_display(
+    state: &SessionState,
+    liveness: &LivenessState,
     session_is_connected: bool,
     active: Option<&ActiveConnection>,
 ) -> FooterDisplay {
+    if matches!(liveness, LivenessState::Unreachable(_)) {
+        return FooterDisplay::Disconnected;
+    }
+    if matches!(state, SessionState::Connecting) {
+        return FooterDisplay::Connecting;
+    }
     match (session_is_connected, active) {
         (true, Some(active)) => FooterDisplay::Connected {
             name: active.name.clone(),
@@ -1006,12 +1029,18 @@ impl ConnectionManagerView {
     /// connect-then-introspect sequencing the app runs at startup -- follows
     /// a successful connect with [`Session::introspect`] so the schema
     /// sidebar reflects the newly chosen connection rather than staying
-    /// empty or showing the previous connection's stale tree. On success,
-    /// updates [`Self::active`] to this row's name/url so the footer and the
-    /// modal's active-row highlight both reflect the switch. Updates
-    /// [`Self::status`] with the final outcome once the whole sequence
-    /// settles. Does not itself close the modal; see
-    /// [`Self::connect_and_close`] for the row-click/Enter path that does.
+    /// empty or showing the previous connection's stale tree.
+    ///
+    /// [`Self::active`] is updated to this row's name/url synchronously,
+    /// before the connect attempt itself runs, so anything observing this
+    /// view's active connection (the footer, the modal's active-row
+    /// highlight, and -- through it -- `ui::workspace::WorkspaceView`'s own
+    /// tab/schema reset) reacts immediately rather than waiting for the
+    /// attempt to succeed or fail; a failed attempt never reverts `active`
+    /// back to whatever connection preceded it. Updates [`Self::status`]
+    /// with the final outcome once the whole sequence settles. Does not
+    /// itself close the modal; see [`Self::connect_and_close`] for the
+    /// row-click/Enter path that does.
     #[tracing::instrument(name = "connection_manager_connect", skip_all)]
     pub fn connect_index(&mut self, index: usize, cx: &mut Context<Self>) -> Task<()> {
         let Some(row) = self.rows.get(index) else {
@@ -1030,19 +1059,18 @@ impl ConnectionManagerView {
         };
         tracing::info!(name = %name, "connecting to saved connection");
         self.status = Some("connecting...".to_string());
-        cx.notify();
-
-        let session = self.session.clone();
-        let active_on_success = ActiveConnection {
+        self.active = Some(ActiveConnection {
             id: Some(row.connection.id),
             name: name.clone(),
             url: url.clone(),
-        };
+        });
+        cx.notify();
+
+        let connect_task = self
+            .session
+            .update(cx, |session, cx| session.connect_to(url, cx));
+        let session = self.session.clone();
         cx.spawn(async move |this, cx| {
-            let Ok(connect_task) = session.update(cx, |session, cx| session.connect_to(url, cx))
-            else {
-                return;
-            };
             connect_task.await;
 
             let outcome = session.read_with(cx, |session, _app| match session.state() {
@@ -1061,9 +1089,6 @@ impl ConnectionManagerView {
             }
 
             let _ = this.update(cx, |view, cx| {
-                if outcome.is_ok() {
-                    view.active = Some(active_on_success);
-                }
                 view.status = Some(match outcome {
                     Ok(()) => format!("Connected to {name}."),
                     Err(reason) => format!("Failed to connect to {name}: {reason}"),
@@ -1088,8 +1113,13 @@ impl ConnectionManagerView {
     /// Connect to the form's current URL through the session, without
     /// persisting it to the store. Rejects an empty or unrecognized-scheme
     /// URL the same way [`validate_new_connection`] does, without touching
-    /// the session. On a successful connect, closes the modal; a failed
-    /// connect leaves the modal open with the error in the status line.
+    /// the session.
+    ///
+    /// [`Self::active`] is updated to this URL synchronously, before the
+    /// connect attempt itself runs (see [`Self::connect_index`]'s doc
+    /// comment for why). On a successful connect, closes the modal; a
+    /// failed connect leaves the modal open with the error in the status
+    /// line, without reverting `active`.
     #[tracing::instrument(name = "connection_manager_connect_unsaved", skip_all)]
     pub fn connect_unsaved(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let url = self.url_field.read(cx).value().to_string();
@@ -1106,19 +1136,18 @@ impl ConnectionManagerView {
         };
         tracing::info!(name = %display_name, "connecting to unsaved connection");
         self.status = Some(format!("Connecting to {display_name}..."));
-        cx.notify();
-
-        let session = self.session.clone();
-        let active_on_success = ActiveConnection {
+        self.active = Some(ActiveConnection {
             id: None,
             name: display_name.clone(),
             url: url.clone(),
-        };
+        });
+        cx.notify();
+
+        let connect_task = self
+            .session
+            .update(cx, |session, cx| session.connect_to(url, cx));
+        let session = self.session.clone();
         cx.spawn(async move |this, cx| {
-            let Ok(connect_task) = session.update(cx, |session, cx| session.connect_to(url, cx))
-            else {
-                return;
-            };
             connect_task.await;
 
             let outcome = session.read_with(cx, |session, _app| match session.state() {
@@ -1138,7 +1167,6 @@ impl ConnectionManagerView {
 
             let _ = this.update(cx, |view, cx| {
                 if outcome.is_ok() {
-                    view.active = Some(active_on_success);
                     view.close(cx);
                 } else if let Err(reason) = &outcome {
                     view.status = Some(format!("Failed to connect to {display_name}: {reason}"));

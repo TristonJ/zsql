@@ -956,13 +956,13 @@ mod resize_tests {
 mod render_tests {
     use std::time::Duration;
 
-    use gpui::AppContext as _;
+    use gpui::{AppContext as _, Entity};
     use zsql_core::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 
     use super::WorkspaceView;
     use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::{ConnectionArgs, ConnectionStore};
-    use crate::session::{SchemaState, Session};
+    use crate::session::{SchemaState, Session, SessionState};
     use crate::tab_session::{self, ConnectionKey};
     use crate::ui::connections::ActiveConnection;
 
@@ -1314,6 +1314,218 @@ mod render_tests {
                  not conn-a's leftover tabs"
             );
             assert!(!tabs.tabs()[0].dirty());
+        });
+    }
+
+    /// Build a workspace with two saved connections ("conn-a", already
+    /// active with an open generated tab standing in for its own tabs and
+    /// captured results, and "conn-b" at `conn_b_url`), for the connect-index
+    /// switch-reset tests below.
+    fn build_switch_fixture<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        label: &str,
+        conn_b_url: &str,
+    ) -> (
+        Entity<Session>,
+        Entity<WorkspaceView>,
+        &'a mut gpui::VisualTestContext,
+        super::TabId,
+    ) {
+        let session = sample_schema_session(cx);
+        let paths = PersistenceTestPaths::new(label);
+        let mut store = ConnectionStore::load(&paths.connections).expect("load must succeed");
+        store
+            .add(ConnectionArgs {
+                name: "conn-a".to_owned(),
+                url: "postgres://localhost/a".to_owned(),
+            })
+            .expect("add conn-a must succeed");
+        store
+            .add(ConnectionArgs {
+                name: "conn-b".to_owned(),
+                url: conn_b_url.to_owned(),
+            })
+            .expect("add conn-b must succeed");
+
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session.clone(),
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                store,
+                Duration::from_secs(2),
+                None,
+                cx,
+            )
+        });
+
+        // Mark "conn-a" active (without touching the session -- it is
+        // already `Connected`/`Ready` by construction) and open a generated
+        // tab against it, standing in for connection A's own open tabs and
+        // captured results that the switch under test must discard.
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(
+                ActiveConnection {
+                    id: None,
+                    name: "conn-a".to_owned(),
+                    url: "postgres://localhost/a".to_owned(),
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let generated_id = workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.open_or_reuse_generated("public", "orders", cx)
+            })
+        });
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert!(
+                tabs.tabs().iter().any(|tab| tab.id() == generated_id),
+                "connection A's generated tab must be open before the switch"
+            );
+        });
+
+        (session, workspace, vcx, generated_id)
+    }
+
+    /// Dispatching a switch through the real `ConnectionManagerView::connect_index`
+    /// path must reset the schema tree and swap the open tabs synchronously,
+    /// at the moment the switch is dispatched -- not once (or if) the
+    /// connect attempt it kicks off actually resolves. Reads every assertion
+    /// right after the dispatching call returns, before awaiting its task or
+    /// advancing the executor at all, then lets the (successful) connect
+    /// play out to prove the ordinary happy path is otherwise unaffected.
+    #[gpui::test]
+    async fn switching_via_connect_index_resets_the_tree_and_tabs_before_the_connect_resolves(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let (session, workspace, vcx, generated_id) =
+            build_switch_fixture(cx, "connect-index-sync-reset", "sqlite::memory:");
+
+        // Dispatch the switch to "conn-b" and read everything back
+        // synchronously -- no `.await` on the returned task, no
+        // `run_until_parked`, yet.
+        let connections = workspace.read_with(vcx, |workspace, _cx| workspace.connections.clone());
+        let task = connections.update(vcx, |connections, cx| connections.connect_index(1, cx));
+
+        session.read_with(vcx, |session, _app| {
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "expected the schema tree to reset synchronously, got {:?}",
+                session.schema()
+            );
+        });
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert_eq!(
+                tabs.tabs().len(),
+                1,
+                "expected only the fresh default tab, got {:?}",
+                tabs.tabs()
+                    .iter()
+                    .map(super::Tab::title)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !tabs.tabs().iter().any(|tab| tab.id() == generated_id),
+                "connection A's generated tab must not survive the switch"
+            );
+            let results = workspace.results.read(cx);
+            assert_eq!(
+                results.source_label_for_test(),
+                "query",
+                "the results pane must no longer show connection A's captured label"
+            );
+        });
+
+        task.await;
+
+        session.read_with(vcx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected the switch to succeed, got {:?}",
+                session.state()
+            );
+        });
+        connections.read_with(vcx, |connections, _app| {
+            assert_eq!(
+                connections.active().map(|active| active.name.as_str()),
+                Some("conn-b"),
+                "expected the successful switch to leave conn-b active"
+            );
+            assert!(
+                connections
+                    .status()
+                    .is_some_and(|status| status.contains("Connected to conn-b")),
+                "expected the usual success status text, got {:?}",
+                connections.status()
+            );
+        });
+        workspace.read_with(vcx, |workspace, cx| {
+            assert_eq!(
+                workspace.tabs.read(cx).tabs().len(),
+                1,
+                "a successful connect must not add or remove tabs beyond the reset"
+            );
+        });
+    }
+
+    /// The same switch as above, but the target connection fails: the
+    /// workspace must not revert to connection A's tree or tabs, and
+    /// `active` must stay pointed at the failed target rather than
+    /// resurrecting the connection that preceded it.
+    #[gpui::test]
+    async fn a_failed_switch_via_connect_index_leaves_the_reset_tree_and_tabs_in_place(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let (session, workspace, vcx, generated_id) =
+            build_switch_fixture(cx, "connect-index-sync-reset-fail", "cassandra://host/db");
+
+        let connections = workspace.read_with(vcx, |workspace, _cx| workspace.connections.clone());
+        let task = connections.update(vcx, |connections, cx| connections.connect_index(1, cx));
+        task.await;
+
+        session.read_with(vcx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected the switch to fail, got {:?}",
+                session.state()
+            );
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "a failed switch must not resurrect connection A's schema tree, got {:?}",
+                session.schema()
+            );
+        });
+        connections.read_with(vcx, |connections, _app| {
+            assert_eq!(
+                connections.active().map(|active| active.name.as_str()),
+                Some("conn-b"),
+                "active must stay pointed at the failed target, not revert to conn-a"
+            );
+        });
+        workspace.read_with(vcx, |workspace, cx| {
+            let tabs = workspace.tabs.read(cx);
+            assert_eq!(
+                tabs.tabs().len(),
+                1,
+                "expected only conn-b's fresh default tab to remain"
+            );
+            assert!(
+                !tabs.tabs().iter().any(|tab| tab.id() == generated_id),
+                "connection A's generated tab must not have been resurrected"
+            );
         });
     }
 

@@ -1154,21 +1154,41 @@ impl ResultsView {
             .collect()
     }
 
+    /// The status bar's connection-lifecycle dot color, label, and trailing
+    /// error text (if any), from the session's real state and liveness --
+    /// never [`ResultsView::effective_state`]'s frozen tab snapshot. A tab
+    /// frozen to an older, successful result must not keep showing
+    /// "Connected" while the session itself is `Connecting` to a different
+    /// target, has errored, or has gone unreachable; conversely the label
+    /// and error text are always computed from the same state, so they can
+    /// never disagree.
+    ///
+    /// [`SessionState::Connected`] alone is enough for the "Connected"
+    /// label: every registered driver's `connect()` already performs a real
+    /// pool connection plus a synchronous liveness check before resolving,
+    /// so `Connected` already implies a verified-reachable connection.
+    /// Waiting for the recurring probe's first [`LivenessState::Healthy`]
+    /// result on top of that would only add a probe-interval-sized delay
+    /// with no correctness benefit.
+    fn connection_status(&self, cx: &Context<Self>) -> (u32, &'static str, Option<String>) {
+        let session = self.session.read(cx);
+        let state = session.state();
+        let liveness = session.liveness();
+        let (dot_color, label) = status_indicator(state, liveness, cx.theme());
+        let error_message = match state {
+            SessionState::Error(message) => Some(message.clone()),
+            _ => None,
+        };
+        (dot_color, label, error_message)
+    }
+
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time. `text_document` is the same document
     /// [`ResultsView::render_bar`] was given.
     fn render_status_bar(&self, text_document: Option<&str>, cx: &Context<Self>) -> Div {
         let active_theme = cx.theme();
         let colors = active_theme.colors;
-        let session = self.session.read(cx);
-        // Liveness is the connection's real-time health, independent of
-        // which tab is displayed, so it is read straight off `session`
-        // rather than through `effective_state`: a dead connection must
-        // show as disconnected regardless of whether the active tab is
-        // frozen to an older, still-successful snapshot.
-        let liveness = session.liveness().clone();
-        let state = self.effective_state(cx);
-        let (dot_color, label) = status_indicator(state, &liveness, active_theme);
+        let (dot_color, label, error_message) = self.connection_status(cx);
 
         let mut bar = div()
             .flex()
@@ -1192,27 +1212,35 @@ impl ResultsView {
                     .child(label),
             );
 
+        // Query metrics (row/line count, elapsed time) keep coming from the
+        // displayed tab's own effective state, frozen or live: a frozen
+        // tab's completed-query numbers are unrelated to the session's
+        // current connection lifecycle.
+        let effective_state = self.effective_state(cx);
         let (metrics_count, metrics_unit) = match text_document {
             Some(document) => (document_line_count(document), "lines"),
             None => (self.effective_result(cx).rows.len(), "rows"),
         };
-        if let Some((count_text, elapsed_text)) = status_metrics(state, metrics_count, metrics_unit)
+        if let Some((count_text, elapsed_text)) =
+            status_metrics(effective_state, metrics_count, metrics_unit)
         {
             bar = bar.child(count_text).child(elapsed_text);
         }
 
-        if let Some(total_row_count_text) = format_total_row_count(session.row_count()) {
+        if let Some(total_row_count_text) =
+            format_total_row_count(self.session.read(cx).row_count())
+        {
             bar = bar.child(total_row_count_text);
         }
 
-        if let SessionState::Error(message) = state {
+        if let Some(message) = error_message {
             bar = bar.child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_color(rgb(colors.status_error))
-                    .child(message.clone()),
+                    .child(message),
             );
         }
 
@@ -2364,6 +2392,141 @@ mod tests {
             Some(("17 lines".to_owned(), "3 ms".to_owned())),
             "the Text view's status metric must read lines, not rows"
         );
+    }
+
+    // ---- connection_status: the status bar's real-session-state wiring --
+
+    #[gpui::test]
+    fn connection_status_shows_connecting_for_a_frozen_tab_while_the_session_is_switching(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(SessionState::Connecting, ResultSet::default())
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+
+        view.update(vcx, |view, cx| {
+            view.show_snapshot(
+                super::ResultsSnapshot {
+                    source_label: "public.orders".into(),
+                    state: SessionState::Results(Duration::from_millis(42)),
+                    result: sample_result(),
+                },
+                cx,
+            );
+        });
+
+        view.update(vcx, |view, cx| {
+            let (_dot_color, label, error) = view.connection_status(cx);
+            assert_eq!(
+                label, "Connecting…",
+                "switching sessions must show Connecting, not the frozen tab's stale Connected"
+            );
+            assert!(error.is_none());
+
+            let metrics = status_metrics(
+                view.effective_state(cx),
+                view.effective_result(cx).rows.len(),
+                "rows",
+            );
+            assert_eq!(
+                metrics,
+                Some(("2 rows".to_owned(), "42 ms".to_owned())),
+                "the frozen tab's own row/elapsed metrics must be unaffected by the switch"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn connection_status_never_shows_connected_for_a_failed_or_timed_out_connect(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                SessionState::Error("liveness probe timed out after 3000ms".to_owned()),
+                ResultSet::default(),
+            )
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+
+        // The tab is still frozen to a prior, successful run: the failed
+        // connect must not be masked by it.
+        view.update(vcx, |view, cx| {
+            view.show_snapshot(
+                super::ResultsSnapshot {
+                    source_label: "public.orders".into(),
+                    state: SessionState::Results(Duration::from_millis(9)),
+                    result: sample_result(),
+                },
+                cx,
+            );
+        });
+
+        view.update(vcx, |view, cx| {
+            let (_dot_color, label, error) = view.connection_status(cx);
+            assert_ne!(label, "Connected");
+            assert_eq!(label, "Error");
+            assert_eq!(
+                error,
+                Some("liveness probe timed out after 3000ms".to_owned())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn connection_status_shows_connected_immediately_after_connect_without_waiting_for_a_probe(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A freshly successful connect: liveness has not had time to reach
+        // Healthy yet (no probe has ticked), and there is no frozen tab.
+        let session = cx
+            .new(|_cx| Session::new_for_render_test(SessionState::Connected, ResultSet::default()));
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+
+        view.update(vcx, |view, cx| {
+            let (_dot_color, label, error) = view.connection_status(cx);
+            assert_eq!(label, "Connected");
+            assert!(error.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn connection_status_shows_disconnected_when_the_session_liveness_is_unreachable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Query results were previously frozen into the tab while the
+        // connection was healthy; the session's liveness has since gone
+        // Unreachable and must override the stale frozen indicator.
+        let session = cx
+            .new(|_cx| Session::new_for_render_test(SessionState::Connected, ResultSet::default()));
+        session.update(cx, |session, _cx| {
+            session.set_liveness_for_test(LivenessState::Unreachable("connection reset".into()));
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+
+        view.update(vcx, |view, cx| {
+            view.show_snapshot(
+                super::ResultsSnapshot {
+                    source_label: "public.orders".into(),
+                    state: SessionState::Results(Duration::from_millis(9)),
+                    result: sample_result(),
+                },
+                cx,
+            );
+        });
+
+        view.update(vcx, |view, cx| {
+            let (_dot_color, label, error) = view.connection_status(cx);
+            assert_eq!(
+                label, "Disconnected",
+                "an unreachable liveness must override a frozen tab's stale Connected indicator"
+            );
+            assert!(error.is_none());
+        });
     }
 
     #[test]

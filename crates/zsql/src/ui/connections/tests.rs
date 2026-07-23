@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     connections::ConnectionArgs,
-    session::{Session, SessionState},
+    session::{LivenessState, Session, SessionState},
 };
 
 /// The liveness probe timeout every test builds its manager with, unless a
@@ -213,42 +213,135 @@ fn host_label_falls_back_to_the_scheme_stripped_remainder_when_no_host_segment_i
 
 // ---- footer_display ---------------------------------------------------
 
-#[test]
-fn footer_display_shows_the_active_connections_name_and_host_when_connected() {
-    let active = ActiveConnection {
+fn sample_active_connection() -> ActiveConnection {
+    ActiveConnection {
         id: None,
         name: "zsql local".to_owned(),
         url: "postgres://localhost:5432/zsql".to_owned(),
-    };
-    match footer_display(true, Some(&active)) {
+    }
+}
+
+#[test]
+fn footer_display_shows_the_active_connections_name_and_host_when_connected() {
+    let active = sample_active_connection();
+    match footer_display(
+        &SessionState::Connected,
+        &LivenessState::Unknown,
+        true,
+        Some(&active),
+    ) {
         super::FooterDisplay::Connected { name, host } => {
             assert_eq!(name, "zsql local");
             assert_eq!(host, "localhost:5432");
         }
-        other @ super::FooterDisplay::Disconnected => {
-            panic!("expected FooterDisplay::Connected, got {other:?}")
-        }
+        other => panic!("expected FooterDisplay::Connected, got {other:?}"),
     }
 }
 
 #[test]
 fn footer_display_is_disconnected_when_the_session_holds_no_live_connection() {
-    let active = ActiveConnection {
-        id: None,
-        name: "zsql local".to_owned(),
-        url: "postgres://localhost:5432/zsql".to_owned(),
-    };
+    let active = sample_active_connection();
     assert_eq!(
-        footer_display(false, Some(&active)),
-        super::FooterDisplay::Disconnected
+        footer_display(
+            &SessionState::Error("connection refused".to_owned()),
+            &LivenessState::Unknown,
+            false,
+            Some(&active)
+        ),
+        super::FooterDisplay::Disconnected,
+        "a failed connect must render the not-connected prompt, not an error affordance"
     );
 }
 
 #[test]
 fn footer_display_is_disconnected_when_connected_but_no_active_connection_is_tracked() {
     assert_eq!(
-        footer_display(true, None),
+        footer_display(
+            &SessionState::Connected,
+            &LivenessState::Unknown,
+            true,
+            None
+        ),
         super::FooterDisplay::Disconnected
+    );
+}
+
+#[test]
+fn footer_display_shows_connecting_during_a_connect_attempt() {
+    assert_eq!(
+        footer_display(
+            &SessionState::Connecting,
+            &LivenessState::Unknown,
+            false,
+            None
+        ),
+        super::FooterDisplay::Connecting
+    );
+}
+
+#[test]
+fn footer_display_shows_connected_immediately_after_a_successful_connect_needs_no_probe() {
+    // A fresh `Connected` session has not had time for the recurring
+    // liveness probe to complete even once yet.
+    let active = sample_active_connection();
+    assert_eq!(
+        footer_display(
+            &SessionState::Connected,
+            &LivenessState::Unknown,
+            true,
+            Some(&active)
+        ),
+        super::FooterDisplay::Connected {
+            name: "zsql local".to_owned(),
+            host: "localhost:5432".to_owned(),
+        },
+        "Connected must not wait on the first Healthy probe result"
+    );
+}
+
+#[test]
+fn footer_display_shows_connecting_when_switching_even_though_the_prior_connection_is_still_held() {
+    // Mid-switch: `connect_url` moves `state` to `Connecting` but keeps the
+    // prior connection's `Arc` alive (and `is_connected()` therefore still
+    // true) until the new attempt resolves.
+    let active = sample_active_connection();
+    assert_eq!(
+        footer_display(
+            &SessionState::Connecting,
+            &LivenessState::Healthy,
+            true,
+            Some(&active)
+        ),
+        super::FooterDisplay::Connecting,
+        "Connecting must win over a stale still-connected read from the connection being replaced"
+    );
+}
+
+#[test]
+fn footer_display_is_disconnected_when_liveness_is_unreachable_even_though_connected() {
+    let active = sample_active_connection();
+    let unreachable = LivenessState::Unreachable("connection reset".to_owned());
+    assert_eq!(
+        footer_display(&SessionState::Connected, &unreachable, true, Some(&active)),
+        super::FooterDisplay::Disconnected
+    );
+}
+
+#[test]
+fn footer_display_stays_connected_through_a_query_error_that_leaves_the_connection_live() {
+    let active = sample_active_connection();
+    assert_eq!(
+        footer_display(
+            &SessionState::Error("syntax error at or near \"selct\"".to_owned()),
+            &LivenessState::Healthy,
+            true,
+            Some(&active)
+        ),
+        super::FooterDisplay::Connected {
+            name: "zsql local".to_owned(),
+            host: "localhost:5432".to_owned(),
+        },
+        "a query error must not be mistaken for a connect failure while the connection is live"
     );
 }
 
@@ -785,6 +878,129 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
     });
 }
 
+#[gpui::test]
+async fn connect_index_updates_active_synchronously_before_the_connect_resolves(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-index-sync-active");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "mem".to_owned(),
+            url: "sqlite::memory:".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    let task = manager.update(cx, |view, cx| {
+        assert!(view.active().is_none(), "no connection is active yet");
+        let task = view.connect_index(0, cx);
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("mem"),
+            "active must reflect the target connection synchronously at dispatch time, \
+             before the connect attempt itself has resolved"
+        );
+        task
+    });
+    task.await;
+}
+
+#[gpui::test]
+async fn connect_and_close_updates_active_synchronously_before_the_connect_resolves(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-and-close-sync-active");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "mem".to_owned(),
+            url: "sqlite::memory:".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    let task = manager.update(cx, |view, cx| {
+        let task = view.connect_and_close(0, cx);
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("mem"),
+            "connect_and_close must update active synchronously too"
+        );
+        assert!(
+            !view.is_open(),
+            "connect_and_close must close the modal immediately"
+        );
+        task
+    });
+    task.await;
+}
+
+#[gpui::test]
+async fn a_failed_connect_index_does_not_revert_active_to_the_previous_connection(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-index-fail-keeps-active");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "mem".to_owned(),
+            url: "sqlite::memory:".to_owned(),
+        })
+        .expect("add must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "unrecognized".to_owned(),
+            url: "cassandra://host/db".to_owned(),
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager
+        .update(cx, |view, cx| view.connect_index(0, cx))
+        .await;
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("mem")
+        );
+    });
+
+    manager
+        .update(cx, |view, cx| view.connect_index(1, cx))
+        .await;
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("unrecognized"),
+            "a failed switch must stay pointed at its own target, not revert to \
+             the connection that preceded it"
+        );
+        assert!(
+            view.status()
+                .is_some_and(|status| status.contains("Failed")),
+            "expected a failure status, got {:?}",
+            view.status()
+        );
+    });
+}
+
 // ---- connect_unsaved (add form's "Connect" button) -----------------------
 
 #[gpui::test]
@@ -822,6 +1038,82 @@ async fn connect_unsaved_connects_without_persisting_and_closes_the_modal(cx: &m
             matches!(session.state(), SessionState::Connected),
             "connect_unsaved must actually connect the session, got {:?}",
             session.state()
+        );
+    });
+}
+
+#[gpui::test]
+async fn connect_unsaved_updates_active_synchronously_before_the_connect_resolves(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-unsaved-sync-active");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.show_add_form(cx);
+        view.set_name_input("scratch", cx);
+        view.set_url_input("sqlite::memory:", cx);
+    });
+
+    let task = manager.update(cx, |view, cx| {
+        let task = view.connect_unsaved(cx);
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("scratch"),
+            "active must reflect the target connection synchronously at dispatch time"
+        );
+        task
+    });
+    task.await;
+}
+
+#[gpui::test]
+async fn a_failed_connect_unsaved_does_not_revert_active_and_leaves_the_modal_open(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-unsaved-fail-keeps-active");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| {
+        view.open(cx);
+        view.show_add_form(cx);
+        view.set_name_input("will-fail", cx);
+        // SQLite path in nonexistent directory: deterministically fails to connect
+        let unopenable = format!(
+            "sqlite:{}/zsql-connections-test-nonexistent-dir/db.sqlite3",
+            std::env::temp_dir().display()
+        );
+        view.set_url_input(&unopenable, cx);
+    });
+
+    let task = manager.update(cx, ConnectionManagerView::connect_unsaved);
+    task.await;
+
+    manager.read_with(cx, |view, _app| {
+        assert_eq!(
+            view.active().map(|active| active.name.as_str()),
+            Some("will-fail"),
+            "a failed connect_unsaved must keep active pointing at the failed target, not revert"
+        );
+        assert!(
+            view.is_open(),
+            "a failed connect_unsaved must leave the modal open"
+        );
+        assert!(
+            view.status()
+                .is_some_and(|status| status.contains("Failed to connect")),
+            "expected a failure status, got {:?}",
+            view.status()
         );
     });
 }
