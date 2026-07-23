@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
+use zsql_ui::modal::ModalSize;
 
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, TestOutcome,
@@ -1215,7 +1216,7 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
         .expect("the modal panel must be tagged and painted");
     assert_eq!(
         bounds.size.width,
-        crate::ui::theme::MODAL_WIDTH,
+        ModalSize::Small.width(),
         "a long URL must never widen the modal panel"
     );
 }

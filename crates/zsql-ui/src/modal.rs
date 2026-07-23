@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    Div, ElementId, IntoElement, Pixels, RenderOnce, Stateful, div, prelude::*, px, rgb, rgba,
+    Div, ElementId, FocusHandle, IntoElement, Pixels, RenderOnce, Stateful, div, prelude::*, px,
+    rgb, rgba,
 };
 
 use crate::{
@@ -19,7 +20,8 @@ pub struct Modal<H: IntoElement + 'static, B: IntoElement + 'static> {
     head: H,
     body: B,
     has_close_icon: bool,
-    on_close: Rc<dyn Fn((), &mut gpui::Window, &mut gpui::App)>,
+    on_close: Rc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App)>,
+    focus_handle: Option<FocusHandle>,
 }
 
 pub enum ModalSize {
@@ -56,6 +58,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
             body: div(),
             has_close_icon: true,
             on_close: Rc::new(move |(), _, _cx| {}),
+            focus_handle: None,
         }
     }
 
@@ -64,9 +67,17 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         self
     }
 
+    /// Track `focus_handle` on the modal's key-dispatch container so its
+    /// keyboard handlers fire while it is focused. The caller is responsible
+    /// for focusing this same handle when the modal opens
+    pub fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle.clone());
+        self
+    }
+
     pub fn on_close(
         mut self,
-        on_close: impl Fn((), &mut gpui::Window, &mut gpui::App) + 'static,
+        on_close: impl Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static,
     ) -> Self {
         self.on_close = Rc::new(on_close);
         self
@@ -85,6 +96,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
             body: child,
             has_close_icon: self.has_close_icon,
             on_close: self.on_close,
+            focus_handle: self.focus_handle,
         }
     }
 
@@ -96,6 +108,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
             body: self.body,
             has_close_icon: self.has_close_icon,
             on_close: self.on_close,
+            focus_handle: self.focus_handle,
         }
     }
 }
@@ -131,7 +144,7 @@ impl<H: IntoElement, B: IntoElement> Modal<H, B> {
                         style.text_color(rgb(colors.text_primary))
                     }),
             )
-            .on_click(move |_e, w, cx| close_listener((), w, cx))
+            .on_click(move |_e, w, cx| close_listener(&(), w, cx))
     }
 
     fn render_scrim(&self, cx: &mut gpui::App) -> Stateful<Div> {
@@ -147,10 +160,13 @@ impl<H: IntoElement, B: IntoElement> Modal<H, B> {
             .bg(rgba(colors.scrim))
             // Block mouse events from reaching the workspace behind the modal
             .occlude()
+            .when_some(self.focus_handle.clone(), |el, handle| {
+                el.track_focus(&handle)
+            })
             .on_key_down(move |event, window, cx| {
-                if event.keystroke.key.as_str() == "Escape" {
+                if event.keystroke.key.as_str() == "escape" {
                     cx.stop_propagation();
-                    close_listener((), window, cx);
+                    close_listener(&(), window, cx);
                 }
             })
             // For now, we don't allow "click out" of modals
