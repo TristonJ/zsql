@@ -17,8 +17,11 @@ use zsql_ui::{
     theme::ActiveTheme,
 };
 
-use super::{TestOutcome, driver_display_label};
-use crate::{drivers::detect_driver_id, ui::theme};
+use super::TestOutcome;
+use crate::{
+    drivers::detect_driver_id,
+    ui::{connections::driver_display_label, theme},
+};
 
 /// The connection form's input fields, test-outcome banner, and footer.
 pub struct ConnectionForm {
@@ -63,27 +66,22 @@ pub struct ConnectionForm {
 }
 
 /// What [`ConnectionForm`] asks its parent to do, in response to a footer
-/// button click or an Enter keystroke in the name/url fields. Carries no
-/// name/url payload: the parent reads the live values back out through
-/// [`ConnectionForm::input_values`], so they never have a chance to drift
-/// out of sync with what is actually shown.
+/// button click or an Enter keystroke in the name/url fields
 pub enum ConnectionFormEvent {
-    /// The Cancel button, or Escape: discard the form and return to the
-    /// list.
+    /// The form has been discarded
     Cancel,
-    /// The Test button: probe the current URL without saving or connecting.
-    Test,
-    /// The add form's Connect button: connect to the current URL without
-    /// persisting it.
-    Connect,
-    /// The add form's Save button, or Enter in add mode: persist a new
-    /// connection.
-    Add,
-    /// The edit form's Save changes button, or Enter in edit mode: persist
-    /// the edit to the connection with `id`.
+    /// The test action has been triggered for a URL
+    Test { url: String },
+    /// Connect to the URL without persisting it.
+    Connect { name: String, url: String },
+    /// Persist a new connection
+    Add { name: String, url: String },
+    /// Persist changes to a connection
     Edit {
         /// The connection being edited.
         id: Uuid,
+        name: String,
+        url: String,
     },
 }
 
@@ -123,32 +121,19 @@ impl ConnectionForm {
 
         cx.observe(&url_field, |view, _field, cx| view.on_url_field_changed(cx))
             .detach();
-        cx.observe(&host_field, |view, _field, cx| {
-            view.on_host_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&port_field, |view, _field, cx| {
-            view.on_port_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&user_field, |view, _field, cx| {
-            view.on_user_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&password_field, |view, _field, cx| {
-            view.on_password_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&database_field, |view, _field, cx| {
-            view.on_database_field_changed(cx);
-        })
-        .detach();
-        cx.observe(&tls_field, |view, _field, cx| view.on_tls_field_changed(cx))
+        cx.observe(&host_field, Self::on_host_field_changed)
             .detach();
-        cx.observe(&sqlite_path_field, |view, _field, cx| {
-            view.on_sqlite_path_field_changed(cx);
-        })
-        .detach();
+        cx.observe(&port_field, Self::on_port_field_changed)
+            .detach();
+        cx.observe(&user_field, Self::on_user_field_changed)
+            .detach();
+        cx.observe(&password_field, Self::on_password_field_changed)
+            .detach();
+        cx.observe(&database_field, Self::on_database_field_changed)
+            .detach();
+        cx.observe(&tls_field, Self::on_tls_field_changed).detach();
+        cx.observe(&sqlite_path_field, Self::on_sqlite_path_field_changed)
+            .detach();
 
         cx.subscribe(&name_field, |view, _field, event, cx| {
             view.on_submit_field_event(event, cx);
@@ -188,9 +173,11 @@ impl ConnectionForm {
         if !matches!(event, TextFieldEvent::Submit) {
             return;
         }
+
+        let (name, url) = self.input_values(cx);
         match self.mode {
-            ConnectionFormMode::Add => cx.emit(ConnectionFormEvent::Add),
-            ConnectionFormMode::Edit { id } => cx.emit(ConnectionFormEvent::Edit { id }),
+            ConnectionFormMode::Add => cx.emit(ConnectionFormEvent::Add { name, url }),
+            ConnectionFormMode::Edit { id } => cx.emit(ConnectionFormEvent::Edit { id, name, url }),
         }
     }
 
@@ -217,6 +204,8 @@ impl ConnectionForm {
     }
 
     /// The form's current name and URL field values.
+    ///
+    /// Returns (name, url)
     #[must_use]
     pub fn input_values(&self, cx: &App) -> (String, String) {
         let name = self.name_field.read(cx).value().to_string();
@@ -494,6 +483,10 @@ impl ConnectionForm {
             .child(
                 secondary_button("connection-form-cancel", window, cx)
                     .track_focus(&self.cancel_focus)
+                    // Lets render tests find this button's painted bounds via
+                    // `VisualTestContext::debug_bounds` -- a no-op outside
+                    // test/test-support builds.
+                    .debug_selector(|| "connection-form-cancel".to_owned())
                     .child("Cancel")
                     .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
                         cx.emit(ConnectionFormEvent::Cancel);
@@ -502,9 +495,12 @@ impl ConnectionForm {
             .child(
                 secondary_button("connection-form-test", window, cx)
                     .track_focus(&self.test_focus)
+                    .debug_selector(|| "connection-form-test".to_owned())
                     .child("Test")
-                    .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
-                        cx.emit(ConnectionFormEvent::Test);
+                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                        cx.emit(ConnectionFormEvent::Test {
+                            url: view.input_values(cx).1,
+                        });
                     })),
             )
             .child(div().flex_1());
@@ -515,17 +511,21 @@ impl ConnectionForm {
                     .child(
                         secondary_button("connection-form-connect", window, cx)
                             .track_focus(&self.connect_focus)
+                            .debug_selector(|| "connection-form-connect".to_owned())
                             .child("Connect")
-                            .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
-                                cx.emit(ConnectionFormEvent::Connect);
+                            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                                let (name, url) = view.input_values(cx);
+                                cx.emit(ConnectionFormEvent::Connect { name, url });
                             })),
                     )
                     .child(
                         primary_button("connection-form-save", window, cx)
                             .track_focus(&self.save_focus)
+                            .debug_selector(|| "connection-form-save".to_owned())
                             .child("Save")
-                            .on_click(cx.listener(|_view, _event: &ClickEvent, _window, cx| {
-                                cx.emit(ConnectionFormEvent::Add);
+                            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                                let (name, url) = view.input_values(cx);
+                                cx.emit(ConnectionFormEvent::Add { name, url });
                             })),
                     );
             }
@@ -533,9 +533,11 @@ impl ConnectionForm {
                 footer = footer.child(
                     primary_button("connection-form-save", window, cx)
                         .track_focus(&self.save_focus)
+                        .debug_selector(|| "connection-form-save".to_owned())
                         .child("Save changes")
-                        .on_click(cx.listener(move |_view, _event: &ClickEvent, _window, cx| {
-                            cx.emit(ConnectionFormEvent::Edit { id });
+                        .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
+                            let (name, url) = view.input_values(cx);
+                            cx.emit(ConnectionFormEvent::Edit { id, name, url });
                         })),
                 );
             }
@@ -713,8 +715,11 @@ impl ConnectionForm {
         self.sync_fields_from_url(cx);
     }
 
-    fn on_host_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.host_field.read(cx).value().to_string();
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_host_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let value = field.read(cx).value().to_string();
         let Some(parsed) = self.parsed_url.as_mut() else {
             return;
         };
@@ -723,8 +728,9 @@ impl ConnectionForm {
         }
     }
 
-    fn on_port_field_changed(&mut self, cx: &mut Context<Self>) {
-        let text = self.port_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_port_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let text = field.read(cx).value().to_string();
         let text = text.trim();
         // `None` means "leave the port alone" (an invalid partial number
         // mid-edit, e.g. out of `u16` range); `Some(None)` clears it;
@@ -745,8 +751,9 @@ impl ConnectionForm {
         }
     }
 
-    fn on_user_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.user_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_user_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let value = field.read(cx).value().to_string();
         let Some(parsed) = self.parsed_url.as_mut() else {
             return;
         };
@@ -754,8 +761,9 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
-    fn on_password_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.password_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_password_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let value = field.read(cx).value().to_string();
         let Some(parsed) = self.parsed_url.as_mut() else {
             return;
         };
@@ -763,8 +771,9 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
-    fn on_database_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.database_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_database_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let value = field.read(cx).value().to_string();
         let Some(parsed) = self.parsed_url.as_mut() else {
             return;
         };
@@ -772,8 +781,9 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
-    fn on_tls_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.tls_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_tls_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
+        let value = field.read(cx).value().to_string();
         let Ok(driver_id) = self.driver_id.clone() else {
             return;
         };
@@ -789,8 +799,13 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
-    fn on_sqlite_path_field_changed(&mut self, cx: &mut Context<Self>) {
-        let value = self.sqlite_path_field.read(cx).value().to_string();
+    #[allow(clippy::needless_pass_by_value)]
+    fn on_sqlite_path_field_changed(
+        &mut self,
+        field: Entity<TextFieldState>,
+        cx: &mut Context<Self>,
+    ) {
+        let value = field.read(cx).value().to_string();
         let Some(parsed) = self.parsed_url.as_mut() else {
             return;
         };
@@ -909,3 +924,6 @@ fn set_field_value_if_changed(
         field.update(cx, |field, _cx| field.set_value_quiet(value));
     }
 }
+
+#[cfg(test)]
+mod tests;

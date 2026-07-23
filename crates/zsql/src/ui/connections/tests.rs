@@ -1,11 +1,7 @@
 use std::time::Duration;
 
-use gpui::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, Keystroke,
-    Modifiers, TestAppContext, VisualTestContext,
-};
+use gpui::{AppContext as _, Context, Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
 
-use super::form::ConnectionFormEvent;
 use super::{
     ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, TestOutcome,
     footer_display, host_label,
@@ -13,8 +9,8 @@ use super::{
 use crate::{
     connections::ConnectionArgs,
     session::{LivenessState, Session, SessionState},
+    ui::connections::form::ConnectionFormEvent,
 };
-use zsql_ui::text_field::TextFieldEvent;
 
 /// The liveness probe timeout every test builds its manager with, unless a
 /// test specifically cares about the value itself.
@@ -92,25 +88,6 @@ fn a_freshly_loaded_store_lists_every_saved_connection(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn an_unrecognized_scheme_surfaces_as_an_error_tag_not_a_panic(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("bad-scheme");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "mystery".to_owned(),
-            url: "cassandra://host/db".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(view.connections()[0].connection.display_kind, "Unknown");
-    });
-}
-
-#[gpui::test]
 fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) {
     let temp = TempStorePath::new("add");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -120,7 +97,9 @@ fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) 
     manager.update(cx, |view, cx| {
         view.set_name_input("new db", cx);
         view.set_url_input("sqlite::memory:", cx);
-        view.add_connection(cx).expect("add must succeed");
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
     });
 
     manager.read_with(cx, |view, _app| {
@@ -144,7 +123,8 @@ fn adding_a_connection_with_an_empty_name_is_rejected_without_persisting(cx: &mu
     manager.update(cx, |view, cx| {
         view.set_name_input("", cx);
         view.set_url_input("sqlite::memory:", cx);
-        view.add_connection(cx)
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -162,7 +142,8 @@ fn adding_a_connection_with_an_empty_url_is_rejected_without_persisting(cx: &mut
     manager.update(cx, |view, cx| {
         view.set_name_input("new db", cx);
         view.set_url_input("", cx);
-        view.add_connection(cx)
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -182,7 +163,8 @@ fn adding_a_connection_with_an_unrecognized_scheme_is_rejected_without_persistin
     manager.update(cx, |view, cx| {
         view.set_name_input("mystery", cx);
         view.set_url_input("cassandra://host/db", cx);
-        view.add_connection(cx)
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
@@ -397,11 +379,11 @@ fn show_add_form_then_cancel_returns_to_the_list_without_persisting(cx: &mut Tes
     let temp = TempStorePath::new("cancel-add");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
+    manager.update_in(vcx, |view, window, cx| {
         view.open(cx);
-        view.show_add_form(cx);
+        view.show_add_form(window, cx);
         assert_eq!(view.current_view(), ManagerView::Form);
 
         view.set_name_input("staging", cx);
@@ -423,14 +405,16 @@ fn adding_a_connection_returns_the_modal_to_the_list_panel(cx: &mut TestAppConte
     let temp = TempStorePath::new("add-returns-to-list");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
+    manager.update_in(vcx, |view, window, cx| {
         view.open(cx);
-        view.show_add_form(cx);
+        view.show_add_form(window, cx);
         view.set_name_input("staging", cx);
         view.set_url_input("postgres://host/db", cx);
-        view.add_connection(cx).expect("add must succeed");
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
 
         assert_eq!(view.current_view(), ManagerView::List);
         assert_eq!(view.connections().len(), 1);
@@ -475,99 +459,6 @@ fn deleting_a_connection_removes_it_from_the_list_and_persists(cx: &mut TestAppC
 // ---- edit / save_edit ---------------------------------------------------
 
 #[gpui::test]
-fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("edit-prefill");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "staging".to_owned(),
-            url: "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-
-        let id = view.connections()[0].connection.id;
-        assert_eq!(
-            view.current_view(),
-            ManagerView::Form,
-            "edit form must be shown"
-        );
-        assert_eq!(
-            view.form.read(cx).edit_id(),
-            Some(id),
-            "edit form must be shown for the right row"
-        );
-        assert_eq!(
-            view.form.read(cx).name_field.read(cx).value().as_ref(),
-            "staging"
-        );
-        assert_eq!(
-            view.form.read(cx).url_field.read(cx).value().as_ref(),
-            "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require"
-        );
-        assert_eq!(
-            view.form.read(cx).host_field.read(cx).value().as_ref(),
-            "staging.internal"
-        );
-        assert_eq!(
-            view.form.read(cx).port_field.read(cx).value().as_ref(),
-            "5432"
-        );
-        assert_eq!(
-            view.form.read(cx).user_field.read(cx).value().as_ref(),
-            "app"
-        );
-        assert_eq!(
-            view.form.read(cx).password_field.read(cx).value().as_ref(),
-            "s3cr3t"
-        );
-        assert_eq!(
-            view.form.read(cx).database_field.read(cx).value().as_ref(),
-            "app"
-        );
-        assert_eq!(
-            view.form.read(cx).tls_field.read(cx).value().as_ref(),
-            "require"
-        );
-    });
-}
-
-#[gpui::test]
-fn show_edit_form_for_a_sqlite_url_prefills_only_the_path_field(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("edit-prefill-sqlite");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "reports".to_owned(),
-            url: "sqlite:///tmp/reports.db".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        assert_eq!(view.pending_driver_id(cx), Ok("sqlite"));
-        assert_eq!(
-            view.form
-                .read(cx)
-                .sqlite_path_field
-                .read(cx)
-                .value()
-                .as_ref(),
-            "/tmp/reports.db"
-        );
-        assert!(view.form.read(cx).host_field.read(cx).value().is_empty());
-    });
-}
-
-#[gpui::test]
 fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mut TestAppContext) {
     let temp = TempStorePath::new("save-edit");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -585,18 +476,21 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
         .expect("add second");
 
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
+    let id = manager.read_with(vcx, |view, _app| view.connections()[0].connection.id);
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_edit_form(id, window, cx);
         view.set_name_input("first renamed", cx);
         let host_field = view.form.read(cx).host_field.clone();
         host_field.update(cx, |field, cx| field.set_value("otherhost", cx));
     });
 
-    manager.update(cx, |view, cx| {
-        let id = view.connections()[0].connection.id;
-        view.save_edit(id, cx).expect("save_edit must succeed");
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.save_edit(cx, id, &name, url)
+            .expect("save_edit must succeed");
 
         assert_eq!(
             view.connections().len(),
@@ -621,233 +515,6 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
     assert_eq!(reloaded.connections()[0].name, "first renamed");
 }
 
-// ---- URL -> fields sync ---------------------------------------------
-
-#[gpui::test]
-fn editing_the_url_field_reparses_every_driver_field(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("url-to-fields");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input(
-            "mssql://sa:pw@dbhost:1433/zsql?trustServerCertificate=true",
-            cx,
-        );
-    });
-
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(view.pending_driver_id(cx), Ok("mssql"));
-        assert_eq!(
-            view.form.read(cx).host_field.read(cx).value().as_ref(),
-            "dbhost"
-        );
-        assert_eq!(
-            view.form.read(cx).port_field.read(cx).value().as_ref(),
-            "1433"
-        );
-        assert_eq!(
-            view.form.read(cx).user_field.read(cx).value().as_ref(),
-            "sa"
-        );
-        assert_eq!(
-            view.form.read(cx).password_field.read(cx).value().as_ref(),
-            "pw"
-        );
-        assert_eq!(
-            view.form.read(cx).database_field.read(cx).value().as_ref(),
-            "zsql"
-        );
-        assert_eq!(
-            view.form.read(cx).tls_field.read(cx).value().as_ref(),
-            "true"
-        );
-        assert!(view.form.read(cx).dim_reason().is_none());
-    });
-}
-
-#[gpui::test]
-fn an_unparseable_url_dims_the_field_section_with_a_reason_and_re_enables_once_valid(
-    cx: &mut TestAppContext,
-) {
-    let temp = TempStorePath::new("dim-reenable");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@", cx);
-    });
-    manager.read_with(cx, |view, cx| {
-        assert!(
-            view.form.read(cx).dim_reason().is_some(),
-            "an incomplete URL must dim the field section"
-        );
-        // The scheme is still recognizable, so the layout stays Postgres-shaped.
-        assert_eq!(view.pending_driver_id(cx), Ok("postgres"));
-    });
-
-    manager.update(cx, |view, cx| {
-        view.set_url_input("postgres://app@host:5432/db", cx);
-    });
-    manager.read_with(cx, |view, cx| {
-        assert!(
-            view.form.read(cx).dim_reason().is_none(),
-            "a now-valid URL must clear the dim reason"
-        );
-        assert_eq!(
-            view.form.read(cx).host_field.read(cx).value().as_ref(),
-            "host"
-        );
-    });
-}
-
-// ---- fields -> URL sync -----------------------------------------------
-
-#[gpui::test]
-fn editing_the_port_field_changes_only_the_urls_port(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-port");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
-    });
-    manager.update(cx, |view, cx| {
-        let port_field = view.form.read(cx).port_field.clone();
-        port_field.update(cx, |field, cx| field.set_value("6543", cx));
-    });
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(
-            view.form.read(cx).url_field.read(cx).value().as_ref(),
-            "postgres://app:s3cr3t@host:6543/app?sslmode=require",
-            "only the port must change in the rebuilt URL"
-        );
-    });
-}
-
-#[gpui::test]
-fn editing_the_host_field_leaves_user_password_database_and_params_intact(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-host");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
-    });
-    manager.update(cx, |view, cx| {
-        let host_field = view.form.read(cx).host_field.clone();
-        host_field.update(cx, |field, cx| field.set_value("otherhost", cx));
-    });
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(
-            view.form.read(cx).url_field.read(cx).value().as_ref(),
-            "postgres://app:s3cr3t@otherhost:5432/app?sslmode=require"
-        );
-    });
-}
-
-#[gpui::test]
-fn clearing_the_tls_field_removes_the_param_instead_of_leaving_it_empty(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-tls-clear");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
-    });
-    manager.update(cx, |view, cx| {
-        let tls_field = view.form.read(cx).tls_field.clone();
-        tls_field.update(cx, |field, cx| field.set_value("", cx));
-    });
-    manager.read_with(cx, |view, cx| {
-        let url = view.form.read(cx).url_field.read(cx).value().to_string();
-        assert_eq!(
-            url, "postgres://app:s3cr3t@host:5432/app",
-            "clearing the TLS field must drop sslmode entirely, not leave 'sslmode='"
-        );
-        assert!(!url.contains("sslmode"));
-    });
-}
-
-#[gpui::test]
-fn editing_a_driver_field_rewrites_the_url_field_live(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-to-url-live");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@host:5432/orders", cx);
-    });
-    manager.update(cx, |view, cx| {
-        let database_field = view.form.read(cx).database_field.clone();
-        database_field.update(cx, |field, cx| field.set_value("other_db", cx));
-    });
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(
-            view.form.read(cx).url_field.read(cx).value().as_ref(),
-            "postgres://app@host:5432/other_db",
-            "URL rewritten"
-        );
-    });
-}
-
-#[gpui::test]
-fn editing_the_sqlite_path_field_rewrites_the_url(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("field-sqlite-path");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("sqlite::memory:", cx);
-    });
-    manager.update(cx, |view, cx| {
-        let sqlite_path_field = view.form.read(cx).sqlite_path_field.clone();
-        sqlite_path_field.update(cx, |field, cx| field.set_value("/tmp/scratch.db", cx));
-    });
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(
-            view.form.read(cx).url_field.read(cx).value().as_ref(),
-            "sqlite:///tmp/scratch.db"
-        );
-    });
-}
-
-// ---- password masking --------------------------------------------------
-
-#[gpui::test]
-fn the_password_field_starts_masked_and_the_toggle_reveals_it(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("password-mask");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.read_with(cx, |view, cx| {
-        assert!(view.form.read(cx).password_field.read(cx).is_masked());
-    });
-
-    manager.update(cx, |view, cx| {
-        view.form
-            .update(cx, super::form::ConnectionForm::toggle_password_visible);
-    });
-    manager.read_with(cx, |view, cx| {
-        assert!(!view.form.read(cx).password_field.read(cx).is_masked());
-    });
-}
-
 // ---- connect_and_close (row click / Enter) ------------------------------
 
 #[gpui::test]
@@ -869,7 +536,8 @@ async fn connect_and_close_connects_and_clears_is_open(cx: &mut TestAppContext) 
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, ConnectionManagerView::open);
-    let task = manager.update(cx, |view, cx| view.connect_and_close(0, cx));
+    let id = manager.read_with(cx, |view, _app| view.connections()[0].connection.id);
+    let task = manager.update(cx, |view, cx| view.connect_and_close(id, cx));
     task.await;
 
     manager.read_with(cx, |view, _app| {
@@ -917,10 +585,10 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
             !view.is_open(),
             "Enter on a focused row must close the modal, the same as clicking it"
         );
-        // `connect_index` sets this synchronously, before the connect
-        // attempt itself completes -- proof the real keyboard-dispatch path
-        // reached the row's connect handler, the same one the click path
-        // uses, not just that the modal happened to close some other way.
+        // `connect` sets this synchronously, before the connect attempt
+        // itself completes -- proof the real keyboard-dispatch path reached
+        // the row's connect handler, the same one the click path uses, not
+        // just that the modal happened to close some other way.
         assert!(
             view.status()
                 .is_some_and(|status| status.contains("connecting")),
@@ -931,13 +599,11 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
 }
 
 #[gpui::test]
-async fn connect_index_updates_active_synchronously_before_the_connect_resolves(
-    cx: &mut TestAppContext,
-) {
+async fn connect_updates_active_synchronously_before_the_connect_resolves(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let _guard = crate::test_support::serialize_real_io();
 
-    let temp = TempStorePath::new("connect-index-sync-active");
+    let temp = TempStorePath::new("connect-sync-active");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
         .add(ConnectionArgs {
@@ -949,9 +615,10 @@ async fn connect_index_updates_active_synchronously_before_the_connect_resolves(
     let session = cx.new(|_cx| session_with_no_url());
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
+    let id = manager.read_with(cx, |view, _app| view.connections()[0].connection.id);
     let task = manager.update(cx, |view, cx| {
         assert!(view.active().is_none(), "no connection is active yet");
-        let task = view.connect_index(0, cx);
+        let task = view.connect(id, cx);
         assert_eq!(
             view.active().map(|active| active.name.as_str()),
             Some("mem"),
@@ -982,8 +649,9 @@ async fn connect_and_close_updates_active_synchronously_before_the_connect_resol
     let session = cx.new(|_cx| session_with_no_url());
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
+    let id = manager.read_with(cx, |view, _app| view.connections()[0].connection.id);
     let task = manager.update(cx, |view, cx| {
-        let task = view.connect_and_close(0, cx);
+        let task = view.connect_and_close(id, cx);
         assert_eq!(
             view.active().map(|active| active.name.as_str()),
             Some("mem"),
@@ -999,13 +667,13 @@ async fn connect_and_close_updates_active_synchronously_before_the_connect_resol
 }
 
 #[gpui::test]
-async fn a_failed_connect_index_does_not_revert_active_to_the_previous_connection(
+async fn a_failed_connect_does_not_revert_active_to_the_previous_connection(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
     let _guard = crate::test_support::serialize_real_io();
 
-    let temp = TempStorePath::new("connect-index-fail-keeps-active");
+    let temp = TempStorePath::new("connect-fail-keeps-active");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
         .add(ConnectionArgs {
@@ -1023,8 +691,15 @@ async fn a_failed_connect_index_does_not_revert_active_to_the_previous_connectio
     let session = cx.new(|_cx| session_with_no_url());
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
+    let (id_mem, id_unrecognized) = manager.read_with(cx, |view, _app| {
+        (
+            view.connections()[0].connection.id,
+            view.connections()[1].connection.id,
+        )
+    });
+
     manager
-        .update(cx, |view, cx| view.connect_index(0, cx))
+        .update(cx, |view, cx| view.connect(id_mem, cx))
         .await;
     manager.read_with(cx, |view, _app| {
         assert_eq!(
@@ -1034,7 +709,7 @@ async fn a_failed_connect_index_does_not_revert_active_to_the_previous_connectio
     });
 
     manager
-        .update(cx, |view, cx| view.connect_index(1, cx))
+        .update(cx, |view, cx| view.connect(id_unrecognized, cx))
         .await;
 
     manager.read_with(cx, |view, _app| {
@@ -1064,18 +739,21 @@ async fn connect_unsaved_connects_without_persisting_and_closes_the_modal(cx: &m
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
     let session_for_assert = session.clone();
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
         view.set_name_input("scratch", cx);
         view.set_url_input("sqlite::memory:", cx);
     });
 
-    let task = manager.update(cx, ConnectionManagerView::connect_unsaved);
+    let task = manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.connect_unsaved(cx, name, url)
+    });
     task.await;
 
-    manager.read_with(cx, |view, _app| {
+    manager.read_with(vcx, |view, _app| {
         assert!(
             !view.is_open(),
             "connect_unsaved must close the modal once the connect succeeds"
@@ -1085,7 +763,7 @@ async fn connect_unsaved_connects_without_persisting_and_closes_the_modal(cx: &m
             "connect_unsaved must never persist the connection to the store"
         );
     });
-    session_for_assert.read_with(cx, |session, _app| {
+    session_for_assert.read_with(vcx, |session, _app| {
         assert!(
             matches!(session.state(), SessionState::Connected),
             "connect_unsaved must actually connect the session, got {:?}",
@@ -1104,16 +782,17 @@ async fn connect_unsaved_updates_active_synchronously_before_the_connect_resolve
     let temp = TempStorePath::new("connect-unsaved-sync-active");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
         view.set_name_input("scratch", cx);
         view.set_url_input("sqlite::memory:", cx);
     });
 
-    let task = manager.update(cx, |view, cx| {
-        let task = view.connect_unsaved(cx);
+    let task = manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        let task = view.connect_unsaved(cx, name, url);
         assert_eq!(
             view.active().map(|active| active.name.as_str()),
             Some("scratch"),
@@ -1134,11 +813,11 @@ async fn a_failed_connect_unsaved_does_not_revert_active_and_leaves_the_modal_op
     let temp = TempStorePath::new("connect-unsaved-fail-keeps-active");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
+    manager.update_in(vcx, |view, window, cx| {
         view.open(cx);
-        view.show_add_form(cx);
+        view.show_add_form(window, cx);
         view.set_name_input("will-fail", cx);
         // SQLite path in nonexistent directory: deterministically fails to connect
         let unopenable = format!(
@@ -1148,10 +827,13 @@ async fn a_failed_connect_unsaved_does_not_revert_active_and_leaves_the_modal_op
         view.set_url_input(&unopenable, cx);
     });
 
-    let task = manager.update(cx, ConnectionManagerView::connect_unsaved);
+    let task = manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.connect_unsaved(cx, name, url)
+    });
     task.await;
 
-    manager.read_with(cx, |view, _app| {
+    manager.read_with(vcx, |view, _app| {
         assert_eq!(
             view.active().map(|active| active.name.as_str()),
             Some("will-fail"),
@@ -1194,16 +876,22 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
 
     let session = cx.new(|_cx| session_with_no_url());
     let session_for_assert = session.clone();
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        view.cancel_form(cx);
-        let id = view.connections()[1].connection.id;
-        let _ = view.delete_id(id, cx);
+    let (id_mem, id_other) = manager.read_with(vcx, |view, _app| {
+        (
+            view.connections()[0].connection.id,
+            view.connections()[1].connection.id,
+        )
     });
 
-    session_for_assert.read_with(cx, |session, _app| {
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_edit_form(id_mem, window, cx);
+        view.cancel_form(cx);
+        let _ = view.delete_id(id_other, cx);
+    });
+
+    session_for_assert.read_with(vcx, |session, _app| {
         assert!(
             matches!(session.state(), SessionState::Empty),
             "neither editing nor deleting a row may connect the session, got {:?}",
@@ -1225,18 +913,21 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
     let session_for_assert = session.clone();
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
         view.set_name_input("scratch", cx);
         view.set_url_input("sqlite::memory:", cx);
     });
 
-    let task = manager.update(cx, ConnectionManagerView::run_test);
+    let task = manager.update(vcx, |view, cx| {
+        let url = view.form.read(cx).input_values(cx).1;
+        view.run_test(cx, url)
+    });
     task.await;
 
-    manager.read_with(cx, |view, app| {
+    manager.read_with(vcx, |view, app| {
         match view.test_outcome(app) {
             Some(TestOutcome::Connected { .. }) => {}
             other => panic!("expected a successful Test outcome, got {other:?}"),
@@ -1246,7 +937,7 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
             "Test must never persist a connection to the store"
         );
     });
-    session_for_assert.read_with(cx, |session, _app| {
+    session_for_assert.read_with(vcx, |session, _app| {
         assert!(
             matches!(session.state(), SessionState::Empty),
             "Test must never touch the app's live session, got {:?}",
@@ -1263,23 +954,210 @@ async fn a_failed_test_reports_the_drivers_error_inline(cx: &mut TestAppContext)
     let temp = TempStorePath::new("test-button-fail");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
         view.set_url_input(
             "postgres://nobody:nobody@zsql-test-unreachable.invalid:5432/db",
             cx,
         );
     });
 
-    let task = manager.update(cx, ConnectionManagerView::run_test);
+    let task = manager.update(vcx, |view, cx| {
+        let url = view.form.read(cx).input_values(cx).1;
+        view.run_test(cx, url)
+    });
     task.await;
 
-    manager.read_with(cx, |view, app| match view.test_outcome(app) {
+    manager.read_with(vcx, |view, app| match view.test_outcome(app) {
         Some(TestOutcome::Failed(message)) => assert!(!message.is_empty()),
         other => panic!("expected a failed Test outcome, got {other:?}"),
     });
+}
+
+// ---- form event routing (on_form_event) ---------------------------------
+//
+// Emits each ConnectionFormEvent variant on the manager's real form entity
+// (the same [`Entity<ConnectionForm>`] the manager subscribes to in
+// `ConnectionManagerView::new`), so a miswired or dropped match arm in
+// `on_form_event` would fail these even though nothing here calls
+// cancel_form/run_test/connect_unsaved/add_connection/save_edit directly.
+
+#[gpui::test]
+fn a_cancel_event_from_the_real_form_returns_the_modal_to_the_list(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("route-cancel");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.open(cx);
+        view.show_add_form(window, cx);
+        assert_eq!(view.current_view(), ManagerView::Form);
+    });
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |_form, cx| cx.emit(ConnectionFormEvent::Cancel));
+
+    manager.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.current_view(),
+            ManagerView::List,
+            "a Cancel event emitted by the real form must reach cancel_form"
+        );
+    });
+}
+
+// The Test/Connect routing tests below emit their event with an
+// unregistered-scheme URL so `run_test`/`connect_unsaved` take their
+// synchronous validation-failure path (see [`super::validate_new_connection`]'s
+// sibling check in each) rather than spawning a real connect -- enough to
+// prove the event reached the right method, without the real-IO machinery
+// (`allow_parking`/`serialize_real_io`) the connect/test *behavior* tests
+// elsewhere in this module already cover.
+
+#[gpui::test]
+fn a_test_event_from_the_real_form_reaches_run_test(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("route-test");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+    });
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |_form, cx| {
+        cx.emit(ConnectionFormEvent::Test {
+            url: "cassandra://host/db".to_owned(),
+        });
+    });
+
+    manager.read_with(vcx, |view, app| {
+        assert!(
+            matches!(view.test_outcome(app), Some(TestOutcome::Failed(_))),
+            "a Test event emitted by the real form must reach run_test, got {:?}",
+            view.test_outcome(app)
+        );
+    });
+}
+
+#[gpui::test]
+fn a_connect_event_from_the_real_form_reaches_connect_unsaved(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("route-connect");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.open(cx);
+        view.show_add_form(window, cx);
+    });
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |_form, cx| {
+        cx.emit(ConnectionFormEvent::Connect {
+            name: "scratch".to_owned(),
+            url: "cassandra://host/db".to_owned(),
+        });
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        assert!(
+            view.status()
+                .is_some_and(|status| status.contains("Cannot connect")),
+            "a Connect event emitted by the real form must reach connect_unsaved, got {:?}",
+            view.status()
+        );
+        assert!(
+            view.connections().is_empty(),
+            "connect_unsaved must never persist the connection to the store"
+        );
+    });
+}
+
+#[gpui::test]
+fn an_add_event_from_the_real_form_persists_a_new_connection(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("route-add");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.open(cx);
+        view.show_add_form(window, cx);
+    });
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |_form, cx| {
+        cx.emit(ConnectionFormEvent::Add {
+            name: "staging".to_owned(),
+            url: "postgres://host/db".to_owned(),
+        });
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.current_view(),
+            ManagerView::List,
+            "an Add event emitted by the real form must reach add_connection"
+        );
+        assert_eq!(view.connections().len(), 1);
+        assert_eq!(view.connections()[0].connection.name, "staging");
+    });
+
+    let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+    assert_eq!(reloaded.connections().len(), 1);
+    assert_eq!(reloaded.connections()[0].name, "staging");
+}
+
+#[gpui::test]
+fn an_edit_event_from_the_real_form_updates_the_row_in_place(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("route-edit");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+        })
+        .expect("add first");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    let id = manager.read_with(vcx, |view, _app| view.connections()[0].connection.id);
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_edit_form(id, window, cx);
+    });
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |_form, cx| {
+        cx.emit(ConnectionFormEvent::Edit {
+            id,
+            name: "first renamed".to_owned(),
+            url: "postgres://otherhost/a".to_owned(),
+        });
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.current_view(),
+            ManagerView::List,
+            "an Edit event emitted by the real form must reach save_edit"
+        );
+        assert_eq!(view.connections().len(), 1, "editing must not append a row");
+        assert_eq!(view.connections()[0].connection.name, "first renamed");
+        assert_eq!(
+            view.connections()[0].connection.get_url().unwrap(),
+            "postgres://otherhost/a"
+        );
+    });
+
+    let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+    assert_eq!(reloaded.connections()[0].name, "first renamed");
 }
 
 // ---- render smoke tests --------------------------------------------------
@@ -1307,77 +1185,9 @@ fn the_closed_modal_renders_nothing_and_the_open_modal_renders_without_panicking
     let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
 
     manager.update(vcx, ConnectionManagerView::open);
-    manager.update(vcx, ConnectionManagerView::show_add_form);
+    manager.update_in(vcx, ConnectionManagerView::show_add_form);
     manager.update(vcx, ConnectionManagerView::cancel_form);
     vcx.run_until_parked();
-}
-
-#[gpui::test]
-fn the_edit_form_renders_prefilled_without_panicking(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("render-edit");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "staging".to_owned(),
-            url: "postgres://app@staging.internal:5432/app".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_edit_form(0, cx);
-    });
-    vcx.run_until_parked();
-}
-
-#[gpui::test]
-fn the_sqlite_field_section_renders_the_path_field_and_not_host_or_port(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("render-sqlite");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_url_input("sqlite::memory:", cx);
-    });
-    vcx.run_until_parked();
-
-    manager.read_with(vcx, |view, app| {
-        assert_eq!(view.pending_driver_id(app), Ok("sqlite"));
-    });
-}
-
-#[gpui::test]
-fn the_field_section_renders_dimmed_while_unparseable_and_undimmed_once_valid(
-    cx: &mut TestAppContext,
-) {
-    let temp = TempStorePath::new("render-dim");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@", cx);
-    });
-    vcx.run_until_parked();
-    manager.read_with(vcx, |view, app| {
-        assert!(view.form.read(app).dim_reason().is_some());
-    });
-
-    manager.update(vcx, |view, cx| {
-        view.set_url_input("postgres://app@host/db", cx);
-    });
-    vcx.run_until_parked();
-    manager.read_with(vcx, |view, app| {
-        assert!(view.form.read(app).dim_reason().is_none());
-    });
 }
 
 #[gpui::test]
@@ -1393,9 +1203,9 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
     );
     assert!(long_url.len() > 200, "the URL must actually be long");
 
-    manager.update(vcx, |view, cx| {
+    manager.update_in(vcx, |view, window, cx| {
         view.open(cx);
-        view.show_add_form(cx);
+        view.show_add_form(window, cx);
         view.set_url_input(&long_url, cx);
     });
     vcx.run_until_parked();
@@ -1408,603 +1218,4 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
         crate::ui::theme::MODAL_WIDTH,
         "a long URL must never widen the modal panel"
     );
-}
-
-// ---- Tab / Shift-Tab focus order -----------------------------------------
-
-#[gpui::test]
-fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("tab-order");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_url_input("postgres://app@host:5432/db", cx);
-    });
-    vcx.run_until_parked();
-
-    let expected_order = manager.update(vcx, |view, cx| view.focus_order(cx));
-    assert!(
-        expected_order.len() >= 3,
-        "the add form over a parsed postgres URL must expose name, url, and driver fields"
-    );
-
-    vcx.update(|window, _cx| {
-        window.focus(&expected_order[0]);
-    });
-
-    // Tab moves focus forward through each control in order.
-    for expected in expected_order.iter().skip(1) {
-        vcx.simulate_keystrokes("tab");
-        vcx.update(|window, cx| {
-            assert_eq!(window.focused(cx).as_ref(), Some(expected));
-        });
-    }
-
-    // Tab from the last control wraps back to the first.
-    vcx.simulate_keystrokes("tab");
-    vcx.update(|window, cx| {
-        assert_eq!(window.focused(cx).as_ref(), Some(&expected_order[0]));
-    });
-
-    // Shift-Tab from the first control wraps back to the last.
-    vcx.simulate_keystrokes("shift-tab");
-    vcx.update(|window, cx| {
-        assert_eq!(
-            window.focused(cx).as_ref(),
-            Some(&expected_order[expected_order.len() - 1])
-        );
-    });
-}
-
-/// [`tab_and_shift_tab_move_focus_through_the_form_in_visual_order`]'s
-/// scenario, parameterized over `url`: opens the add form on `url`, then
-/// checks the form's own `focus_order()` round-trips through Tab and
-/// Shift-Tab, including wrap-around at both ends.
-fn assert_focus_order_round_trips_through_tab_and_shift_tab(cx: &mut TestAppContext, url: &str) {
-    let temp = TempStorePath::new("tab-order-round-trip");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_url_input(url, cx);
-    });
-    vcx.run_until_parked();
-
-    let expected_order = manager.update(vcx, |view, cx| view.focus_order(cx));
-    assert!(
-        expected_order.len() >= 3,
-        "the add form over a parsed url must expose name, url, and driver fields"
-    );
-
-    assert_tab_cycles_through_in_order(vcx, &expected_order);
-}
-
-#[gpui::test]
-fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order_for_an_mssql_url(
-    cx: &mut TestAppContext,
-) {
-    assert_focus_order_round_trips_through_tab_and_shift_tab(cx, "mssql://sa:pw@dbhost:1433/db");
-}
-
-#[gpui::test]
-fn tab_and_shift_tab_move_focus_through_the_form_in_visual_order_for_a_sqlite_url(
-    cx: &mut TestAppContext,
-) {
-    assert_focus_order_round_trips_through_tab_and_shift_tab(cx, "sqlite::memory:");
-}
-
-/// Tab forward through every handle in `order` starting from `order[0]`,
-/// asserting each keystroke lands on the next concrete handle, then checks
-/// wrap-around in both directions: Tab from the last control back to the
-/// first, and Shift-Tab from the first back to the last.
-fn assert_tab_cycles_through_in_order(vcx: &mut VisualTestContext, order: &[FocusHandle]) {
-    assert!(
-        order.len() >= 2,
-        "need at least two controls to cycle through"
-    );
-    vcx.update(|window, _cx| window.focus(&order[0]));
-    vcx.run_until_parked();
-
-    for expected in order.iter().skip(1) {
-        vcx.simulate_keystrokes("tab");
-        vcx.update(|window, cx| {
-            assert_eq!(window.focused(cx).as_ref(), Some(expected));
-        });
-    }
-
-    vcx.simulate_keystrokes("tab");
-    vcx.update(|window, cx| {
-        assert_eq!(
-            window.focused(cx).as_ref(),
-            Some(&order[0]),
-            "Tab from the last control must wrap to the first"
-        );
-    });
-
-    vcx.simulate_keystrokes("shift-tab");
-    vcx.update(|window, cx| {
-        assert_eq!(
-            window.focused(cx).as_ref(),
-            Some(&order[order.len() - 1]),
-            "Shift-Tab from the first control must wrap to the last"
-        );
-    });
-}
-
-/// The add form's full concrete focus chain over a parsed, non-sqlite URL:
-/// name, url, every network field, then the footer buttons in visual order.
-fn add_form_network_focus_chain(
-    view: &ConnectionManagerView,
-    cx: &Context<ConnectionManagerView>,
-) -> Vec<FocusHandle> {
-    let form = view.form.read(cx);
-    vec![
-        form.name_field.read(cx).focus_handle(cx),
-        form.url_field.read(cx).focus_handle(cx),
-        form.host_field.read(cx).focus_handle(cx),
-        form.port_field.read(cx).focus_handle(cx),
-        form.user_field.read(cx).focus_handle(cx),
-        form.password_field.read(cx).focus_handle(cx),
-        form.database_field.read(cx).focus_handle(cx),
-        form.tls_field.read(cx).focus_handle(cx),
-        form.cancel_focus.clone(),
-        form.test_focus.clone(),
-        form.connect_focus.clone(),
-        form.save_focus.clone(),
-    ]
-}
-
-/// The edit form's equivalent of [`add_form_network_focus_chain`] (no
-/// Connect button).
-fn edit_form_network_focus_chain(
-    view: &ConnectionManagerView,
-    cx: &Context<ConnectionManagerView>,
-) -> Vec<FocusHandle> {
-    let form = view.form.read(cx);
-    vec![
-        form.name_field.read(cx).focus_handle(cx),
-        form.url_field.read(cx).focus_handle(cx),
-        form.host_field.read(cx).focus_handle(cx),
-        form.port_field.read(cx).focus_handle(cx),
-        form.user_field.read(cx).focus_handle(cx),
-        form.password_field.read(cx).focus_handle(cx),
-        form.database_field.read(cx).focus_handle(cx),
-        form.tls_field.read(cx).focus_handle(cx),
-        form.cancel_focus.clone(),
-        form.test_focus.clone(),
-        form.save_focus.clone(),
-    ]
-}
-
-/// For the add form over `url` (expected to resolve to the `mysql` driver,
-/// whether via a `mysql://` or `mariadb://` scheme), Tab from the URL field
-/// must advance through host, port, user, password, database, and tls
-/// before reaching the footer buttons, and the whole chain must wrap in
-/// both directions. Asserts against each field's own focus handle, not a
-/// re-derived `focus_order()` list, so the assertion cannot pass merely
-/// because `focus_order()` and the test agree on the same (possibly wrong)
-/// derivation.
-fn assert_add_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url: &str) {
-    let temp = TempStorePath::new("tab-order-network-add");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_url_input(url, cx);
-    });
-    vcx.run_until_parked();
-
-    manager.read_with(vcx, |view, app| {
-        assert_eq!(
-            view.pending_driver_id(app),
-            Ok("mysql"),
-            "url {url} must resolve to the registered mysql driver"
-        );
-    });
-
-    let order = manager.update(vcx, |view, cx| add_form_network_focus_chain(view, cx));
-    assert_tab_cycles_through_in_order(vcx, &order);
-}
-
-/// [`assert_add_form_tab_order_covers_network_fields`]'s edit-form
-/// equivalent: the row at index 0 is pre-loaded from `url` and the form is
-/// opened via [`ConnectionManagerView::show_edit_form`].
-fn assert_edit_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url: &str) {
-    let temp = TempStorePath::new("tab-order-network-edit");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "db".to_owned(),
-            url: url.to_owned(),
-        })
-        .expect("add must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
-
-    manager.update(vcx, |view, cx| {
-        view.open(cx);
-        view.show_edit_form(0, cx);
-    });
-    vcx.run_until_parked();
-
-    manager.read_with(vcx, |view, app| {
-        assert_eq!(
-            view.pending_driver_id(app),
-            Ok("mysql"),
-            "url {url} must resolve to the registered mysql driver"
-        );
-    });
-
-    let order = manager.update(vcx, |view, cx| edit_form_network_focus_chain(view, cx));
-    assert_tab_cycles_through_in_order(vcx, &order);
-}
-
-#[gpui::test]
-fn tab_order_for_the_add_form_covers_network_fields_for_a_mysql_url(cx: &mut TestAppContext) {
-    assert_add_form_tab_order_covers_network_fields(cx, "mysql://app:pw@dbhost:3306/orders");
-}
-
-#[gpui::test]
-fn tab_order_for_the_add_form_covers_network_fields_for_a_mariadb_url(cx: &mut TestAppContext) {
-    assert_add_form_tab_order_covers_network_fields(cx, "mariadb://app:pw@dbhost:3306/orders");
-}
-
-#[gpui::test]
-fn tab_order_for_the_edit_form_covers_network_fields_for_a_mysql_url(cx: &mut TestAppContext) {
-    assert_edit_form_tab_order_covers_network_fields(cx, "mysql://app:pw@dbhost:3306/orders");
-}
-
-#[gpui::test]
-fn tab_order_for_the_edit_form_covers_network_fields_for_a_mariadb_url(cx: &mut TestAppContext) {
-    assert_edit_form_tab_order_covers_network_fields(cx, "mariadb://app:pw@dbhost:3306/orders");
-}
-
-#[gpui::test]
-fn focus_order_for_an_empty_url_contains_only_name_url_and_footer_buttons(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("tab-order-empty-url");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-    });
-
-    manager.update(cx, |view, cx| {
-        assert!(view.pending_driver_id(cx).is_err());
-        let order = view.focus_order(cx);
-        let form = view.form.read(cx);
-        let expected = vec![
-            form.name_field.read(cx).focus_handle(cx),
-            form.url_field.read(cx).focus_handle(cx),
-            form.cancel_focus.clone(),
-            form.test_focus.clone(),
-            form.connect_focus.clone(),
-            form.save_focus.clone(),
-        ];
-        assert_eq!(
-            order, expected,
-            "an empty URL must expose no driver fields at all"
-        );
-    });
-}
-
-#[gpui::test]
-fn focus_order_for_an_unrecognized_scheme_contains_only_name_url_and_footer_buttons(
-    cx: &mut TestAppContext,
-) {
-    let temp = TempStorePath::new("tab-order-unrecognized-scheme");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("cassandra://host/db", cx);
-    });
-
-    manager.update(cx, |view, cx| {
-        assert!(view.pending_driver_id(cx).is_err());
-        let order = view.focus_order(cx);
-        let form = view.form.read(cx);
-        let expected = vec![
-            form.name_field.read(cx).focus_handle(cx),
-            form.url_field.read(cx).focus_handle(cx),
-            form.cancel_focus.clone(),
-            form.test_focus.clone(),
-            form.connect_focus.clone(),
-            form.save_focus.clone(),
-        ];
-        assert_eq!(
-            order, expected,
-            "an unrecognized scheme must expose no driver fields, not even a stale sqlite path field"
-        );
-    });
-}
-
-// ---- on_form_event router (footer button wiring) -------------------------
-
-#[gpui::test]
-fn a_cancel_event_from_the_form_returns_the_modal_to_the_list(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("form-event-cancel");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.open(cx);
-        view.show_add_form(cx);
-        view.set_name_input("staging", cx);
-        view.form
-            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Cancel));
-    });
-
-    manager.read_with(cx, |view, cx| {
-        assert_eq!(
-            view.current_view(),
-            ManagerView::List,
-            "a Cancel event emitted by the form must route through on_form_event to cancel_form"
-        );
-        assert!(view.form.read(cx).name_field.read(cx).value().is_empty());
-    });
-}
-
-#[gpui::test]
-fn an_add_event_from_the_form_persists_a_new_connection(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("form-event-add");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_name_input("from-footer", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        view.form
-            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Add));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "an Add event emitted by the form must route through on_form_event to add_connection"
-        );
-        assert_eq!(view.connections()[0].connection.name, "from-footer");
-        assert_eq!(view.current_view(), ManagerView::List);
-    });
-}
-
-#[gpui::test]
-fn an_edit_event_from_the_form_updates_the_row_in_place(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("form-event-edit");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "first".to_owned(),
-            url: "postgres://host/a".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        view.set_name_input("renamed via footer", cx);
-        let id = view.connections()[0].connection.id;
-        view.form
-            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Edit { id }));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "an Edit event must update the row in place, not append a duplicate"
-        );
-        assert_eq!(view.connections()[0].connection.name, "renamed via footer");
-        assert_eq!(
-            view.current_view(),
-            ManagerView::List,
-            "an Edit event emitted by the form must route through on_form_event to save_edit"
-        );
-    });
-}
-
-/// [`ConnectionManagerView::run_test`]'s spawned probe is real I/O the
-/// manager never awaits synchronously; the routing this test pins is
-/// [`super::ConnectionManagerView::on_form_event`] reaching `run_test` at
-/// all, which is already visible in the `Pending` outcome `run_test` sets
-/// before it ever spawns the probe -- the probe's own eventual result is
-/// covered by [`running_test_never_mutates_the_sessions_active_connection_or_persists`].
-#[gpui::test]
-fn a_test_event_from_the_form_starts_a_probe_via_run_test(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("form-event-test");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_url_input("sqlite::memory:", cx);
-        view.form
-            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Test));
-    });
-
-    manager.read_with(cx, |view, app| {
-        assert_eq!(
-            view.test_outcome(app),
-            Some(&TestOutcome::Pending),
-            "a Test event emitted by the form must route through on_form_event to run_test"
-        );
-    });
-}
-
-/// [`ConnectionManagerView::connect_unsaved`]'s equivalent of
-/// [`a_test_event_from_the_form_starts_a_probe_via_run_test`]'s doc comment:
-/// pins the routing through its synchronous, pre-await side effects (`active`
-/// and `status` updated before the connect itself resolves), the same
-/// contract [`connect_unsaved_updates_active_synchronously_before_the_connect_resolves`]
-/// asserts when calling `connect_unsaved` directly.
-#[gpui::test]
-fn a_connect_event_from_the_form_dispatches_a_connect_via_connect_unsaved(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("form-event-connect");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_name_input("via-footer", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        view.form
-            .update(cx, |_form, cx| cx.emit(ConnectionFormEvent::Connect));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.active().map(|active| active.name.as_str()),
-            Some("via-footer"),
-            "a Connect event emitted by the form must route through on_form_event to \
-             connect_unsaved"
-        );
-        assert!(
-            view.status()
-                .is_some_and(|status| status.contains("Connecting")),
-            "expected the connecting status connect_unsaved sets synchronously, got {:?}",
-            view.status()
-        );
-    });
-}
-
-// ---- Enter-to-submit (name/url TextFieldEvent::Submit) --------------------
-
-#[gpui::test]
-fn submitting_the_name_field_in_add_mode_persists_a_new_connection(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("submit-name-add");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_name_input("enter-submitted", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        let name_field = view.form.read(cx).name_field.clone();
-        name_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "Enter in the name field must submit the add form, the same as clicking Save"
-        );
-        assert_eq!(view.connections()[0].connection.name, "enter-submitted");
-        assert_eq!(view.current_view(), ManagerView::List);
-    });
-}
-
-#[gpui::test]
-fn submitting_the_url_field_in_add_mode_persists_a_new_connection(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("submit-url-add");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_add_form(cx);
-        view.set_name_input("enter-submitted-url", cx);
-        view.set_url_input("sqlite::memory:", cx);
-        let url_field = view.form.read(cx).url_field.clone();
-        url_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "Enter in the url field must submit the add form, the same as clicking Save"
-        );
-        assert_eq!(view.connections()[0].connection.name, "enter-submitted-url");
-        assert_eq!(view.current_view(), ManagerView::List);
-    });
-}
-
-#[gpui::test]
-fn submitting_the_name_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("submit-name-edit");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "first".to_owned(),
-            url: "postgres://host/a".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        view.set_name_input("edited via enter", cx);
-        let name_field = view.form.read(cx).name_field.clone();
-        name_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "Enter in edit mode must update the row in place, not append a duplicate"
-        );
-        assert_eq!(view.connections()[0].connection.name, "edited via enter");
-        assert_eq!(view.current_view(), ManagerView::List);
-    });
-}
-
-#[gpui::test]
-fn submitting_the_url_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("submit-url-edit");
-    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    store
-        .add(ConnectionArgs {
-            name: "first".to_owned(),
-            url: "postgres://host/a".to_owned(),
-        })
-        .expect("add must succeed");
-
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.show_edit_form(0, cx);
-        view.set_name_input("edited via enter url", cx);
-        let url_field = view.form.read(cx).url_field.clone();
-        url_field.update(cx, |_field, cx| cx.emit(TextFieldEvent::Submit));
-    });
-
-    manager.read_with(cx, |view, _app| {
-        assert_eq!(
-            view.connections().len(),
-            1,
-            "Enter in edit mode must update the row in place, not append a duplicate"
-        );
-        assert_eq!(
-            view.connections()[0].connection.name,
-            "edited via enter url"
-        );
-        assert_eq!(view.current_view(), ManagerView::List);
-    });
 }

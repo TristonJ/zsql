@@ -26,6 +26,7 @@ use crate::ui::connections::form::{ConnectionForm, ConnectionFormEvent};
 use crate::ui::format::host_label;
 
 mod form;
+mod list;
 
 /// Which panel the connection-manager modal currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,13 +219,6 @@ impl ConnectionManagerView {
         &self.rows
     }
 
-    /// The most recent add/connect/delete/save attempt's status message, if
-    /// any.
-    #[must_use]
-    pub fn status(&self) -> Option<&str> {
-        self.status.as_deref()
-    }
-
     /// The Test button's most recent (or in-flight) outcome, if any. Test
     /// helper: production rendering reads this straight off [`Self::form`]
     /// itself (see [`ConnectionForm::test_outcome`]) since the form draws
@@ -232,14 +226,6 @@ impl ConnectionManagerView {
     #[cfg(test)]
     pub fn test_outcome<'a>(&self, cx: &'a App) -> Option<&'a TestOutcome> {
         self.form.read(cx).test_outcome()
-    }
-
-    /// The driver id the form's current URL detects, purely from its scheme
-    /// (see [`detect_driver_id`]). Test helper (see [`Self::test_outcome`]'s
-    /// doc comment for why this is not otherwise needed on the manager).
-    #[cfg(test)]
-    pub fn pending_driver_id(&self, cx: &App) -> Result<&'static str, String> {
-        self.form.read(cx).pending_driver_id()
     }
 
     /// The focusable controls in the currently-shown form, in visual
@@ -266,6 +252,14 @@ impl ConnectionManagerView {
     #[must_use]
     pub fn active(&self) -> Option<&ActiveConnection> {
         self.active.as_ref()
+    }
+
+    /// The most recent add/connect/delete/save attempt's outcome, if any.
+    /// Test helper: production rendering hands this straight to the list
+    /// panel's status line rather than reading it back off itself.
+    #[cfg(test)]
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
     }
 
     /// The stable tab-session key for whichever connection is currently
@@ -348,24 +342,25 @@ impl ConnectionManagerView {
     }
 
     /// Switch the open modal to the empty add-connection form.
-    pub fn show_add_form(&mut self, cx: &mut Context<Self>) {
+    pub fn show_add_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.view = ManagerView::Form;
         self.form.update(cx, ConnectionForm::begin_add);
         self.status = None;
+        self.form.read(cx).name_focus_handle(cx).focus(window);
         cx.notify();
     }
 
     /// Switch the open modal to the edit form for the connection at `index`,
     /// pre-filled from its stored name/url.
-    pub fn show_edit_form(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.rows.get(index) else {
-            tracing::warn!(index, "edit requested for an out-of-range row");
+    pub fn show_edit_form(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.iter().find(|r| r.connection.id == id) else {
+            tracing::warn!(id = %id, "edit requested for a non-existing row");
             return;
         };
         let url = match row.connection.get_url() {
             Ok(url) => url,
             Err(e) => {
-                tracing::warn!(index, "edit requested for a row with an invalid URL: {e}");
+                tracing::warn!(id = %id, "edit requested for a row with an invalid URL: {e}");
                 self.status = Some(format!("Cannot edit: {e}"));
                 cx.notify();
                 return;
@@ -377,6 +372,7 @@ impl ConnectionManagerView {
         self.status = None;
         self.form
             .update(cx, |form, cx| form.begin_edit(id, name, url, cx));
+        self.form.read(cx).name_focus_handle(cx).focus(window);
         cx.notify();
     }
 
@@ -416,17 +412,17 @@ impl ConnectionManagerView {
     fn on_form_event(&mut self, event: &ConnectionFormEvent, cx: &mut Context<Self>) {
         match event {
             ConnectionFormEvent::Cancel => self.cancel_form(cx),
-            ConnectionFormEvent::Test => {
-                self.run_test(cx).detach();
+            ConnectionFormEvent::Test { url } => {
+                self.run_test(cx, url.clone()).detach();
             }
-            ConnectionFormEvent::Connect => {
-                self.connect_unsaved(cx).detach();
+            ConnectionFormEvent::Connect { name, url } => {
+                self.connect_unsaved(cx, name.clone(), url.clone()).detach();
             }
-            ConnectionFormEvent::Add => {
-                let _ = self.add_connection(cx);
+            ConnectionFormEvent::Add { name, url } => {
+                let _ = self.add_connection(cx, name, url.clone());
             }
-            ConnectionFormEvent::Edit { id } => {
-                let _ = self.save_edit(*id, cx);
+            ConnectionFormEvent::Edit { id, name, url } => {
+                let _ = self.save_edit(cx, *id, name, url.clone());
             }
         }
     }
@@ -486,16 +482,20 @@ impl ConnectionManagerView {
     /// Input validation failures are reported through [`Self::status`]
     /// rather than this `Result`, since they never reach the store.
     #[tracing::instrument(name = "connection_manager_add", skip_all)]
-    pub fn add_connection(&mut self, cx: &mut Context<Self>) -> Result<(), ConnectionStoreError> {
-        let (name, url) = self.form.read(cx).input_values(cx);
-        if let Err(message) = validate_new_connection(&name, &url) {
+    pub fn add_connection(
+        &mut self,
+        cx: &mut Context<Self>,
+        name: &str,
+        url: String,
+    ) -> Result<(), ConnectionStoreError> {
+        if let Err(message) = validate_new_connection(name, &url) {
             tracing::warn!(reason = %message, "rejected invalid connection input");
             self.status = Some(message);
             cx.notify();
             return Ok(());
         }
         let connection = ConnectionArgs {
-            name: name.clone(),
+            name: name.to_string(),
             url,
         };
         match self.store.add(connection) {
@@ -527,18 +527,19 @@ impl ConnectionManagerView {
     #[tracing::instrument(name = "connection_manager_save_edit", skip_all, fields(index))]
     pub fn save_edit(
         &mut self,
-        id: Uuid,
         cx: &mut Context<Self>,
+        id: Uuid,
+        name: &str,
+        url: String,
     ) -> Result<(), ConnectionStoreError> {
-        let (name, url) = self.form.read(cx).input_values(cx);
-        if let Err(message) = validate_new_connection(&name, &url) {
+        if let Err(message) = validate_new_connection(name, &url) {
             tracing::warn!(reason = %message, "rejected invalid connection edit");
             self.status = Some(message);
             cx.notify();
             return Ok(());
         }
         let args = ConnectionArgs {
-            name: name.clone(),
+            name: name.to_string(),
             url,
         };
         match self.store.update(id, args) {
@@ -637,9 +638,9 @@ impl ConnectionManagerView {
     /// itself close the modal; see [`Self::connect_and_close`] for the
     /// row-click/Enter path that does.
     #[tracing::instrument(name = "connection_manager_connect", skip_all)]
-    pub fn connect_index(&mut self, index: usize, cx: &mut Context<Self>) -> Task<()> {
-        let Some(row) = self.rows.get(index) else {
-            tracing::warn!(index, "connect requested for an out-of-range row");
+    pub fn connect(&mut self, id: Uuid, cx: &mut Context<Self>) -> Task<()> {
+        let Some(row) = self.rows.iter().find(|r| r.connection.id == id) else {
+            tracing::warn!(id = %id, "connect requested for an out-of-range row");
             return Task::ready(());
         };
         let name = row.connection.name.clone();
@@ -693,14 +694,9 @@ impl ConnectionManagerView {
         })
     }
 
-    /// Connect to the row at `id` (see [`Self::connect_index`]) and close
-    /// the modal, the behavior a click on a list row's body -- or an
-    /// `Enter` while it is focused -- triggers. Closing happens immediately
-    /// once the connect attempt is dispatched, not once it resolves: a
-    /// connect can take a while, and the modal closing right away (matching
-    /// the click) is what makes this feel instantaneous.
-    pub fn connect_and_close(&mut self, index: usize, cx: &mut Context<Self>) -> Task<()> {
-        let task = self.connect_index(index, cx);
+    /// Connect to the row with `id` (see [`Self::connect`]) and close the modal
+    pub fn connect_and_close(&mut self, id: Uuid, cx: &mut Context<Self>) -> Task<()> {
+        let task = self.connect(id, cx);
         self.close(cx);
         task
     }
@@ -716,8 +712,12 @@ impl ConnectionManagerView {
     /// failed connect leaves the modal open with the error in the status
     /// line, without reverting `active`.
     #[tracing::instrument(name = "connection_manager_connect_unsaved", skip_all)]
-    pub fn connect_unsaved(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        let (name, url) = self.form.read(cx).input_values(cx);
+    pub fn connect_unsaved(
+        &mut self,
+        cx: &mut Context<Self>,
+        name: String,
+        url: String,
+    ) -> Task<()> {
         if let Err(reason) = detect_driver_id(&url) {
             self.status = Some(format!("Cannot connect: {reason}"));
             cx.notify();
@@ -776,8 +776,7 @@ impl ConnectionManagerView {
     /// [`ConnectionForm::set_test_outcome`]) immediately, then the final
     /// result once the attempt settles.
     #[tracing::instrument(name = "connection_manager_test", skip_all)]
-    pub fn run_test(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        let url = self.form.read(cx).input_values(cx).1;
+    pub fn run_test(&mut self, cx: &mut Context<Self>, url: String) -> Task<()> {
         if let Err(reason) = detect_driver_id(&url) {
             self.form.update(cx, |form, cx| {
                 form.set_test_outcome(Some(TestOutcome::Failed(reason)), cx);
