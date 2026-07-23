@@ -15,7 +15,6 @@ use config::Config;
 use connections::ConnectionStore;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use session::{Session, SessionState};
-use ui::connections::active_connection_for_url;
 use ui::workspace::WorkspaceView;
 use zsql_ui::theme::{Theme, get_builtin_fonts};
 
@@ -31,19 +30,11 @@ fn main() -> anyhow::Result<()> {
         Some(path) => Config::load_or_default(&path)?,
         None => Config::default(),
     };
-    let has_configured_url = cfg.resolve_url().is_some();
-    tracing::info!(theme = %cfg.theme.name, has_configured_url, "zsql starting");
 
     let connection_store = match Config::connections_path() {
         Some(path) => ConnectionStore::load(&path)?,
         None => ConnectionStore::in_memory(),
     };
-    // Snapshot before `connection_store` is moved into `WorkspaceView::new`
-    // below: the startup connect task still needs it to resolve the footer's
-    // active-connection label for a `DATABASE_URL`/`Config`-fallback URL
-    // that matches (or doesn't match) a saved connection.
-    let saved_connections = connection_store.connections().to_vec();
-    let resolved_url = cfg.resolve_url();
 
     Application::new()
         .with_assets(zsql_ui::icon::IconAssetSource)
@@ -107,7 +98,6 @@ fn main() -> anyhow::Result<()> {
                     .detach();
 
                     let startup_session = session.clone();
-                    let startup_workspace = workspace.clone();
                     cx.spawn(async move |cx| {
                         let connect_task = startup_session.update(cx, Session::connect)?;
                         connect_task.await;
@@ -120,12 +110,6 @@ fn main() -> anyhow::Result<()> {
                         })?;
 
                         if is_connected {
-                            if let Some(url) = &resolved_url {
-                                let active = active_connection_for_url(url, &saved_connections);
-                                startup_workspace.update(cx, |workspace, cx| {
-                                    workspace.set_active_connection(active, cx);
-                                })?;
-                            }
                             let introspect_task =
                                 startup_session.update(cx, Session::introspect)?;
                             introspect_task.await;

@@ -18,6 +18,7 @@ use gpui::{
     ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, Render, Stateful, Task,
     Window, div, prelude::*, px, rgb, rgba,
 };
+use uuid::Uuid;
 use zsql_core::{Connection, ConnectionUrl};
 use zsql_ui::button::{primary_button, secondary_button};
 use zsql_ui::grid;
@@ -26,10 +27,11 @@ use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
 use zsql_ui::theme::ActiveTheme;
 
 use super::theme;
-use crate::connections::{ConnectionStore, ConnectionStoreError, StoredConnection};
-use crate::drivers;
+use crate::connections::{ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection};
+use crate::drivers::{self, detect_driver_id};
 use crate::session::{Session, SessionState, probe_connection};
 use crate::tab_session::ConnectionKey;
+use crate::ui::format::host_label;
 
 /// Which panel the connection-manager modal currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +41,10 @@ pub enum ManagerView {
     /// The "new connection" form: an empty form, offering Connect/Save.
     AddForm,
     /// The "edit connection" form, pre-filled from the [`StoredConnection`]
-    /// at this row index, offering only Save changes.
+    /// with this id
     EditForm {
-        /// The row index (into [`ConnectionManagerView::connections`]) being
-        /// edited.
-        index: usize,
+        /// The row id (of [`ConnectionManagerView::connections`])
+        id: uuid::Uuid,
     },
 }
 
@@ -54,6 +55,9 @@ pub enum ManagerView {
 /// saved).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveConnection {
+    /// The id of the [`StoredConnection`] this name/url pair came from, if any. `None`
+    /// for a `DATABASE_URL`/`Config` fallback connection with no saved entry behind it.
+    pub id: Option<Uuid>,
     /// The display name shown in the footer and the modal's active row.
     pub name: String,
     /// The connection URL this name was resolved for.
@@ -103,46 +107,6 @@ pub fn footer_display(
     }
 }
 
-/// Determine the active-connection label for a freshly connected `url`: the
-/// name of whichever [`StoredConnection`] in `saved` has a matching url
-/// (first match wins), or -- when `url` matches no saved connection, e.g. a
-/// `DATABASE_URL`/`Config` fallback connection -- a name derived from the
-/// url's host via [`host_label`], so the footer always has something
-/// sensible to show instead of a blank label.
-#[must_use]
-pub fn active_connection_for_url(url: &str, saved: &[StoredConnection]) -> ActiveConnection {
-    let name = saved
-        .iter()
-        .find(|connection| connection.url == url)
-        .map_or_else(|| host_label(url), |connection| connection.name.clone());
-    ActiveConnection {
-        name,
-        url: url.to_owned(),
-    }
-}
-
-/// Extract a `host[:port]`-shaped label from a connection URL for display,
-/// e.g. `postgres://user:pass@localhost:5432/db` -> `localhost:5432`. Falls
-/// back to the scheme-stripped remainder of the URL if no host segment can
-/// be isolated (e.g. a `sqlite:` path), so even an unusual URL still renders
-/// something instead of an empty label.
-#[must_use]
-pub fn host_label(url: &str) -> String {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let after_userinfo = after_scheme
-        .rsplit_once('@')
-        .map_or(after_scheme, |(_, rest)| rest);
-    let host = after_userinfo
-        .split(['/', '?'])
-        .next()
-        .unwrap_or(after_userinfo);
-    if host.is_empty() {
-        after_scheme.to_owned()
-    } else {
-        host.to_owned()
-    }
-}
-
 /// One persisted connection as shown in the manager, with its auto-detected
 /// driver id (or the detection failure's message, surfaced inline rather
 /// than hidden) derived fresh from the URL every time the row list is built
@@ -150,11 +114,8 @@ pub fn host_label(url: &str) -> String {
 /// drivers.
 #[derive(Debug, Clone)]
 pub struct ConnectionRow {
-    /// The persisted name/url pair this row renders.
+    /// The persisted connection this row renders.
     pub connection: StoredConnection,
-    /// `Ok(driver id)` if the URL's scheme resolved to a registered driver,
-    /// `Err(message)` otherwise.
-    pub driver_id: Result<&'static str, String>,
 }
 
 /// The identity and coloring of one list row's trailing icon button (edit or
@@ -415,7 +376,7 @@ impl ConnectionManagerView {
             .store
             .connections()
             .iter()
-            .any(|connection| connection.name == active.name && connection.url == active.url);
+            .any(|connection| Some(connection.id) == active.id);
         Some(if is_saved {
             ConnectionKey::Saved(active.name.clone())
         } else {
@@ -535,9 +496,19 @@ impl ConnectionManagerView {
             tracing::warn!(index, "edit requested for an out-of-range row");
             return;
         };
+        let url = match row.connection.get_url() {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!(index, "edit requested for a row with an invalid URL: {e}");
+                self.status = Some(format!("Cannot edit: {e}"));
+                cx.notify();
+                return;
+            }
+        };
         let name = row.connection.name.clone();
-        let url = row.connection.url.clone();
-        self.view = ManagerView::EditForm { index };
+        self.view = ManagerView::EditForm {
+            id: row.connection.id,
+        };
         self.status = None;
         self.test_outcome = None;
         self.name_field
@@ -597,10 +568,8 @@ impl ConnectionManagerView {
         )
     }
 
-    /// Replace the tracked active connection, e.g. after a successful
-    /// connect (see [`Self::connect_index`]) or at startup once
-    /// [`Session::connect`]'s fallback URL resolves (see
-    /// [`active_connection_for_url`]).
+    /// Replace the tracked active connection
+    #[cfg(test)]
     pub fn set_active(&mut self, active: Option<ActiveConnection>, cx: &mut Context<Self>) {
         self.active = active;
         cx.notify();
@@ -613,8 +582,8 @@ impl ConnectionManagerView {
             ManagerView::AddForm => {
                 let _ = self.add_connection(cx);
             }
-            ManagerView::EditForm { index } => {
-                let _ = self.save_edit(index, cx);
+            ManagerView::EditForm { id } => {
+                let _ = self.save_edit(id, cx);
             }
             ManagerView::List => {}
         }
@@ -652,15 +621,6 @@ fn validate_new_connection(name: &str, url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Detect the driver id `url` would resolve to, using the same registered
-/// drivers and selection function the real connect path uses.
-fn detect_driver_id(url: &str) -> Result<&'static str, String> {
-    let drivers = drivers::registered_drivers();
-    zsql_core::select_driver(&drivers, url)
-        .map(|driver| driver.id())
-        .map_err(|err| err.to_string())
-}
-
 /// The branded label a driver id displays as in the UI (badge, divider,
 /// list tag) -- distinct from the id itself, which stays lowercase for
 /// scheme matching and query-param lookups.
@@ -680,7 +640,6 @@ fn build_rows(connections: &[StoredConnection]) -> Vec<ConnectionRow> {
         .iter()
         .map(|connection| ConnectionRow {
             connection: connection.clone(),
-            driver_id: detect_driver_id(&connection.url),
         })
         .collect()
 }
@@ -917,7 +876,7 @@ impl ConnectionManagerView {
             cx.notify();
             return Ok(());
         }
-        let connection = StoredConnection {
+        let connection = ConnectionArgs {
             name: name.clone(),
             url,
         };
@@ -950,7 +909,7 @@ impl ConnectionManagerView {
     #[tracing::instrument(name = "connection_manager_save_edit", skip_all, fields(index))]
     pub fn save_edit(
         &mut self,
-        index: usize,
+        id: Uuid,
         cx: &mut Context<Self>,
     ) -> Result<(), ConnectionStoreError> {
         let (name, url) = self.input_values(cx);
@@ -960,13 +919,13 @@ impl ConnectionManagerView {
             cx.notify();
             return Ok(());
         }
-        let connection = StoredConnection {
+        let args = ConnectionArgs {
             name: name.clone(),
             url,
         };
-        match self.store.update(index, connection) {
+        match self.store.update(id, args) {
             Ok(()) => {
-                tracing::info!(index, name = %name, "connection updated");
+                tracing::info!(id = %id, name = %name, "connection updated");
                 self.rebuild_rows(cx);
                 self.view = ManagerView::List;
                 self.clear_inputs(cx);
@@ -983,7 +942,7 @@ impl ConnectionManagerView {
         }
     }
 
-    /// Delete the saved connection at `index` from the store, persist the
+    /// Delete the saved connection at `id` from the store, persist the
     /// removal, and refresh the row list. If the deleted connection was the
     /// tracked active one, clears [`Self::active`] so the footer/modal fall
     /// back to the disconnected prompt rather than continuing to show a
@@ -994,25 +953,30 @@ impl ConnectionManagerView {
     /// # Errors
     /// Returns [`ConnectionStoreError`] if the store could not be written.
     #[tracing::instrument(name = "connection_manager_delete", skip_all, fields(index))]
-    pub fn delete_index(
+    pub fn delete_id(
         &mut self,
-        index: usize,
+        id: Uuid,
         cx: &mut Context<Self>,
     ) -> Result<(), ConnectionStoreError> {
-        let Some(row) = self.rows.get(index) else {
-            tracing::warn!(index, "delete requested for an out-of-range row");
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.connection.id == id)
+            .cloned();
+        let Some(row) = row else {
+            tracing::warn!(id = %id, "delete requested for an non-existing row");
             return Ok(());
         };
-        let deleted = row.connection.clone();
+        let deleted = row.connection;
 
-        match self.store.remove(index) {
+        match self.store.remove(id) {
             Ok(()) => {
                 tracing::info!(name = %deleted.name, "connection deleted");
                 self.rebuild_rows(cx);
                 if self
                     .active
                     .as_ref()
-                    .is_some_and(|active| active.name == deleted.name && active.url == deleted.url)
+                    .is_some_and(|active| active.id == Some(deleted.id))
                 {
                     self.active = None;
                 }
@@ -1036,7 +1000,7 @@ impl ConnectionManagerView {
         self.row_focus_handles = self.rows.iter().map(|_| cx.focus_handle()).collect();
     }
 
-    /// Connect to the saved connection at `index` through
+    /// Connect to the saved connection with `id` through
     /// [`Session::connect_to`], the same driver-selection path every
     /// connection in the app goes through, then -- mirroring the
     /// connect-then-introspect sequencing the app runs at startup -- follows
@@ -1055,13 +1019,22 @@ impl ConnectionManagerView {
             return Task::ready(());
         };
         let name = row.connection.name.clone();
-        let url = row.connection.url.clone();
-        tracing::info!(name = %name, driver = ?row.driver_id, "connecting to saved connection");
+        let url = match row.connection.get_url() {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::error!(error = %err, "unable to read connection URL");
+                self.status = Some(format!("Failed to connect to {name}: {err}"));
+                cx.notify();
+                return Task::ready(());
+            }
+        };
+        tracing::info!(name = %name, "connecting to saved connection");
         self.status = Some("connecting...".to_string());
         cx.notify();
 
         let session = self.session.clone();
         let active_on_success = ActiveConnection {
+            id: Some(row.connection.id),
             name: name.clone(),
             url: url.clone(),
         };
@@ -1100,7 +1073,7 @@ impl ConnectionManagerView {
         })
     }
 
-    /// Connect to the row at `index` (see [`Self::connect_index`]) and close
+    /// Connect to the row at `id` (see [`Self::connect_index`]) and close
     /// the modal, the behavior a click on a list row's body -- or an
     /// `Enter` while it is focused -- triggers. Closing happens immediately
     /// once the connect attempt is dispatched, not once it resolves: a
@@ -1137,6 +1110,7 @@ impl ConnectionManagerView {
 
         let session = self.session.clone();
         let active_on_success = ActiveConnection {
+            id: None,
             name: display_name.clone(),
             url: url.clone(),
         };
@@ -1434,18 +1408,17 @@ impl ConnectionManagerView {
     ) -> Stateful<Div> {
         let active_theme = cx.theme();
         let colors = active_theme.colors;
-        let driver_label = match &row.driver_id {
-            Ok(id) => driver_display_label(id).to_owned(),
-            Err(_) => "unrecognized".to_owned(),
-        };
-        let is_active = self.active.as_ref().is_some_and(|active| {
-            active.name == row.connection.name && active.url == row.connection.url
-        });
+        let driver_label = row.connection.display_kind.clone();
+        let is_active = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == Some(row.connection.id));
         let focus_handle = self
             .row_focus_handles
             .get(index)
             .cloned()
             .unwrap_or_else(|| cx.focus_handle());
+        let id = row.connection.id;
 
         let mut item = div()
             .id(("connection-modal-row", index))
@@ -1497,7 +1470,7 @@ impl ConnectionManagerView {
                     hover_color: colors.status_error,
                 },
                 move |view, cx| {
-                    let _ = view.delete_index(index, cx);
+                    let _ = view.delete_id(id, cx);
                 },
             ));
 
@@ -1548,7 +1521,7 @@ impl ConnectionManagerView {
                     .text_size(px(theme::MODAL_ROW_URL_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
                     .truncate()
-                    .child(row.connection.url.clone()),
+                    .child(row.connection.display_host.clone()),
             )
     }
 
@@ -1930,13 +1903,13 @@ impl ConnectionManagerView {
                             })),
                     );
             }
-            ManagerView::EditForm { index } => {
+            ManagerView::EditForm { id } => {
                 footer = footer.child(
                     primary_button("connection-form-save", window, cx)
                         .track_focus(&self.save_focus)
                         .child("Save changes")
                         .on_click(cx.listener(move |view, _event: &ClickEvent, _window, cx| {
-                            let _ = view.save_edit(index, cx);
+                            let _ = view.save_edit(id, cx);
                         })),
                 );
             }

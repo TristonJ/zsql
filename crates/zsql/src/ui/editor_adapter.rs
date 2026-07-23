@@ -101,11 +101,11 @@ mod live_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(url);
-
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| session.connect_to(url, cx))
+            .await;
         session.read_with(cx, |session, _app| {
             assert!(
                 matches!(session.state(), SessionState::Connected),

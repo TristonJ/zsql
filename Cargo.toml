@@ -60,6 +60,9 @@ percent-encoding = "2"
 # dependency graph via sqlx's `chrono` feature; declared directly here since
 # the zsql crate uses it independently of sqlx.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
+# Used to store URLs / connection strings safely
+keyring = { version = "4", features = ["v1"] }
 
 [workspace.lints.clippy]
 # Pedantic on from day 1 (priority -1 so targeted allows can override).

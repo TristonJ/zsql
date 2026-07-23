@@ -9,9 +9,13 @@
 //! does today.
 
 use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::{drivers::detect_driver_name, ui::format::host_label};
 
 /// Owner-only file mode (`rw-------`) the connection store is written with.
 /// The entirety of V0's "secure": filesystem permissions only, no
@@ -19,18 +23,110 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 const STORE_FILE_MODE: u32 = 0o600;
 
-/// A user-named, persisted connection: a display name paired with its
-/// connection URL. The driver that will handle it is never stored here --
-/// it is derived from the URL's scheme on demand via
-/// [`zsql_core::select_driver`], so it can never go stale relative to the
-/// registered drivers.
+/// A user-named, persisted connection: a display name paired with its id.
+/// The connection URL itself is stored using the OS keyring
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredConnection {
+    /// An automatically-generated unique ID for this connection, used to identify it
+    pub id: uuid::Uuid,
     /// User-given display name.
     pub name: String,
-    /// The connection URL, e.g. `postgres://user@host/db` or
-    /// `sqlite:///path/to.db`.
+    /// A displayed kind for this connection - persisted so we don't need to access the
+    /// keyring to display information about the connection.
+    pub display_kind: String,
+    /// A displayed host for this connection - persisted so we don't need to access the
+    /// keyring to display information about the connection.
+    pub display_host: String,
+}
+
+/// A connection that has not yet been persisted to disk
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionArgs {
+    /// User-given display name.
+    pub name: String,
+    /// The connection URL to be saved in the OS keyring
     pub url: String,
+}
+
+impl ConnectionArgs {
+    pub fn into_stored(self) -> Result<StoredConnection, ConnectionStoreError> {
+        let stored = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: self.name,
+            display_kind: detect_driver_name(&self.url)
+                .unwrap_or("Unknown")
+                .to_owned(),
+            display_host: host_label(&self.url),
+        };
+        stored.set_url(&self.url)?;
+        Ok(stored)
+    }
+}
+
+impl StoredConnection {
+    #[cfg(not(test))]
+    pub fn get_url(&self) -> Result<String, ConnectionStoreError> {
+        let entry = self.get_keyring_entry()?;
+        Ok(entry.get_password()?)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn get_url(&self) -> Result<String, ConnectionStoreError> {
+        use std::io::Read;
+        let path = self.get_mock_file_path();
+        let mut url = String::new();
+        let mut file = File::open(&path).expect("failed to open mock keyring file");
+        file.read_to_string(&mut url)
+            .expect("failed to read mock keyring file");
+        Ok(url)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn set_url(&self, url: &str) -> Result<(), ConnectionStoreError> {
+        use std::io::Write;
+        let path = self.get_mock_file_path();
+        let mut file = File::create(path).expect("failed to create mock keyring file");
+        file.write_all(url.as_bytes())
+            .expect("failed to write mock keyring file");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn delete_url(&self) -> Result<(), ConnectionStoreError> {
+        let file_path = self.get_mock_file_path();
+        std::fs::remove_file(file_path).expect("failed to delete mock keyring file");
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn set_url(&self, url: &str) -> Result<(), ConnectionStoreError> {
+        let entry = self.get_keyring_entry()?;
+        entry.set_password(url)?;
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn delete_url(&self) -> Result<(), ConnectionStoreError> {
+        let entry = self.get_keyring_entry()?;
+        entry.delete_credential()?;
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn get_keyring_entry(&self) -> Result<keyring::Entry, ConnectionStoreError> {
+        let username = format!("zsql-connection-{}", self.id);
+        let entry = keyring::Entry::new("zsql", &username)?;
+        Ok(entry)
+    }
+
+    #[cfg(test)]
+    fn get_mock_file_path(&self) -> PathBuf {
+        let dir = std::env::temp_dir();
+        dir.join(format!("zsql-test-connection-{}.txt", self.id))
+    }
 }
 
 /// The on-disk shape of the connection store file: a single named array so
@@ -57,6 +153,9 @@ pub enum ConnectionStoreError {
     /// The store file could not be written (or its permissions set).
     #[error("failed to write connection store: {0}")]
     Write(std::io::Error),
+    /// There was an error accessing the OS keyring
+    #[error("failed to access OS keyring: {0}")]
+    Keyring(#[from] keyring::Error),
 }
 
 /// The persisted list of [`StoredConnection`]s, backed by a single TOML
@@ -66,6 +165,7 @@ pub enum ConnectionStoreError {
 pub struct ConnectionStore {
     path: PathBuf,
     connections: Vec<StoredConnection>,
+    pending_connections: Vec<ConnectionArgs>,
 }
 
 impl ConnectionStore {
@@ -78,6 +178,7 @@ impl ConnectionStore {
         Self {
             path: PathBuf::new(),
             connections: Vec::new(),
+            pending_connections: Vec::new(),
         }
     }
 
@@ -97,6 +198,7 @@ impl ConnectionStore {
             return Ok(Self {
                 path: path.to_owned(),
                 connections: Vec::new(),
+                pending_connections: Vec::new(),
             });
         }
 
@@ -106,6 +208,7 @@ impl ConnectionStore {
         Ok(Self {
             path: path.to_owned(),
             connections: file.connections,
+            pending_connections: Vec::new(),
         })
     }
 
@@ -122,8 +225,8 @@ impl ConnectionStore {
     /// # Errors
     /// Returns [`ConnectionStoreError`] if the store cannot be written.
     #[tracing::instrument(name = "connection_store_add", skip_all, fields(name = %connection.name))]
-    pub fn add(&mut self, connection: StoredConnection) -> Result<(), ConnectionStoreError> {
-        self.connections.push(connection);
+    pub fn add(&mut self, connection: ConnectionArgs) -> Result<(), ConnectionStoreError> {
+        self.pending_connections.push(connection);
         if let Err(err) = self.save() {
             self.connections.pop();
             return Err(err);
@@ -131,52 +234,64 @@ impl ConnectionStore {
         Ok(())
     }
 
-    /// Replace the connection at `index` with `connection` in place (same
-    /// position, no append) and persist the updated list immediately.
-    /// Mirrors [`Self::add`]/[`Self::remove`]'s rollback-on-save-failure
-    /// discipline: on a write failure the original entry is restored and an
-    /// `Err` is returned. An out-of-range `index` is a no-op that returns
-    /// `Ok(())`.
+    /// Replace the connection with `id` with `args` in place and persist the updated
+    /// list immediately. A no-op if the `id` is not found.
     ///
     /// # Errors
     /// Returns [`ConnectionStoreError`] if the store cannot be written.
     #[tracing::instrument(name = "connection_store_update", skip_all, fields(index))]
     pub fn update(
         &mut self,
-        index: usize,
-        connection: StoredConnection,
+        id: uuid::Uuid,
+        args: ConnectionArgs,
     ) -> Result<(), ConnectionStoreError> {
-        let Some(slot) = self.connections.get_mut(index) else {
+        let Some(index) = self.connections.iter().position(|conn| conn.id == id) else {
+            tracing::warn!(id = %id, "update requested for a non-existent connection id");
+            return Ok(());
+        };
+        let Some(conn) = self.connections.get_mut(index) else {
             tracing::warn!(index, "update requested for an out-of-range index");
             return Ok(());
         };
-        let previous = std::mem::replace(slot, connection);
+        let prior_args = ConnectionArgs {
+            name: conn.name.clone(),
+            url: conn.get_url()?,
+        };
+        // Attempt to update the keyring first
+        conn.set_url(&args.url)?;
+        conn.name = args.name;
+        // Now try to save - undoing the keyring change if it fails
         if let Err(err) = self.save() {
-            self.connections[index] = previous;
+            let conn = self
+                .connections
+                .get_mut(index)
+                .expect("index must still be valid");
+            conn.set_url(&prior_args.url)?;
+            conn.name = prior_args.name;
             return Err(err);
         }
         Ok(())
     }
 
-    /// Remove the connection at `index` and persist the updated list
-    /// immediately. Mirrors [`Self::add`]'s rollback-on-save-failure
-    /// discipline: on a write failure the removed entry is reinserted at its
-    /// original position and an `Err` is returned, so a failed remove can
-    /// never leave the on-disk store out of sync with what's in memory. An
-    /// out-of-range `index` is a no-op that returns `Ok(())`, mirroring how
-    /// the connection manager already treats an out-of-range connect index.
+    /// Remove the connection with `id` and persist the updated list
+    /// immediately
     ///
     /// # Errors
     /// Returns [`ConnectionStoreError`] if the store cannot be written.
     #[tracing::instrument(name = "connection_store_remove", skip_all, fields(index))]
-    pub fn remove(&mut self, index: usize) -> Result<(), ConnectionStoreError> {
-        if index >= self.connections.len() {
-            tracing::warn!(index, "remove requested for an out-of-range index");
+    pub fn remove(&mut self, id: uuid::Uuid) -> Result<(), ConnectionStoreError> {
+        let Some(index) = self.connections.iter().position(|conn| conn.id == id) else {
+            tracing::warn!(id = %id, "remove requested for a non-existent connection id");
             return Ok(());
-        }
+        };
+        // Do the reverse of save/update, first removing from the disk, then keyring
         let removed = self.connections.remove(index);
         if let Err(err) = self.save() {
             self.connections.insert(index, removed);
+            return Err(err);
+        }
+        if let Err(err) = removed.delete_url() {
+            tracing::error!(id = %removed.id, "failed to delete connection URL from keyring: {err}");
             return Err(err);
         }
         Ok(())
@@ -185,10 +300,17 @@ impl ConnectionStore {
     /// Write the current list to `path`, creating its parent directory if
     /// needed, then set owner-only permissions on the resulting file.
     #[tracing::instrument(name = "connection_store_save", skip_all)]
-    fn save(&self) -> Result<(), ConnectionStoreError> {
+    fn save(&mut self) -> Result<(), ConnectionStoreError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(ConnectionStoreError::Write)?;
         }
+        // Persist the pending connections to the OS keyring
+        let added = self
+            .pending_connections
+            .drain(..)
+            .map(ConnectionArgs::into_stored)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.connections.extend(added);
         let file = ConnectionStoreFile {
             connections: self.connections.clone(),
         };
@@ -216,7 +338,7 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), ConnectionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionStore, StoredConnection};
+    use super::{ConnectionArgs, ConnectionStore, StoredConnection};
 
     /// A temp file path this test owns exclusively, removed on drop so
     /// tests never leak files into the real temp dir.
@@ -241,16 +363,30 @@ mod tests {
         }
     }
 
-    fn sample() -> StoredConnection {
-        StoredConnection {
+    fn sample() -> ConnectionArgs {
+        ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://user:pass@localhost:5432/app".to_owned(),
         }
     }
 
+    fn assert_connection_eq(actual: &StoredConnection, expected: &ConnectionArgs) {
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(
+            actual.get_url().expect("must get URL"),
+            expected.url,
+            "the connection URL must match"
+        );
+    }
+
     #[test]
     fn stored_connection_round_trips_through_toml_with_no_data_loss() {
-        let connection = sample();
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "test".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+        };
         let text = toml::to_string(&connection).expect("must serialize");
         let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
         assert_eq!(parsed, connection);
@@ -285,7 +421,12 @@ mod tests {
         // A fresh `load` call, simulating a new process reading the file
         // this one just wrote.
         let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
-        assert_eq!(reloaded.connections(), &[sample()]);
+        assert_eq!(
+            reloaded.connections().len(),
+            1,
+            "the reloaded store must have one connection"
+        );
+        assert_connection_eq(&reloaded.connections()[0], &sample());
     }
 
     #[test]
@@ -293,11 +434,11 @@ mod tests {
         let temp = TempStorePath::new("two");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
 
-        let first = StoredConnection {
+        let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
         };
-        let second = StoredConnection {
+        let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
         };
@@ -305,7 +446,8 @@ mod tests {
         store.add(second.clone()).expect("add second");
 
         let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
-        assert_eq!(reloaded.connections(), &[first, second]);
+        assert_connection_eq(&reloaded.connections()[0], &first);
+        assert_connection_eq(&reloaded.connections()[1], &second);
     }
 
     #[test]
@@ -389,45 +531,44 @@ mod tests {
         let temp = TempStorePath::new("update");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
 
-        let first = StoredConnection {
+        let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
         };
-        let second = StoredConnection {
+        let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
         };
         store.add(first).expect("add first");
         store.add(second.clone()).expect("add second");
 
-        let updated_first = StoredConnection {
+        let first_id = store.connections()[0].id;
+        let updated_first = ConnectionArgs {
             name: "first renamed".to_owned(),
             url: "postgres://host/other".to_owned(),
         };
         store
-            .update(0, updated_first.clone())
+            .update(first_id, updated_first.clone())
             .expect("update must succeed");
 
-        assert_eq!(
-            store.connections(),
-            &[updated_first.clone(), second.clone()],
-            "only index 0 must change; the list length must stay the same"
-        );
+        assert_connection_eq(&store.connections()[0], &updated_first);
+        assert_connection_eq(&store.connections()[1], &second);
 
         let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
-        assert_eq!(reloaded.connections(), &[updated_first, second]);
+        assert_connection_eq(&reloaded.connections()[0], &updated_first);
+        assert_connection_eq(&reloaded.connections()[1], &second);
     }
 
     #[test]
-    fn updating_an_out_of_range_index_is_a_no_op() {
+    fn updating_an_non_existing_id_is_a_no_op() {
         let temp = TempStorePath::new("update-out-of-range");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
         store.add(sample()).expect("add must succeed");
 
         store
             .update(
-                5,
-                StoredConnection {
+                uuid::Uuid::new_v4(),
+                ConnectionArgs {
                     name: "nope".to_owned(),
                     url: "postgres://host/db".to_owned(),
                 },
@@ -435,10 +576,11 @@ mod tests {
             .expect("an out-of-range update must not error");
 
         assert_eq!(
-            store.connections(),
-            &[sample()],
+            store.connections().len(),
+            1,
             "an out-of-range update must not change the list"
         );
+        assert_connection_eq(&store.connections()[0], &sample());
     }
 
     #[cfg(unix)]
@@ -463,8 +605,8 @@ mod tests {
             .expect("setup: make store file read-only");
 
         let result = store.update(
-            0,
-            StoredConnection {
+            store.connections()[0].id,
+            ConnectionArgs {
                 name: "renamed".to_owned(),
                 url: "postgres://host/renamed".to_owned(),
             },
@@ -473,12 +615,7 @@ mod tests {
             result.is_err(),
             "update must fail when the store file cannot be overwritten"
         );
-        assert_eq!(
-            store.connections(),
-            &[sample()],
-            "a failed save must restore the original entry in memory: {:?}",
-            store.connections()
-        );
+        assert_connection_eq(&store.connections()[0], &sample());
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("teardown: restore file permissions");
@@ -490,47 +627,42 @@ mod tests {
         let temp = TempStorePath::new("remove");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
 
-        let first = StoredConnection {
+        let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
         };
-        let second = StoredConnection {
+        let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
         };
         store.add(first.clone()).expect("add first");
         store.add(second.clone()).expect("add second");
 
-        store.remove(0).expect("remove must succeed");
-        assert_eq!(
-            store.connections(),
-            std::slice::from_ref(&second),
-            "removing index 0 must leave only the second connection in memory"
-        );
+        store
+            .remove(store.connections()[0].id)
+            .expect("remove must succeed");
+        assert_connection_eq(&store.connections()[0], &second);
 
         let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
         assert_eq!(
-            reloaded.connections(),
-            &[second],
-            "the removal must be persisted to disk"
+            reloaded.connections().len(),
+            1,
+            "the reloaded store must have one connection"
         );
+        assert_connection_eq(&reloaded.connections()[0], &second);
     }
 
     #[test]
-    fn removing_an_out_of_range_index_is_a_no_op() {
+    fn removing_a_non_existing_id_is_a_no_op() {
         let temp = TempStorePath::new("remove-out-of-range");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
         store.add(sample()).expect("add must succeed");
 
         store
-            .remove(5)
+            .remove(uuid::Uuid::new_v4())
             .expect("an out-of-range remove must not error");
 
-        assert_eq!(
-            store.connections(),
-            &[sample()],
-            "an out-of-range remove must not change the list"
-        );
+        assert_connection_eq(&store.connections()[0], &sample());
     }
 
     #[cfg(unix)]
@@ -557,17 +689,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
             .expect("setup: make store file read-only");
 
-        let result = store.remove(0);
+        let result = store.remove(store.connections()[0].id);
         assert!(
             result.is_err(),
             "remove must fail when the store file cannot be overwritten"
         );
-        assert_eq!(
-            store.connections(),
-            &[sample()],
-            "a failed save must restore the removed entry in memory: {:?}",
-            store.connections()
-        );
+        assert_connection_eq(&store.connections()[0], &sample());
 
         // Restore permissions so the temp dir can be cleaned up.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))

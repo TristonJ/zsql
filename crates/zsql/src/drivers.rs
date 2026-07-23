@@ -44,6 +44,22 @@ pub async fn connect(url: String) -> Result<Box<dyn Connection>, CoreError> {
     driver.connect(&cfg).await
 }
 
+/// Detect the driver id `url` would resolve to
+pub fn detect_driver_id(url: &str) -> Result<&'static str, String> {
+    let drivers = registered_drivers();
+    zsql_core::select_driver(&drivers, url)
+        .map(|driver| driver.id())
+        .map_err(|err| err.to_string())
+}
+
+/// Detect the driver name `url` would resolve to
+pub fn detect_driver_name(url: &str) -> Result<&'static str, String> {
+    let drivers = registered_drivers();
+    zsql_core::select_driver(&drivers, url)
+        .map(|driver| driver.display_name())
+        .map_err(|err| err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

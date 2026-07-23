@@ -32,8 +32,6 @@ pub struct Config {
     pub theme: ThemeConfig,
     /// Query execution limits and defaults.
     pub query: QueryConfig,
-    /// Connection defaults.
-    pub connection: ConnectionConfig,
     /// Connection liveliness probe timing.
     pub liveness: LivenessConfig,
     /// Sizing bounds for the resizable workspace panes.
@@ -76,14 +74,6 @@ pub struct QueryConfig {
     /// session reports a truncated result rather than continuing to grow
     /// without bound.
     pub max_result_rows: u64,
-}
-
-/// Connection defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ConnectionConfig {
-    /// Optional default URL; the `DATABASE_URL` env var overrides it.
-    pub default_url: Option<String>,
 }
 
 /// Timing for the recurring connection liveliness probe that runs once a
@@ -301,15 +291,6 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
-    }
-
-    /// Resolve the effective connection URL: `DATABASE_URL` wins, else the
-    /// configured default.
-    #[must_use]
-    pub fn resolve_url(&self) -> Option<String> {
-        std::env::var("DATABASE_URL")
-            .ok()
-            .or_else(|| self.connection.default_url.clone())
     }
 }
 

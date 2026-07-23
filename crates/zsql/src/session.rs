@@ -139,16 +139,10 @@ impl Session {
     /// Build a session for `cfg`'s resolved connection URL
     #[must_use]
     pub fn new(cfg: &Config) -> Self {
-        let url = cfg.resolve_url();
-        let state = if url.is_some() {
-            SessionState::Connecting
-        } else {
-            SessionState::Empty
-        };
         Self {
-            url,
+            url: None,
             connection: None,
-            state,
+            state: SessionState::Empty,
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: cfg.query.preview_limit,
@@ -879,14 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn new_session_with_a_configured_url_starts_connecting() {
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some("postgres://localhost/db".to_owned());
-        let session = Session::new(&cfg);
-        assert!(matches!(session.state(), SessionState::Connecting));
-    }
-
-    #[test]
     fn columns_then_batches_then_done_builds_the_expected_result_set() {
         let mut session = session_with_no_url();
         session.state = SessionState::Running;
@@ -1249,15 +1235,11 @@ mod gpui_tests {
 
     #[gpui::test]
     async fn connect_with_an_empty_resolved_url_reports_a_readable_error(cx: &mut TestAppContext) {
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(String::new());
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-
-        session.read_with(cx, |session, _app| {
-            assert!(matches!(session.state(), SessionState::Connecting));
-        });
-
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| session.connect_to("", cx))
+            .await;
 
         session.read_with(cx, |session, _app| match session.state() {
             SessionState::Error(message) => {
@@ -1275,12 +1257,16 @@ mod gpui_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url =
-            Some("postgres://nobody:nobody@zsql-test-unreachable.invalid:5432/db".to_owned());
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(
+                    "postgres://nobody:nobody@zsql-test-unreachable.invalid:5432/db",
+                    cx,
+                )
+            })
+            .await;
 
         session.read_with(cx, |session, _app| match session.state() {
             SessionState::Error(message) => {
@@ -1302,11 +1288,13 @@ mod gpui_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some("sqlite::memory:".to_owned());
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to("sqlite::memory:".to_owned(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2582,13 +2570,13 @@ mod live_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
-
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-
-        let connect_task = session.update(cx, Session::connect);
-        connect_task.await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2647,11 +2635,14 @@ mod live_tests {
         let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
         cfg.query.max_result_rows = 100;
 
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2706,11 +2697,13 @@ mod live_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
-
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2728,11 +2721,13 @@ mod live_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
-
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2766,11 +2761,13 @@ mod live_tests {
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 
-        let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
-
+        let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(
@@ -2830,13 +2827,16 @@ mod live_tests {
         let _guard = crate::test_support::serialize_real_io();
 
         let mut cfg = Config::default();
-        cfg.connection.default_url = Some(live_database_url());
         cfg.liveness.probe_interval_ms = 100;
         cfg.liveness.probe_timeout_ms = 2_000;
         let interval = cfg.liveness.probe_interval();
 
         let session = cx.new(|_cx| Session::new(&cfg));
-        session.update(cx, Session::connect).await;
+        session
+            .update(cx, |session, cx| {
+                session.connect_to(live_database_url(), cx)
+            })
+            .await;
 
         session.read_with(cx, |session, _app| {
             assert!(matches!(session.state(), SessionState::Connected));

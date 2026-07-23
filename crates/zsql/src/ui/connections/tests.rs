@@ -6,10 +6,13 @@ use gpui::{
 };
 
 use super::{
-    ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, StoredConnection,
-    TestOutcome, active_connection_for_url, footer_display, host_label,
+    ActiveConnection, ConnectionManagerView, ConnectionStore, ManagerView, TestOutcome,
+    footer_display, host_label,
 };
-use crate::session::{Session, SessionState};
+use crate::{
+    connections::ConnectionArgs,
+    session::{Session, SessionState},
+};
 
 /// The liveness probe timeout every test builds its manager with, unless a
 /// test specifically cares about the value itself.
@@ -56,13 +59,13 @@ fn a_freshly_loaded_store_lists_every_saved_connection(cx: &mut TestAppContext) 
     let temp = TempStorePath::new("list");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://localhost/app".to_owned(),
         })
         .expect("add must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "local sqlite".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
@@ -81,8 +84,8 @@ fn a_freshly_loaded_store_lists_every_saved_connection(cx: &mut TestAppContext) 
             .collect();
         assert_eq!(names, vec!["local pg", "local sqlite"]);
 
-        assert_eq!(view.connections()[0].driver_id, Ok("postgres"));
-        assert_eq!(view.connections()[1].driver_id, Ok("sqlite"));
+        assert_eq!(view.connections()[0].connection.display_kind, "PostgreSQL");
+        assert_eq!(view.connections()[1].connection.display_kind, "SQLite");
     });
 }
 
@@ -91,7 +94,7 @@ fn an_unrecognized_scheme_surfaces_as_an_error_tag_not_a_panic(cx: &mut TestAppC
     let temp = TempStorePath::new("bad-scheme");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "mystery".to_owned(),
             url: "cassandra://host/db".to_owned(),
         })
@@ -101,7 +104,7 @@ fn an_unrecognized_scheme_surfaces_as_an_error_tag_not_a_panic(cx: &mut TestAppC
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.read_with(cx, |view, _app| {
-        assert!(view.connections()[0].driver_id.is_err());
+        assert_eq!(view.connections()[0].connection.display_kind, "Unknown");
     });
 }
 
@@ -121,7 +124,7 @@ fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) 
     manager.read_with(cx, |view, _app| {
         assert_eq!(view.connections().len(), 1);
         assert_eq!(view.connections()[0].connection.name, "new db");
-        assert_eq!(view.connections()[0].driver_id, Ok("sqlite"));
+        assert_eq!(view.connections()[0].connection.display_kind, "SQLite");
     });
 
     let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
@@ -208,28 +211,12 @@ fn host_label_falls_back_to_the_scheme_stripped_remainder_when_no_host_segment_i
     assert!(!label.is_empty());
 }
 
-#[test]
-fn active_connection_for_url_uses_the_matching_saved_connections_name() {
-    let saved = vec![StoredConnection {
-        name: "zsql local".to_owned(),
-        url: "postgres://localhost:5432/zsql".to_owned(),
-    }];
-    let active = active_connection_for_url("postgres://localhost:5432/zsql", &saved);
-    assert_eq!(active.name, "zsql local");
-    assert_eq!(active.url, "postgres://localhost:5432/zsql");
-}
-
-#[test]
-fn active_connection_for_url_falls_back_to_a_host_derived_name_when_unsaved() {
-    let active = active_connection_for_url("postgres://localhost:5432/zsql", &[]);
-    assert_eq!(active.name, "localhost:5432");
-}
-
 // ---- footer_display ---------------------------------------------------
 
 #[test]
 fn footer_display_shows_the_active_connections_name_and_host_when_connected() {
     let active = ActiveConnection {
+        id: None,
         name: "zsql local".to_owned(),
         url: "postgres://localhost:5432/zsql".to_owned(),
     };
@@ -247,6 +234,7 @@ fn footer_display_shows_the_active_connections_name_and_host_when_connected() {
 #[test]
 fn footer_display_is_disconnected_when_the_session_holds_no_live_connection() {
     let active = ActiveConnection {
+        id: None,
         name: "zsql local".to_owned(),
         url: "postgres://localhost:5432/zsql".to_owned(),
     };
@@ -362,13 +350,13 @@ fn deleting_a_connection_removes_it_from_the_list_and_persists(cx: &mut TestAppC
     let temp = TempStorePath::new("delete");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
         })
         .expect("add first");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
         })
@@ -378,7 +366,8 @@ fn deleting_a_connection_removes_it_from_the_list_and_persists(cx: &mut TestAppC
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.delete_index(0, cx).expect("delete must succeed");
+        let id = view.connections()[0].connection.id;
+        view.delete_id(id, cx).expect("delete must succeed");
         assert_eq!(view.connections().len(), 1);
         assert_eq!(view.connections()[0].connection.name, "second");
     });
@@ -395,7 +384,7 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
     let temp = TempStorePath::new("edit-prefill");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "staging".to_owned(),
             url: "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require".to_owned(),
         })
@@ -407,9 +396,10 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
 
+        let id = view.connections()[0].connection.id;
         assert_eq!(
             view.current_view(),
-            ManagerView::EditForm { index: 0 },
+            ManagerView::EditForm { id },
             "edit form must be shown for the right row"
         );
         assert_eq!(view.name_field.read(cx).value().as_ref(), "staging");
@@ -434,7 +424,7 @@ fn show_edit_form_for_a_sqlite_url_prefills_only_the_path_field(cx: &mut TestApp
     let temp = TempStorePath::new("edit-prefill-sqlite");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "reports".to_owned(),
             url: "sqlite:///tmp/reports.db".to_owned(),
         })
@@ -459,13 +449,13 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
     let temp = TempStorePath::new("save-edit");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
         })
         .expect("add first");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "second".to_owned(),
             url: "postgres://host/b".to_owned(),
         })
@@ -482,7 +472,8 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
     });
 
     manager.update(cx, |view, cx| {
-        view.save_edit(0, cx).expect("save_edit must succeed");
+        let id = view.connections()[0].connection.id;
+        view.save_edit(id, cx).expect("save_edit must succeed");
 
         assert_eq!(
             view.connections().len(),
@@ -491,11 +482,11 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
         );
         assert_eq!(view.connections()[0].connection.name, "first renamed");
         assert_eq!(
-            view.connections()[0].connection.url,
+            view.connections()[0].connection.get_url().unwrap(),
             "postgres://otherhost/a"
         );
         assert_eq!(
-            view.connections()[1].connection.url,
+            view.connections()[1].connection.get_url().unwrap(),
             "postgres://host/b",
             "the untouched row must be unaffected"
         );
@@ -722,7 +713,7 @@ async fn connect_and_close_connects_and_clears_is_open(cx: &mut TestAppContext) 
     let temp = TempStorePath::new("connect-close");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
@@ -757,7 +748,7 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
     let temp = TempStorePath::new("row-enter");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
@@ -845,13 +836,13 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
     let temp = TempStorePath::new("edit-delete-no-connect");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
         .expect("add must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "other".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
@@ -864,7 +855,8 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
     manager.update(cx, |view, cx| {
         view.show_edit_form(0, cx);
         view.cancel_form(cx);
-        let _ = view.delete_index(1, cx);
+        let id = view.connections()[1].connection.id;
+        let _ = view.delete_id(id, cx);
     });
 
     session_for_assert.read_with(cx, |session, _app| {
@@ -955,13 +947,13 @@ fn the_closed_modal_renders_nothing_and_the_open_modal_renders_without_panicking
     let temp = TempStorePath::new("render");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://localhost/app".to_owned(),
         })
         .expect("add must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "local sqlite".to_owned(),
             url: "sqlite::memory:".to_owned(),
         })
@@ -981,7 +973,7 @@ fn the_edit_form_renders_prefilled_without_panicking(cx: &mut TestAppContext) {
     let temp = TempStorePath::new("render-edit");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "staging".to_owned(),
             url: "postgres://app@staging.internal:5432/app".to_owned(),
         })
@@ -1285,7 +1277,7 @@ fn assert_edit_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url
     let temp = TempStorePath::new("tab-order-network-edit");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
     store
-        .add(StoredConnection {
+        .add(ConnectionArgs {
             name: "db".to_owned(),
             url: url.to_owned(),
         })

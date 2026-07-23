@@ -229,6 +229,28 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+/// Extract a `host[:port]`-shaped label from a connection URL for display,
+/// e.g. `postgres://user:pass@localhost:5432/db` -> `localhost:5432`. Falls
+/// back to the scheme-stripped remainder of the URL if no host segment can
+/// be isolated (e.g. a `sqlite:` path), so even an unusual URL still renders
+/// something instead of an empty label.
+#[must_use]
+pub fn host_label(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let after_userinfo = after_scheme
+        .rsplit_once('@')
+        .map_or(after_scheme, |(_, rest)| rest);
+    let host = after_userinfo
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_userinfo);
+    if host.is_empty() {
+        after_scheme.to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use zsql_core::{ColumnMeta, Row, Value};

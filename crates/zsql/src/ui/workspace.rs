@@ -207,11 +207,8 @@ impl WorkspaceView {
         }
     }
 
-    /// Set the tracked active connection, e.g. once the startup connect
-    /// (`main.rs`, via [`Session::connect`]'s resolved URL) succeeds. Threads
-    /// straight through to the connection-manager modal, which is the single
-    /// owner of this state; the footer observes that entity and updates
-    /// itself.
+    /// Set the tracked active connection
+    #[cfg(test)]
     pub fn set_active_connection(&mut self, active: ActiveConnection, cx: &mut Context<Self>) {
         self.connections
             .update(cx, |view, cx| view.set_active(Some(active), cx));
@@ -964,7 +961,7 @@ mod render_tests {
 
     use super::WorkspaceView;
     use crate::config::{LayoutConfig, ValuePanelConfig};
-    use crate::connections::{ConnectionStore, StoredConnection};
+    use crate::connections::{ConnectionArgs, ConnectionStore};
     use crate::session::{SchemaState, Session};
     use crate::tab_session::{self, ConnectionKey};
     use crate::ui::connections::ActiveConnection;
@@ -1019,13 +1016,13 @@ mod render_tests {
         let mut store =
             ConnectionStore::load(path).expect("loading a nonexistent path must succeed empty");
         store
-            .add(StoredConnection {
+            .add(ConnectionArgs {
                 name: "conn-a".to_owned(),
                 url: "postgres://localhost/a".to_owned(),
             })
             .expect("add conn-a must succeed");
         store
-            .add(StoredConnection {
+            .add(ConnectionArgs {
                 name: "conn-b".to_owned(),
                 url: "postgres://localhost/b".to_owned(),
             })
@@ -1255,6 +1252,16 @@ mod render_tests {
         let session = sample_schema_session(cx);
         let paths = PersistenceTestPaths::new("switch");
         let store = store_with_two_saved_connections(&paths.connections);
+        let conn_a = ActiveConnection {
+            id: Some(store.connections()[0].id),
+            name: "conn-a".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let conn_b = ActiveConnection {
+            id: Some(store.connections()[1].id),
+            name: "conn-b".to_owned(),
+            url: "postgres://localhost/b".to_owned(),
+        };
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
             WorkspaceView::new(
                 session,
@@ -1266,15 +1273,6 @@ mod render_tests {
                 cx,
             )
         });
-
-        let conn_a = ActiveConnection {
-            name: "conn-a".to_owned(),
-            url: "postgres://localhost/a".to_owned(),
-        };
-        let conn_b = ActiveConnection {
-            name: "conn-b".to_owned(),
-            url: "postgres://localhost/b".to_owned(),
-        };
 
         workspace.update(vcx, |workspace, cx| {
             workspace.set_active_connection(conn_a, cx);
@@ -1345,11 +1343,14 @@ mod render_tests {
             )
         });
 
+        let conn_a_id = uuid::Uuid::new_v4();
         let conn_a = ActiveConnection {
+            id: Some(conn_a_id),
             name: "conn-a".to_owned(),
             url: "postgres://localhost/a".to_owned(),
         };
         let conn_b = ActiveConnection {
+            id: Some(uuid::Uuid::new_v4()),
             name: "conn-b".to_owned(),
             url: "postgres://localhost/b".to_owned(),
         };
@@ -1381,6 +1382,7 @@ mod render_tests {
         .expect("overwrite must succeed");
 
         let conn_a_again = ActiveConnection {
+            id: Some(conn_a_id),
             name: "conn-a".to_owned(),
             url: "postgres://localhost/a".to_owned(),
         };
@@ -1411,6 +1413,7 @@ mod render_tests {
         let session = sample_schema_session(cx);
         let paths = PersistenceTestPaths::new("restore-from-disk");
         let store = store_with_two_saved_connections(&paths.connections);
+        let conn_a_id = store.connections()[0].id;
 
         // Seed conn-a's tab session on disk before the workspace exists, as
         // if written by a previous run of the app.
@@ -1457,6 +1460,7 @@ mod render_tests {
         workspace.update(vcx, |workspace, cx| {
             workspace.set_active_connection(
                 ActiveConnection {
+                    id: Some(conn_a_id),
                     name: "conn-a".to_owned(),
                     url: "postgres://localhost/a".to_owned(),
                 },
@@ -1501,6 +1505,7 @@ mod render_tests {
         let session = sample_schema_session(cx);
         let paths = PersistenceTestPaths::new("quit-flush");
         let store = store_with_two_saved_connections(&paths.connections);
+        let conn_a_id = store.connections()[0].id;
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
             WorkspaceView::new(
                 session,
@@ -1516,6 +1521,7 @@ mod render_tests {
         workspace.update(vcx, |workspace, cx| {
             workspace.set_active_connection(
                 ActiveConnection {
+                    id: Some(conn_a_id),
                     name: "conn-a".to_owned(),
                     url: "postgres://localhost/a".to_owned(),
                 },

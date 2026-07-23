@@ -37,6 +37,8 @@ flume = { workspace = true }
 futures = { workspace = true }
 # `connections.rs`'s `ConnectionStoreError`.
 thiserror = { workspace = true }
+uuid = { workspace = true }
+keyring = { workspace = true }
 
 [dev-dependencies]
 # Enables `gpui::test` / `TestAppContext` (gpui's headless, deterministic test
