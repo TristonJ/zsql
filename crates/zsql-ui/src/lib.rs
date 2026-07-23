@@ -4,6 +4,7 @@
 pub mod button;
 pub mod grid;
 pub mod icon;
+pub mod icon_button;
 pub mod scrollable;
 pub mod scrollbar;
 pub mod table;
