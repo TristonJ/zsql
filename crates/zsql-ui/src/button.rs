@@ -8,10 +8,10 @@ use crate::theme::ActiveTheme;
 /// A common base for all buttons, which handles hover state and basic styling.
 /// Hover state is manually implemented because GPUI does not support (currently)
 /// updating text styles on hover.
-pub(crate) fn button_base<T>(
+pub(crate) fn button_base(
     id: impl Into<ElementId>,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut App,
 ) -> (gpui::Stateful<Div>, Entity<bool>) {
     let id = id.into();
     let hover_id = SharedString::new(format!("{id}-hovered"));
@@ -38,10 +38,10 @@ pub(crate) fn button_base<T>(
 }
 
 /// A primary button is the most important button on a page
-pub fn primary_button<T>(
+pub fn primary_button(
     id: impl Into<ElementId>,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut App,
 ) -> gpui::Stateful<Div> {
     let (btn, hovered) = button_base(id, window, cx);
     let theme = cx.theme();
@@ -54,10 +54,10 @@ pub fn primary_button<T>(
 }
 
 /// A secondary button is less important than a primary button, but still important
-pub fn secondary_button<T>(
+pub fn secondary_button(
     id: impl Into<ElementId>,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut App,
 ) -> gpui::Stateful<Div> {
     let (btn, hovered) = button_base(id, window, cx);
     let theme = cx.theme();
@@ -71,10 +71,10 @@ pub fn secondary_button<T>(
 }
 
 /// A destructive button is a button that performs a destructive action
-pub fn destructive_button<T>(
+pub fn destructive_button(
     id: impl Into<ElementId>,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut App,
 ) -> gpui::Stateful<Div> {
     let (btn, hovered) = button_base(id, window, cx);
     let theme = cx.theme();

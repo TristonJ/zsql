@@ -1393,7 +1393,7 @@ mod render_tests {
         (session, workspace, vcx, generated_id)
     }
 
-    /// Dispatching a switch through the real `ConnectionManagerView::connect_index`
+    /// Dispatching a switch through the real `ConnectionManagerView::connect`
     /// path must reset the schema tree and swap the open tabs synchronously,
     /// at the moment the switch is dispatched -- not once (or if) the
     /// connect attempt it kicks off actually resolves. Reads every assertion
@@ -1401,7 +1401,7 @@ mod render_tests {
     /// advancing the executor at all, then lets the (successful) connect
     /// play out to prove the ordinary happy path is otherwise unaffected.
     #[gpui::test]
-    async fn switching_via_connect_index_resets_the_tree_and_tabs_before_the_connect_resolves(
+    async fn switching_via_connect_resets_the_tree_and_tabs_before_the_connect_resolves(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -1414,7 +1414,10 @@ mod render_tests {
         // synchronously -- no `.await` on the returned task, no
         // `run_until_parked`, yet.
         let connections = workspace.read_with(vcx, |workspace, _cx| workspace.connections.clone());
-        let task = connections.update(vcx, |connections, cx| connections.connect_index(1, cx));
+        let conn_b_id = connections.read_with(vcx, |connections, _app| {
+            connections.connections()[1].connection.id
+        });
+        let task = connections.update(vcx, |connections, cx| connections.connect(conn_b_id, cx));
 
         session.read_with(vcx, |session, _app| {
             assert!(
@@ -1483,7 +1486,7 @@ mod render_tests {
     /// `active` must stay pointed at the failed target rather than
     /// resurrecting the connection that preceded it.
     #[gpui::test]
-    async fn a_failed_switch_via_connect_index_leaves_the_reset_tree_and_tabs_in_place(
+    async fn a_failed_switch_via_connect_leaves_the_reset_tree_and_tabs_in_place(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -1493,7 +1496,10 @@ mod render_tests {
             build_switch_fixture(cx, "connect-index-sync-reset-fail", "cassandra://host/db");
 
         let connections = workspace.read_with(vcx, |workspace, _cx| workspace.connections.clone());
-        let task = connections.update(vcx, |connections, cx| connections.connect_index(1, cx));
+        let conn_b_id = connections.read_with(vcx, |connections, _app| {
+            connections.connections()[1].connection.id
+        });
+        let task = connections.update(vcx, |connections, cx| connections.connect(conn_b_id, cx));
         task.await;
 
         session.read_with(vcx, |session, _app| {
