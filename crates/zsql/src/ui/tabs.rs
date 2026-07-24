@@ -11,13 +11,13 @@
 use std::collections::HashMap;
 
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
-use zsql_core::RelationKind;
+use zsql_core::{RelationKind, ResultSet};
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
 use super::results::{ResultsSnapshot, ResultsView};
 use super::schema_view::SchemaTabView;
-use crate::session::Session;
+use crate::session::{Session, SessionState};
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 
 /// Identifies one open tab, stable for its lifetime and never reused within
@@ -296,12 +296,29 @@ impl TabModel {
             return;
         }
 
-        let Some(snapshot) = tab.last_run.clone() else {
-            self.results.update(cx, ResultsView::show_empty);
+        if let Some(snapshot) = tab.last_run.clone() {
+            self.results
+                .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
             return;
-        };
-        self.results
-            .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
+        }
+
+        let state = self.session.read(cx).state().clone();
+        if matches!(state, SessionState::Empty | SessionState::Connecting) {
+            self.results
+                .update(cx, |results, cx| results.show_live(label, cx));
+            return;
+        }
+
+        self.results.update(cx, |results, cx| {
+            results.show_snapshot(
+                ResultsSnapshot {
+                    source_label: label,
+                    state: SessionState::Connected,
+                    result: ResultSet::default(),
+                },
+                cx,
+            );
+        });
     }
 
     /// Dispatch `task` (a run just started for `id`, labeled `label`) as

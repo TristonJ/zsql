@@ -321,15 +321,6 @@ impl ResultsView {
         cx.notify();
     }
 
-    /// Completely clear the view's derived state
-    pub fn show_empty(&mut self, cx: &mut Context<Self>) {
-        self.source_label = "".into();
-        self.frozen = None;
-        self.reset_for_new_result();
-        self.sync_dimensions(cx);
-        cx.notify();
-    }
-
     /// Clear every piece of state derived from the previous result, right
     /// before a new result becomes current: the incrementally-folded
     /// column-width cache (so the next `sync_dimensions` call recomputes
