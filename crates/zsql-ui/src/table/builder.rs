@@ -8,19 +8,23 @@ use std::rc::Rc;
 
 use gpui::{
     App, Context, Div, ElementId, Entity, FocusHandle, MouseButton, MouseDownEvent, Pixels, Render,
-    SharedString, UniformList, UniformListScrollHandle, Window, div, prelude::*, px, rgb, rgba,
+    SharedString, UniformList, UniformListScrollHandle, Window, div, prelude::*, rgb, rgba,
     uniform_list,
 };
 
 use crate::scrollable::restrict_wheel_to_own_axis;
-use crate::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
+use crate::scrollable::{ScrollableState, ScrollbarStyle, WithScrollbars};
 use crate::theme::ActiveTheme;
 
 use super::column::TableColumn;
 use super::gutter::{
     Gutter, gutter_cell_shell, gutter_header_shell, row_number_cell_shell, row_number_header_shell,
 };
+use super::layout::{
+    ColumnGeometry, ColumnLayout, column_geometry, read_scroll_handles, sync_scroll_axes,
+};
 use super::measure;
+use super::resize::{self, ColumnResizeConfig};
 use super::row::TableRow;
 use super::state::TableState;
 use super::style::TableStyle;
@@ -60,6 +64,7 @@ pub struct Table<V: Render> {
     selectable: bool,
     on_cell_double_click: Option<CellDoubleClickHandler<V>>,
     on_cell_right_click: Option<CellRightClickHandler<V>>,
+    column_resize: Option<ColumnResizeConfig<V>>,
 }
 
 /// How to size the table's vertical extent in its parent. Defaults to [`TableSizing::Fill`].
@@ -140,6 +145,7 @@ impl<V: Render> Table<V> {
             selectable: false,
             on_cell_double_click: None,
             on_cell_right_click: None,
+            column_resize: None,
         }
     }
 
@@ -236,6 +242,24 @@ impl<V: Render> Table<V> {
         self
     }
 
+    /// Opt this table into a draggable resize handle on every data column's
+    /// header cell trailing border (never the pinned gutter). `min_width` is
+    /// the floor a column is never dragged narrower than; `on_resize` is
+    /// called with the resized column's index and its new width on every
+    /// pointer move while a drag is in progress, so the caller can store the
+    /// live width (e.g. into its own per-column width cache) and notify. Off
+    /// by default, so an existing table opts in explicitly rather than
+    /// gaining resize handles unannounced.
+    #[must_use]
+    pub fn resizable_columns(
+        mut self,
+        min_width: Pixels,
+        on_resize: impl Fn(&mut V, usize, Pixels, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        self.column_resize = Some(ColumnResizeConfig::new(min_width, on_resize));
+        self
+    }
+
     /// The data pane's batch cell renderer, wired through `cx.processor` so
     /// it keeps `&mut V` access for building each visible range's cells.
     /// Each returned [`TableRow`] is expected to carry at most one cell per
@@ -272,6 +296,7 @@ impl<V: Render> Table<V> {
             selectable,
             on_cell_double_click,
             on_cell_right_click,
+            column_resize,
         } = self;
         let rows = rows.unwrap_or_else(|| -> RowRenderer<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
@@ -280,36 +305,19 @@ impl<V: Render> Table<V> {
         let double_click_listener = build_double_click_listener(on_cell_double_click, &state, cx);
         let right_click_listener = build_right_click_listener(on_cell_right_click, &state, cx);
 
-        let layouts: Vec<ColumnLayout> = columns
-            .iter()
-            .map(|column| ColumnLayout {
-                width: column.width,
-                grow: column.grow,
-            })
-            .collect();
-        let column_widths: Vec<Pixels> = layouts.iter().map(|layout| layout.width).collect();
-        let content_extent = px(content_extent_for_columns(&column_widths));
-        // When any column grows, the table fills its container's width so the
-        // growable columns have slack to expand into; otherwise rows stay at
-        // their fixed content width and scroll horizontally when they overflow.
-        let fill_width = layouts.iter().any(|layout| layout.grow);
+        let ColumnGeometry {
+            layouts,
+            column_count,
+            content_extent,
+            fill_width,
+        } = column_geometry(&columns);
 
-        let (handles, focused_cell) = {
-            let table_state = state.read(cx);
-            (
-                TableScrollHandles {
-                    scroll: table_state.scroll.clone(),
-                    row_scroll_handle: table_state.row_scroll_handle.clone(),
-                    col_scroll_handle: table_state.col_scroll_handle.clone(),
-                },
-                table_state.focused_cell(),
-            )
-        };
+        let (handles, focused_cell) = read_scroll_handles(&state, cx);
 
         sync_scroll_axes(
             &handles,
             row_count,
-            column_widths.len(),
+            column_count,
             content_extent,
             style,
             table_height,
@@ -325,7 +333,14 @@ impl<V: Render> Table<V> {
             &state,
             cx,
         );
-        let header_row = build_header_row(columns, &style, content_extent, fill_width, &state);
+        let header_row = resize::build_header_row(
+            columns,
+            &style,
+            content_extent,
+            fill_width,
+            column_resize.is_some(),
+            &state,
+        );
 
         let data_list = build_data_list(
             &id,
@@ -368,6 +383,7 @@ impl<V: Render> Table<V> {
         let scrollable_data_pane = data_pane.with_scrollbars(&handles.scroll, scrollbar_style, cx);
 
         let mut root = div().flex().flex_row().flex_1().min_h_0().w_full();
+        root = resize::wire_root(root, column_resize.as_ref(), &state, cx);
         if let Some(pane) = gutter_pane {
             root = root.child(pane);
         }
@@ -434,67 +450,6 @@ fn build_data_list<V: Render>(
         })
         .track_scroll(row_scroll_handle),
     )
-}
-
-/// The three scroll handles a table drives, grouped so they travel together
-/// rather than as three positional arguments that can be transposed.
-struct TableScrollHandles {
-    scroll: Entity<ScrollableState>,
-    row_scroll_handle: gpui::UniformListScrollHandle,
-    col_scroll_handle: gpui::ScrollHandle,
-}
-
-/// Recompute both scroll axes' content extent for this render and push them
-/// into the scrollable state, so its scrollbars and drag geometry stay current
-/// with the table's latest row/column counts.
-fn sync_scroll_axes<V: Render>(
-    handles: &TableScrollHandles,
-    row_count: usize,
-    column_count: usize,
-    content_extent: Pixels,
-    style: TableStyle,
-    table_height: TableSizing,
-    cx: &mut Context<V>,
-) {
-    let TableScrollHandles {
-        scroll,
-        row_scroll_handle,
-        col_scroll_handle,
-    } = handles;
-    let _span =
-        tracing::trace_span!("zsql_ui::table::sync_scroll_axes", row_count, column_count).entered();
-    let vertical_extent = content_extent_for_row_count(row_count, style.row_height);
-    tracing::trace!(
-        vertical_extent,
-        horizontal_extent = f32::from(content_extent),
-        "recomputed the table's scroll axes for this render"
-    );
-    scroll.update(cx, |scroll, _cx| {
-        // A `Fit` table grows to all its rows and never scrolls vertically on
-        // its own -- its parent page scrolls instead -- so it must not
-        // configure a vertical axis, or it would paint a vertical scrollbar
-        // over content the parent is responsible for scrolling. A `Fill`
-        // table is bounded by its parent and scrolls its rows internally, so
-        // it keeps its vertical axis.
-        match table_height {
-            TableSizing::Fill => {
-                scroll.vertical(
-                    Axis::new(
-                        ScrollSource::UniformList(row_scroll_handle.clone()),
-                        vertical_extent,
-                    )
-                    .track_start(f32::from(style.header_height)),
-                );
-            }
-            TableSizing::Fit => {
-                scroll.clear_vertical();
-            }
-        }
-        scroll.horizontal(Axis::new(
-            ScrollSource::Container(col_scroll_handle.clone()),
-            f32::from(content_extent),
-        ));
-    });
 }
 
 /// The pinned left pane, or `None` for [`Gutter::None`].
@@ -589,34 +544,6 @@ fn assemble_gutter_pane(
     pane.child(header).child(list)
 }
 
-/// The data pane's sticky column-header row.
-fn build_header_row(
-    columns: Vec<TableColumn>,
-    style: &TableStyle,
-    content_extent: Pixels,
-    fill_width: bool,
-    state: &Entity<TableState>,
-) -> Div {
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .flex_shrink_0()
-        .min_w(content_extent)
-        .h(style.header_height)
-        .bg(rgb(style.header_bg));
-    if fill_width {
-        row = row.w_full();
-    }
-    if style.borders.row {
-        row = row.border_b_1().border_color(rgb(style.header_border));
-    }
-    for (index, column) in columns.into_iter().enumerate() {
-        let cell = cell_shell(column.width, column.grow, style).child(column.header);
-        row = row.child(tag_header_cell(cell, index, state));
-    }
-    row
-}
-
 /// One data-pane body row, its cells wrapped in `style`'s chrome; see
 /// [`Table::rows`] for the cell-count contract this enforces in debug
 /// builds.
@@ -633,14 +560,6 @@ fn build_body_row(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> 
         row.cells.len() - ctx.layouts.len(),
     );
     build_body_row_cells(row, row_index, ctx)
-}
-
-/// A column's per-cell sizing, carried from its [`TableColumn`] to every body
-/// cell so header and body stay aligned. See [`TableColumn::grow`].
-#[derive(Debug, Clone, Copy)]
-struct ColumnLayout {
-    width: Pixels,
-    grow: bool,
 }
 
 /// Everything one data-pane body row needs beyond its own [`TableRow`] and
@@ -798,7 +717,7 @@ fn select_cell_on_right_click(
 /// any leftover row width. `min_w(width)` also pins a growable cell's flex
 /// minimum to `width` rather than its content's min-content size, so a long
 /// value truncates within the cell instead of forcing the whole row wider.
-fn cell_shell(width: Pixels, grow: bool, style: &TableStyle) -> Div {
+pub(super) fn cell_shell(width: Pixels, grow: bool, style: &TableStyle) -> Div {
     let mut cell = div()
         .flex()
         .items_center()
@@ -816,20 +735,36 @@ fn cell_shell(width: Pixels, grow: bool, style: &TableStyle) -> Div {
     cell
 }
 
-/// Total pixel height of `row_count` body rows, i.e. the vertical
-/// scrollbar's content extent.
-// Row counts here are always far below `f32`'s exact-integer range, so this
-// conversion cannot lose meaningful precision.
-#[allow(clippy::cast_precision_loss)]
-fn content_extent_for_row_count(row_count: usize, row_height: Pixels) -> f32 {
-    row_count as f32 * f32::from(row_height)
+/// A header cell's sizing and border chrome, split out from
+/// [`cell_shell`] and left non-clipping (no `.truncate()`) so a resize
+/// handle positioned outside its trailing border is not masked out of
+/// painting or hit-testing by an ancestor's `overflow_hidden`. Sizes
+/// identically to [`cell_shell`]; pair with [`cell_content`] for the
+/// padded, truncating content [`cell_shell`] would otherwise apply itself.
+pub(super) fn cell_frame(width: Pixels, grow: bool, style: &TableStyle) -> Div {
+    let mut frame = div().h_full().relative();
+    frame = if grow {
+        frame.flex_grow().flex_basis(width).min_w(width)
+    } else {
+        frame.flex_shrink_0().w(width)
+    };
+    if style.borders.column {
+        frame = frame.border_r_1().border_color(rgb(style.row_border));
+    }
+    frame
 }
 
-/// Total pixel width of the data pane's columns, i.e. the horizontal
-/// scrollbar's content extent. Excludes the pinned gutter pane, which never
-/// scrolls horizontally.
-fn content_extent_for_columns(column_widths: &[Pixels]) -> f32 {
-    column_widths.iter().copied().map(f32::from).sum()
+/// The padded, truncating content wrapper a [`cell_frame`] holds full-size,
+/// carrying the clipping behavior [`cell_shell`] otherwise applies to its
+/// own sizing/border div.
+pub(super) fn cell_content(style: &TableStyle) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .h_full()
+        .w_full()
+        .px(style.cell_padding_x)
+        .truncate()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -886,7 +821,7 @@ fn tag_first_gutter_cell(
 /// actually moves in step with a horizontal scroll/drag rather than only
 /// checking that the shared scroll handle's offset changed.
 #[cfg(any(test, feature = "test-support"))]
-fn tag_header_cell(cell: Div, index: usize, state: &Entity<TableState>) -> Div {
+pub(super) fn tag_header_cell(cell: Div, index: usize, state: &Entity<TableState>) -> Div {
     if index == 0 {
         let selector = header_first_cell_id(state).to_string();
         cell.debug_selector(move || selector.clone())
@@ -897,7 +832,7 @@ fn tag_header_cell(cell: Div, index: usize, state: &Entity<TableState>) -> Div {
 
 /// A no-op outside test builds.
 #[cfg(not(any(test, feature = "test-support")))]
-fn tag_header_cell(cell: Div, _index: usize, _state: &Entity<TableState>) -> Div {
+pub(super) fn tag_header_cell(cell: Div, _index: usize, _state: &Entity<TableState>) -> Div {
     cell
 }
 
@@ -988,8 +923,7 @@ mod tests {
     };
 
     use super::{
-        Table, body_first_cell_debug_selector, content_extent_for_columns,
-        content_extent_for_row_count, gutter_first_cell_debug_selector,
+        Table, body_first_cell_debug_selector, gutter_first_cell_debug_selector,
         header_first_cell_debug_selector,
     };
     use crate::scrollable::{
@@ -1136,22 +1070,6 @@ mod tests {
             "a row with 2 cells but only 1 column must paint exactly 1 cell (zip-style \
              truncation), not one per supplied cell"
         );
-    }
-
-    #[test]
-    fn content_extent_for_columns_sums_the_widths() {
-        let widths = vec![px(100.0), px(150.0), px(80.0)];
-        assert!((content_extent_for_columns(&widths) - 330.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn content_extent_for_columns_is_zero_for_no_columns() {
-        assert!((content_extent_for_columns(&[]) - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn content_extent_for_row_count_multiplies_by_row_height() {
-        assert!((content_extent_for_row_count(10, px(24.0)) - 240.0).abs() < f32::EPSILON);
     }
 
     /// Renders a two-column, header-only table in a `pane`-wide container and

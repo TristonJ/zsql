@@ -13,7 +13,9 @@
 mod builder;
 mod column;
 mod gutter;
+mod layout;
 pub mod measure;
+mod resize;
 mod row;
 mod state;
 mod style;
@@ -30,3 +32,5 @@ pub use builder::{
     body_first_cell_debug_selector, gutter_first_cell_debug_selector,
     header_first_cell_debug_selector,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use resize::column_resize_handle_debug_selector;

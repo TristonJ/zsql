@@ -104,6 +104,12 @@ pub struct ResultsView {
     /// `session`.
     frozen: Option<ResultsSnapshot>,
     column_widths: Vec<Pixels>,
+    /// Parallel to `column_widths`: `true` for a column whose width came
+    /// from a manual header-border drag rather than the auto-fit estimate,
+    /// so [`ResultsView::sync_dimensions`] leaves it alone as further rows
+    /// stream in. Cleared alongside `column_widths` by
+    /// [`ResultsView::reset_for_new_result`].
+    column_width_overrides: Vec<bool>,
     /// Per-column max formatted-text char count seen so far
     column_max_body_chars: Vec<usize>,
     /// How many of `session.result().rows` have already been folded into
@@ -240,6 +246,7 @@ impl ResultsView {
             source_label: source_label.into(),
             frozen: None,
             column_widths: Vec::new(),
+            column_width_overrides: Vec::new(),
             column_max_body_chars: Vec::new(),
             folded_row_count: 0,
             table_state: cx.new(TableState::new),
@@ -330,6 +337,7 @@ impl ResultsView {
     /// different result.
     fn reset_for_new_result(&mut self) {
         self.column_widths = Vec::new();
+        self.column_width_overrides = Vec::new();
         self.column_max_body_chars = Vec::new();
         self.folded_row_count = 0;
         self.view_mode = ViewMode::Grid;
@@ -409,6 +417,7 @@ impl ResultsView {
 
         if result.columns.len() != self.column_max_body_chars.len() {
             self.column_max_body_chars = vec![0; result.columns.len()];
+            self.column_width_overrides = vec![false; result.columns.len()];
             self.folded_row_count = 0;
         }
 
@@ -425,13 +434,29 @@ impl ResultsView {
         }
         self.folded_row_count = result.rows.len();
 
+        // A column flagged in `column_width_overrides` was set by a manual
+        // header-border drag rather than this auto-fit estimate, so its
+        // prior width is carried forward untouched rather than
+        // recomputed here.
         let table_style = Self::table_style(cx.theme());
+        let previous_widths = self.column_widths.clone();
         self.column_widths = result
             .columns
             .iter()
             .zip(self.column_max_body_chars.iter())
-            .map(|(column, &max_body_chars)| {
-                column_width_from_parts(column, max_body_chars, &table_style)
+            .enumerate()
+            .map(|(index, (column, &max_body_chars))| {
+                let auto_fit = || column_width_from_parts(column, max_body_chars, &table_style);
+                if self
+                    .column_width_overrides
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    previous_widths.get(index).copied().unwrap_or_else(auto_fit)
+                } else {
+                    auto_fit()
+                }
             })
             .collect();
 
@@ -1108,7 +1133,30 @@ impl ResultsView {
             .on_cell_right_click(|view, row, col, event, _window, cx| {
                 view.open_cell_context_menu(row, col, event.position, cx);
             })
+            .resizable_columns(px(theme::MIN_COLUMN_WIDTH), Self::resize_column)
             .render(cx)
+    }
+
+    /// [`zsql_ui::table::Table::resizable_columns`]'s live-resize callback:
+    /// stores `column`'s new `width` and marks it so a later
+    /// [`ResultsView::sync_dimensions`] call leaves it alone, mirroring
+    /// [`ResultsView::value_panel_drag_move`]'s per-move update. Never
+    /// touches the grid's focused cell or keyboard focus.
+    fn resize_column(
+        &mut self,
+        column: usize,
+        width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _span = tracing::trace_span!("results_resize_column", column).entered();
+        if let Some(slot) = self.column_widths.get_mut(column) {
+            *slot = width;
+        }
+        if let Some(overridden) = self.column_width_overrides.get_mut(column) {
+            *overridden = true;
+        }
+        cx.notify();
     }
 
     /// The one `TableStyle` both `render_grid`'s live `Table` and
@@ -2177,7 +2225,7 @@ mod tests {
 
     use gpui::{
         AppContext as _, Focusable as _, Hsla, Modifiers, MouseButton, MouseDownEvent,
-        MouseUpEvent, font, px, rgb,
+        MouseMoveEvent, MouseUpEvent, font, point, px, rgb,
     };
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
@@ -2190,7 +2238,8 @@ mod tests {
     use crate::session::{LivenessState, Session};
     use crate::ui::theme;
     use zsql_editor::{HighlightKind, StyleSpan, syntax_color};
-    use zsql_ui::table::body_first_cell_debug_selector;
+    use zsql_ui::scrollable::horizontal_thumb_debug_selector;
+    use zsql_ui::table::{body_first_cell_debug_selector, column_resize_handle_debug_selector};
     use zsql_ui::theme::Theme;
 
     fn column(name: &str, type_name: &str) -> ColumnMeta {
@@ -2872,6 +2921,322 @@ mod tests {
                 "width should grow once a longer cell streams in"
             );
         });
+    }
+
+    // -- column resize -----------------------------------------------------
+
+    #[gpui::test]
+    fn dragging_a_column_header_border_resizes_only_that_column_without_touching_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        let (start_width_0, start_width_1) =
+            view.read_with(vcx, |v, _app| (v.column_widths[0], v.column_widths[1]));
+
+        // Select a cell (and focus the grid via it) before the drag, so the
+        // assertions below actually constrain the drag against a real prior
+        // selection/focus rather than trivially observing that dragging did
+        // not create one out of a `None` starting point.
+        let cell_bounds = vcx
+            .debug_bounds(body_first_cell_debug_selector(&table_state))
+            .expect("the top-of-viewport body cell must be painted");
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: gpui::point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            ),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            Some((0, 0)),
+            "the setup click must select row 0, column 0 before the drag begins"
+        );
+        let selected_cell = table_state.read_with(vcx, |s, _app| s.focused_cell());
+        let focused_before = vcx.update(|window, cx| window.focused(cx));
+
+        let handle_bounds = vcx
+            .debug_bounds(column_resize_handle_debug_selector(&table_state, 0))
+            .expect("column 0's resize handle must be painted");
+        let origin = handle_bounds.origin;
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: origin,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            start_width_0,
+            "pressing down on the handle must not itself resize the column"
+        );
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            selected_cell,
+            "pressing down on the resize handle must not change the grid's selection"
+        );
+        assert_eq!(
+            vcx.update(|window, cx| window.focused(cx)),
+            focused_before,
+            "pressing down on the resize handle must not move keyboard focus"
+        );
+
+        vcx.simulate_event(MouseMoveEvent {
+            position: point(origin.x + px(40.0), origin.y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            start_width_0 + px(40.0),
+            "dragging the handle by +40px must widen exactly that column by 40px"
+        );
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[1]),
+            start_width_1,
+            "a different column's width must be untouched by another column's drag"
+        );
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            selected_cell,
+            "moving the pointer during the drag must not change the grid's selection"
+        );
+        assert_eq!(
+            vcx.update(|window, cx| window.focused(cx)),
+            focused_before,
+            "moving the pointer during the drag must not move keyboard focus"
+        );
+
+        vcx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(origin.x + px(40.0), origin.y),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            start_width_0 + px(40.0),
+            "releasing the drag must leave the resized width in place"
+        );
+        assert_eq!(
+            table_state.read_with(vcx, |s, _app| s.focused_cell()),
+            selected_cell,
+            "starting, performing, or ending a column-border drag must never change the grid's \
+             focused/selected cell"
+        );
+        assert_eq!(
+            vcx.update(|window, cx| window.focused(cx)),
+            focused_before,
+            "ending the drag must not move keyboard focus either"
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_a_column_header_border_past_the_minimum_clamps_exactly_at_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        let handle_bounds = vcx
+            .debug_bounds(column_resize_handle_debug_selector(&table_state, 0))
+            .expect("column 0's resize handle must be painted");
+        let origin = handle_bounds.origin;
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: origin,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseMoveEvent {
+            position: point(px(0.0), origin.y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            px(theme::MIN_COLUMN_WIDTH),
+            "dragging far past the configured minimum must clamp exactly at it, not go to zero \
+             or negative"
+        );
+    }
+
+    #[gpui::test]
+    fn resizing_a_column_immediately_grows_the_horizontal_scroll_content_extent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Mirrors `horizontal_scrollbar_is_shown_after_the_first_frame_when_columns_overflow`'s
+        // wide-columns setup, so the horizontal thumb is already painted
+        // before the drag and its shrinkage afterward reflects a real
+        // content-extent change, not one appearing from nothing.
+        let columns: Vec<ColumnMeta> = (0..40)
+            .map(|index| ColumnMeta {
+                name: format!("a_fairly_long_column_name_{index}"),
+                type_name: "text".to_owned(),
+                nullable: true,
+            })
+            .collect();
+        let row = Row(columns
+            .iter()
+            .map(|_| Value::Text("a moderately long cell value".to_owned()))
+            .collect());
+        let result = ResultSet {
+            columns,
+            rows: vec![row],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(SessionState::Results(Duration::from_millis(1)), result)
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+        vcx.run_until_parked();
+
+        let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+        let scroll = table_state.read_with(vcx, |s, _app| s.scroll().clone());
+        let thumb_width_before = vcx
+            .debug_bounds(horizontal_thumb_debug_selector(&scroll))
+            .expect("40 overflowing wide columns must already show a horizontal thumb")
+            .size
+            .width;
+
+        let handle_bounds = vcx
+            .debug_bounds(column_resize_handle_debug_selector(&table_state, 0))
+            .expect("column 0's resize handle must be painted");
+        let origin = handle_bounds.origin;
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: origin,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseMoveEvent {
+            position: point(origin.x + px(400.0), origin.y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        vcx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(origin.x + px(400.0), origin.y),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+
+        let thumb_width_after = vcx
+            .debug_bounds(horizontal_thumb_debug_selector(&scroll))
+            .expect("the horizontal thumb must still be painted after widening one column")
+            .size
+            .width;
+
+        assert!(
+            thumb_width_after < thumb_width_before,
+            "widening a column by 400px must immediately recompute the horizontal content \
+             extent -- reflected here as a smaller thumb, since a larger content extent behind \
+             the same fixed viewport shrinks the thumb's share of the track -- without any \
+             extra scroll or window-resize event: before={thumb_width_before:?} \
+             after={thumb_width_after:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_manually_resized_column_survives_sync_dimensions_as_more_rows_stream_in(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let columns = vec![ColumnMeta {
+            name: "v".to_owned(),
+            type_name: "text".to_owned(),
+            nullable: true,
+        }];
+        let first_batch = ResultSet {
+            columns: columns.clone(),
+            rows: vec![Row(vec![Value::Text("ab".to_owned())])],
+            affected: None,
+            notices: Vec::new(),
+        };
+        let session =
+            cx.new(|_cx| Session::new_for_render_test(SessionState::Running, first_batch));
+        let session_for_view = session.clone();
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| super::ResultsView::new(session_for_view, "t", cx));
+
+        let resized_width = px(275.0);
+        view.update_in(vcx, |view, window, cx| {
+            view.resize_column(0, resized_width, window, cx);
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            resized_width
+        );
+
+        // A second batch arrives with a much longer cell in the same
+        // column -- the auto-fit estimate for it would exceed
+        // `resized_width`, so any leak of the auto-fit path back into a
+        // manually resized column would show up as a width change here.
+        session.update(vcx, |session, _cx| {
+            session.set_result_for_test(ResultSet {
+                columns,
+                rows: vec![
+                    Row(vec![Value::Text("ab".to_owned())]),
+                    Row(vec![Value::Text(
+                        "a much longer value than before, wide enough to grow an auto-fit column"
+                            .to_owned(),
+                    )]),
+                ],
+                affected: None,
+                notices: Vec::new(),
+            });
+        });
+        view.update(vcx, super::ResultsView::sync_dimensions);
+
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            resized_width,
+            "a manually resized column's width must survive further streamed rows rather than \
+             being overwritten by sync_dimensions's auto-fit measurement"
+        );
+    }
+
+    #[gpui::test]
+    fn manual_column_resize_does_not_survive_reset_for_new_result(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_results(cx, sample_result());
+        vcx.run_until_parked();
+
+        let auto_fit_width = view.read_with(vcx, |v, _app| v.column_widths[0]);
+        let resized_width = auto_fit_width + px(120.0);
+        view.update_in(vcx, |view, window, cx| {
+            view.resize_column(0, resized_width, window, cx);
+        });
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            resized_width
+        );
+
+        view.update(vcx, |view, cx| {
+            view.show_live("public.orders", cx);
+        });
+
+        assert_eq!(
+            view.read_with(vcx, |v, _app| v.column_widths[0]),
+            auto_fit_width,
+            "show_live's reset_for_new_result must clear a manual override, so a fresh result \
+             renders with the auto-fit width again rather than a stale manual one"
+        );
     }
 
     // -- cell selection / copy -------------------------------------------
