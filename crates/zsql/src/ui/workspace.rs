@@ -502,7 +502,7 @@ impl WorkspaceView {
                 view.activate_tab(id, window, cx);
             }))
             .child(
-                zsql_ui::tabs::close_glyph(active_theme)
+                zsql_ui::tabs::close_glyph(format!("close-icon-{id}"), active_theme)
                     .id(("workspace-tab-close", id))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
@@ -674,7 +674,7 @@ impl WorkspaceView {
                     .items_center()
                     .gap(px(theme::GENERATED_STRIP_TRAILING_GAP))
                     .px(px(theme::GENERATED_STRIP_TRAILING_PADDING_X))
-                    .child(zsql_ui::grid::type_tag("generated", active_theme))
+                    .child(zsql_ui::grid::type_tag_accent("generated", active_theme))
                     .child(
                         div()
                             .text_size(px(theme::GENERATED_HINT_TEXT_SIZE))

@@ -8,21 +8,43 @@ use gpui::{AnyElement, IntoElement, Pixels};
 /// content is entirely caller-built.
 pub struct TableColumn {
     /// This column's width. Applied identically to its header cell and
-    /// every body cell, so header and body stay aligned.
+    /// every body cell, so header and body stay aligned. For a [`grow`]able
+    /// column this is a floor the column never shrinks below, not a fixed
+    /// size.
+    ///
+    /// [`grow`]: TableColumn::grow
     pub width: Pixels,
+    /// Whether this column expands to absorb a share of any horizontal space
+    /// left over once every column has its [`width`]. When any column in a
+    /// table grows, the table fills its container's width instead of leaving
+    /// trailing empty space, and growable columns split the slack evenly.
+    /// Off by default, which keeps a table's columns at exactly their fixed
+    /// widths (and horizontally scrollable when they overflow).
+    ///
+    /// [`width`]: TableColumn::width
+    pub grow: bool,
     /// The header cell's content.
     pub header: AnyElement,
 }
 
 impl TableColumn {
-    /// A column of `width` pixels, with `header` as its header cell's
-    /// content.
+    /// A fixed-width column of `width` pixels, with `header` as its header
+    /// cell's content.
     #[must_use]
     pub fn new(width: Pixels, header: impl IntoElement) -> Self {
         Self {
             width,
+            grow: false,
             header: header.into_any_element(),
         }
+    }
+
+    /// Let this column grow past its `width` to help fill the table's
+    /// container, treating `width` as a floor. See [`TableColumn::grow`].
+    #[must_use]
+    pub fn grow(mut self) -> Self {
+        self.grow = true;
+        self
     }
 }
 

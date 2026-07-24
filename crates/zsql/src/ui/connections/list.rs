@@ -250,7 +250,7 @@ impl RenderOnce for ConnectionListItem {
                 grid::status_dot_outline(colors.text_tertiary)
             })
             .child(row_meta)
-            .child(grid::type_tag(&self.driver, active_theme))
+            .child(grid::type_tag_accent(&self.driver, active_theme))
             .child(
                 RowIconButton {
                     id_name: "edit-connection-button",

@@ -280,8 +280,19 @@ impl<V: Render> Table<V> {
         let double_click_listener = build_double_click_listener(on_cell_double_click, &state, cx);
         let right_click_listener = build_right_click_listener(on_cell_right_click, &state, cx);
 
-        let column_widths: Vec<Pixels> = columns.iter().map(|column| column.width).collect();
+        let layouts: Vec<ColumnLayout> = columns
+            .iter()
+            .map(|column| ColumnLayout {
+                width: column.width,
+                grow: column.grow,
+            })
+            .collect();
+        let column_widths: Vec<Pixels> = layouts.iter().map(|layout| layout.width).collect();
         let content_extent = px(content_extent_for_columns(&column_widths));
+        // When any column grows, the table fills its container's width so the
+        // growable columns have slack to expand into; otherwise rows stay at
+        // their fixed content width and scroll horizontally when they overflow.
+        let fill_width = layouts.iter().any(|layout| layout.grow);
 
         let (handles, focused_cell) = {
             let table_state = state.read(cx);
@@ -314,12 +325,13 @@ impl<V: Render> Table<V> {
             &state,
             cx,
         );
-        let header_row = build_header_row(columns, &style, content_extent, &state);
+        let header_row = build_header_row(columns, &style, content_extent, fill_width, &state);
 
         let data_list = build_data_list(
             &id,
             row_count,
-            column_widths,
+            layouts,
+            fill_width,
             style,
             content_extent,
             table_height,
@@ -370,7 +382,8 @@ impl<V: Render> Table<V> {
 fn build_data_list<V: Render>(
     id: &ElementId,
     row_count: usize,
-    column_widths: Vec<Pixels>,
+    layouts: Vec<ColumnLayout>,
+    fill_width: bool,
     style: TableStyle,
     content_extent: Pixels,
     table_height: TableSizing,
@@ -394,7 +407,9 @@ fn build_data_list<V: Render>(
                 let top_of_viewport = range.start;
                 let indices = range.clone();
                 let row_ctx = BodyRowContext {
-                    column_widths: &column_widths,
+                    layouts: &layouts,
+                    fill_width,
+                    content_extent,
                     style: &style,
                     top_of_viewport,
                     focused_cell,
@@ -579,6 +594,7 @@ fn build_header_row(
     columns: Vec<TableColumn>,
     style: &TableStyle,
     content_extent: Pixels,
+    fill_width: bool,
     state: &Entity<TableState>,
 ) -> Div {
     let mut row = div()
@@ -588,11 +604,14 @@ fn build_header_row(
         .min_w(content_extent)
         .h(style.header_height)
         .bg(rgb(style.header_bg));
+    if fill_width {
+        row = row.w_full();
+    }
     if style.borders.row {
         row = row.border_b_1().border_color(rgb(style.header_border));
     }
     for (index, column) in columns.into_iter().enumerate() {
-        let cell = cell_shell(column.width, style).child(column.header);
+        let cell = cell_shell(column.width, column.grow, style).child(column.header);
         row = row.child(tag_header_cell(cell, index, state));
     }
     row
@@ -606,14 +625,22 @@ fn build_header_row(
 /// is the row index currently at the top of the data pane's visible range.
 fn build_body_row(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> Div {
     debug_assert!(
-        row.cells.len() <= ctx.column_widths.len(),
+        row.cells.len() <= ctx.layouts.len(),
         "table row was given {} cells but the table only has {} columns; a release build \
          truncates the extra {} cell(s) instead of panicking",
         row.cells.len(),
-        ctx.column_widths.len(),
-        row.cells.len() - ctx.column_widths.len(),
+        ctx.layouts.len(),
+        row.cells.len() - ctx.layouts.len(),
     );
     build_body_row_cells(row, row_index, ctx)
+}
+
+/// A column's per-cell sizing, carried from its [`TableColumn`] to every body
+/// cell so header and body stay aligned. See [`TableColumn::grow`].
+#[derive(Debug, Clone, Copy)]
+struct ColumnLayout {
+    width: Pixels,
+    grow: bool,
 }
 
 /// Everything one data-pane body row needs beyond its own [`TableRow`] and
@@ -622,7 +649,16 @@ fn build_body_row(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> 
 /// Grouped into one struct so row-building functions take a single context
 /// argument instead of a long, easily-transposed positional parameter list.
 struct BodyRowContext<'a> {
-    column_widths: &'a [Pixels],
+    layouts: &'a [ColumnLayout],
+    /// Whether the table fills its container's width (any column grows), in
+    /// which case each body row stretches to the full pane width so its
+    /// growable cells have slack to expand into.
+    fill_width: bool,
+    /// The summed column width, i.e. the row's minimum width. Used only in
+    /// `fill_width` mode, where each body row floors at this (matching the
+    /// header) so a pane narrower than the columns scrolls both in lockstep
+    /// instead of letting the body shrink out of alignment with the header.
+    content_extent: Pixels,
     style: &'a TableStyle,
     /// The row index currently at the top of the data pane's visible range.
     top_of_viewport: usize,
@@ -644,16 +680,17 @@ struct BodyRowContext<'a> {
 fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> Div {
     let style = ctx.style;
     let mut row_div = div().flex().flex_row().items_center().h(style.row_height);
+    if ctx.fill_width {
+        // Mirror the header row: fill the pane so growable cells have slack,
+        // but never shrink below the summed column width, so a narrow pane
+        // scrolls the header and body together instead of misaligning them.
+        row_div = row_div.w_full().min_w(ctx.content_extent);
+    }
     if style.borders.row {
         row_div = row_div.border_b_1().border_color(rgb(style.row_border));
     }
-    for (cell_index, (cell, &width)) in row
-        .cells
-        .into_iter()
-        .zip(ctx.column_widths.iter())
-        .enumerate()
-    {
-        let mut shell = cell_shell(width, style).child(cell);
+    for (cell_index, (cell, layout)) in row.cells.into_iter().zip(ctx.layouts.iter()).enumerate() {
+        let mut shell = cell_shell(layout.width, layout.grow, style).child(cell);
         if ctx.selectable {
             if ctx.focused_cell == Some((row_index, cell_index)) {
                 shell = shell
@@ -755,16 +792,24 @@ fn select_cell_on_right_click(
     }
 }
 
-/// A data-pane cell's chrome, shared by header and body.
-fn cell_shell(width: Pixels, style: &TableStyle) -> Div {
+/// A data-pane cell's chrome, shared by header and body. A fixed column
+/// (`grow == false`) is pinned to exactly `width`; a growable one treats
+/// `width` as a floor (`flex_basis`/`min_w`) and expands to take a share of
+/// any leftover row width. `min_w(width)` also pins a growable cell's flex
+/// minimum to `width` rather than its content's min-content size, so a long
+/// value truncates within the cell instead of forcing the whole row wider.
+fn cell_shell(width: Pixels, grow: bool, style: &TableStyle) -> Div {
     let mut cell = div()
         .flex()
-        .flex_shrink_0()
         .items_center()
-        .w(width)
         .h_full()
         .px(style.cell_padding_x)
         .truncate();
+    cell = if grow {
+        cell.flex_grow().flex_basis(width).min_w(width)
+    } else {
+        cell.flex_shrink_0().w(width)
+    };
     if style.borders.column {
         cell = cell.border_r_1().border_color(rgb(style.row_border));
     }
@@ -963,6 +1008,15 @@ mod tests {
     /// first-cell tagging path, guaranteeing it never matches `row_index`.
     const NO_TAG: usize = usize::MAX;
 
+    /// Fixed (non-growing) column layouts for `widths`, the shape most body-row
+    /// tests want.
+    fn fixed_layouts(widths: &[Pixels]) -> Vec<super::ColumnLayout> {
+        widths
+            .iter()
+            .map(|&width| super::ColumnLayout { width, grow: false })
+            .collect()
+    }
+
     /// Mounts `build_body_row_cells(row, widths, ...)` in a minimal window
     /// and returns how many cells it actually painted, so a test can
     /// observe truncation/short-row behavior directly rather than only
@@ -989,8 +1043,11 @@ mod tests {
                 };
                 let style = TableStyle::default();
                 let count = self.painted_count.clone();
+                let layouts = fixed_layouts(&self.widths);
                 let row_ctx = super::BodyRowContext {
-                    column_widths: &self.widths,
+                    layouts: &layouts,
+                    fill_width: false,
+                    content_extent: px(0.0),
                     style: &style,
                     top_of_viewport: NO_TAG,
                     focused_cell: None,
@@ -1047,8 +1104,11 @@ mod tests {
         // A row with more cells than the table has columns is a caller bug
         // (data that can never reach the screen), so the debug assertion
         // must fire in this (debug-assertions-enabled) test build.
+        let layouts = fixed_layouts(&widths);
         let row_ctx = super::BodyRowContext {
-            column_widths: &widths,
+            layouts: &layouts,
+            fill_width: false,
+            content_extent: px(0.0),
             style: &style,
             top_of_viewport: NO_TAG,
             focused_cell: None,
@@ -1092,6 +1152,77 @@ mod tests {
     #[test]
     fn content_extent_for_row_count_multiplies_by_row_height() {
         assert!((content_extent_for_row_count(10, px(24.0)) - 240.0).abs() < f32::EPSILON);
+    }
+
+    /// Renders a two-column, header-only table in a `pane`-wide container and
+    /// returns the painted width of its first (tagged) header cell, so a test
+    /// can observe how column 0 was actually sized.
+    fn first_header_cell_width(
+        cx: &mut TestAppContext,
+        pane: f32,
+        first_column_grows: bool,
+    ) -> Pixels {
+        struct Probe {
+            state: Entity<TableState>,
+            pane: f32,
+            first_column_grows: bool,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let first = TableColumn::new(px(100.0), div().child("a"));
+                let first = if self.first_column_grows {
+                    first.grow()
+                } else {
+                    first
+                };
+                let table = Table::new("grow-probe", &self.state)
+                    .columns(vec![first, TableColumn::new(px(100.0), div().child("b"))])
+                    .row_count(0)
+                    .render(cx);
+                div()
+                    .w(px(self.pane))
+                    .h(px(120.0))
+                    .flex()
+                    .flex_col()
+                    .child(table)
+            }
+        }
+
+        let (probe, vcx) = cx.add_window_view(|_w, cx| Probe {
+            state: cx.new(TableState::new),
+            pane,
+            first_column_grows,
+        });
+        vcx.run_until_parked();
+        let state = probe.read_with(vcx, |p, _| p.state.clone());
+        vcx.debug_bounds(header_first_cell_debug_selector(&state))
+            .expect("the first header cell must be painted")
+            .size
+            .width
+    }
+
+    #[gpui::test]
+    fn a_growable_column_expands_past_its_width_to_fill_the_pane(cx: &mut TestAppContext) {
+        // Two 100px columns in a 600px pane leave 400px of slack; the sole
+        // growable column must absorb it, ending far wider than its base 100px.
+        let width = first_header_cell_width(cx, 600.0, true);
+        assert!(
+            width > px(200.0),
+            "a growable column must expand past its base width to fill the pane, got {width:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn fixed_columns_stay_at_their_width_and_do_not_fill_the_pane(cx: &mut TestAppContext) {
+        // With no growable column the table keeps its fixed widths (and would
+        // scroll on overflow) rather than stretching, so column 0 stays 100px
+        // even though the 600px pane has ample room -- the fill behavior is
+        // strictly opt-in, leaving the results grid's fixed layout unchanged.
+        let width = first_header_cell_width(cx, 600.0, false);
+        assert!(
+            (width - px(100.0)).abs() < px(1.0),
+            "a fixed column must keep its base width regardless of pane width, got {width:?}"
+        );
     }
 
     /// Which pinned-gutter arrangement [`Harness`] builds for its table.

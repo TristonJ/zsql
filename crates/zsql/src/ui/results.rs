@@ -1806,14 +1806,14 @@ fn column_header(column: &ColumnMeta, active_theme: &Theme) -> AnyElement {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
+        .items_center()
         .gap_2()
         .child(
             div()
                 .text_color(rgb(active_theme.colors.text_primary))
                 .child(column.name.clone()),
         )
-        .child(grid::type_tag(&column.type_name, active_theme))
+        .child(grid::type_tag_tertiary(&column.type_name, active_theme))
         .into_any_element()
 }
 

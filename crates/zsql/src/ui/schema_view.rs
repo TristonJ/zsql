@@ -181,7 +181,7 @@ impl SchemaTabView {
                 div()
                     .flex()
                     .flex_row()
-                    .items_baseline()
+                    .items_center()
                     .gap_2()
                     .child(icon(
                         IconName::Table,
@@ -204,6 +204,7 @@ impl SchemaTabView {
             )
             .child(
                 div()
+                    .ml_2()
                     .text_size(px(theme::SCHEMA_KIND_PILL_TEXT_SIZE))
                     .text_color(rgb(colors.accent))
                     .border_1()
@@ -251,14 +252,24 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_COLUMNS_WIDTHS;
+        // Type and Default hold the most variable-length content (long type
+        // names, long default expressions), so they absorb any width left over
+        // once the table fills its section; the rest stay at their fixed width.
+        let grows = [true, true, false, true, false];
         let columns = ["Column", "Type", "Null", "Default", "Keys"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column = TableColumn::new(
                     width,
                     header_cell(column.to_string(), active_theme).px(cell_x_padding()),
-                )
+                );
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
@@ -268,6 +279,7 @@ impl SchemaTabView {
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
+                    row_height: px(36.0),
                     ..TableStyle::themed(active_theme)
                 })
                 .columns(columns)
@@ -323,7 +335,7 @@ impl SchemaTabView {
                     div()
                         .px(cell_x_padding())
                         .child(
-                            grid::type_tag(&column.type_name, active_theme)
+                            grid::type_tag_accent(&column.type_name, active_theme)
                                 .flex_shrink_0()
                                 .into_any_element(),
                         )
@@ -353,11 +365,19 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_INDEXES_WIDTHS;
+        let grows = [false, false, false, true];
         let columns = ["Name", "Method", "Unique", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), active_theme))
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column =
+                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
@@ -365,6 +385,10 @@ impl SchemaTabView {
             "Indexes",
             detail.indexes.len(),
             Table::new("schema-indexes-table", &self.indexes_table)
+                .style(TableStyle {
+                    row_height: px(36.0),
+                    ..TableStyle::themed(active_theme)
+                })
                 .columns(columns)
                 .row_count(detail.indexes.len())
                 .rows(Self::render_index_table_row_cells)
@@ -434,11 +458,19 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_CONSTRAINTS_WIDTHS;
-        let columns = ["Name", "Method", "Unique", "Definition"]
+        let grows = [false, false, true];
+        let columns = ["Name", "Type", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), active_theme))
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column =
+                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
@@ -446,6 +478,10 @@ impl SchemaTabView {
             "Constraints",
             detail.constraints.len(),
             Table::new("schema-constraints-table", &self.constraints_table)
+                .style(TableStyle {
+                    row_height: px(36.0),
+                    ..TableStyle::themed(active_theme)
+                })
                 .columns(columns)
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)
@@ -579,6 +615,8 @@ fn section(
     div()
         .flex()
         .flex_col()
+        .w(theme::SCHEMA_SECTION_WIDTH)
+        .max_w_full()
         .child(
             div()
                 .flex()
