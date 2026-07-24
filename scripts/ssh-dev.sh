@@ -11,9 +11,16 @@ USER_NAME="${ZSQL_SSH_USER:-zsql}"
 PASSWORD="${ZSQL_SSH_PASSWORD:-zsql}"
 IMAGE="${ZSQL_SSH_IMAGE:-lscr.io/linuxserver/openssh-server:latest}"
 PG_PORT="${ZSQL_PG_PORT:-5432}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIXTURE_PUBKEY="${ZSQL_SSH_FIXTURE_PUBKEY:-${SCRIPT_DIR}/../crates/zsql-ssh/tests/fixtures/id_ed25519.pub}"
 
 case "${1:-up}" in
   up)
+    if [ ! -f "$FIXTURE_PUBKEY" ]; then
+      echo "fixture public key not found: $FIXTURE_PUBKEY" >&2
+      echo "(crates/zsql-ssh/tests/fixtures/id_ed25519.pub should be committed)" >&2
+      exit 1
+    fi
     docker run --rm -d \
       --name "$NAME" \
       --add-host=host.docker.internal:host-gateway \
@@ -22,6 +29,7 @@ case "${1:-up}" in
       -e PASSWORD_ACCESS=true \
       -e USER_NAME="$USER_NAME" \
       -e USER_PASSWORD="$PASSWORD" \
+      -e PUBLIC_KEY="$(cat "$FIXTURE_PUBKEY")" \
       -p "${PORT}:2222" \
       "$IMAGE" >/dev/null
     # The published port opens (via docker-proxy) before sshd inside the
@@ -57,6 +65,7 @@ case "${1:-up}" in
     echo "sshd up on localhost:${PORT}"
     echo "  ssh user:     ${USER_NAME}"
     echo "  ssh password: ${PASSWORD}"
+    echo "  ssh key:      ${FIXTURE_PUBKEY%.pub} (authorized via ${FIXTURE_PUBKEY})"
     echo "forwards from inside the container reach the dev postgres at host.docker.internal:${PG_PORT}"
     echo "(run scripts/pg-dev.sh up first so that target is reachable)"
     echo
@@ -66,6 +75,8 @@ case "${1:-up}" in
     echo "export ZSQL_TEST_SSH_PASSWORD=${PASSWORD}"
     echo "export ZSQL_TEST_SSH_REMOTE_HOST=host.docker.internal"
     echo "export ZSQL_TEST_SSH_REMOTE_PORT=${PG_PORT}"
+    echo
+    echo "cargo test -p zsql-ssh --features ssh-integration-tests --test ssh_integration"
     ;;
   down)
     docker stop "$NAME" >/dev/null && echo "stopped $NAME"
