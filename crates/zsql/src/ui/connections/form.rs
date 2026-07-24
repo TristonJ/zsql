@@ -3,6 +3,12 @@
 //! self-contained input component with no session or store of its own --
 //! every button emits a [`ConnectionFormEvent`] for [`super::ConnectionManagerView`]
 //! (which owns the session and store) to act on.
+//!
+//! The SSH tunnel section ([`ssh`]) and the per-driver TLS control ([`tls`])
+//! are split into their own submodules to keep this file under the
+//! project's line-count convention; both extend [`ConnectionForm`] with
+//! `impl` blocks rather than owning a separate type, since their state and
+//! rendering are as much a part of the form as the driver fields above them.
 
 use gpui::{
     App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Window, div,
@@ -18,10 +24,16 @@ use zsql_ui::{
 };
 
 use super::TestOutcome;
+use crate::connections::{SshAuthKind, StoredSsh};
 use crate::{
-    drivers::detect_driver_id,
+    drivers::{detect_driver_id, is_network},
     ui::{connections::driver_display_label, theme},
 };
+
+mod ssh;
+mod tls;
+
+pub(crate) use ssh::HostKeyMode;
 
 /// The connection form's input fields, test-outcome banner, and footer.
 pub struct ConnectionForm {
@@ -37,9 +49,9 @@ pub struct ConnectionForm {
     /// Masked by default; see [`Self::toggle_password_visible`].
     pub(crate) password_field: Entity<TextFieldState>,
     pub(crate) database_field: Entity<TextFieldState>,
-    /// The driver's TLS query-parameter value (`sslmode` for postgres,
-    /// `trustServerCertificate` for mssql).
-    pub(crate) tls_field: Entity<TextFieldState>,
+    /// Focus target for the TLS-verification mode control (see [`tls`]),
+    /// which has no text field of its own to carry a focus handle.
+    pub(crate) tls_focus: FocusHandle,
     /// `SQLite`'s single field: a file path (or `:memory:`).
     pub(crate) sqlite_path_field: Entity<TextFieldState>,
     /// The URL field's current text, parsed -- `None` while it does not
@@ -63,6 +75,25 @@ pub struct ConnectionForm {
     pub(crate) test_focus: FocusHandle,
     pub(crate) connect_focus: FocusHandle,
     pub(crate) save_focus: FocusHandle,
+
+    // -- SSH tunnel section (see `ssh`) --------------------------------
+    //
+    // Independent of `parsed_url`/`ConnectionUrl`: these settings are not
+    // part of the connection URL and are never written into it.
+    /// Whether the SSH tunnel is used when connecting.
+    pub(crate) ssh_enabled: bool,
+    pub(crate) ssh_enabled_focus: FocusHandle,
+    pub(crate) ssh_host_field: Entity<TextFieldState>,
+    pub(crate) ssh_port_field: Entity<TextFieldState>,
+    pub(crate) ssh_user_field: Entity<TextFieldState>,
+    pub(crate) ssh_auth_kind: SshAuthKind,
+    pub(crate) ssh_auth_focus: FocusHandle,
+    pub(crate) ssh_password_field: Entity<TextFieldState>,
+    pub(crate) ssh_key_path_field: Entity<TextFieldState>,
+    pub(crate) ssh_key_passphrase_field: Entity<TextFieldState>,
+    pub(crate) ssh_host_key_mode: HostKeyMode,
+    pub(crate) ssh_host_key_focus: FocusHandle,
+    pub(crate) ssh_known_hosts_path_field: Entity<TextFieldState>,
 }
 
 /// What [`ConnectionForm`] asks its parent to do, in response to a footer
@@ -115,9 +146,27 @@ impl ConnectionForm {
             field
         });
         let database_field = cx.new(|cx| TextFieldState::new("database", None, cx));
-        let tls_field = cx.new(|cx| TextFieldState::new("", None, cx));
         let sqlite_path_field =
             cx.new(|cx| TextFieldState::new("/path/to.db or :memory:", None, cx));
+
+        let ssh_host_field = cx.new(|cx| TextFieldState::new("ssh host", None, cx));
+        let ssh_port_field = cx.new(|cx| {
+            TextFieldState::new(crate::config::DEFAULT_SSH_TUNNEL_PORT.to_string(), None, cx)
+        });
+        let ssh_user_field = cx.new(|cx| TextFieldState::new("ssh user", None, cx));
+        let ssh_password_field = cx.new(|cx| {
+            let mut field = TextFieldState::new("ssh password", None, cx);
+            field.set_masked(true, cx);
+            field
+        });
+        let ssh_key_path_field = cx.new(|cx| TextFieldState::new("/path/to/key", None, cx));
+        let ssh_key_passphrase_field = cx.new(|cx| {
+            let mut field = TextFieldState::new("key passphrase", None, cx);
+            field.set_masked(true, cx);
+            field
+        });
+        let ssh_known_hosts_path_field =
+            cx.new(|cx| TextFieldState::new("/path/to/known_hosts", None, cx));
 
         cx.observe(&url_field, |view, _field, cx| view.on_url_field_changed(cx))
             .detach();
@@ -131,7 +180,6 @@ impl ConnectionForm {
             .detach();
         cx.observe(&database_field, Self::on_database_field_changed)
             .detach();
-        cx.observe(&tls_field, Self::on_tls_field_changed).detach();
         cx.observe(&sqlite_path_field, Self::on_sqlite_path_field_changed)
             .detach();
 
@@ -153,7 +201,7 @@ impl ConnectionForm {
             user_field,
             password_field,
             database_field,
-            tls_field,
+            tls_focus: cx.focus_handle(),
             sqlite_path_field,
             parsed_url: None,
             driver_id: Err("empty URL".to_owned()),
@@ -163,6 +211,20 @@ impl ConnectionForm {
             test_focus: cx.focus_handle(),
             connect_focus: cx.focus_handle(),
             save_focus: cx.focus_handle(),
+
+            ssh_enabled: false,
+            ssh_enabled_focus: cx.focus_handle(),
+            ssh_host_field,
+            ssh_port_field,
+            ssh_user_field,
+            ssh_auth_kind: SshAuthKind::Agent,
+            ssh_auth_focus: cx.focus_handle(),
+            ssh_password_field,
+            ssh_key_path_field,
+            ssh_key_passphrase_field,
+            ssh_host_key_mode: HostKeyMode::AcceptNew,
+            ssh_host_key_focus: cx.focus_handle(),
+            ssh_known_hosts_path_field,
         }
     }
 
@@ -191,14 +253,25 @@ impl ConnectionForm {
     }
 
     /// Reset the form to an edit form for connection `id`, prefilled with
-    /// `name`/`url` and every driver field parsed out of `url`.
-    pub fn begin_edit(&mut self, id: Uuid, name: String, url: String, cx: &mut Context<Self>) {
+    /// `name`/`url` and every driver field parsed out of `url`, plus `ssh`/
+    /// `ssh_secret` in the SSH section (both `None` for a connection with no
+    /// tunnel configured, or one saved before SSH tunnel support existed).
+    pub fn begin_edit(
+        &mut self,
+        id: Uuid,
+        name: String,
+        url: String,
+        ssh: Option<StoredSsh>,
+        ssh_secret: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.mode = ConnectionFormMode::Edit { id };
         self.name_field
             .update(cx, |field, _cx| field.set_value_quiet(name));
         self.url_field
             .update(cx, |field, _cx| field.set_value_quiet(url));
         self.sync_fields_from_url(cx);
+        self.apply_ssh_state(ssh, ssh_secret, cx);
         self.test_outcome = None;
         cx.notify();
     }
@@ -256,7 +329,12 @@ impl ConnectionForm {
 
     /// The divider + driver-specific fields, or a plain hint when the URL's
     /// scheme is not (yet) recognized at all.
-    fn render_driver_field_section(&self, driver_label: &str, cx: &Context<Self>) -> Div {
+    fn render_driver_field_section(
+        &self,
+        driver_label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let colors = cx.theme().colors;
         let Ok(driver_id) = self.pending_driver_id() else {
             return div()
@@ -287,14 +365,14 @@ impl ConnectionForm {
                 el.opacity(theme::CONNECTION_FORM_DIM_OPACITY)
             });
 
-        section = if driver_id == "sqlite" {
+        section = if is_network(driver_id) {
+            self.render_network_fields(section, driver_id, colors, window, cx)
+        } else {
             section.child(Self::labeled_field(
                 "Database file",
                 colors,
                 self.sqlite_path_field.clone(),
             ))
-        } else {
-            self.render_network_fields(section, driver_id, colors, cx)
         };
 
         if let Some(extras_line) = self.render_extra_query_params_line(driver_id, colors) {
@@ -317,14 +395,16 @@ impl ConnectionForm {
         wrapper
     }
 
-    /// The Host/Port, User/Password, Database, and TLS-param fields shared
-    /// by the non-sqlite network drivers, appended onto `section`.
+    /// The Host/Port, User/Password, Database, and TLS fields shared by the
+    /// non-sqlite network drivers, followed by the SSH tunnel section,
+    /// appended onto `section`.
     fn render_network_fields(
         &self,
         section: Div,
         driver_id: &str,
         colors: zsql_ui::theme::Colors,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Div {
         section
             .child(
@@ -360,15 +440,12 @@ impl ConnectionForm {
                 colors,
                 self.database_field.clone(),
             ))
-            .child(Self::labeled_field(
-                tls_param_label(driver_id),
-                colors,
-                self.tls_field.clone(),
-            ))
+            .child(self.render_tls_control(driver_id, colors, window, cx))
+            .child(self.render_ssh_section(colors, window, cx))
     }
 
     /// A read-only line listing any query parameters the URL carries beyond
-    /// `driver_id`'s own TLS param -- parts a field edit still preserves
+    /// `driver_id`'s own TLS param(s) -- parts a field edit still preserves
     /// (see [`zsql_core::ConnectionUrl::extra_query_params`]) but has no
     /// field of its own to show, so they are surfaced here instead of
     /// silently hidden. `None` for sqlite (no query params) or when there
@@ -378,11 +455,11 @@ impl ConnectionForm {
         driver_id: &str,
         colors: zsql_ui::theme::Colors,
     ) -> Option<Div> {
-        if driver_id == "sqlite" {
+        if !is_network(driver_id) {
             return None;
         }
         let parsed = self.parsed_url.as_ref()?;
-        let extras = parsed.extra_query_params(&[tls_param_key(driver_id)]);
+        let extras = parsed.extra_query_params(&tls::known_query_keys(driver_id));
         if extras.is_empty() {
             return None;
         }
@@ -603,10 +680,7 @@ impl ConnectionForm {
         parsed: &ConnectionUrl,
         cx: &mut Context<Self>,
     ) {
-        if driver_id == "sqlite" {
-            let path = parsed.sqlite_path().unwrap_or_default();
-            set_field_value_if_changed(&self.sqlite_path_field, path, cx);
-        } else {
+        if is_network(driver_id) {
             let host = parsed.host().unwrap_or_default();
             set_field_value_if_changed(&self.host_field, &host, cx);
             let port = parsed
@@ -619,10 +693,11 @@ impl ConnectionForm {
             set_field_value_if_changed(&self.password_field, &password, cx);
             let database = parsed.database();
             set_field_value_if_changed(&self.database_field, &database, cx);
-            let tls = parsed
-                .query_param(tls_param_key(driver_id))
-                .unwrap_or_default();
-            set_field_value_if_changed(&self.tls_field, &tls, cx);
+            // The TLS mode has no field of its own to sync: it is read
+            // straight off `parsed_url` wherever it renders.
+        } else {
+            let path = parsed.sqlite_path().unwrap_or_default();
+            set_field_value_if_changed(&self.sqlite_path_field, path, cx);
         }
     }
 
@@ -648,15 +723,16 @@ impl ConnectionForm {
             self.url_field.read(cx).focus_handle(cx),
         ];
         if let Ok(driver_id) = self.driver_id.as_deref() {
-            if driver_id == "sqlite" {
-                order.push(self.sqlite_path_field.read(cx).focus_handle(cx));
-            } else {
+            if is_network(driver_id) {
                 order.push(self.host_field.read(cx).focus_handle(cx));
                 order.push(self.port_field.read(cx).focus_handle(cx));
                 order.push(self.user_field.read(cx).focus_handle(cx));
                 order.push(self.password_field.read(cx).focus_handle(cx));
                 order.push(self.database_field.read(cx).focus_handle(cx));
-                order.push(self.tls_field.read(cx).focus_handle(cx));
+                order.push(self.tls_focus.clone());
+                self.push_ssh_focus_order(&mut order, cx);
+            } else {
+                order.push(self.sqlite_path_field.read(cx).focus_handle(cx));
             }
         }
         order.push(self.cancel_focus.clone());
@@ -671,8 +747,8 @@ impl ConnectionForm {
         order
     }
 
-    /// Empty every form field and reset the parsed-URL/driver-detection
-    /// state to the empty-URL baseline
+    /// Empty every form field and reset the parsed-URL/driver-detection and
+    /// SSH-section state to the empty-URL baseline
     fn clear_inputs(&mut self, cx: &mut Context<Self>) {
         self.name_field
             .update(cx, |field, _cx| field.set_value_quiet(""));
@@ -688,13 +764,12 @@ impl ConnectionForm {
             .update(cx, |field, _cx| field.set_value_quiet(""));
         self.database_field
             .update(cx, |field, _cx| field.set_value_quiet(""));
-        self.tls_field
-            .update(cx, |field, _cx| field.set_value_quiet(""));
         self.sqlite_path_field
             .update(cx, |field, _cx| field.set_value_quiet(""));
         self.parsed_url = None;
         self.driver_id = Err("empty URL".to_owned());
         self.dim_reason = Some("empty URL".to_owned());
+        self.reset_ssh_state(cx);
         cx.notify();
     }
 
@@ -782,24 +857,6 @@ impl ConnectionForm {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn on_tls_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
-        let value = field.read(cx).value().to_string();
-        let Ok(driver_id) = self.driver_id.clone() else {
-            return;
-        };
-        let Some(parsed) = self.parsed_url.as_mut() else {
-            return;
-        };
-        let key = tls_param_key(driver_id);
-        if value.trim().is_empty() {
-            parsed.remove_query_param(key);
-        } else {
-            parsed.set_query_param(key, &value);
-        }
-        self.reserialize_url(cx);
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
     fn on_sqlite_path_field_changed(
         &mut self,
         field: Entity<TextFieldState>,
@@ -883,7 +940,7 @@ impl Render for ConnectionForm {
                     .child(self.url_field.clone()),
             );
 
-        body = body.child(self.render_driver_field_section(&driver_label, cx));
+        body = body.child(self.render_driver_field_section(&driver_label, window, cx));
         body = body.child(self.render_test_outcome(cx));
 
         div()
@@ -891,25 +948,6 @@ impl Render for ConnectionForm {
             .flex_col()
             .child(body)
             .child(self.render_footer(window, cx))
-    }
-}
-
-/// The query-parameter key `zsql_core::ConnectionUrl` reads/writes for
-/// `driver_id`'s TLS setting.
-fn tls_param_key(driver_id: &str) -> &'static str {
-    if driver_id == "mssql" {
-        "trustServerCertificate"
-    } else {
-        "sslmode"
-    }
-}
-
-/// The field label for `driver_id`'s TLS setting.
-fn tls_param_label(driver_id: &str) -> &'static str {
-    if driver_id == "mssql" {
-        "Trust server certificate"
-    } else {
-        "SSL mode"
     }
 }
 

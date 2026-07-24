@@ -24,6 +24,10 @@ const TAB_SESSIONS_FILE_NAME: &str = "tab_sessions.json";
 /// [`crate::theme_resolve`].
 const THEMES_DIR_NAME: &str = "themes";
 
+/// The standard SSH port, used to fill in a connection form's SSH tunnel
+/// port when left empty.
+pub const DEFAULT_SSH_TUNNEL_PORT: u16 = 22;
+
 /// Top-level application config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

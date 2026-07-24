@@ -8,7 +8,7 @@ use super::{
     footer_display, host_label,
 };
 use crate::{
-    connections::ConnectionArgs,
+    connections::{ConnectionArgs, SshAuthKind},
     session::{LivenessState, Session, SessionState},
     ui::connections::form::ConnectionFormEvent,
 };
@@ -1253,4 +1253,318 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
         ModalSize::Small.width(),
         "a long URL must never widen the modal panel"
     );
+}
+
+// ---- SSH round-trip through add_connection -------------------------------
+
+#[gpui::test]
+fn adding_a_connection_with_ssh_agent_auth_persists_it(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("add-ssh-agent");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+        view.set_name_input("tunneled agent", cx);
+        view.set_url_input("postgres://app@dbhost:5432/app", cx);
+        let form = view.form.clone();
+        form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("bastion.example.com", cx));
+        let port_field = form.read(cx).ssh_port_field.clone();
+        port_field.update(cx, |field, cx| field.set_value("2222", cx));
+        let user_field = form.read(cx).ssh_user_field.clone();
+        user_field.update(cx, |field, cx| field.set_value("deploy", cx));
+    });
+
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        let stored = &view.connections()[0].connection;
+        let ssh = stored.ssh.clone().expect("ssh must be persisted");
+        assert!(ssh.enabled);
+        assert_eq!(ssh.host, "bastion.example.com");
+        assert_eq!(ssh.port, 2222);
+        assert_eq!(ssh.user, "deploy");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Agent));
+        assert!(
+            stored.get_ssh_secret().is_err(),
+            "agent auth must not write a keyring secret"
+        );
+    });
+}
+
+#[gpui::test]
+fn adding_a_connection_with_ssh_password_auth_persists_it_and_its_secret(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("add-ssh-password");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+        view.set_name_input("tunneled password", cx);
+        view.set_url_input("postgres://app@dbhost:5432/app", cx);
+        let form = view.form.clone();
+        form.update(cx, |form, cx| {
+            form.set_ssh_enabled(true, cx);
+            form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+        });
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("bastion.example.com", cx));
+        let user_field = form.read(cx).ssh_user_field.clone();
+        user_field.update(cx, |field, cx| field.set_value("deploy", cx));
+        let password_field = form.read(cx).ssh_password_field.clone();
+        password_field.update(cx, |field, cx| field.set_value("hunter2", cx));
+    });
+
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        let stored = &view.connections()[0].connection;
+        let ssh = stored.ssh.clone().expect("ssh must be persisted");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Password));
+        assert_eq!(
+            stored
+                .get_ssh_secret()
+                .expect("secret must be in the keyring"),
+            "hunter2"
+        );
+    });
+}
+
+#[gpui::test]
+fn adding_a_connection_with_ssh_key_auth_persists_it_and_the_passphrase(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("add-ssh-key");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+        view.set_name_input("tunneled key", cx);
+        view.set_url_input("postgres://app@dbhost:5432/app", cx);
+        let form = view.form.clone();
+        form.update(cx, |form, cx| {
+            form.set_ssh_enabled(true, cx);
+            form.set_ssh_auth_kind(SshAuthKind::Key, cx);
+        });
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("bastion.example.com", cx));
+        let key_path_field = form.read(cx).ssh_key_path_field.clone();
+        key_path_field.update(cx, |field, cx| {
+            field.set_value("/home/user/.ssh/id_ed25519", cx);
+        });
+        let passphrase_field = form.read(cx).ssh_key_passphrase_field.clone();
+        passphrase_field.update(cx, |field, cx| field.set_value("key-secret", cx));
+    });
+
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        let stored = &view.connections()[0].connection;
+        let ssh = stored.ssh.clone().expect("ssh must be persisted");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Key));
+        assert_eq!(
+            ssh.key_path.as_deref(),
+            Some(std::path::Path::new("/home/user/.ssh/id_ed25519"))
+        );
+        assert_eq!(
+            stored
+                .get_ssh_secret()
+                .expect("secret must be in the keyring"),
+            "key-secret"
+        );
+    });
+}
+
+#[gpui::test]
+fn adding_a_connection_with_ssh_left_disabled_persists_no_ssh_and_no_secret(
+    cx: &mut TestAppContext,
+) {
+    let temp = TempStorePath::new("add-ssh-disabled");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+        view.set_name_input("no tunnel", cx);
+        view.set_url_input("postgres://app@dbhost:5432/app", cx);
+    });
+
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.add_connection(cx, &name, url)
+            .expect("add must succeed");
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        let stored = &view.connections()[0].connection;
+        assert_eq!(stored.ssh, None);
+        assert!(
+            stored.get_ssh_secret().is_err(),
+            "no ssh secret may be written to the keyring when SSH is left disabled"
+        );
+    });
+}
+
+#[gpui::test]
+fn editing_a_connection_to_enable_ssh_persists_the_change(cx: &mut TestAppContext) {
+    let temp = TempStorePath::new("edit-enable-ssh");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "first".to_owned(),
+            url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
+        })
+        .expect("add must succeed");
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+    let id = manager.read_with(vcx, |view, _app| view.connections()[0].connection.id);
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_edit_form(id, window, cx);
+        let form = view.form.clone();
+        form.update(cx, |form, cx| {
+            form.set_ssh_enabled(true, cx);
+            form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+        });
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| field.set_value("bastion.example.com", cx));
+        let password_field = form.read(cx).ssh_password_field.clone();
+        password_field.update(cx, |field, cx| field.set_value("edited-secret", cx));
+    });
+
+    manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.save_edit(cx, id, &name, url)
+            .expect("save_edit must succeed");
+    });
+
+    manager.read_with(vcx, |view, _app| {
+        let stored = &view.connections()[0].connection;
+        let ssh = stored.ssh.clone().expect("ssh must be persisted");
+        assert!(ssh.enabled);
+        assert_eq!(ssh.host, "bastion.example.com");
+        assert_eq!(
+            stored
+                .get_ssh_secret()
+                .expect("secret must be in the keyring"),
+            "edited-secret"
+        );
+    });
+}
+
+// ---- Test/Connect open the tunnel before the driver connect ---------------
+
+#[gpui::test]
+async fn run_test_with_an_unreachable_ssh_host_reports_an_ssh_layer_failure(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("test-ssh-unreachable");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.show_add_form(window, cx);
+        view.set_url_input(
+            "postgres://nobody@zsql-test-should-never-be-dialed.invalid:5432/db",
+            cx,
+        );
+        let form = view.form.clone();
+        form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| {
+            field.set_value("zsql-test-unreachable-ssh.invalid", cx);
+        });
+        let user_field = form.read(cx).ssh_user_field.clone();
+        user_field.update(cx, |field, cx| field.set_value("nobody", cx));
+    });
+
+    let task = manager.update(vcx, |view, cx| {
+        let url = view.form.read(cx).input_values(cx).1;
+        view.run_test(cx, url)
+    });
+    task.await;
+
+    manager.read_with(vcx, |view, app| match view.test_outcome(app) {
+        Some(TestOutcome::Failed(message)) => {
+            assert!(
+                message.contains("ssh host"),
+                "expected an ssh-layer failure (proving the driver connect was never \
+                 attempted against the unreachable postgres host), got: {message}"
+            );
+        }
+        other => panic!("expected a Failed outcome from the unreachable ssh host, got {other:?}"),
+    });
+}
+
+#[gpui::test]
+async fn connect_unsaved_does_not_silently_ignore_the_forms_ssh_section(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("connect-unsaved-ssh-ordering");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.open(cx);
+        view.show_add_form(window, cx);
+        view.set_name_input("scratch", cx);
+        view.set_url_input(
+            "postgres://nobody@zsql-test-should-never-be-dialed.invalid:5432/db",
+            cx,
+        );
+        let form = view.form.clone();
+        form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
+        let host_field = form.read(cx).ssh_host_field.clone();
+        host_field.update(cx, |field, cx| {
+            field.set_value("zsql-test-unreachable-ssh.invalid", cx);
+        });
+        let user_field = form.read(cx).ssh_user_field.clone();
+        user_field.update(cx, |field, cx| field.set_value("nobody", cx));
+    });
+
+    let task = manager.update(vcx, |view, cx| {
+        let (name, url) = view.form.read(cx).input_values(cx);
+        view.connect_unsaved(cx, name, url)
+    });
+    task.await;
+
+    manager.read_with(vcx, |view, _app| {
+        let status = view.status();
+        assert!(
+            status.is_some_and(|status| status.contains("ssh host")),
+            "expected an ssh-layer failure (proving the driver connect was never \
+             attempted against the unreachable postgres host) and that the form's \
+             enabled SSH section was not silently ignored, got {status:?}"
+        );
+        assert!(
+            view.is_open(),
+            "a failed connect_unsaved must leave the modal open"
+        );
+    });
 }
