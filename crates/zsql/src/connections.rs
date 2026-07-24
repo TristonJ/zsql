@@ -1,16 +1,8 @@
-//! Persisted connection store: user-named database connection URLs saved to
-//! disk under [`crate::config::Config::connections_path`].
-//!
-//! V0 "secure" storage means the store file is written with owner-only
-//! filesystem permissions (`0600` on unix) -- see [`STORE_FILE_MODE`]. It
-//! does not integrate with any OS keyring or external secret manager; that
-//! integration is deferred. Treat this file as sensitive: a connection URL
-//! may embed a plaintext password, exactly as the `DATABASE_URL` env var
-//! does today.
+//! Persisted connection store: user-named database connections saved to
+//! disk under [`crate::config::Config::connections_path`]. Connection URLs
+//! themselves are stored in the OS keyring.
 
 use std::fs;
-#[cfg(test)]
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -64,68 +56,27 @@ impl ConnectionArgs {
 }
 
 impl StoredConnection {
-    #[cfg(not(test))]
     pub fn get_url(&self) -> Result<String, ConnectionStoreError> {
         let entry = self.get_keyring_entry()?;
         Ok(entry.get_password()?)
     }
 
-    #[cfg(test)]
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn get_url(&self) -> Result<String, ConnectionStoreError> {
-        use std::io::Read;
-        let path = self.get_mock_file_path();
-        let mut url = String::new();
-        let mut file = File::open(&path).expect("failed to open mock keyring file");
-        file.read_to_string(&mut url)
-            .expect("failed to read mock keyring file");
-        Ok(url)
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn set_url(&self, url: &str) -> Result<(), ConnectionStoreError> {
-        use std::io::Write;
-        let path = self.get_mock_file_path();
-        let mut file = File::create(path).expect("failed to create mock keyring file");
-        file.write_all(url.as_bytes())
-            .expect("failed to write mock keyring file");
-        Ok(())
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn delete_url(&self) -> Result<(), ConnectionStoreError> {
-        let file_path = self.get_mock_file_path();
-        std::fs::remove_file(file_path).expect("failed to delete mock keyring file");
-        Ok(())
-    }
-
-    #[cfg(not(test))]
     pub(crate) fn set_url(&self, url: &str) -> Result<(), ConnectionStoreError> {
         let entry = self.get_keyring_entry()?;
         entry.set_password(url)?;
         Ok(())
     }
 
-    #[cfg(not(test))]
     pub(crate) fn delete_url(&self) -> Result<(), ConnectionStoreError> {
         let entry = self.get_keyring_entry()?;
-        entry.delete_credential()?;
+        entry.delete()?;
         Ok(())
     }
 
-    #[cfg(not(test))]
-    fn get_keyring_entry(&self) -> Result<keyring::Entry, ConnectionStoreError> {
+    fn get_keyring_entry(&self) -> Result<crate::keyring::Entry, ConnectionStoreError> {
         let username = format!("zsql-connection-{}", self.id);
-        let entry = keyring::Entry::new("zsql", &username)?;
+        let entry = crate::keyring::Entry::new(&username)?;
         Ok(entry)
-    }
-
-    #[cfg(test)]
-    fn get_mock_file_path(&self) -> PathBuf {
-        let dir = std::env::temp_dir();
-        dir.join(format!("zsql-test-connection-{}.txt", self.id))
     }
 }
 
@@ -155,7 +106,7 @@ pub enum ConnectionStoreError {
     Write(std::io::Error),
     /// There was an error accessing the OS keyring
     #[error("failed to access OS keyring: {0}")]
-    Keyring(#[from] keyring::Error),
+    Keyring(#[from] crate::keyring::Error),
 }
 
 /// The persisted list of [`StoredConnection`]s, backed by a single TOML

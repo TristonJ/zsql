@@ -3,6 +3,7 @@
 mod config;
 mod connections;
 mod drivers;
+mod keyring;
 mod observability;
 mod session;
 mod tab_session;
