@@ -258,27 +258,6 @@ pub fn connection_test_pending_bg(theme: &Theme) -> u32 {
     Colors::wash(theme.colors.status_warn, 0x1f)
 }
 
-// ---- schema tab / view -----------------------------------------------
-
-/// Width of a right-click context menu.
-pub const CONTEXT_MENU_WIDTH: Pixels = px(210.0);
-/// Padding around a context menu's items.
-pub const CONTEXT_MENU_PADDING: Pixels = px(5.0);
-/// Corner radius of a context menu.
-pub const CONTEXT_MENU_RADIUS: f32 = 8.0;
-/// Height of one context menu item.
-pub const CONTEXT_MENU_ITEM_HEIGHT: Pixels = px(28.0);
-/// Horizontal padding inside a context menu item.
-pub const CONTEXT_MENU_ITEM_PADDING_X: Pixels = px(9.0);
-/// Corner radius of a context menu item.
-pub const CONTEXT_MENU_ITEM_RADIUS: f32 = 5.0;
-/// Text size of a context menu item's label.
-pub const CONTEXT_MENU_ITEM_TEXT_SIZE: f32 = 12.0;
-/// Height of a context menu's separator line.
-pub const CONTEXT_MENU_SEPARATOR_HEIGHT: Pixels = px(1.0);
-/// Vertical margin around a context menu separator.
-pub const CONTEXT_MENU_SEPARATOR_MARGIN_Y: Pixels = px(5.0);
-
 // ---- results grid value panel ------------------------------------------
 
 /// Height of the value panel's header (column name + pin/expand/close).
