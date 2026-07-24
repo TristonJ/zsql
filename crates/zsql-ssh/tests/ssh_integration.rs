@@ -1,5 +1,5 @@
-//! Live SSH tunnel integration test. Gated behind the `ssh-integration-tests`
-//! feature and skipped from the default gate entirely: it needs a real sshd
+//! Live SSH tunnel integration tests. Gated behind the `ssh-integration-tests`
+//! feature and skipped from the default gate entirely: they need a real sshd
 //! reachable at `ZSQL_TEST_SSH_*` (see `scripts/ssh-dev.sh`), forwarding to a
 //! real Postgres started with `scripts/pg-dev.sh`.
 #![cfg(feature = "ssh-integration-tests")]
@@ -7,6 +7,7 @@
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use zsql_ssh::{HostKeyPolicy, SshAuth, SshConfig, open_tunnel};
@@ -18,6 +19,12 @@ use zsql_ssh::{HostKeyPolicy, SshAuth, SshConfig, open_tunnel};
 /// end to end without needing full protocol/auth handling in this test.
 const SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 
+/// The key fixture `scripts/ssh-dev.sh` provisions into the dev sshd's
+/// `authorized_keys`, so the key-auth case needs no extra setup beyond it.
+fn fixture_key_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/id_ed25519")
+}
+
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
 }
@@ -26,14 +33,24 @@ fn required_env(key: &str) -> String {
     env::var(key).unwrap_or_else(|_| panic!("{key} must be set to run ssh-integration-tests"))
 }
 
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    futures_lite_block_on(fut)
+fn ssh_port() -> u16 {
+    env_or("ZSQL_TEST_SSH_PORT", "2222")
+        .parse()
+        .expect("ZSQL_TEST_SSH_PORT must be a valid port number")
 }
 
-/// Minimal single-threaded blocking executor so this test does not need a
-/// tokio runtime of its own: [`open_tunnel`]'s returned future is meant to
+fn remote_target() -> (String, u16) {
+    let host = env_or("ZSQL_TEST_SSH_REMOTE_HOST", "host.docker.internal");
+    let port = env_or("ZSQL_TEST_SSH_REMOTE_PORT", "5432")
+        .parse()
+        .expect("ZSQL_TEST_SSH_REMOTE_PORT must be a valid port number");
+    (host, port)
+}
+
+/// Minimal single-threaded blocking executor so these tests do not need a
+/// tokio runtime of their own: [`open_tunnel`]'s returned future is meant to
 /// be drivable from any executor, and polling it manually here proves that.
-fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::pin::pin;
     use std::task::{Context, Poll, Wake, Waker};
 
@@ -53,22 +70,10 @@ fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-#[test]
-fn tunnel_forwards_bytes_to_the_real_postgres_server() {
-    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
-    let ssh_port: u16 = env_or("ZSQL_TEST_SSH_PORT", "2222")
-        .parse()
-        .expect("ZSQL_TEST_SSH_PORT must be a valid port number");
-    let ssh_user = required_env("ZSQL_TEST_SSH_USER");
-    let ssh_password = required_env("ZSQL_TEST_SSH_PASSWORD");
-    let remote_host = env_or("ZSQL_TEST_SSH_REMOTE_HOST", "host.docker.internal");
-    let remote_port: u16 = env_or("ZSQL_TEST_SSH_REMOTE_PORT", "5432")
-        .parse()
-        .expect("ZSQL_TEST_SSH_REMOTE_PORT must be a valid port number");
-
-    let mut cfg = SshConfig::new(ssh_host, ssh_user, SshAuth::Password(ssh_password));
-    cfg.port = ssh_port;
-    cfg.host_key = HostKeyPolicy::AcceptNew;
+/// Opens `cfg`'s tunnel and proves it forwards bytes by round-tripping a
+/// Postgres `SSLRequest` through it.
+fn assert_tunnel_forwards_to_postgres(cfg: SshConfig) {
+    let (remote_host, remote_port) = remote_target();
 
     let tunnel = block_on(open_tunnel(cfg, remote_host, remote_port))
         .expect("tunnel should open against the dev sshd + postgres");
@@ -93,4 +98,58 @@ fn tunnel_forwards_bytes_to_the_real_postgres_server() {
         "expected postgres's SSLRequest reply to be 'S' or 'N', got {:?}",
         reply[0]
     );
+}
+
+#[test]
+fn tunnel_forwards_bytes_to_the_real_postgres_server_with_password_auth() {
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_user = required_env("ZSQL_TEST_SSH_USER");
+    let ssh_password = required_env("ZSQL_TEST_SSH_PASSWORD");
+
+    let mut cfg = SshConfig::new(ssh_host, ssh_user, SshAuth::Password(ssh_password));
+    cfg.port = ssh_port();
+    cfg.host_key = HostKeyPolicy::AcceptNew;
+
+    assert_tunnel_forwards_to_postgres(cfg);
+}
+
+#[test]
+fn tunnel_forwards_bytes_to_the_real_postgres_server_with_key_auth() {
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_user = required_env("ZSQL_TEST_SSH_USER");
+
+    let mut cfg = SshConfig::new(
+        ssh_host,
+        ssh_user,
+        SshAuth::Key {
+            path: fixture_key_path(),
+            passphrase: None,
+        },
+    );
+    cfg.port = ssh_port();
+    cfg.host_key = HostKeyPolicy::AcceptNew;
+
+    assert_tunnel_forwards_to_postgres(cfg);
+}
+
+/// Agent auth needs a real ssh-agent with a matching key loaded, which is
+/// impractical to provision in CI. Run this manually:
+///
+///   1. `scripts/ssh-dev.sh up` (provisions the same key fixture used above)
+///   2. `eval "$(ssh-agent -s)"`
+///   3. `ssh-add crates/zsql-ssh/tests/fixtures/id_ed25519`
+///   4. `ZSQL_TEST_SSH_USER=zsql cargo test -p zsql-ssh --features
+///      ssh-integration-tests --test ssh_integration -- --ignored
+///      tunnel_forwards_bytes_to_the_real_postgres_server_with_agent_auth`
+#[test]
+#[ignore = "needs a real ssh-agent with the fixture key loaded; see doc comment"]
+fn tunnel_forwards_bytes_to_the_real_postgres_server_with_agent_auth() {
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_user = required_env("ZSQL_TEST_SSH_USER");
+
+    let mut cfg = SshConfig::new(ssh_host, ssh_user, SshAuth::Agent);
+    cfg.port = ssh_port();
+    cfg.host_key = HostKeyPolicy::AcceptNew;
+
+    assert_tunnel_forwards_to_postgres(cfg);
 }

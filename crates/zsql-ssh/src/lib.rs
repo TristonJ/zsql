@@ -7,9 +7,11 @@
 //! the tokio work happens on a dedicated background runtime owned by this
 //! crate.
 
+mod auth;
 mod config;
 mod error;
 mod handler;
+mod host_key;
 mod runtime;
 mod tunnel;
 

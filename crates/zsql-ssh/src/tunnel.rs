@@ -2,7 +2,7 @@
 //! connections to a remote host:port over an SSH `direct-tcpip` channel.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::copy_bidirectional;
@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::interval;
 
+use crate::auth;
 use crate::config::{HostKeyPolicy, SshAuth, SshConfig};
 use crate::error::SshError;
 use crate::handler::ClientHandler;
@@ -70,7 +71,7 @@ impl Drop for SshTunnel {
 ///
 /// # Errors
 ///
-/// Returns an error if `cfg.auth` or `cfg.host_key` is not yet supported,
+/// Returns an error if `cfg.host_key` policy is not yet supported (Prompt),
 /// the SSH host is unreachable, authentication fails, the session ends
 /// abnormally, or the local loopback listener cannot be created.
 #[tracing::instrument(name = "ssh_open_tunnel", skip(cfg), fields(host = %cfg.host, port = cfg.port))]
@@ -79,7 +80,6 @@ pub async fn open_tunnel(
     remote_host: String,
     remote_port: u16,
 ) -> Result<SshTunnel, SshError> {
-    let password = extract_password(&cfg.auth)?;
     require_supported_host_key_policy(&cfg.host_key)?;
 
     let handle = runtime::handle();
@@ -88,7 +88,6 @@ pub async fn open_tunnel(
 
     handle.spawn(run_tunnel(
         cfg,
-        password,
         remote_host,
         remote_port,
         ready_tx,
@@ -105,32 +104,17 @@ pub async fn open_tunnel(
     }
 }
 
-/// The only auth kind currently implemented is [`SshAuth::Password`]; the
-/// others are defined on [`SshAuth`] so support can be added without an API
-/// change.
-fn extract_password(auth: &SshAuth) -> Result<String, SshError> {
-    match auth {
-        SshAuth::Password(password) => Ok(password.clone()),
-        SshAuth::Agent => Err(SshError::UnsupportedAuth { auth: "agent" }),
-        SshAuth::Key { .. } => Err(SshError::UnsupportedAuth { auth: "key-file" }),
-    }
-}
-
-/// Only [`HostKeyPolicy::AcceptNew`] is verified against yet; the other
-/// variants are defined on [`HostKeyPolicy`] so verification can be added
-/// without an API change. Checked up front so an unsupported policy fails
-/// immediately instead of after a wasted connect and handshake.
+/// Only [`HostKeyPolicy::Prompt`] is unimplemented; the interactive
+/// confirmation it needs is out of scope for this crate. Checked up front so
+/// it fails immediately instead of after a wasted connect and handshake.
 fn require_supported_host_key_policy(policy: &HostKeyPolicy) -> Result<(), SshError> {
     match policy {
-        HostKeyPolicy::AcceptNew => Ok(()),
-        HostKeyPolicy::KnownHosts(_) => Err(SshError::UnsupportedHostKeyPolicy {
-            policy: "known_hosts",
-        }),
+        HostKeyPolicy::AcceptNew | HostKeyPolicy::KnownHosts(_) => Ok(()),
         HostKeyPolicy::Prompt => Err(SshError::UnsupportedHostKeyPolicy { policy: "prompt" }),
     }
 }
 
-type SessionHandle = russh::client::Handle<ClientHandler>;
+pub(crate) type SessionHandle = russh::client::Handle<ClientHandler>;
 
 /// Runs entirely on the shared background runtime: connects and
 /// authenticates the SSH session, binds the local listener, reports
@@ -138,14 +122,12 @@ type SessionHandle = russh::client::Handle<ClientHandler>;
 /// loop until `shutdown_rx` fires.
 async fn run_tunnel(
     cfg: SshConfig,
-    password: String,
     remote_host: String,
     remote_port: u16,
     ready_tx: oneshot::Sender<Result<SocketAddr, SshError>>,
     shutdown_rx: oneshot::Receiver<()>,
 ) {
-    let established = match tokio::time::timeout(CONNECT_TIMEOUT, establish(&cfg, &password)).await
-    {
+    let established = match tokio::time::timeout(CONNECT_TIMEOUT, establish(&cfg)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(SshError::Connect {
             host: cfg.host.clone(),
@@ -189,33 +171,34 @@ async fn run_tunnel(
 }
 
 /// Connects and authenticates the SSH session, then binds the local
-/// loopback listener. Kept as one step so a failure at either stage
-/// resolves `open_tunnel` to an error instead of leaving a half-open
-/// listener with no session.
-#[tracing::instrument(name = "ssh_connect", skip(cfg, password), fields(host = %cfg.host, port = cfg.port))]
-async fn establish(
-    cfg: &SshConfig,
-    password: &str,
-) -> Result<(SessionHandle, TcpListener), SshError> {
+/// loopback listener. Kept as one step so a failure at any stage resolves
+/// `open_tunnel` to an error instead of leaving a half-open listener with no
+/// session.
+#[tracing::instrument(name = "ssh_connect", skip(cfg), fields(host = %cfg.host, port = cfg.port))]
+async fn establish(cfg: &SshConfig) -> Result<(SessionHandle, TcpListener), SshError> {
+    if matches!(cfg.auth, SshAuth::Agent) {
+        auth::ensure_agent_available().await?;
+    }
+
     let config = Arc::new(russh::client::Config::default());
-    let handler = ClientHandler::new(cfg.host_key.clone());
+    let (handler, host_key_error) =
+        ClientHandler::new(cfg.host_key.clone(), cfg.host.clone(), cfg.port);
 
-    let mut session = russh::client::connect(config, (cfg.host.as_str(), cfg.port), handler)
-        .await
-        .map_err(|err| SshError::Connect {
-            host: cfg.host.clone(),
-            port: cfg.port,
-            reason: err.to_string(),
-        })?;
+    let mut session =
+        match russh::client::connect(config, (cfg.host.as_str(), cfg.port), handler).await {
+            Ok(session) => session,
+            Err(err) => {
+                return Err(
+                    take_host_key_error(&host_key_error).unwrap_or(SshError::Connect {
+                        host: cfg.host.clone(),
+                        port: cfg.port,
+                        reason: err.to_string(),
+                    }),
+                );
+            }
+        };
 
-    let auth_result = session
-        .authenticate_password(cfg.user.as_str(), password)
-        .await
-        .map_err(|err| SshError::Session {
-            reason: err.to_string(),
-        })?;
-
-    require_auth_success(&cfg.user, &auth_result)?;
+    auth::authenticate(&mut session, cfg.user.as_str(), &cfg.auth).await?;
 
     let listener = TcpListener::bind((LOCAL_BIND_HOST, EPHEMERAL_PORT))
         .await
@@ -226,17 +209,12 @@ async fn establish(
     Ok((session, listener))
 }
 
-/// Maps a password-authentication outcome to a result, split out from
-/// [`establish`] so the auth-failure path can be unit tested against a
-/// synthetic [`russh::client::AuthResult`] without a live SSH server.
-fn require_auth_success(user: &str, result: &russh::client::AuthResult) -> Result<(), SshError> {
-    if result.success() {
-        Ok(())
-    } else {
-        Err(SshError::AuthFailed {
-            user: user.to_owned(),
-        })
-    }
+/// Recovers the specific host-key rejection reason the handler stashed
+/// during the handshake, if any. `check_server_key` can only tell russh
+/// "reject this" via a bare `false`, so the precise [`SshError`] travels out
+/// through this cell instead of being lost to a generic connect failure.
+fn take_host_key_error(cell: &Arc<Mutex<Option<SshError>>>) -> Option<SshError> {
+    cell.lock().ok().and_then(|mut guard| guard.take())
 }
 
 /// Accepts inbound loopback connections and forwards each one to
@@ -349,37 +327,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use super::{
-        SshTunnel, extract_password, keepalive_interval, open_tunnel, require_auth_success,
-        require_supported_host_key_policy,
-    };
+    use super::{SshTunnel, keepalive_interval, open_tunnel, require_supported_host_key_policy};
     use crate::config::{HostKeyPolicy, SshAuth, SshConfig};
     use crate::error::SshError;
     use crate::runtime;
 
-    #[test]
-    fn extract_password_accepts_password_auth() {
-        let auth = SshAuth::Password("hunter2".to_owned());
-        assert_eq!(extract_password(&auth).unwrap(), "hunter2");
-    }
-
-    #[test]
-    fn extract_password_rejects_agent_auth() {
-        let err = extract_password(&SshAuth::Agent).unwrap_err();
-        assert!(matches!(err, SshError::UnsupportedAuth { auth: "agent" }));
-    }
-
-    #[test]
-    fn extract_password_rejects_key_auth() {
-        let auth = SshAuth::Key {
-            path: "/home/alice/.ssh/id_ed25519".into(),
-            passphrase: None,
-        };
-        let err = extract_password(&auth).unwrap_err();
-        assert!(matches!(
-            err,
-            SshError::UnsupportedAuth { auth: "key-file" }
-        ));
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
     }
 
     #[test]
@@ -388,15 +344,9 @@ mod tests {
     }
 
     #[test]
-    fn require_supported_host_key_policy_rejects_known_hosts() {
+    fn require_supported_host_key_policy_accepts_known_hosts() {
         let policy = HostKeyPolicy::KnownHosts("/home/alice/.ssh/known_hosts".into());
-        let err = require_supported_host_key_policy(&policy).unwrap_err();
-        assert!(matches!(
-            err,
-            SshError::UnsupportedHostKeyPolicy {
-                policy: "known_hosts"
-            }
-        ));
+        assert!(require_supported_host_key_policy(&policy).is_ok());
     }
 
     #[test]
@@ -420,66 +370,6 @@ mod tests {
                 .await
                 .is_some()
         );
-    }
-
-    #[test]
-    fn require_auth_success_accepts_a_successful_result() {
-        let result = russh::client::AuthResult::Success;
-        assert!(require_auth_success("alice", &result).is_ok());
-    }
-
-    #[test]
-    fn require_auth_success_rejects_a_failed_result_without_a_live_server() {
-        let result = russh::client::AuthResult::Failure {
-            remaining_methods: russh::MethodSet::empty(),
-            partial_success: false,
-        };
-        let err = require_auth_success("alice", &result).unwrap_err();
-        match err {
-            SshError::AuthFailed { user } => assert_eq!(user, "alice"),
-            other => panic!("expected SshError::AuthFailed, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_auth_is_rejected_before_touching_the_network() {
-        let cfg = SshConfig::new("192.0.2.1", "alice", SshAuth::Agent);
-        let result = open_tunnel(cfg, "db.internal".to_owned(), 5432).await;
-        assert!(matches!(
-            result,
-            Err(SshError::UnsupportedAuth { auth: "agent" })
-        ));
-    }
-
-    #[tokio::test]
-    async fn key_auth_is_rejected_before_touching_the_network() {
-        let cfg = SshConfig::new(
-            "192.0.2.1",
-            "alice",
-            SshAuth::Key {
-                path: "/home/alice/.ssh/id_ed25519".into(),
-                passphrase: None,
-            },
-        );
-        let result = open_tunnel(cfg, "db.internal".to_owned(), 5432).await;
-        assert!(matches!(
-            result,
-            Err(SshError::UnsupportedAuth { auth: "key-file" })
-        ));
-    }
-
-    #[tokio::test]
-    async fn known_hosts_host_key_policy_is_rejected_before_touching_the_network() {
-        let mut cfg = SshConfig::new("192.0.2.1", "alice", SshAuth::Password("hunter2".into()));
-        cfg.host_key = HostKeyPolicy::KnownHosts("/home/alice/.ssh/known_hosts".into());
-
-        let result = open_tunnel(cfg, "db.internal".to_owned(), 5432).await;
-        assert!(matches!(
-            result,
-            Err(SshError::UnsupportedHostKeyPolicy {
-                policy: "known_hosts"
-            })
-        ));
     }
 
     #[tokio::test]
@@ -514,6 +404,42 @@ mod tests {
             }
             other => panic!("expected SshError::Connect, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn key_auth_against_a_closed_local_port_returns_a_connect_error() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let closed_port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let mut cfg = SshConfig::new(
+            "127.0.0.1",
+            "alice",
+            SshAuth::Key {
+                path: fixture_path("id_ed25519"),
+                passphrase: None,
+            },
+        );
+        cfg.port = closed_port;
+
+        let result = open_tunnel(cfg, "db.internal".to_owned(), 5432).await;
+        assert!(matches!(result, Err(SshError::Connect { .. })));
+    }
+
+    #[tokio::test]
+    async fn known_hosts_policy_attempts_a_real_connect_rather_than_failing_fast() {
+        // A bad known_hosts path is only consulted once a server key is
+        // received, so it must not short-circuit before the network attempt.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let closed_port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let mut cfg = SshConfig::new("127.0.0.1", "alice", SshAuth::Password("hunter2".into()));
+        cfg.port = closed_port;
+        cfg.host_key = HostKeyPolicy::KnownHosts("/nonexistent/known_hosts".into());
+
+        let result = open_tunnel(cfg, "db.internal".to_owned(), 5432).await;
+        assert!(matches!(result, Err(SshError::Connect { .. })));
     }
 
     /// Minimal single-threaded blocking executor with no tokio runtime of
