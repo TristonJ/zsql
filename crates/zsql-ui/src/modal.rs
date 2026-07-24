@@ -13,8 +13,6 @@ use crate::{
 pub const MODAL_CLOSE_ICON_SIZE: Pixels = px(13.0);
 const MODAL_CLOSE_HOVER_GROUP: &str = "modal-close-hover";
 
-/// The modal's close callback: invoked with no event payload, just window
-/// and app access to perform the close.
 type ModalCloseHandler = Rc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App)>;
 
 #[derive(IntoElement)]

@@ -502,7 +502,7 @@ impl WorkspaceView {
                 view.activate_tab(id, window, cx);
             }))
             .child(
-                zsql_ui::tabs::close_glyph(format!("close-icon-{}", id), active_theme)
+                zsql_ui::tabs::close_glyph(format!("close-icon-{id}"), active_theme)
                     .id(("workspace-tab-close", id))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
