@@ -45,10 +45,10 @@ pub struct TextView {
     /// Horizontal scroll position of the Text view's body pane while wrap is
     /// off; the gutter never scrolls horizontally.
     text_col_scroll_handle: ScrollHandle,
-    /// Backs the Text view body pane's horizontal scrollbar: its axis is
-    /// reconfigured each render from the current longest line's extent, and
-    /// [`WithScrollbars`] overlays the track+thumb the same way the grid's
-    /// `Table` does.
+    /// Backs the Text view body pane's scrollbars: its vertical axis follows
+    /// the shared row list and its horizontal axis the current longest line's
+    /// extent, both reconfigured each render, and [`WithScrollbars`] overlays
+    /// the tracks+thumbs the same way the grid's `Table` does.
     text_scroll_state: Entity<ScrollableState>,
     /// Vertical scroll position of the Text view's single unified line list
     /// while wrap is on, where lines are not virtualized (their heights vary
@@ -233,13 +233,16 @@ impl TextView {
             .h_full()
             .child(gutter_list);
 
-        // Point the body pane's horizontal axis at the widest line's measured
-        // extent (see `text_content_width`). Only the horizontal axis is
-        // configured, so `with_scrollbars` paints just the bottom track -- the
-        // vertical list keeps its own native wheel scrolling with no vertical
-        // thumb, unchanged from before.
         let col_scroll_handle = self.text_col_scroll_handle.clone();
+        let row_scroll_handle = self.text_row_scroll_handle.clone();
+        // line counts stay far below f32's exact-integer range
+        #[allow(clippy::cast_precision_loss)]
+        let vertical_extent = line_count as f32 * f32::from(theme::TEXT_VIEW_LINE_HEIGHT);
         self.text_scroll_state.update(cx, |state, _cx| {
+            state.vertical(Axis::new(
+                ScrollSource::UniformList(row_scroll_handle),
+                vertical_extent,
+            ));
             state.horizontal(Axis::new(
                 ScrollSource::Container(col_scroll_handle),
                 f32::from(content_extent),
