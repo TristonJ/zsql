@@ -6,6 +6,8 @@ mod drivers;
 mod keyring;
 mod observability;
 mod session;
+#[cfg(all(test, feature = "ssh-integration-tests"))]
+mod ssh_live_tests;
 mod tab_session;
 #[cfg(test)]
 mod test_support;

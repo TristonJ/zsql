@@ -362,9 +362,33 @@ impl ConnectionUrl {
     }
 }
 
+/// Rewrite `url`'s host and port to `tunnel_addr`, leaving every other part
+/// (credentials, database, query parameters) untouched. This is the
+/// non-verifying fallback for routing a network connection through a local
+/// tunnel: the real host is discarded entirely, so a driver dialing the
+/// rewritten URL cannot verify a TLS certificate against it.
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` cannot be parsed, or is a sqlite-path
+/// URL (which has no host/port to rewrite).
+pub fn rewrite_for_tunnel(
+    url: &str,
+    tunnel_addr: std::net::SocketAddr,
+) -> Result<String, CoreError> {
+    let mut parsed = ConnectionUrl::parse(url)?;
+    if parsed.is_sqlite() {
+        return Err(CoreError::Url(
+            "a sqlite URL has no host to rewrite for a tunnel".to_owned(),
+        ));
+    }
+    parsed.set_host(&tunnel_addr.ip().to_string())?;
+    parsed.set_port(Some(tunnel_addr.port()))?;
+    Ok(parsed.to_url_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ConnectionUrl;
+    use super::{ConnectionUrl, rewrite_for_tunnel};
 
     // -- parse failures ----------------------------------------------------
 
@@ -651,5 +675,51 @@ mod tests {
             Some("hello world".to_string()),
             "extra param must remain readable after TLS edit"
         );
+    }
+
+    // -- rewrite_for_tunnel -----------------------------------------------
+
+    #[test]
+    fn rewrite_for_tunnel_replaces_only_the_host_and_port() {
+        let tunnel_addr = "127.0.0.1:54321".parse().unwrap();
+        let rewritten = rewrite_for_tunnel(
+            "postgres://app:s3cr3t@staging.internal:5432/app",
+            tunnel_addr,
+        )
+        .expect("rewrite must succeed");
+        assert_eq!(rewritten, "postgres://app:s3cr3t@127.0.0.1:54321/app");
+    }
+
+    #[test]
+    fn rewrite_for_tunnel_preserves_a_percent_encoded_password() {
+        let tunnel_addr = "127.0.0.1:9999".parse().unwrap();
+        let rewritten =
+            rewrite_for_tunnel("postgres://app:p%2Fw%40rd@db.example.com/app", tunnel_addr)
+                .expect("rewrite must succeed");
+        let parsed = ConnectionUrl::parse(&rewritten).expect("rewritten URL must parse");
+        assert_eq!(parsed.host().as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.port(), Some(9999));
+        assert_eq!(
+            parsed.password().as_deref(),
+            Some("p/w@rd"),
+            "the original percent-encoded password must survive the rewrite"
+        );
+    }
+
+    #[test]
+    fn rewrite_for_tunnel_discards_an_ipv6_remote_host_in_favor_of_the_tunnel_address() {
+        let tunnel_addr = "127.0.0.1:7777".parse().unwrap();
+        let rewritten = rewrite_for_tunnel("postgres://app@[2001:db8::1]:5432/app", tunnel_addr)
+            .expect("rewrite must succeed");
+        let parsed = ConnectionUrl::parse(&rewritten).expect("rewritten URL must parse");
+        assert_eq!(parsed.host().as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.port(), Some(7777));
+        assert_eq!(parsed.user(), "app");
+    }
+
+    #[test]
+    fn rewrite_for_tunnel_rejects_a_sqlite_url() {
+        let tunnel_addr = "127.0.0.1:1".parse().unwrap();
+        assert!(rewrite_for_tunnel("sqlite::memory:", tunnel_addr).is_err());
     }
 }

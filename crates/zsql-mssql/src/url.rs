@@ -25,6 +25,12 @@ pub(crate) struct MssqlUrl {
     /// against a trust store. Off by default; local/dev servers using a
     /// self-signed certificate need `trustservercertificate=true`.
     pub(crate) trust_server_certificate: bool,
+    /// Path to an additional trusted CA certificate file, checked alongside
+    /// the system trust store. Lets a server certificate issued by a
+    /// private CA (a self-signed dev certificate, for instance) pass full
+    /// chain-and-hostname verification without disabling verification
+    /// altogether via `trust_server_certificate`.
+    pub(crate) ca_cert: Option<String>,
 }
 
 /// Parse `url` into its [`MssqlUrl`] fields.
@@ -96,6 +102,7 @@ pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
 
     let mut encrypt = true;
     let mut trust_server_certificate = false;
+    let mut ca_cert = None;
     for pair in query.into_iter().flat_map(|query| query.split('&')) {
         if pair.is_empty() {
             continue;
@@ -106,6 +113,7 @@ pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
             "trustservercertificate" | "trust_server_certificate" => {
                 trust_server_certificate = parse_bool_param(key, value)?;
             }
+            "sslrootcert" | "ssl_root_cert" => ca_cert = Some(value.to_owned()),
             _ => {}
         }
     }
@@ -118,6 +126,7 @@ pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
         database,
         encrypt,
         trust_server_certificate,
+        ca_cert,
     })
 }
 
@@ -276,6 +285,18 @@ mod tests {
     #[test]
     fn rejects_an_invalid_boolean_query_parameter() {
         assert!(parse("mssql://localhost/db?encrypt=sideways").is_err());
+    }
+
+    #[test]
+    fn parses_a_ca_cert_path() {
+        let url = parse("mssql://localhost/db?sslrootcert=/etc/zsql/ca.crt").unwrap();
+        assert_eq!(url.ca_cert.as_deref(), Some("/etc/zsql/ca.crt"));
+    }
+
+    #[test]
+    fn ca_cert_defaults_to_absent() {
+        let url = parse("mssql://localhost/db").unwrap();
+        assert_eq!(url.ca_cert, None);
     }
 
     #[test]

@@ -1,17 +1,51 @@
 //! `Session` owns the app's single active database connection and drives the
 //! query lifecycle the results grid renders
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::Either;
 use gpui::{BackgroundExecutor, Context, Task, prelude::*};
 use zsql_core::{
-    Connection, CoreError, QueryEvent, RelationSchema, ResultSet, RowCount, SchemaTree,
+    Connection, ConnectionUrl, CoreError, QueryEvent, RelationSchema, ResultSet, RowCount,
+    SchemaTree,
 };
 
 use crate::config::Config;
 use crate::drivers;
+
+/// The standard port a network driver's URL falls back to when it names no
+/// explicit port of its own, keyed by [`crate::drivers::detect_driver_id`]'s
+/// id. Only consulted when opening a tunnel: the tunnel's remote endpoint
+/// must be a concrete host and port even if the URL never spelled the port
+/// out.
+fn default_port_for_driver(driver_id: &str) -> Option<u16> {
+    match driver_id {
+        "postgres" => Some(5432),
+        "mysql" => Some(3306),
+        "mssql" => Some(1433),
+        _ => None,
+    }
+}
+
+/// Anything with the same drop-driven lifecycle contract as an open SSH
+/// tunnel: dropping it must tear the tunnel down, and it exposes the local
+/// loopback address a driver should dial instead of the real remote host.
+/// Kept as a trait object (rather than naming [`zsql_ssh::SshTunnel`]
+/// directly in [`Session`]) so tests can substitute a lightweight fake
+/// without opening a real SSH session.
+pub(crate) trait TunnelHandle: Send + Sync {
+    /// The loopback address a driver should dial to reach this tunnel's
+    /// remote endpoint.
+    fn local_addr(&self) -> SocketAddr;
+}
+
+impl TunnelHandle for zsql_ssh::SshTunnel {
+    fn local_addr(&self) -> SocketAddr {
+        zsql_ssh::SshTunnel::local_addr(self)
+    }
+}
 
 /// What the session (and the results grid it drives) currently displays.
 #[derive(Debug, Clone)]
@@ -74,6 +108,13 @@ pub struct Session {
     url: Option<String>,
     /// The live connection, once `connect` succeeds
     connection: Option<Arc<dyn Connection>>,
+    /// The active connection's SSH tunnel, if it was opened through one.
+    /// `None` for a direct connection, or before any connect attempt.
+    /// Replaced (dropping whatever was there before) at the same point
+    /// `connection` is replaced: synchronously when a new attempt is
+    /// dispatched (see [`Session::connect_url`]), and again once that
+    /// attempt resolves.
+    tunnel: Option<Box<dyn TunnelHandle>>,
     /// The current lifecycle state a view renders.
     state: SessionState,
     /// The schema sidebar's current state
@@ -142,6 +183,7 @@ impl Session {
         Self {
             url: None,
             connection: None,
+            tunnel: None,
             state: SessionState::Empty,
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
@@ -247,7 +289,7 @@ impl Session {
             cx.notify();
             return Task::ready(());
         };
-        self.connect_url(url, cx)
+        self.connect_url(url, None, cx)
     }
 
     /// Connect to an explicitly chosen URL (e.g. a saved connection picked
@@ -255,14 +297,38 @@ impl Session {
     /// currently active. The driver is resolved from `url`'s scheme via
     /// [`drivers::connect`]; this crate never picks a driver directly.
     pub fn connect_to(&mut self, url: impl Into<String>, cx: &mut Context<Self>) -> Task<()> {
-        self.connect_url(url.into(), cx)
+        self.connect_url(url.into(), None, cx)
     }
 
-    /// Shared implementation behind [`Session::connect`] and
-    /// [`Session::connect_to`]: connect to `url` through
-    /// [`drivers::connect`], replacing the current connection and
-    /// (re)starting the liveliness probe loop on success.
-    fn connect_url(&mut self, url: String, cx: &mut Context<Self>) -> Task<()> {
+    /// Connect to `url` through an SSH tunnel described by `ssh`, replacing
+    /// whatever connection is currently active. `ssh` is `None` for a direct
+    /// connection (equivalent to [`Session::connect_to`]) or when the chosen
+    /// connection has no tunnel configured (or has one but it is disabled).
+    ///
+    /// When `ssh` is `Some`, [`zsql_ssh::open_tunnel`] is awaited and must
+    /// succeed before the driver's own connect is ever attempted; a tunnel
+    /// failure surfaces as [`SessionState::Error`] the same way a driver
+    /// connect failure does, and no driver connect is attempted at all.
+    pub fn connect_to_with_ssh(
+        &mut self,
+        url: impl Into<String>,
+        ssh: Option<zsql_ssh::SshConfig>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        self.connect_url(url.into(), ssh, cx)
+    }
+
+    /// Shared implementation behind [`Session::connect`], [`Session::connect_to`],
+    /// and [`Session::connect_to_with_ssh`]: connect to `url` (through `ssh`'s
+    /// tunnel first, if given) via [`drivers::connect`]/[`drivers::connect_tunneled`],
+    /// replacing the current connection and tunnel and (re)starting the
+    /// liveliness probe loop on success.
+    fn connect_url(
+        &mut self,
+        url: String,
+        ssh: Option<zsql_ssh::SshConfig>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         self.state = SessionState::Connecting;
         self.liveness = LivenessState::Unknown;
         // Every connect attempt targets a different (or not-yet-known)
@@ -270,6 +336,12 @@ impl Session {
         // attempt is replacing must stop being shown as current immediately,
         // not only once (or if) the attempt succeeds.
         self.set_schema(SchemaState::NotLoaded);
+        // The prior tunnel (if any) is torn down as part of this same
+        // synchronous reset, not deferred until this attempt resolves: a
+        // switch that never completes (or is itself superseded before it
+        // does) must not leave the previous tunnel's listener/session
+        // lingering any longer than the schema/tabs reset it rides alongside.
+        self.tunnel = None;
         // A fresh connect attempt invalidates any liveness probe loop tied
         // to whatever connection preceded it, even if this attempt goes on
         // to fail: that prior loop's next tick (or in-flight probe) must
@@ -283,13 +355,26 @@ impl Session {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let connect_result = cx.background_spawn(drivers::connect(url)).await;
+            let outcome = cx.background_spawn(open_tunnel_and_connect(url, ssh)).await;
 
             let connected = this.update(cx, |session, cx| {
-                let connected = match connect_result {
-                    Ok(conn) => {
+                // A newer connect attempt may have superseded this one while its
+                // tunnel and driver connect ran in the background. If so this
+                // outcome is stale: installing its connection and tunnel would
+                // leave a live tunnel held as current with no matching probe
+                // loop, and clearing state on its failure would wipe the newer
+                // attempt. Drop whatever this attempt produced (the tunnel and
+                // connection in `outcome` are torn down as it falls out of
+                // scope) and leave the current generation's state untouched.
+                if session.connection_generation != generation {
+                    tracing::debug!("discarding a superseded connect attempt's result");
+                    return false;
+                }
+                let connected = match outcome {
+                    Ok((conn, tunnel)) => {
                         tracing::info!("session connected");
                         session.connection = Some(Arc::from(conn));
+                        session.tunnel = tunnel;
                         session.state = SessionState::Connected;
                         true
                     }
@@ -299,8 +384,11 @@ impl Session {
                         // bump already invalidated its probe loop, and leaving it
                         // in `self.connection` would let `run_query` silently
                         // execute against the database this failed switch was
-                        // meant to replace.
+                        // meant to replace. Any tunnel this attempt itself opened
+                        // was already torn down inside `open_tunnel_and_connect`
+                        // before this error ever reached here.
                         session.connection = None;
+                        session.tunnel = None;
                         session.state = SessionState::Error(err.to_string());
                         false
                     }
@@ -707,6 +795,71 @@ fn row_limit_reached(accumulated: u64, limit: u64) -> bool {
     accumulated >= limit
 }
 
+/// A successful connect's outcome: the live connection, and the tunnel it
+/// was opened through, if any.
+type TunneledConnectOutcome = (Box<dyn Connection>, Option<Box<dyn TunnelHandle>>);
+
+/// Opens `ssh`'s tunnel (if given) before connecting to `url`, so a bad SSH
+/// config surfaces as a connect failure before the driver is ever touched.
+/// With no `ssh` config, this is exactly [`drivers::connect`].
+#[tracing::instrument(name = "session_open_tunnel_before_connect", skip_all)]
+async fn open_tunnel_and_connect(
+    url: String,
+    ssh: Option<zsql_ssh::SshConfig>,
+) -> Result<TunneledConnectOutcome, CoreError> {
+    let Some(ssh_cfg) = ssh else {
+        let conn = drivers::connect(url).await?;
+        return Ok((conn, None));
+    };
+
+    let (remote_host, remote_port) = remote_target(&url)?;
+    tracing::info!("opening ssh tunnel before connect");
+    let tunnel = zsql_ssh::open_tunnel(ssh_cfg, remote_host, remote_port)
+        .await
+        .map_err(|err| CoreError::Connection(err.to_string()))?;
+
+    let (conn, tunnel) = connect_through_open_tunnel(url, Box::new(tunnel)).await?;
+    Ok((conn, Some(tunnel)))
+}
+
+/// Connects to `url` through `tunnel`'s already-open local address. On
+/// failure, `tunnel` is dropped as part of this same attempt (it is not
+/// returned in the `Err` case), so a driver connect failure after a
+/// successfully opened tunnel never leaves that tunnel outliving the failed
+/// attempt.
+async fn connect_through_open_tunnel(
+    url: String,
+    tunnel: Box<dyn TunnelHandle>,
+) -> Result<(Box<dyn Connection>, Box<dyn TunnelHandle>), CoreError> {
+    let tunnel_addr = tunnel.local_addr();
+    let conn = drivers::connect_tunneled(url, tunnel_addr).await?;
+    Ok((conn, tunnel))
+}
+
+/// The real remote host and port an SSH tunnel for `url` should forward to:
+/// `url`'s own host and (explicit or driver-default) port.
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` cannot be parsed or has no host (a
+/// sqlite URL never reaches this: SSH tunneling only applies to network
+/// connections).
+fn remote_target(url: &str) -> Result<(String, u16), CoreError> {
+    let parsed = ConnectionUrl::parse(url)?;
+    let host = parsed.host().ok_or_else(|| {
+        CoreError::Url("an SSH tunnel requires a network URL with a host".to_owned())
+    })?;
+    let port = match parsed.port() {
+        Some(port) => port,
+        None => drivers::detect_driver_id(url)
+            .ok()
+            .and_then(default_port_for_driver)
+            .ok_or_else(|| {
+                CoreError::Url("an SSH tunnel requires an explicit port for this URL".to_owned())
+            })?,
+    };
+    Ok((host, port))
+}
+
 /// Test-only constructors used by the UI views' render and action tests.
 #[cfg(test)]
 impl Session {
@@ -716,6 +869,7 @@ impl Session {
         Self {
             url: None,
             connection: None,
+            tunnel: None,
             state,
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
@@ -800,6 +954,71 @@ impl Session {
     pub(crate) fn probe_timeout_for_test(&self) -> Duration {
         self.probe_timeout
     }
+
+    /// Install `tunnel` as the session's active tunnel directly, as if a
+    /// prior `connect_to_with_ssh` call had already opened it, without
+    /// actually connecting anything.
+    pub(crate) fn set_tunnel_for_test(&mut self, tunnel: Box<dyn TunnelHandle>) {
+        self.tunnel = Some(tunnel);
+    }
+
+    /// Whether the session currently holds an active tunnel.
+    pub(crate) fn has_tunnel_for_test(&self) -> bool {
+        self.tunnel.is_some()
+    }
+
+    /// Drop only the session's tunnel, leaving `connection` (and everything
+    /// else) untouched -- simulating the tunnel dying out from under an
+    /// otherwise-healthy connection, without tearing down the connection
+    /// itself the way a real reconnect would. Only exercised by the gated
+    /// `ssh_live_tests` module, which is the only place a real tunnel (as
+    /// opposed to a fake one) is under test.
+    #[cfg(feature = "ssh-integration-tests")]
+    pub(crate) fn kill_tunnel_for_test(&mut self) {
+        self.tunnel = None;
+    }
+
+    /// The active tunnel's local loopback address, if any. Only exercised by
+    /// the gated `ssh_live_tests` module.
+    #[cfg(feature = "ssh-integration-tests")]
+    pub(crate) fn tunnel_local_addr_for_test(&self) -> Option<SocketAddr> {
+        self.tunnel.as_ref().map(|tunnel| tunnel.local_addr())
+    }
+}
+
+/// A [`TunnelHandle`] double whose drop is observable via an atomic counter,
+/// letting a test prove a tunnel was torn down without opening a real SSH
+/// session. Shared between this module's plain (`block_on`) tests and its
+/// `gpui`-driven ones.
+#[cfg(test)]
+pub(crate) struct FakeTunnel {
+    open_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl FakeTunnel {
+    /// Build a handle that increments `open_count` now and decrements it
+    /// again on drop, so a caller can assert `open_count` reaching `0`
+    /// proves this handle (and only this handle) was torn down.
+    pub(crate) fn new(open_count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        open_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { open_count }
+    }
+}
+
+#[cfg(test)]
+impl TunnelHandle for FakeTunnel {
+    fn local_addr(&self) -> SocketAddr {
+        "127.0.0.1:1".parse().expect("valid loopback address")
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeTunnel {
+    fn drop(&mut self) {
+        self.open_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Introspect `connection`'s reachable schema.
@@ -867,12 +1086,22 @@ pub(crate) async fn probe_connection(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use zsql_core::{ColumnMeta, CoreError, QueryEvent, Row, RowBatch, Value};
 
-    use super::{Config, Session, SessionState};
+    use super::{
+        Config, FakeTunnel, Session, SessionState, TunnelHandle, connect_through_open_tunnel,
+        default_port_for_driver, remote_target,
+    };
 
     fn session_with_no_url() -> Session {
         Session::new(&Config::default())
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        futures::executor::block_on(fut)
     }
 
     #[test]
@@ -1170,6 +1399,91 @@ mod tests {
         assert_eq!(session.result().rows.len(), 4);
         assert!(matches!(session.state(), SessionState::Truncating { .. }));
     }
+
+    // -- tunnel lifecycle ---------------------------------------------------
+
+    #[test]
+    fn remote_target_uses_the_urls_own_explicit_port() {
+        let (host, port) = remote_target("postgres://user:pw@db.internal:6543/app").unwrap();
+        assert_eq!(host, "db.internal");
+        assert_eq!(port, 6543);
+    }
+
+    #[test]
+    fn remote_target_falls_back_to_the_drivers_default_port() {
+        let (host, port) = remote_target("mysql://user@db.internal/app").unwrap();
+        assert_eq!(host, "db.internal");
+        assert_eq!(port, 3306);
+    }
+
+    #[test]
+    fn remote_target_rejects_a_sqlite_url() {
+        assert!(remote_target("sqlite::memory:").is_err());
+    }
+
+    #[test]
+    fn remote_target_rejects_a_hostful_url_with_no_port_and_no_driver_default() {
+        // A host is present but the scheme has no registered driver (so no
+        // default port) and the URL carries no explicit port, leaving nothing
+        // for the tunnel to forward to.
+        assert!(remote_target("redis://host/db").is_err());
+    }
+
+    #[test]
+    fn default_port_for_driver_covers_every_network_driver() {
+        assert_eq!(default_port_for_driver("postgres"), Some(5432));
+        assert_eq!(default_port_for_driver("mysql"), Some(3306));
+        assert_eq!(default_port_for_driver("mssql"), Some(1433));
+        assert_eq!(default_port_for_driver("sqlite"), None);
+    }
+
+    /// A tunnel that opened successfully but whose driver connect then fails
+    /// must be torn down as part of that same failed attempt: the returned
+    /// error must not carry the tunnel forward, and the fake's drop must
+    /// already have run by the time this function returns.
+    #[test]
+    fn a_failed_connect_through_an_open_tunnel_tears_the_tunnel_down() {
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let tunnel: Box<dyn TunnelHandle> = Box::new(FakeTunnel::new(open_count.clone()));
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        let result = block_on(connect_through_open_tunnel(
+            "cassandra://host/db".to_owned(),
+            tunnel,
+        ));
+
+        assert!(
+            result.is_err(),
+            "an unrecognized-scheme URL must fail the driver connect"
+        );
+        assert_eq!(
+            open_count.load(Ordering::SeqCst),
+            0,
+            "the tunnel opened for a failed connect attempt must be torn down \
+             as part of that same attempt"
+        );
+    }
+
+    /// Dropping the owning `Session` must drop any tunnel it still holds:
+    /// `Session` carries no manual `Drop` impl of its own, so this is really
+    /// pinning that the `tunnel` field is a plain, ordinarily-dropped value
+    /// rather than something leaked out from under it (e.g. into a detached
+    /// task).
+    #[test]
+    fn dropping_the_session_drops_its_active_tunnel() {
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let mut session = session_with_no_url();
+        session.set_tunnel_for_test(Box::new(FakeTunnel::new(open_count.clone())));
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        drop(session);
+
+        assert_eq!(
+            open_count.load(Ordering::SeqCst),
+            0,
+            "dropping the session must drop its active tunnel"
+        );
+    }
 }
 
 /// `TestAppContext`-driven `Session` tests that need no live database
@@ -1184,7 +1498,7 @@ mod gpui_tests {
         RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
     };
 
-    use super::{Config, LivenessState, SchemaState, Session, SessionState};
+    use super::{Config, FakeTunnel, LivenessState, SchemaState, Session, SessionState};
 
     fn session_with_no_url() -> Session {
         Session::new(&Config::default())
@@ -1294,6 +1608,55 @@ mod gpui_tests {
                 );
             }
             other => panic!("expected SessionState::Error, got {other:?}"),
+        });
+    }
+
+    /// A tunnel that cannot be opened must fail the connect before any driver
+    /// connect is attempted, surfacing as `Error` with no connection installed
+    /// -- the ordering contract of a tunneled connect.
+    #[gpui::test]
+    async fn a_tunnel_that_cannot_open_errors_without_connecting(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        // Bind then immediately release a loopback port so a connect to it is
+        // deterministically refused, rather than depending on a port happening
+        // to be unused.
+        let refused_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a loopback port")
+            .local_addr()
+            .expect("read the bound port")
+            .port();
+
+        let mut ssh = zsql_ssh::SshConfig::new(
+            "127.0.0.1",
+            "zsql",
+            zsql_ssh::SshAuth::Password("unused".to_owned()),
+        );
+        ssh.port = refused_port;
+
+        let cfg = Config::default();
+        let session = cx.new(|_cx| Session::new(&cfg));
+        session
+            .update(cx, |session, cx| {
+                session.connect_to_with_ssh(
+                    "postgres://user:pw@db.internal:5432/app",
+                    Some(ssh),
+                    cx,
+                )
+            })
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "a tunnel that cannot open must surface as Error, got {:?}",
+                session.state()
+            );
+            assert!(
+                session.connection.is_none(),
+                "no driver connection may be installed when the tunnel fails to open"
+            );
         });
     }
 
@@ -2625,6 +2988,114 @@ mod gpui_tests {
             Some(RowCount::Exact(3)),
             "expected the row count to match the 3 seeded rows, got {row_count:?}"
         );
+    }
+
+    // -- tunnel lifecycle ---------------------------------------------------
+
+    /// A successful connect switch must drop whatever tunnel the previous
+    /// connection was using: `connect_to`'s synchronous reset clears it
+    /// before the new attempt (which here opens no tunnel of its own) even
+    /// starts.
+    #[gpui::test]
+    async fn a_successful_switch_drops_the_previous_tunnel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let session = cx.new(|_cx| session_with_no_url());
+        session.update(cx, |session, _cx| {
+            session.set_tunnel_for_test(Box::new(FakeTunnel::new(open_count.clone())));
+        });
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        session
+            .update(cx, |session, cx| session.connect_to("sqlite::memory:", cx))
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected the switch to succeed, got {:?}",
+                session.state()
+            );
+        });
+        assert_eq!(
+            open_count.load(Ordering::SeqCst),
+            0,
+            "a successful switch must drop the tunnel it superseded"
+        );
+    }
+
+    /// A failed connect switch must still drop whatever tunnel the previous
+    /// connection was using, exactly as a successful one does.
+    #[gpui::test]
+    async fn a_failed_switch_drops_the_previous_tunnel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let session = cx.new(|_cx| session_with_no_url());
+        session.update(cx, |session, _cx| {
+            session.set_tunnel_for_test(Box::new(FakeTunnel::new(open_count.clone())));
+        });
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+
+        session
+            .update(cx, |session, cx| {
+                session.connect_to("cassandra://host/db", cx)
+            })
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected the switch to fail, got {:?}",
+                session.state()
+            );
+        });
+        assert_eq!(
+            open_count.load(Ordering::SeqCst),
+            0,
+            "a failed switch must still drop the tunnel it superseded"
+        );
+    }
+
+    /// The old tunnel must be gone at the exact same synchronous point the
+    /// schema resets to `NotLoaded` -- not deferred until the new attempt
+    /// resolves -- mirroring `connect_to_resets_schema_to_not_loaded_synchronously_regardless_of_prior_state`.
+    #[gpui::test]
+    async fn a_switch_drops_the_previous_tunnel_synchronously_alongside_the_schema_reset(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let session = cx.new(|_cx| session_with_no_url());
+        session.update(cx, |session, _cx| {
+            session.set_tunnel_for_test(Box::new(FakeTunnel::new(open_count.clone())));
+        });
+
+        let task = session.update(cx, |session, cx| {
+            let task = session.connect_to("sqlite::memory:", cx);
+            assert_eq!(
+                open_count.load(Ordering::SeqCst),
+                0,
+                "the previous tunnel must already be gone synchronously, \
+                 in the same call that dispatches the switch"
+            );
+            assert!(
+                matches!(session.schema(), SchemaState::NotLoaded),
+                "expected the schema to reset in that same synchronous call"
+            );
+            assert!(
+                !session.has_tunnel_for_test(),
+                "the session must not report holding a tunnel synchronously either"
+            );
+            task
+        });
+
+        task.await;
     }
 }
 

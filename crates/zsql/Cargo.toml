@@ -20,6 +20,11 @@ zsql-postgres = { path = "../zsql-postgres" }
 zsql-sqlite = { path = "../zsql-sqlite" }
 zsql-mssql = { path = "../zsql-mssql" }
 zsql-mysql = { path = "../zsql-mysql" }
+# The only other place in the workspace allowed to depend on `zsql-ssh`
+# beyond the crate itself: `session.rs` drives `open_tunnel` to set up a
+# tunnel before `drivers::connect`, but never names a tokio or russh type --
+# only `zsql_ssh`'s own public surface (`SshConfig`, `SshTunnel`, `SshError`).
+zsql-ssh = { path = "../zsql-ssh" }
 zsql-ui = { path = "../zsql-ui" }
 zsql-editor = { path = "../zsql-editor" }
 anyhow = { workspace = true }
@@ -60,3 +65,10 @@ zsql-ui = { path = "../zsql-ui", features = ["test-support"] }
 
 [lints]
 workspace = true
+
+[features]
+# Gates `session.rs`'s `ssh_live_tests` module: a dockerized sshd tunneling
+# to real Postgres/MySQL/MSSQL databases, following the same pattern as
+# `zsql-postgres`/`zsql-mssql`/`zsql-mysql`'s own `driver-integration-tests`
+# and `zsql-ssh`'s `ssh-integration-tests`. See `scripts/ssh-dev.sh`.
+ssh-integration-tests = []

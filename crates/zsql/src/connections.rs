@@ -170,6 +170,41 @@ impl StoredConnection {
         let account = format!("{account_prefix}{id}");
         Ok(crate::keyring::Entry::new(&account)?)
     }
+
+    /// Build the [`zsql_ssh::SshConfig`] this connection's tunnel should
+    /// open with, reading its secret (password or key passphrase, if any)
+    /// from the keyring. `None` when no tunnel is configured, or one is
+    /// configured but not enabled.
+    ///
+    /// # Errors
+    /// Returns [`ConnectionStoreError::Keyring`] if a password- or
+    /// key-passphrase-authenticated tunnel's secret cannot be read from the
+    /// keyring.
+    pub fn ssh_config(&self) -> Result<Option<zsql_ssh::SshConfig>, ConnectionStoreError> {
+        let Some(ssh) = self.ssh.as_ref().filter(|ssh| ssh.enabled) else {
+            return Ok(None);
+        };
+        let auth = match ssh.auth_kind {
+            SshAuthKind::Agent => zsql_ssh::SshAuth::Agent,
+            SshAuthKind::Password => zsql_ssh::SshAuth::Password(self.get_ssh_secret()?),
+            SshAuthKind::Key => zsql_ssh::SshAuth::Key {
+                path: ssh.key_path.clone().unwrap_or_default(),
+                // A key with no passphrase has no keyring entry at all
+                // (`ConnectionArgs::into_stored` only writes one when
+                // `ssh_secret` is set), so a missing entry here means
+                // "unprotected key", not an error.
+                passphrase: self.get_ssh_secret().ok(),
+            },
+        };
+        let mut cfg = zsql_ssh::SshConfig::new(ssh.host.clone(), ssh.user.clone(), auth);
+        cfg.port = ssh.port;
+        cfg.host_key = match &ssh.host_key_policy {
+            HostKeyPolicy::KnownHosts(path) => zsql_ssh::HostKeyPolicy::KnownHosts(path.clone()),
+            HostKeyPolicy::AcceptNew => zsql_ssh::HostKeyPolicy::AcceptNew,
+            HostKeyPolicy::Prompt => zsql_ssh::HostKeyPolicy::Prompt,
+        };
+        Ok(Some(cfg))
+    }
 }
 
 /// The on-disk shape of the connection store file: a single named array so
@@ -1268,6 +1303,179 @@ mod tests {
         assert!(
             result.is_err(),
             "the SSH secret must be gone from the keyring after removal, got {result:?}"
+        );
+    }
+
+    // -- ssh_config ---------------------------------------------------------
+
+    #[test]
+    fn ssh_config_is_none_when_no_ssh_is_configured() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "plain".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: None,
+        };
+        assert!(connection.ssh_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn ssh_config_is_none_when_ssh_is_configured_but_disabled() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "disabled tunnel".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                enabled: false,
+                ..sample_ssh()
+            }),
+        };
+        assert!(connection.ssh_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn ssh_config_builds_agent_auth_with_no_keyring_access() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "agent".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Agent,
+                ..sample_ssh()
+            }),
+        };
+        let cfg = connection
+            .ssh_config()
+            .expect("agent auth needs no keyring access")
+            .expect("ssh is enabled");
+        assert!(matches!(cfg.auth, zsql_ssh::SshAuth::Agent));
+        assert_eq!(cfg.host, "bastion.example.com");
+        assert_eq!(cfg.port, 2222);
+        assert_eq!(cfg.user, "deploy");
+    }
+
+    #[test]
+    fn ssh_config_builds_password_auth_from_the_keyring_secret() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "password".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Password,
+                ..sample_ssh()
+            }),
+        };
+        connection
+            .set_ssh_secret("tunnel-password")
+            .expect("set_ssh_secret must succeed");
+
+        let cfg = connection
+            .ssh_config()
+            .expect("password auth must succeed")
+            .expect("ssh is enabled");
+        assert!(matches!(
+            cfg.auth,
+            zsql_ssh::SshAuth::Password(ref pw) if pw == "tunnel-password"
+        ));
+    }
+
+    #[test]
+    fn ssh_config_reports_an_error_when_password_auth_has_no_keyring_secret() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "password, missing secret".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Password,
+                ..sample_ssh()
+            }),
+        };
+        assert!(connection.ssh_config().is_err());
+    }
+
+    #[test]
+    fn ssh_config_builds_key_auth_with_a_keyring_passphrase() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "key with passphrase".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Key,
+                key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+                ..sample_ssh()
+            }),
+        };
+        connection
+            .set_ssh_secret("key-passphrase")
+            .expect("set_ssh_secret must succeed");
+
+        let cfg = connection
+            .ssh_config()
+            .expect("key auth must succeed")
+            .expect("ssh is enabled");
+        match cfg.auth {
+            zsql_ssh::SshAuth::Key { path, passphrase } => {
+                assert_eq!(path, PathBuf::from("/home/user/.ssh/id_ed25519"));
+                assert_eq!(passphrase.as_deref(), Some("key-passphrase"));
+            }
+            other => panic!("expected SshAuth::Key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_config_builds_key_auth_with_no_passphrase_when_the_keyring_has_none() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "unprotected key".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Key,
+                key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+                ..sample_ssh()
+            }),
+        };
+
+        let cfg = connection
+            .ssh_config()
+            .expect("an unprotected key must not require a keyring secret")
+            .expect("ssh is enabled");
+        match cfg.auth {
+            zsql_ssh::SshAuth::Key { passphrase, .. } => {
+                assert_eq!(passphrase, None);
+            }
+            other => panic!("expected SshAuth::Key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_config_translates_the_host_key_policy() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "known hosts".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "localhost".to_owned(),
+            ssh: Some(StoredSsh {
+                auth_kind: SshAuthKind::Agent,
+                host_key_policy: HostKeyPolicy::KnownHosts(PathBuf::from(
+                    "/home/user/.ssh/known_hosts",
+                )),
+                ..sample_ssh()
+            }),
+        };
+        let cfg = connection
+            .ssh_config()
+            .expect("agent auth must succeed")
+            .expect("ssh is enabled");
+        assert_eq!(
+            cfg.host_key,
+            zsql_ssh::HostKeyPolicy::KnownHosts(PathBuf::from("/home/user/.ssh/known_hosts"))
         );
     }
 

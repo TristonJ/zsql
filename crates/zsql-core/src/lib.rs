@@ -10,10 +10,11 @@ pub mod row_count;
 pub mod schema;
 pub mod schema_detail;
 pub mod sql;
+pub mod tls_verify;
 pub mod value;
 
 pub use config::ConnConfig;
-pub use connection_url::ConnectionUrl;
+pub use connection_url::{ConnectionUrl, rewrite_for_tunnel};
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
 pub use registry::select_driver;
@@ -24,4 +25,5 @@ pub use schema_detail::{
     RelationSchema,
 };
 pub use sql::{default_preview_query, quote_ident};
+pub use tls_verify::TlsVerify;
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

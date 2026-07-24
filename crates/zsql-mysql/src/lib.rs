@@ -8,6 +8,7 @@ mod driver;
 mod error;
 mod introspect;
 mod quoting;
+mod tunnel;
 mod url;
 mod values;
 

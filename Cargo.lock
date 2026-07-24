@@ -9030,6 +9030,7 @@ dependencies = [
  "zsql-mysql",
  "zsql-postgres",
  "zsql-sqlite",
+ "zsql-ssh",
  "zsql-ui",
 ]
 
