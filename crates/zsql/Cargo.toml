@@ -1,6 +1,7 @@
 [package]
 name = "zsql"
 version = "0.0.0"
+description = "A fast, lightweight desktop SQL editor."
 edition.workspace = true
 license.workspace = true
 publish = false
