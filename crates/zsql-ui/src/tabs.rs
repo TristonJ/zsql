@@ -4,7 +4,7 @@
 //! only primitives, so the caller owns all tab data, click behavior, and any
 //! domain-specific styling layered on top (e.g. a "generated" tint).
 
-use gpui::{Div, div, prelude::*, px, rgb, rgba};
+use gpui::{Div, div, prelude::*, px, rgb};
 
 use crate::{icon::icon, theme::Theme};
 
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn close_and_new_tab_glyphs_build() {
         let theme = Theme::default();
-        let _close = close_glyph(&theme);
+        let _close = close_glyph("close", &theme);
         let _new_tab = new_tab_glyph(&theme);
     }
 }

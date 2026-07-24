@@ -340,7 +340,7 @@ pub const SCHEMA_SECTION_COUNT_PILL_RADIUS: f32 = 20.0;
 /// Horizontal padding inside a section label's trailing count pill.
 pub const SCHEMA_SECTION_COUNT_PILL_PADDING_X: Pixels = px(7.0);
 /// The minimum width of the schema sections
-pub const SCHEMA_SECTION_WIDTH: Pixels = px(1000.0);
+pub const SCHEMA_SECTION_WIDTH: Pixels = px(1200.0);
 
 /// Width of a column row's left key-rail tick.
 pub const SCHEMA_RAIL_WIDTH: Pixels = px(3.0);
@@ -387,7 +387,7 @@ pub const SCHEMA_INDEX_UNIQUE_LABEL: &str = "unique";
 /// show a full Postgres type name (e.g. `character varying(255)` or
 /// `timestamp with time zone`) without clipping its type tag.
 pub const SCHEMA_COLUMNS_WIDTHS: [Pixels; 5] =
-    [px(190.0), px(210.0), px(90.0), px(220.0), px(220.0)];
+    [px(190.0), px(210.0), px(100.0), px(220.0), px(220.0)];
 /// Fixed pixel widths of the Indexes table's cells, in display order (Name,
 /// Method, Unique, Definition).
 pub const SCHEMA_INDEXES_WIDTHS: [Pixels; 4] = [px(220.0), px(100.0), px(80.0), px(360.0)];

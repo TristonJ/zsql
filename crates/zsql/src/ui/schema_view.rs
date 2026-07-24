@@ -181,7 +181,7 @@ impl SchemaTabView {
                 div()
                     .flex()
                     .flex_row()
-                    .items_baseline()
+                    .items_center()
                     .gap_2()
                     .child(icon(
                         IconName::Table,
@@ -252,14 +252,24 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_COLUMNS_WIDTHS;
+        // Type and Default hold the most variable-length content (long type
+        // names, long default expressions), so they absorb any width left over
+        // once the table fills its section; the rest stay at their fixed width.
+        let grows = [true, true, false, true, false];
         let columns = ["Column", "Type", "Null", "Default", "Keys"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column = TableColumn::new(
                     width,
                     header_cell(column.to_string(), active_theme).px(cell_x_padding()),
-                )
+                );
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
@@ -355,11 +365,19 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_INDEXES_WIDTHS;
+        let grows = [false, false, false, true];
         let columns = ["Name", "Method", "Unique", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), active_theme))
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column =
+                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
@@ -440,11 +458,19 @@ impl SchemaTabView {
     ) -> impl IntoElement {
         let active_theme = cx.theme();
         let widths = theme::SCHEMA_CONSTRAINTS_WIDTHS;
-        let columns = ["Name", "Method", "Unique", "Definition"]
+        let grows = [false, false, true];
+        let columns = ["Name", "Type", "Definition"]
             .iter()
             .zip(widths.iter())
-            .map(|(column, &width)| {
-                TableColumn::new(width, header_cell(column.to_string(), active_theme))
+            .zip(grows.iter())
+            .map(|((column, &width), &grow)| {
+                let table_column =
+                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                if grow {
+                    table_column.grow()
+                } else {
+                    table_column
+                }
             })
             .collect();
 
