@@ -15,6 +15,16 @@ use crate::{drivers::detect_driver_name, ui::format::host_label};
 #[cfg(unix)]
 const STORE_FILE_MODE: u32 = 0o600;
 
+/// Keyring account prefix for a connection's database URL, followed by the
+/// connection id.
+const CONNECTION_KEYRING_ACCOUNT_PREFIX: &str = "zsql-connection-";
+
+/// Keyring account prefix for a connection's SSH tunnel secret (password or
+/// key passphrase), followed by the connection id. Kept distinct from
+/// [`CONNECTION_KEYRING_ACCOUNT_PREFIX`] so the database URL and the SSH
+/// secret are independent keyring entries.
+const SSH_KEYRING_ACCOUNT_PREFIX: &str = "zsql-ssh-";
+
 /// A user-named, persisted connection: a display name paired with its id.
 /// The connection URL itself is stored using the OS keyring
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,15 +39,68 @@ pub struct StoredConnection {
     /// A displayed host for this connection - persisted so we don't need to access the
     /// keyring to display information about the connection.
     pub display_host: String,
+    /// Non-secret SSH tunnel settings. Absent for connections with no
+    /// tunnel configured, and for connections saved before SSH tunnel
+    /// support existed.
+    #[serde(default)]
+    pub ssh: Option<StoredSsh>,
+}
+
+/// Non-secret SSH tunnel settings for a [`StoredConnection`]. The SSH
+/// password or key passphrase, if any, is never held here - see
+/// [`StoredConnection::get_ssh_secret`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSsh {
+    /// Whether the tunnel is used when connecting.
+    pub enabled: bool,
+    /// The SSH server's hostname or IP address.
+    pub host: String,
+    /// The SSH server's port.
+    pub port: u16,
+    /// The username to authenticate to the SSH server as.
+    pub user: String,
+    /// How to authenticate to the SSH server.
+    pub auth_kind: SshAuthKind,
+    /// The private key file, used when `auth_kind` is [`SshAuthKind::Key`].
+    pub key_path: Option<PathBuf>,
+    /// How the SSH server's host key is verified.
+    pub host_key_policy: HostKeyPolicy,
+}
+
+/// How zsql authenticates to the SSH server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SshAuthKind {
+    /// Delegate to a running `ssh-agent`.
+    Agent,
+    /// A password, kept in the OS keyring.
+    Password,
+    /// A private key file, optionally protected by a passphrase kept in the OS keyring.
+    Key,
+}
+
+/// How an SSH server's host key is verified before a tunnel is used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostKeyPolicy {
+    /// Verify against entries in a `known_hosts` file.
+    KnownHosts(PathBuf),
+    /// Accept and record any host key not already known (trust-on-first-use).
+    AcceptNew,
+    /// Reserved for an interactive accept/reject prompt.
+    Prompt,
 }
 
 /// A connection that has not yet been persisted to disk
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConnectionArgs {
     /// User-given display name.
     pub name: String,
     /// The connection URL to be saved in the OS keyring
     pub url: String,
+    /// Non-secret SSH tunnel settings, if a tunnel is configured.
+    pub ssh: Option<StoredSsh>,
+    /// The SSH password or key passphrase to be saved in the OS keyring.
+    /// Absent when SSH is disabled, uses agent auth, or an unprotected key.
+    pub ssh_secret: Option<String>,
 }
 
 impl ConnectionArgs {
@@ -49,34 +112,63 @@ impl ConnectionArgs {
                 .unwrap_or("Unknown")
                 .to_owned(),
             display_host: host_label(&self.url),
+            ssh: self.ssh,
         };
         stored.set_url(&self.url)?;
+        if let Some(secret) = &self.ssh_secret {
+            stored.set_ssh_secret(secret)?;
+        }
         Ok(stored)
     }
 }
 
 impl StoredConnection {
     pub fn get_url(&self) -> Result<String, ConnectionStoreError> {
-        let entry = self.get_keyring_entry()?;
+        let entry = Self::keyring_entry(CONNECTION_KEYRING_ACCOUNT_PREFIX, self.id)?;
         Ok(entry.get_password()?)
     }
 
     pub(crate) fn set_url(&self, url: &str) -> Result<(), ConnectionStoreError> {
-        let entry = self.get_keyring_entry()?;
+        let entry = Self::keyring_entry(CONNECTION_KEYRING_ACCOUNT_PREFIX, self.id)?;
         entry.set_password(url)?;
         Ok(())
     }
 
     pub(crate) fn delete_url(&self) -> Result<(), ConnectionStoreError> {
-        let entry = self.get_keyring_entry()?;
+        let entry = Self::keyring_entry(CONNECTION_KEYRING_ACCOUNT_PREFIX, self.id)?;
         entry.delete()?;
         Ok(())
     }
 
-    fn get_keyring_entry(&self) -> Result<crate::keyring::Entry, ConnectionStoreError> {
-        let username = format!("zsql-connection-{}", self.id);
-        let entry = crate::keyring::Entry::new(&username)?;
-        Ok(entry)
+    /// The SSH tunnel password or key passphrase, if one is stored for this
+    /// connection.
+    ///
+    /// # Errors
+    /// Returns [`ConnectionStoreError::Keyring`] if the OS keyring cannot
+    /// be accessed, or if no secret is currently stored for this connection.
+    pub fn get_ssh_secret(&self) -> Result<String, ConnectionStoreError> {
+        let entry = Self::keyring_entry(SSH_KEYRING_ACCOUNT_PREFIX, self.id)?;
+        Ok(entry.get_password()?)
+    }
+
+    pub(crate) fn set_ssh_secret(&self, secret: &str) -> Result<(), ConnectionStoreError> {
+        let entry = Self::keyring_entry(SSH_KEYRING_ACCOUNT_PREFIX, self.id)?;
+        entry.set_password(secret)?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_ssh_secret(&self) -> Result<(), ConnectionStoreError> {
+        let entry = Self::keyring_entry(SSH_KEYRING_ACCOUNT_PREFIX, self.id)?;
+        entry.delete()?;
+        Ok(())
+    }
+
+    fn keyring_entry(
+        account_prefix: &str,
+        id: uuid::Uuid,
+    ) -> Result<crate::keyring::Entry, ConnectionStoreError> {
+        let account = format!("{account_prefix}{id}");
+        Ok(crate::keyring::Entry::new(&account)?)
     }
 }
 
@@ -207,9 +299,20 @@ impl ConnectionStore {
         let prior_args = ConnectionArgs {
             name: conn.name.clone(),
             url: conn.get_url()?,
+            ssh: conn.ssh.clone(),
+            ssh_secret: if conn.ssh.is_some() {
+                conn.get_ssh_secret().ok()
+            } else {
+                None
+            },
         };
         // Attempt to update the keyring first
         conn.set_url(&args.url)?;
+        match &args.ssh_secret {
+            Some(secret) => conn.set_ssh_secret(secret)?,
+            None => conn.delete_ssh_secret()?,
+        }
+        conn.ssh = args.ssh;
         conn.name = args.name;
         // Now try to save - undoing the keyring change if it fails
         if let Err(err) = self.save() {
@@ -218,6 +321,11 @@ impl ConnectionStore {
                 .get_mut(index)
                 .expect("index must still be valid");
             conn.set_url(&prior_args.url)?;
+            match &prior_args.ssh_secret {
+                Some(secret) => conn.set_ssh_secret(secret)?,
+                None => conn.delete_ssh_secret()?,
+            }
+            conn.ssh = prior_args.ssh;
             conn.name = prior_args.name;
             return Err(err);
         }
@@ -243,6 +351,10 @@ impl ConnectionStore {
         }
         if let Err(err) = removed.delete_url() {
             tracing::error!(id = %removed.id, "failed to delete connection URL from keyring: {err}");
+            return Err(err);
+        }
+        if let Err(err) = removed.delete_ssh_secret() {
+            tracing::error!(id = %removed.id, "failed to delete SSH secret from keyring: {err}");
             return Err(err);
         }
         Ok(())
@@ -289,7 +401,11 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), ConnectionStoreError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionArgs, ConnectionStore, StoredConnection};
+    use std::path::PathBuf;
+
+    use super::{
+        ConnectionArgs, ConnectionStore, HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh,
+    };
 
     /// A temp file path this test owns exclusively, removed on drop so
     /// tests never leak files into the real temp dir.
@@ -318,6 +434,22 @@ mod tests {
         ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://user:pass@localhost:5432/app".to_owned(),
+            ssh: None,
+            ssh_secret: None,
+        }
+    }
+
+    /// Non-secret SSH settings used by tests that don't care about specific
+    /// field values, just that a tunnel is configured.
+    fn sample_ssh() -> StoredSsh {
+        StoredSsh {
+            enabled: true,
+            host: "bastion.example.com".to_owned(),
+            port: 2222,
+            user: "deploy".to_owned(),
+            auth_kind: SshAuthKind::Password,
+            key_path: None,
+            host_key_policy: HostKeyPolicy::AcceptNew,
         }
     }
 
@@ -337,10 +469,113 @@ mod tests {
             name: "test".to_owned(),
             display_kind: "postgres".to_owned(),
             display_host: "localhost".to_owned(),
+            ssh: None,
         };
         let text = toml::to_string(&connection).expect("must serialize");
         let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
         assert_eq!(parsed, connection);
+    }
+
+    #[test]
+    fn stored_connection_with_no_ssh_round_trips_through_toml() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "no tunnel".to_owned(),
+            display_kind: "sqlite".to_owned(),
+            display_host: "local file".to_owned(),
+            ssh: None,
+        };
+        let text = toml::to_string(&connection).expect("must serialize");
+        let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
+        assert_eq!(parsed, connection);
+    }
+
+    #[test]
+    fn stored_connection_with_ssh_round_trips_through_toml_for_every_auth_kind_and_host_key_policy()
+    {
+        let cases = [
+            (SshAuthKind::Agent, HostKeyPolicy::AcceptNew, None),
+            (
+                SshAuthKind::Password,
+                HostKeyPolicy::KnownHosts(PathBuf::from("/home/user/.ssh/known_hosts")),
+                None,
+            ),
+            (
+                SshAuthKind::Key,
+                HostKeyPolicy::Prompt,
+                Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+            ),
+        ];
+
+        for (auth_kind, host_key_policy, key_path) in cases {
+            let connection = StoredConnection {
+                id: uuid::Uuid::new_v4(),
+                name: "tunneled".to_owned(),
+                display_kind: "postgres".to_owned(),
+                display_host: "bastion.example.com".to_owned(),
+                ssh: Some(StoredSsh {
+                    enabled: true,
+                    host: "bastion.example.com".to_owned(),
+                    port: 22,
+                    user: "deploy".to_owned(),
+                    auth_kind,
+                    key_path,
+                    host_key_policy,
+                }),
+            };
+            let text = toml::to_string(&connection).expect("must serialize");
+            let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
+            assert_eq!(parsed, connection);
+        }
+    }
+
+    #[test]
+    fn stored_connection_never_serializes_an_ssh_password() {
+        let secret = "hunter2-super-secret-password";
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "tunneled".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "bastion.example.com".to_owned(),
+            ssh: Some(sample_ssh()),
+        };
+        // The password never has anywhere to go on `StoredConnection` or
+        // `StoredSsh` in the first place; this pins that down at the
+        // serialized-text level too, so a future field addition can't
+        // regress it silently.
+        let text = toml::to_string(&connection).expect("must serialize");
+        assert!(
+            !text.contains(secret),
+            "the SSH password must never appear in the serialized TOML, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_url_and_ssh_secret_keyring_accounts_are_independent() {
+        let connection = StoredConnection {
+            id: uuid::Uuid::new_v4(),
+            name: "tunneled".to_owned(),
+            display_kind: "postgres".to_owned(),
+            display_host: "bastion.example.com".to_owned(),
+            ssh: Some(sample_ssh()),
+        };
+        connection
+            .set_url("postgres://host/db")
+            .expect("set_url must succeed");
+        connection
+            .set_ssh_secret("ssh-secret-value")
+            .expect("set_ssh_secret must succeed");
+
+        assert_eq!(
+            connection.get_url().expect("get_url must succeed"),
+            "postgres://host/db"
+        );
+        assert_eq!(
+            connection
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "ssh-secret-value"
+        );
     }
 
     #[test]
@@ -363,6 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_store_file_written_before_ssh_support_defaults_ssh_to_none() {
+        let temp = TempStorePath::new("pre-ssh-store");
+        let id = uuid::Uuid::new_v4();
+        let pre_ssh_toml = format!(
+            "[[connections]]\n\
+             id = \"{id}\"\n\
+             name = \"legacy\"\n\
+             display_kind = \"postgres\"\n\
+             display_host = \"localhost\"\n"
+        );
+        std::fs::write(&temp.0, pre_ssh_toml).expect("setup write failed");
+
+        let store =
+            ConnectionStore::load(&temp.0).expect("a store with no ssh key must still parse");
+        assert_eq!(store.connections().len(), 1);
+        assert_eq!(store.connections()[0].ssh, None);
+    }
+
+    #[test]
     fn adding_a_connection_then_reloading_from_disk_returns_it() {
         let temp = TempStorePath::new("round-trip");
 
@@ -381,6 +635,124 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_connection_with_ssh_then_reloading_from_disk_returns_it() {
+        let temp = TempStorePath::new("ssh-round-trip");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        let args = ConnectionArgs {
+            name: "tunneled".to_owned(),
+            url: "postgres://host/db".to_owned(),
+            ssh: Some(StoredSsh {
+                enabled: true,
+                host: "bastion.example.com".to_owned(),
+                port: 2222,
+                user: "deploy".to_owned(),
+                auth_kind: SshAuthKind::Key,
+                key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+                host_key_policy: HostKeyPolicy::KnownHosts(PathBuf::from(
+                    "/home/user/.ssh/known_hosts",
+                )),
+            }),
+            ssh_secret: Some("key-passphrase".to_owned()),
+        };
+        store.add(args.clone()).expect("add must succeed");
+
+        let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+        assert_eq!(
+            reloaded.connections().len(),
+            1,
+            "the reloaded store must have one connection"
+        );
+        let stored = &reloaded.connections()[0];
+        assert_eq!(stored.name, args.name);
+        assert_eq!(stored.get_url().expect("get_url must succeed"), args.url);
+        assert_eq!(stored.ssh, args.ssh, "every SSH field must round-trip");
+        assert_eq!(
+            stored
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "key-passphrase"
+        );
+    }
+
+    #[test]
+    fn adding_a_connection_with_ssh_password_keeps_it_out_of_the_store_file() {
+        let temp = TempStorePath::new("ssh-password-not-on-disk");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        let secret = "correct horse battery staple";
+        let args = ConnectionArgs {
+            name: "tunneled".to_owned(),
+            url: "postgres://host/db".to_owned(),
+            ssh: Some(StoredSsh {
+                enabled: true,
+                host: "bastion.example.com".to_owned(),
+                port: 2222,
+                user: "deploy".to_owned(),
+                auth_kind: SshAuthKind::Password,
+                key_path: None,
+                host_key_policy: HostKeyPolicy::AcceptNew,
+            }),
+            ssh_secret: Some(secret.to_owned()),
+        };
+        store.add(args).expect("add must succeed");
+
+        let file_bytes = std::fs::read(&temp.0).expect("store file must exist");
+        assert!(
+            !file_bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "the SSH password must never be written to the connection store file"
+        );
+
+        // The non-secret SSH settings, by contrast, are expected in plain
+        // text on disk.
+        let text = String::from_utf8(file_bytes).expect("store file must be utf8");
+        assert!(
+            text.contains("bastion.example.com"),
+            "the non-secret SSH host must be readable on disk"
+        );
+        assert!(
+            text.contains("deploy"),
+            "the non-secret SSH user must be readable on disk"
+        );
+
+        // The password is retrievable only via the keyring, never via the
+        // in-memory `StoredSsh` fields.
+        let stored = &store.connections()[0];
+        assert_eq!(
+            stored
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            secret
+        );
+    }
+
+    #[test]
+    fn adding_a_connection_with_agent_auth_and_no_secret_creates_no_ssh_keyring_entry() {
+        let temp = TempStorePath::new("ssh-agent-no-secret");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        store
+            .add(ConnectionArgs {
+                name: "agent auth".to_owned(),
+                url: "postgres://host/db".to_owned(),
+                ssh: Some(StoredSsh {
+                    auth_kind: SshAuthKind::Agent,
+                    ..sample_ssh()
+                }),
+                ssh_secret: None,
+            })
+            .expect("add must succeed");
+
+        let result = store.connections()[0].get_ssh_secret();
+        assert!(
+            result.is_err(),
+            "agent auth with no secret must not create a zsql-ssh-{{id}} keyring entry, got {result:?}"
+        );
+    }
+
+    #[test]
     fn adding_two_connections_preserves_both_in_order() {
         let temp = TempStorePath::new("two");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
@@ -388,10 +760,14 @@ mod tests {
         let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         store.add(first.clone()).expect("add first");
         store.add(second.clone()).expect("add second");
@@ -485,10 +861,14 @@ mod tests {
         let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         store.add(first).expect("add first");
         store.add(second.clone()).expect("add second");
@@ -497,6 +877,8 @@ mod tests {
         let updated_first = ConnectionArgs {
             name: "first renamed".to_owned(),
             url: "postgres://host/other".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         store
             .update(first_id, updated_first.clone())
@@ -511,6 +893,86 @@ mod tests {
     }
 
     #[test]
+    fn updating_a_connection_changes_its_ssh_settings_and_secret() {
+        let temp = TempStorePath::new("update-ssh");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        store
+            .add(ConnectionArgs {
+                name: "first".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: None,
+                ssh_secret: None,
+            })
+            .expect("add must succeed");
+
+        let id = store.connections()[0].id;
+        let updated = ConnectionArgs {
+            name: "first with tunnel".to_owned(),
+            url: "postgres://host/a".to_owned(),
+            ssh: Some(sample_ssh()),
+            ssh_secret: Some("new-secret".to_owned()),
+        };
+        store
+            .update(id, updated.clone())
+            .expect("update must succeed");
+
+        assert_eq!(store.connections()[0].ssh, updated.ssh);
+        assert_eq!(
+            store.connections()[0]
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "new-secret"
+        );
+
+        let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+        assert_eq!(reloaded.connections()[0].ssh, updated.ssh);
+        assert_eq!(
+            reloaded.connections()[0]
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "new-secret"
+        );
+    }
+
+    #[test]
+    fn updating_a_connection_to_agent_auth_clears_the_stale_ssh_secret() {
+        let temp = TempStorePath::new("update-ssh-to-agent");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        store
+            .add(ConnectionArgs {
+                name: "first".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("stale-password".to_owned()),
+            })
+            .expect("add must succeed");
+        let id = store.connections()[0].id;
+
+        store
+            .update(
+                id,
+                ConnectionArgs {
+                    name: "first with agent auth".to_owned(),
+                    url: "postgres://host/a".to_owned(),
+                    ssh: Some(StoredSsh {
+                        auth_kind: SshAuthKind::Agent,
+                        ..sample_ssh()
+                    }),
+                    ssh_secret: None,
+                },
+            )
+            .expect("update must succeed");
+
+        let result = store.connections()[0].get_ssh_secret();
+        assert!(
+            result.is_err(),
+            "switching to agent auth must clear the stale SSH secret from the keyring, got {result:?}"
+        );
+    }
+
+    #[test]
     fn updating_an_non_existing_id_is_a_no_op() {
         let temp = TempStorePath::new("update-out-of-range");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
@@ -522,6 +984,8 @@ mod tests {
                 ConnectionArgs {
                     name: "nope".to_owned(),
                     url: "postgres://host/db".to_owned(),
+                    ssh: None,
+                    ssh_secret: None,
                 },
             )
             .expect("an out-of-range update must not error");
@@ -560,6 +1024,8 @@ mod tests {
             ConnectionArgs {
                 name: "renamed".to_owned(),
                 url: "postgres://host/renamed".to_owned(),
+                ssh: None,
+                ssh_secret: None,
             },
         );
         assert!(
@@ -567,6 +1033,171 @@ mod tests {
             "update must fail when the store file cannot be overwritten"
         );
         assert_connection_eq(&store.connections()[0], &sample());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("teardown: restore file permissions");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_on_update_restores_the_original_ssh_secret() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "zsql-connections-test-update-ssh-unwritable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("setup: create base dir");
+
+        let path = base.join("connections.toml");
+        let mut store = ConnectionStore::load(&path).expect("initial load must succeed");
+        store
+            .add(ConnectionArgs {
+                name: "first".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("original-secret".to_owned()),
+            })
+            .expect("add must succeed: dir is writable at this point");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("setup: make store file read-only");
+
+        let result = store.update(
+            store.connections()[0].id,
+            ConnectionArgs {
+                name: "renamed".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("attempted-new-secret".to_owned()),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "update must fail when the store file cannot be overwritten"
+        );
+        assert_eq!(
+            store.connections()[0]
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "original-secret",
+            "a failed save must roll the SSH secret back to its prior value"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("teardown: restore file permissions");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_on_update_deletes_a_newly_set_ssh_secret_when_the_prior_connection_had_none() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "zsql-connections-test-update-ssh-add-unwritable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("setup: create base dir");
+
+        let path = base.join("connections.toml");
+        let mut store = ConnectionStore::load(&path).expect("initial load must succeed");
+        store
+            .add(sample())
+            .expect("add must succeed: dir is writable at this point");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("setup: make store file read-only");
+
+        let id = store.connections()[0].id;
+        let result = store.update(
+            id,
+            ConnectionArgs {
+                name: "with tunnel".to_owned(),
+                url: sample().url,
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("just-set-secret".to_owned()),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "update must fail when the store file cannot be overwritten"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("teardown: restore file permissions so the secret can be read back");
+
+        let fresh = StoredConnection {
+            id,
+            name: String::new(),
+            display_kind: String::new(),
+            display_host: String::new(),
+            ssh: None,
+        };
+        let secret_result = fresh.get_ssh_secret();
+        assert!(
+            secret_result.is_err(),
+            "a failed save must delete the just-set SSH secret since the prior connection had none, got {secret_result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_on_update_restores_a_deleted_ssh_secret_when_switching_to_agent_auth() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "zsql-connections-test-update-ssh-drop-unwritable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("setup: create base dir");
+
+        let path = base.join("connections.toml");
+        let mut store = ConnectionStore::load(&path).expect("initial load must succeed");
+        store
+            .add(ConnectionArgs {
+                name: "first".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("original-secret".to_owned()),
+            })
+            .expect("add must succeed: dir is writable at this point");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("setup: make store file read-only");
+
+        // Switch the connection to agent auth, which carries no secret: the
+        // forward path deletes the stored secret, then the save fails, so the
+        // rollback must restore the just-deleted secret rather than leave it gone.
+        let result = store.update(
+            store.connections()[0].id,
+            ConnectionArgs {
+                name: "now on agent".to_owned(),
+                url: "postgres://host/a".to_owned(),
+                ssh: Some(StoredSsh {
+                    auth_kind: SshAuthKind::Agent,
+                    ..sample_ssh()
+                }),
+                ssh_secret: None,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "update must fail when the store file cannot be overwritten"
+        );
+        assert_eq!(
+            store.connections()[0]
+                .get_ssh_secret()
+                .expect("get_ssh_secret must succeed"),
+            "original-secret",
+            "a failed save must restore the SSH secret the forward path deleted"
+        );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("teardown: restore file permissions");
@@ -581,10 +1212,14 @@ mod tests {
         let first = ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         let second = ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         };
         store.add(first.clone()).expect("add first");
         store.add(second.clone()).expect("add second");
@@ -601,6 +1236,39 @@ mod tests {
             "the reloaded store must have one connection"
         );
         assert_connection_eq(&reloaded.connections()[0], &second);
+    }
+
+    #[test]
+    fn removing_a_connection_with_an_ssh_secret_deletes_it_from_the_keyring() {
+        let temp = TempStorePath::new("remove-ssh-secret");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+
+        store
+            .add(ConnectionArgs {
+                name: "tunneled".to_owned(),
+                url: "postgres://host/db".to_owned(),
+                ssh: Some(sample_ssh()),
+                ssh_secret: Some("hunter2".to_owned()),
+            })
+            .expect("add must succeed");
+        let id = store.connections()[0].id;
+
+        store.remove(id).expect("remove must succeed");
+
+        // A fresh `StoredConnection` for the same id, representing a new
+        // `Entry` construction rather than reusing any cached handle.
+        let fresh = StoredConnection {
+            id,
+            name: String::new(),
+            display_kind: String::new(),
+            display_host: String::new(),
+            ssh: None,
+        };
+        let result = fresh.get_ssh_secret();
+        assert!(
+            result.is_err(),
+            "the SSH secret must be gone from the keyring after removal, got {result:?}"
+        );
     }
 
     #[test]

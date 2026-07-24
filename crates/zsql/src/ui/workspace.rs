@@ -1019,12 +1019,16 @@ mod render_tests {
             .add(ConnectionArgs {
                 name: "conn-a".to_owned(),
                 url: "postgres://localhost/a".to_owned(),
+                ssh: None,
+                ssh_secret: None,
             })
             .expect("add conn-a must succeed");
         store
             .add(ConnectionArgs {
                 name: "conn-b".to_owned(),
                 url: "postgres://localhost/b".to_owned(),
+                ssh: None,
+                ssh_secret: None,
             })
             .expect("add conn-b must succeed");
         store
@@ -1338,12 +1342,16 @@ mod render_tests {
             .add(ConnectionArgs {
                 name: "conn-a".to_owned(),
                 url: "postgres://localhost/a".to_owned(),
+                ssh: None,
+                ssh_secret: None,
             })
             .expect("add conn-a must succeed");
         store
             .add(ConnectionArgs {
                 name: "conn-b".to_owned(),
                 url: conn_b_url.to_owned(),
+                ssh: None,
+                ssh_secret: None,
             })
             .expect("add conn-b must succeed");
 
