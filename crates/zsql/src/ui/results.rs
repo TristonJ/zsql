@@ -10,6 +10,7 @@ use gpui::{
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::button::ButtonSwitch;
+use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -681,6 +682,7 @@ impl ResultsView {
             .flex_1()
             .min_h_0()
             // .child(inner.flex_1().min_w_0())
+            // .child(div().min_h_0().flex_1().min_w_0().child(inner))
             .child(inner)
             .child(self.render_value_panel_divider(cx))
             .child(
@@ -777,6 +779,8 @@ impl ResultsView {
                     .text_color(rgb(active_theme.colors.text_tertiary))
                     .child(detail.to_owned()),
             )
+            .flex_1()
+            .min_w_0()
     }
 
     /// The grid, or the Text view when `view_mode` is `Text` and the result
@@ -788,7 +792,7 @@ impl ResultsView {
         if self.view_mode == ViewMode::Text && self.text_view.read(cx).has_document() {
             self.text_view.clone().into_any_element()
         } else {
-            self.render_grid(cx).into_any_element()
+            self.render_grid(cx).flex_1().min_w_0().into_any_element()
         }
     }
 
@@ -1084,67 +1088,42 @@ impl ResultsView {
     /// absorbs off-menu clicks, mirroring the sidebar's relation-row context
     /// menu. Renders nothing when no menu is open.
     fn render_cell_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let active_theme = cx.theme();
-        let menu = self.cell_context_menu.clone()?;
-
-        let content = div()
-            .id("results-cell-context-menu")
-            .occlude()
-            .w(theme::CONTEXT_MENU_WIDTH)
-            .p(theme::CONTEXT_MENU_PADDING)
-            .bg(rgb(active_theme.colors.bg_raised))
-            .border_1()
-            .border_color(rgb(active_theme.colors.border))
-            .rounded(px(theme::CONTEXT_MENU_RADIUS))
-            .child(context_menu_item(cx, "View value", |view, _window, cx| {
-                view.view_value_from_menu(cx);
-            }))
-            .child(context_menu_item(cx, "Copy value", |view, window, cx| {
-                view.copy_focused_cell(&Copy, window, cx);
+        let menu_state = self.cell_context_menu.as_ref()?;
+        let menu = ContextMenu::new("results-cell-context-menu")
+            .position(menu_state.position)
+            .on_close(cx.listener(|view, _event, _window, cx| {
                 view.close_cell_context_menu(cx);
             }))
-            .child(context_menu_item(
-                cx,
-                "Copy row as JSON",
-                |view, _window, cx| {
-                    view.copy_row_as_json(cx);
+            .add_item(ContextMenuItem::new("View value").on_click(cx.listener(
+                |view, _event, _window, cx| {
+                    view.view_value_from_menu(cx);
+                },
+            )))
+            .add_item(ContextMenuItem::new("Copy value").on_click(cx.listener(
+                |view, _event, window, cx| {
+                    view.copy_focused_cell(&Copy, window, cx);
                     view.close_cell_context_menu(cx);
                 },
-            ))
-            .child(context_menu_separator(active_theme))
-            .child(context_menu_item(
-                cx,
-                "Copy column name",
-                |view, _window, cx| {
-                    view.copy_column_name(cx);
-                    view.close_cell_context_menu(cx);
-                },
-            ));
-
-        let backdrop = div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
-                    view.close_cell_context_menu(cx);
-                }),
+            )))
+            .add_item(
+                ContextMenuItem::new("Copy row as JSON").on_click(cx.listener(
+                    |view, _event, _window, cx| {
+                        view.copy_row_as_json(cx);
+                        view.close_cell_context_menu(cx);
+                    },
+                )),
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
-                    view.close_cell_context_menu(cx);
-                }),
-            )
-            .child(
-                anchored()
-                    .position(menu.position)
-                    .snap_to_window()
-                    .child(content),
+            .add_separator()
+            .add_item(
+                ContextMenuItem::new("Copy column name").on_click(cx.listener(
+                    |view, _event, _window, cx| {
+                        view.copy_column_name(cx);
+                        view.close_cell_context_menu(cx);
+                    },
+                )),
             );
 
-        Some(deferred(backdrop).with_priority(1).into_any_element())
+        Some(menu.into_any_element())
     }
 
     // ---- value panel: open/close/pin/follow-selection ----------------
@@ -1434,41 +1413,6 @@ impl Render for ResultsView {
             .child(self.render_status_bar(cx))
             .children(self.render_cell_context_menu(cx))
     }
-}
-
-/// One results grid context menu row, mirroring `sidebar.rs`'s
-/// `context_menu_item`/`ContextMenuState` pattern for the sidebar's
-/// relation-row context menu.
-fn context_menu_item(
-    cx: &Context<ResultsView>,
-    label: &'static str,
-    on_click: impl Fn(&mut ResultsView, &mut Window, &mut Context<ResultsView>) + 'static,
-) -> Stateful<Div> {
-    let active_theme = cx.theme();
-    div()
-        .id(label)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(theme::CONTEXT_MENU_ITEM_HEIGHT)
-        .px(theme::CONTEXT_MENU_ITEM_PADDING_X)
-        .rounded(px(theme::CONTEXT_MENU_ITEM_RADIUS))
-        .cursor_pointer()
-        .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
-        .text_color(rgb(active_theme.colors.text_primary))
-        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(active_theme))))
-        .child(label)
-        .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-            on_click(view, window, cx);
-        }))
-}
-
-/// A thin horizontal divider between context menu item groups.
-fn context_menu_separator(active_theme: &Theme) -> Div {
-    div()
-        .h(theme::CONTEXT_MENU_SEPARATOR_HEIGHT)
-        .my(theme::CONTEXT_MENU_SEPARATOR_MARGIN_Y)
-        .bg(rgb(active_theme.colors.border_soft))
 }
 
 /// A data column's header content: its name plus a type-name badge.

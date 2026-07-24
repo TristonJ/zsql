@@ -2,6 +2,7 @@
 //! views
 
 pub mod button;
+pub mod context_menu;
 pub mod grid;
 pub mod icon;
 pub mod icon_button;

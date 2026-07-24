@@ -452,6 +452,7 @@ impl Render for TextView {
             .flex_row()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .bg(rgb(colors.bg_app))
             .on_mouse_up(
                 MouseButton::Left,
