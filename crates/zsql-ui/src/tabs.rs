@@ -4,9 +4,9 @@
 //! only primitives, so the caller owns all tab data, click behavior, and any
 //! domain-specific styling layered on top (e.g. a "generated" tint).
 
-use gpui::{Div, div, prelude::*, px, rgb};
+use gpui::{Div, div, prelude::*, px, rgb, rgba};
 
-use crate::theme::Theme;
+use crate::{icon::icon, theme::Theme};
 
 /// Height of the tab bar and every tab within it.
 pub const TAB_BAR_HEIGHT: gpui::Pixels = px(36.0);
@@ -119,12 +119,22 @@ pub fn active_underline_dashed(theme: &Theme) -> Div {
 
 /// A tab's trailing close ("x") affordance.
 #[must_use]
-pub fn close_glyph(theme: &Theme) -> Div {
+pub fn close_glyph(id: impl AsRef<str>, theme: &Theme) -> Div {
+    let text_primary = rgb(theme.colors.text_primary);
+    let id = id.as_ref().to_string();
     div()
         .flex_shrink_0()
         .text_size(px(TAB_CLOSE_TEXT_SIZE))
         .text_color(rgb(theme.colors.text_tertiary))
-        .child("x")
+        .group(id.clone())
+        .child(
+            icon(
+                crate::icon::IconName::Close,
+                px(TAB_CLOSE_TEXT_SIZE),
+                theme.colors.text_tertiary,
+            )
+            .group_hover(id, |el| el.text_color(text_primary)),
+        )
 }
 
 /// The trailing "+" affordance that opens a new script tab.

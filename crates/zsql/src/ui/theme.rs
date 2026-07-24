@@ -339,6 +339,8 @@ pub const SCHEMA_SECTION_LABEL_MARGIN_BOTTOM: Pixels = px(8.0);
 pub const SCHEMA_SECTION_COUNT_PILL_RADIUS: f32 = 20.0;
 /// Horizontal padding inside a section label's trailing count pill.
 pub const SCHEMA_SECTION_COUNT_PILL_PADDING_X: Pixels = px(7.0);
+/// The minimum width of the schema sections
+pub const SCHEMA_SECTION_WIDTH: Pixels = px(1000.0);
 
 /// Width of a column row's left key-rail tick.
 pub const SCHEMA_RAIL_WIDTH: Pixels = px(3.0);

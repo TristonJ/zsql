@@ -204,6 +204,7 @@ impl SchemaTabView {
             )
             .child(
                 div()
+                    .ml_2()
                     .text_size(px(theme::SCHEMA_KIND_PILL_TEXT_SIZE))
                     .text_color(rgb(colors.accent))
                     .border_1()
@@ -268,6 +269,7 @@ impl SchemaTabView {
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
+                    row_height: px(36.0),
                     ..TableStyle::themed(active_theme)
                 })
                 .columns(columns)
@@ -323,7 +325,7 @@ impl SchemaTabView {
                     div()
                         .px(cell_x_padding())
                         .child(
-                            grid::type_tag(&column.type_name, active_theme)
+                            grid::type_tag_accent(&column.type_name, active_theme)
                                 .flex_shrink_0()
                                 .into_any_element(),
                         )
@@ -365,6 +367,10 @@ impl SchemaTabView {
             "Indexes",
             detail.indexes.len(),
             Table::new("schema-indexes-table", &self.indexes_table)
+                .style(TableStyle {
+                    row_height: px(36.0),
+                    ..TableStyle::themed(active_theme)
+                })
                 .columns(columns)
                 .row_count(detail.indexes.len())
                 .rows(Self::render_index_table_row_cells)
@@ -446,6 +452,10 @@ impl SchemaTabView {
             "Constraints",
             detail.constraints.len(),
             Table::new("schema-constraints-table", &self.constraints_table)
+                .style(TableStyle {
+                    row_height: px(36.0),
+                    ..TableStyle::themed(active_theme)
+                })
                 .columns(columns)
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)
@@ -579,6 +589,8 @@ fn section(
     div()
         .flex()
         .flex_col()
+        .w(theme::SCHEMA_SECTION_WIDTH)
+        .max_w_full()
         .child(
             div()
                 .flex()

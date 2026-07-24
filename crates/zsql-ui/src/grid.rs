@@ -19,14 +19,26 @@ pub const TYPE_TAG_RADIUS: f32 = 4.0;
 /// Diameter of a status dot.
 pub const STATUS_DOT_SIZE: f32 = 6.0;
 
-/// A small type-name badge, e.g. shown next to a column's name in a header.
+/// A small type-name badge, when it's fairly important
 #[must_use]
-pub fn type_tag(type_name: &str, theme: &Theme) -> Div {
+pub fn type_tag_accent(type_name: &str, theme: &Theme) -> Div {
+    type_tag_base(type_name)
+        .text_color(rgb(theme.colors.accent))
+        .border_color(rgba(Colors::wash(theme.colors.accent, 0x47)))
+}
+
+/// A small type-name badge, when it's not the primary display piece
+#[must_use]
+pub fn type_tag_tertiary(type_name: &str, theme: &Theme) -> Div {
+    type_tag_base(type_name)
+        .text_color(rgb(theme.colors.text_tertiary))
+        .border_color(rgb(theme.colors.border))
+}
+
+fn type_tag_base(type_name: &str) -> Div {
     div()
         .text_size(px(TYPE_TAG_TEXT_SIZE))
-        .text_color(rgb(theme.colors.accent))
         .border_1()
-        .border_color(rgba(Colors::wash(theme.colors.accent, 0x47)))
         .px(px(TYPE_TAG_PADDING_X))
         .rounded(px(TYPE_TAG_RADIUS))
         .child(type_name.to_owned())
@@ -58,12 +70,12 @@ pub fn status_dot_outline(border_color: u32) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, status_dot, status_dot_outline, type_tag};
+    use super::{Theme, status_dot, status_dot_outline, type_tag_accent};
 
     #[test]
     fn type_tag_builds_for_a_type_name() {
         let theme = Theme::default();
-        let _tag = type_tag("int8", &theme);
+        let _tag = type_tag_accent("int8", &theme);
     }
 
     #[test]
