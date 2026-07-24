@@ -14,7 +14,9 @@ mod ui;
 
 use config::Config;
 use connections::ConnectionStore;
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
+};
 use session::{Session, SessionState};
 use ui::workspace::WorkspaceView;
 use zsql_ui::theme::{Theme, get_builtin_fonts};
@@ -23,6 +25,13 @@ use zsql_ui::theme::{Theme, get_builtin_fonts};
 const WINDOW_WIDTH: f32 = 1180.0;
 /// Default window size for the workspace.
 const WINDOW_HEIGHT: f32 = 760.0;
+
+/// The window title shown by the OS (taskbar, window list, title bar).
+const APP_TITLE: &str = "zsql";
+/// Reverse-DNS application identifier reported to the OS. Desktop environments
+/// use it to group the app's windows together, and it is the id the platform
+/// packaging (macOS bundle, Linux `.desktop` `StartupWMClass`) must match.
+const APP_ID: &str = "com.tristonj.zsql";
 
 fn main() -> anyhow::Result<()> {
     observability::init();
@@ -59,6 +68,11 @@ fn main() -> anyhow::Result<()> {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(APP_TITLE.into()),
+                        ..Default::default()
+                    }),
+                    app_id: Some(APP_ID.to_owned()),
                     ..Default::default()
                 },
                 |window, cx| {
