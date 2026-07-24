@@ -29,7 +29,7 @@ impl Render for ConnectionManagerView {
         });
         Modal::<Div, Div>::new("connection-modal")
             .track_focus(&self.modal_focus)
-            .on_close(cx.listener(|view, _, _w, cx| view.close(cx)))
+            .on_close(cx.listener(|view, (), _w, cx| view.close(cx)))
             .head(self.render_modal_head(cx))
             .body(body)
     }
