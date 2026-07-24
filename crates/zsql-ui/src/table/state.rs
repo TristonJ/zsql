@@ -2,8 +2,9 @@
 //! handles both of its panes share, and the [`ScrollableState`] composing
 //! them into scrollbars.
 
-use gpui::{AppContext as _, Context, Entity, ScrollHandle, UniformListScrollHandle};
+use gpui::{AppContext as _, Context, Entity, Pixels, ScrollHandle, UniformListScrollHandle};
 
+use super::resize::ColumnResizeDrag;
 use crate::scrollable::ScrollableState;
 
 /// Frame-persistent scroll and selection state a [`super::Table`] needs
@@ -17,6 +18,9 @@ pub struct TableState {
     /// into the caller's own data -- never the pinned gutter, never
     /// viewport-relative.
     focused_cell: Option<(usize, usize)>,
+    /// `Some` while a column resize drag (see
+    /// [`super::Table::resizable_columns`]) is in progress.
+    column_resize: Option<ColumnResizeDrag>,
 }
 
 impl TableState {
@@ -29,6 +33,7 @@ impl TableState {
             row_scroll_handle: UniformListScrollHandle::new(),
             col_scroll_handle: ScrollHandle::new(),
             focused_cell: None,
+            column_resize: None,
         }
     }
 
@@ -59,6 +64,34 @@ impl TableState {
     /// itself notify -- see [`TableState::set_focused_cell`].
     pub fn clear_focused_cell(&mut self) {
         self.focused_cell = None;
+    }
+
+    /// Begin a column resize drag: `column`'s width is `start_width` and the
+    /// pointer sits at `origin_x` at this moment. Replaces any prior resize
+    /// drag outright. Never touches [`TableState::focused_cell`].
+    pub(super) fn begin_column_resize(
+        &mut self,
+        column: usize,
+        origin_x: Pixels,
+        start_width: Pixels,
+    ) {
+        self.column_resize = Some(ColumnResizeDrag {
+            column,
+            origin_x,
+            start_width,
+        });
+    }
+
+    /// The column resize drag currently in progress, if any.
+    pub(super) fn column_resize(&self) -> Option<ColumnResizeDrag> {
+        self.column_resize
+    }
+
+    /// End the current column resize drag, if one was in progress. Returns
+    /// whether a drag was actually cleared, so the caller only notifies when
+    /// something changed.
+    pub(super) fn end_column_resize(&mut self) -> bool {
+        self.column_resize.take().is_some()
     }
 }
 

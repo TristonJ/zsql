@@ -10,6 +10,10 @@ use crate::theme::Theme;
 pub const DEFAULT_HEADER_HEIGHT: Pixels = px(28.0);
 /// Height of each of a table's body rows.
 pub const DEFAULT_ROW_HEIGHT: Pixels = px(24.0);
+/// Width of a [`super::Table::resizable_columns`] resize handle's hit
+/// target, straddling a header cell's trailing border so a hover near the
+/// border -- not only exactly on the hairline -- picks it up.
+pub(super) const COLUMN_RESIZE_HANDLE_WIDTH: Pixels = px(6.0);
 
 /// Which structural hairlines a table draws. Each edge is independent, so a
 /// caller can drop e.g. column separators while keeping row separators.
