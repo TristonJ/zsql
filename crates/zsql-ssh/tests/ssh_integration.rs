@@ -113,6 +113,84 @@ fn tunnel_forwards_bytes_to_the_real_postgres_server_with_password_auth() {
     assert_tunnel_forwards_to_postgres(cfg);
 }
 
+/// Dropping the tunnel must not just stop *new* connections from being
+/// accepted -- it must also sever an already-open forwarded connection, so
+/// a client mid-conversation with the real server sees its socket close
+/// rather than being left to talk to a database through a tunnel that no
+/// longer exists.
+#[test]
+fn dropping_the_tunnel_closes_an_already_open_forwarded_connection() {
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_user = required_env("ZSQL_TEST_SSH_USER");
+    let ssh_password = required_env("ZSQL_TEST_SSH_PASSWORD");
+    let (remote_host, remote_port) = remote_target();
+
+    let mut cfg = SshConfig::new(ssh_host, ssh_user, SshAuth::Password(ssh_password));
+    cfg.port = ssh_port();
+    cfg.host_key = HostKeyPolicy::AcceptNew;
+
+    let tunnel = block_on(open_tunnel(cfg, remote_host, remote_port))
+        .expect("tunnel should open against the dev sshd + postgres");
+
+    let mut socket = TcpStream::connect(tunnel.local_addr())
+        .expect("connecting to the tunnel's local loopback address should succeed");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout should succeed");
+
+    socket
+        .write_all(&SSL_REQUEST)
+        .expect("writing the SSLRequest packet through the tunnel should succeed");
+    let mut reply = [0u8; 1];
+    socket
+        .read_exact(&mut reply)
+        .expect("postgres should reply to the SSLRequest through the tunnel");
+
+    drop(tunnel);
+
+    // The already-open socket must observe the connection closing: either
+    // a subsequent read returns immediately (EOF/error) instead of hanging,
+    // or a write eventually fails. Polled with a bounded number of short
+    // sleeps rather than asserted instantaneously, since the tunnel's
+    // teardown runs asynchronously on its own background runtime.
+    let mut observed_closed = false;
+    for _ in 0..100 {
+        let mut probe = [0u8; 1];
+        let Ok(()) = socket.write_all(&SSL_REQUEST) else {
+            observed_closed = true;
+            break;
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set_read_timeout should succeed");
+        match socket.read(&mut probe) {
+            Ok(0) => {
+                observed_closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                observed_closed = true;
+                break;
+            }
+            Err(_timed_out) => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        observed_closed,
+        "an already-open forwarded connection must close once its tunnel is dropped"
+    );
+}
+
 #[test]
 fn tunnel_forwards_bytes_to_the_real_postgres_server_with_key_auth() {
     let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");

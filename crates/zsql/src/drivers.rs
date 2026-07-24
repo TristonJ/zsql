@@ -6,6 +6,7 @@
 //! everything downstream (`session.rs`, the connection-manager UI) goes
 //! through [`connect`] and never picks a driver directly.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use zsql_core::{Connection, CoreError, Driver};
@@ -41,6 +42,32 @@ pub async fn connect(url: String) -> Result<Box<dyn Connection>, CoreError> {
     let driver = zsql_core::select_driver(&drivers, &url)?;
     tracing::info!(driver = driver.id(), "driver selected for connection");
     let cfg = driver.parse_url(&url)?;
+    driver.connect(&cfg).await
+}
+
+/// Resolve `url`'s scheme to a registered driver and connect through it,
+/// dialing `tunnel_addr` (an already-open local tunnel's loopback address)
+/// instead of `url`'s own host:port. Each registered driver translates this
+/// into its own client library's terms -- see each driver crate's `tunnel`
+/// module for the specifics.
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` is empty or its scheme has no
+/// registered driver, or whatever error the selected driver's own
+/// `parse_url`/`connect` returns.
+#[tracing::instrument(name = "connect_via_selected_driver_tunneled", skip_all)]
+pub async fn connect_tunneled(
+    url: String,
+    tunnel_addr: SocketAddr,
+) -> Result<Box<dyn Connection>, CoreError> {
+    let drivers = registered_drivers();
+    let driver = zsql_core::select_driver(&drivers, &url)?;
+    tracing::info!(
+        driver = driver.id(),
+        "driver selected for tunneled connection"
+    );
+    let mut cfg = driver.parse_url(&url)?;
+    cfg.tunnel_local_addr = Some(tunnel_addr);
     driver.connect(&cfg).await
 }
 

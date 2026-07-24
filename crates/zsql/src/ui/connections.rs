@@ -630,12 +630,13 @@ impl ConnectionManagerView {
     }
 
     /// Connect to the saved connection with `id` through
-    /// [`Session::connect_to`], the same driver-selection path every
-    /// connection in the app goes through, then -- mirroring the
-    /// connect-then-introspect sequencing the app runs at startup -- follows
-    /// a successful connect with [`Session::introspect`] so the schema
-    /// sidebar reflects the newly chosen connection rather than staying
-    /// empty or showing the previous connection's stale tree.
+    /// [`Session::connect_to_with_ssh`], the same driver-selection path
+    /// every connection in the app goes through (opening the connection's
+    /// SSH tunnel first when one is configured and enabled), then --
+    /// mirroring the connect-then-introspect sequencing the app runs at
+    /// startup -- follows a successful connect with [`Session::introspect`]
+    /// so the schema sidebar reflects the newly chosen connection rather
+    /// than staying empty or showing the previous connection's stale tree.
     ///
     /// [`Self::active`] is updated to this row's name/url synchronously,
     /// before the connect attempt itself runs, so anything observing this
@@ -663,6 +664,15 @@ impl ConnectionManagerView {
                 return Task::ready(());
             }
         };
+        let ssh = match row.connection.ssh_config() {
+            Ok(ssh) => ssh,
+            Err(err) => {
+                tracing::error!(error = %err, "unable to read SSH tunnel secret");
+                self.status = Some(format!("Failed to connect to {name}: {err}"));
+                cx.notify();
+                return Task::ready(());
+            }
+        };
         tracing::info!(name = %name, "connecting to saved connection");
         self.status = Some("connecting...".to_string());
         self.active = Some(ActiveConnection {
@@ -674,7 +684,7 @@ impl ConnectionManagerView {
 
         let connect_task = self
             .session
-            .update(cx, |session, cx| session.connect_to(url, cx));
+            .update(cx, |session, cx| session.connect_to_with_ssh(url, ssh, cx));
         let session = self.session.clone();
         cx.spawn(async move |this, cx| {
             connect_task.await;

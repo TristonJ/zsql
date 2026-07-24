@@ -230,6 +230,10 @@ async fn accept_loop(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut keepalive_ticks = keepalive_interval(keepalive).await;
+    // Tracks every still-running forwarded-connection copy task, so
+    // shutdown can abort them explicitly instead of leaving them to notice
+    // the session disconnecting on their own (see below).
+    let mut forwarded: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
@@ -240,7 +244,15 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((socket, peer)) => {
-                        forward_connection(&session, socket, peer, &remote_host, remote_port).await;
+                        forward_connection(
+                            &session,
+                            socket,
+                            peer,
+                            &remote_host,
+                            remote_port,
+                            &mut forwarded,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "ssh tunnel listener accept failed");
@@ -252,10 +264,22 @@ async fn accept_loop(
                     tracing::warn!(error = %err, "ssh tunnel keepalive failed");
                 }
             }
+            // Reaps finished forwarded-connection tasks as they complete,
+            // so a long-lived tunnel serving many short connections does
+            // not accumulate an ever-growing set of already-done handles.
+            Some(_) = forwarded.join_next(), if !forwarded.is_empty() => {}
         }
     }
 
     drop(listener);
+    // A forwarded connection's copy task can otherwise sit idle
+    // indefinitely waiting on a read that never resolves on its own, so it
+    // is aborted explicitly rather than left to notice the session
+    // disconnecting -- this is what actually severs an already-open
+    // connection through the tunnel (a live database connection, say) the
+    // moment the tunnel is torn down, not just stops new ones from being
+    // accepted.
+    forwarded.abort_all();
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "tunnel closed", "en")
         .await;
@@ -285,14 +309,16 @@ async fn tick_keepalive(ticks: &mut Option<tokio::time::Interval>) {
     }
 }
 
-/// Opens a `direct-tcpip` channel for one accepted socket and spawns a
-/// detached task that copies bytes both ways until either side closes.
+/// Opens a `direct-tcpip` channel for one accepted socket and spawns a task
+/// (tracked in `forwarded`, so the tunnel's shutdown can abort it) that
+/// copies bytes both ways until either side closes.
 async fn forward_connection(
     session: &SessionHandle,
     socket: TcpStream,
     peer: SocketAddr,
     remote_host: &str,
     remote_port: u16,
+    forwarded: &mut tokio::task::JoinSet<()>,
 ) {
     let channel = session
         .channel_open_direct_tcpip(
@@ -311,7 +337,7 @@ async fn forward_connection(
         }
     };
 
-    tokio::spawn(async move {
+    forwarded.spawn(async move {
         let mut socket = socket;
         let mut stream = channel.into_stream();
         if let Err(err) = copy_bidirectional(&mut socket, &mut stream).await {

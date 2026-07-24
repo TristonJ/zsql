@@ -1,5 +1,7 @@
 //! Engine-neutral connection configuration.
 
+use std::net::SocketAddr;
+
 use crate::error::CoreError;
 
 /// Connection configuration. For now this wraps a URL/URL string as-is
@@ -7,10 +9,16 @@ use crate::error::CoreError;
 pub struct ConnConfig {
     /// The connection URL (e.g. `postgres://user:pass@host:5432/db`).
     pub url: String,
+    /// When set, the caller has already opened a local tunnel and this is
+    /// its loopback address: a network driver dials this instead of `url`'s
+    /// own host:port, per that driver's own tunneled-connect translation.
+    /// `None` for an untunneled connect, which is behaviorally identical to
+    /// this field never having existed.
+    pub tunnel_local_addr: Option<SocketAddr>,
 }
 
 impl ConnConfig {
-    /// Build a config from a URL string.
+    /// Build a config from a URL string, with no tunnel.
     ///
     /// # Errors
     /// Returns [`CoreError::Url`] if the URL is empty.
@@ -20,6 +28,7 @@ impl ConnConfig {
         }
         Ok(Self {
             url: url.to_owned(),
+            tunnel_local_addr: None,
         })
     }
 }

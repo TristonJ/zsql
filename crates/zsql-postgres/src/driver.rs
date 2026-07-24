@@ -153,13 +153,24 @@ impl Driver for PostgresDriver {
         ConnConfig::from_url(url)
     }
 
-    #[tracing::instrument(name = "pg_connect", skip_all, fields(driver = self.id()))]
+    #[tracing::instrument(
+        name = "pg_connect",
+        skip_all,
+        fields(driver = self.id(), tls_mode = tracing::field::Empty)
+    )]
     async fn connect(&self, cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
         // Never log `cfg.url`: it may embed a password. Only non-secret
-        // fields (the driver id, above) are attached to this span.
-        let pool = Self::build_pool(&cfg.url).await?;
-        let cancel_pool = Self::build_side_pool(&cfg.url, CANCEL_POOL_CONNECTIONS)?;
-        let probe_pool = Self::build_probe_pool(&cfg.url)?;
+        // fields (the driver id and TLS mode, never the URL) are attached to
+        // this span.
+        let (url, tls_mode) = match cfg.tunnel_local_addr {
+            Some(tunnel_addr) => crate::tunnel::tunneled_connect_url(&cfg.url, tunnel_addr)?,
+            None => (cfg.url.clone(), zsql_core::TlsVerify::Off),
+        };
+        tracing::Span::current().record("tls_mode", tls_mode.label());
+
+        let pool = Self::build_pool(&url).await?;
+        let cancel_pool = Self::build_side_pool(&url, CANCEL_POOL_CONNECTIONS)?;
+        let probe_pool = Self::build_probe_pool(&url)?;
         tracing::info!("postgres connection established");
         Ok(Box::new(PgConnection {
             pool,
@@ -550,6 +561,7 @@ mod tests {
         // Not a valid postgres URL at all (no scheme).
         let cfg = ConnConfig {
             url: "not a valid url".to_owned(),
+            tunnel_local_addr: None,
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));

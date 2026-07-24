@@ -19,6 +19,7 @@
 //! connections for free, without needing a hand-rolled connection pool on
 //! top of a client `tiberius` does not itself pool.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_io::Timer;
@@ -67,17 +68,38 @@ impl Driver for MssqlDriver {
         ConnConfig::from_url(url)
     }
 
-    #[tracing::instrument(name = "mssql_connect", skip_all, fields(driver = self.id()))]
+    #[tracing::instrument(
+        name = "mssql_connect",
+        skip_all,
+        fields(driver = self.id(), tls_mode = tracing::field::Empty)
+    )]
     async fn connect(&self, cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
         // Never log `cfg.url`: it may embed a password. Only non-secret
-        // fields (the driver id, above) are attached to this span.
+        // fields (the driver id and TLS mode, never the URL) are attached to
+        // this span.
         let url = crate::url::parse(&cfg.url)?;
         let config = build_tiberius_config(&url);
-        let mut client = open_client(&config).await?;
+        let dial_addr = cfg.tunnel_local_addr;
+        tracing::Span::current().record("tls_mode", tls_mode_for(&url).label());
+
+        let mut client = open_client(&config, dial_addr).await?;
         liveness_check(&mut client).await?;
         drop(client);
         tracing::info!("mssql connection established");
-        Ok(Box::new(MssqlConnection { config }))
+        Ok(Box::new(MssqlConnection { config, dial_addr }))
+    }
+}
+
+/// The TLS verification level `url` requests, for tracing only: `Off` when
+/// TLS is disabled or the server certificate is trusted unconditionally
+/// (`trustServerCertificate=true`), otherwise `VerifyFull` -- `tiberius` has
+/// no separate "verify chain but not hostname" mode, so there is no
+/// `VerifyCa` case for this driver.
+fn tls_mode_for(url: &MssqlUrl) -> zsql_core::TlsVerify {
+    if !url.encrypt || url.trust_server_certificate {
+        zsql_core::TlsVerify::Off
+    } else {
+        zsql_core::TlsVerify::VerifyFull
     }
 }
 
@@ -100,17 +122,31 @@ fn build_tiberius_config(url: &MssqlUrl) -> tiberius::Config {
     });
     if url.trust_server_certificate {
         config.trust_cert();
+    } else if let Some(ca_cert) = &url.ca_cert {
+        config.trust_cert_ca(ca_cert);
     }
     config
 }
 
 /// Open a fresh TCP connection and complete the TDS login handshake, giving
 /// up after [`CONNECT_TIMEOUT`] so an unreachable host cannot hang forever.
-async fn open_client(config: &tiberius::Config) -> Result<Client<TcpStream>, CoreError> {
+///
+/// When `dial_addr` is set, the TCP connection is made to that address (a
+/// local tunnel's loopback endpoint) instead of `config.get_addr()`, while
+/// `config` itself -- and in particular `config.host`, which drives TLS
+/// hostname verification -- is untouched. This is what lets a tunneled
+/// connection both route through the tunnel and verify the server's
+/// certificate against its real hostname.
+async fn open_client(
+    config: &tiberius::Config,
+    dial_addr: Option<SocketAddr>,
+) -> Result<Client<TcpStream>, CoreError> {
     let connect = async {
-        let tcp = TcpStream::connect(config.get_addr())
-            .await
-            .map_err(|err| map_io_connect_error(&err))?;
+        let tcp = match dial_addr {
+            Some(addr) => TcpStream::connect(addr).await,
+            None => TcpStream::connect(config.get_addr()).await,
+        }
+        .map_err(|err| map_io_connect_error(&err))?;
         tcp.set_nodelay(true)
             .map_err(|err| map_io_connect_error(&err))?;
         Client::connect(config.clone(), tcp)
@@ -148,6 +184,10 @@ async fn liveness_check(client: &mut Client<TcpStream>) -> Result<i32, CoreError
 /// the module-level doc comment's no-persistent-connection design.
 pub struct MssqlConnection {
     config: tiberius::Config,
+    /// When set, every operation dials this address (a local tunnel's
+    /// loopback endpoint) instead of `config.get_addr()`. See
+    /// [`open_client`].
+    dial_addr: Option<SocketAddr>,
 }
 
 #[async_trait]
@@ -155,25 +195,26 @@ impl Connection for MssqlConnection {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
         let (cancel_tx, cancel_rx) = flume::unbounded();
         let config = self.config.clone();
-        async_global_executor::spawn(run_query(config, sql, sink, cancel_rx)).detach();
+        let dial_addr = self.dial_addr;
+        async_global_executor::spawn(run_query(config, dial_addr, sql, sink, cancel_rx)).detach();
         QueryHandle::new(cancel_tx)
     }
 
     #[tracing::instrument(name = "mssql_introspect", skip_all)]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        let mut client = open_client(&self.config).await?;
+        let mut client = open_client(&self.config, self.dial_addr).await?;
         crate::introspect::introspect(&mut client).await
     }
 
     #[tracing::instrument(name = "mssql_ping", skip_all)]
     async fn ping(&self) -> Result<(), CoreError> {
-        let mut client = open_client(&self.config).await?;
+        let mut client = open_client(&self.config, self.dial_addr).await?;
         liveness_check(&mut client).await.map(|_| ())
     }
 
     #[tracing::instrument(name = "mssql_count_rows", skip(self))]
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        let mut client = open_client(&self.config).await?;
+        let mut client = open_client(&self.config, self.dial_addr).await?;
         let partition_row_count = fetch_partition_row_count(&mut client, schema, relation).await?;
         if let Some(row_count) = row_count_from_partition_stats(partition_row_count) {
             tracing::debug!(?row_count, "using partition-stats row-count estimate");
@@ -190,7 +231,7 @@ impl Connection for MssqlConnection {
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
-        let mut client = open_client(&self.config).await?;
+        let mut client = open_client(&self.config, self.dial_addr).await?;
         crate::describe::describe_relation(&mut client, schema, relation).await
     }
 
@@ -316,13 +357,14 @@ async fn fetch_last_rowcount(client: &mut Client<TcpStream>) -> Option<u64> {
 #[tracing::instrument(name = "mssql_stream_query", skip_all)]
 async fn run_query(
     config: tiberius::Config,
+    dial_addr: Option<SocketAddr>,
     sql: String,
     sink: BatchSink,
     cancel_rx: flume::Receiver<()>,
 ) {
     tracing::debug!(sql = %sql, "streaming query");
 
-    let mut client = match open_client(&config).await {
+    let mut client = match open_client(&config, dial_addr).await {
         Ok(client) => client,
         Err(err) => {
             let _ = sink.send_async(Err(err)).await;
@@ -416,6 +458,45 @@ mod tests {
     }
 
     #[test]
+    fn tls_mode_for_is_off_when_the_certificate_is_trusted_unconditionally() {
+        let url =
+            crate::url::parse("mssql://sa:pw@db.internal/db?trustServerCertificate=true").unwrap();
+        assert_eq!(super::tls_mode_for(&url), zsql_core::TlsVerify::Off);
+    }
+
+    #[test]
+    fn tls_mode_for_is_off_when_encryption_is_disabled() {
+        let url = crate::url::parse("mssql://sa:pw@db.internal/db?encrypt=false").unwrap();
+        assert_eq!(super::tls_mode_for(&url), zsql_core::TlsVerify::Off);
+    }
+
+    #[test]
+    fn tls_mode_for_is_verify_full_when_encrypted_and_the_certificate_is_not_trusted_unconditionally()
+     {
+        let url = crate::url::parse("mssql://sa:pw@db.internal/db").unwrap();
+        assert_eq!(super::tls_mode_for(&url), zsql_core::TlsVerify::VerifyFull);
+    }
+
+    /// `tiberius::Config` panics if both `trust_cert` and `trust_cert_ca`
+    /// are ever called on the same config; `trust_server_certificate=true`
+    /// must win over a `sslrootcert` given alongside it, not trigger that
+    /// panic.
+    #[test]
+    fn build_tiberius_config_prefers_trusting_the_certificate_unconditionally_over_a_ca_path() {
+        let url = crate::url::parse(
+            "mssql://sa:pw@db.internal/db?trustServerCertificate=true&sslrootcert=/ca.crt",
+        )
+        .unwrap();
+        super::build_tiberius_config(&url);
+    }
+
+    #[test]
+    fn build_tiberius_config_accepts_a_ca_path_with_no_trust_server_certificate() {
+        let url = crate::url::parse("mssql://sa:pw@db.internal/db?sslrootcert=/ca.crt").unwrap();
+        super::build_tiberius_config(&url);
+    }
+
+    #[test]
     fn driver_ids_are_stable() {
         let driver = MssqlDriver;
         assert_eq!(driver.id(), "mssql");
@@ -460,9 +541,46 @@ mod tests {
         let driver = MssqlDriver;
         let cfg = ConnConfig {
             url: "not a valid url".to_owned(),
+            tunnel_local_addr: None,
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));
+    }
+
+    /// `open_client` must dial `dial_addr` (a stand-in for a tunnel's local
+    /// loopback endpoint) rather than `config.get_addr()` (an unrelated,
+    /// unreachable host), while leaving `config.host` -- what TLS hostname
+    /// verification is checked against -- completely untouched. Proven by
+    /// binding a real local listener, passing its address as `dial_addr`,
+    /// and observing the connection actually arrive there.
+    #[test]
+    fn open_client_dials_the_override_address_leaving_config_host_untouched() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind local test listener");
+        let dial_addr = listener.local_addr().expect("listener local_addr");
+
+        let config = super::build_tiberius_config(
+            &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
+        );
+        assert!(
+            config.get_addr().contains("zsql-test-nonexistent-host"),
+            "sanity check: config.host must still name the unreachable host"
+        );
+
+        let accept = std::thread::spawn(move || listener.accept());
+        // `open_client` will fail the TDS handshake against a plain
+        // listener -- only the dial target is under test here.
+        let _ = block_on(super::open_client(&config, Some(dial_addr)));
+
+        let (_, peer) = accept
+            .join()
+            .expect("accept thread must not panic")
+            .expect("the dial must reach the local listener within this test");
+        assert_ne!(
+            peer.port(),
+            0,
+            "the local listener must have observed a real inbound connection"
+        );
     }
 
     #[test]
@@ -517,7 +635,10 @@ mod tests {
         let config = super::build_tiberius_config(
             &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
         );
-        super::MssqlConnection { config }
+        super::MssqlConnection {
+            config,
+            dial_addr: None,
+        }
     }
 
     #[test]
@@ -573,7 +694,10 @@ mod tests {
         let config = super::build_tiberius_config(
             &crate::url::parse(UNREACHABLE_URL).expect("url should parse"),
         );
-        let handle = super::MssqlConnection { config };
+        let handle = super::MssqlConnection {
+            config,
+            dial_addr: None,
+        };
         let _query_handle = handle.stream_query("SELECT 1".to_owned(), tx);
 
         let evt = rx
