@@ -3,7 +3,7 @@
 //! add/edit form panel (which just hands off to [`super::form::ConnectionForm`]'s
 //! own `Render` impl).
 
-use gpui::{ClickEvent, Context, Div, KeyDownEvent, Render, Window, div, prelude::*, px, rgb};
+use gpui::{Context, Div, KeyDownEvent, Render, Window, div, prelude::*, px, rgb};
 use zsql_ui::modal::Modal;
 use zsql_ui::theme::ActiveTheme;
 
@@ -12,13 +12,14 @@ use crate::ui::connections::list::{ConnectionList, ConnectionListEvent};
 use crate::ui::theme;
 
 impl Render for ConnectionManagerView {
-    /// The modal overlay: a dimmed backdrop (clicking it closes the modal)
-    /// centering a panel that shows either the list or the add/edit form.
-    /// Only ever mounted while [`Self::is_open`] is true -- the caller
-    /// (`ui::workspace::WorkspaceView`) is responsible for conditionally
-    /// mounting this entity in the first place, so `render` does not
-    /// re-check `open` itself.
+    /// The connection manager modal. The caller (`ui::workspace::WorkspaceView`) is
+    /// responsible for conditionally mounting this entity in the first place, so `render`
+    /// does not re-check `open` itself.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Refocus the modal if we need to
+        if std::mem::take(&mut self.refocus_modal) {
+            self.modal_focus.focus(window);
+        }
         let mut body = div().on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
             view.handle_modal_key_down(event, window, cx);
         }));
@@ -41,20 +42,6 @@ impl ConnectionManagerView {
     fn render_modal_head(&self, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let mut head = div().flex().flex_row().items_center();
-
-        if !matches!(self.current_view(), ManagerView::List) {
-            head = head.child(
-                div()
-                    .id("connection-form-back")
-                    .cursor_pointer()
-                    .pr_2()
-                    .text_color(rgb(colors.text_tertiary))
-                    .child("<")
-                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                        view.cancel_form(cx);
-                    })),
-            );
-        }
 
         let is_edit = self.form.read(cx).is_edit();
         let title = match self.current_view() {
