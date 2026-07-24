@@ -24,6 +24,7 @@ use zsql_ui::table::{
 };
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+use super::connections::ConnectionManagerView;
 use super::format::{ValueKind, format_value};
 use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
@@ -31,6 +32,8 @@ use crate::session::{LivenessState, Session, SessionState};
 use crate::ui::format::{self, format_value_for_clipboard, group_thousands};
 use crate::ui::value_panel::data::ValuePanelContent;
 use crate::ui::value_panel::{self, ValuePanel};
+
+mod empty_state;
 
 /// The key context the results grid's own key bindings are scoped to, so
 /// they only fire while the grid is focused.
@@ -114,6 +117,12 @@ pub struct ResultsView {
     focus_handle: FocusHandle,
     /// The right-click cell context menu, if one is open.
     cell_context_menu: Option<CellContextMenuState>,
+    /// The connection-manager modal the Empty-state "Add connection" button
+    /// opens, wired in by [`ResultsView::set_connections_modal`]. `None`
+    /// until wired (e.g. a view built directly in a test other than one
+    /// exercising that button), in which case the button still renders but
+    /// clicking it is a no-op.
+    connections_modal: Option<Entity<ConnectionManagerView>>,
     /// The value panel
     value_panel: Entity<ValuePanel>,
     /// The panel's current dock width, draggable between
@@ -239,6 +248,7 @@ impl ResultsView {
             table_state: cx.new(TableState::new),
             focus_handle,
             cell_context_menu: None,
+            connections_modal: None,
             value_panel,
             // A view built without `configure_value_panel` (any caller other
             // than `WorkspaceView::new`, e.g. a test) still opens to a
@@ -283,6 +293,17 @@ impl ResultsView {
         self.value_panel_min_width = layout.value_panel.min_width;
         self.value_panel_max_width = layout.value_panel.max_width;
         self.value_panel_divider_thickness = layout.divider_thickness;
+    }
+
+    /// Wire the connection-manager modal the Empty-state "Add connection"
+    /// button opens, so clicking it opens the same shared instance the
+    /// connection footer's own click-to-connect affordance opens rather
+    /// than a second one. Called once by
+    /// [`crate::ui::workspace::WorkspaceView::new`] right after
+    /// construction; a view built directly (e.g. in a test) renders that
+    /// button inert until this is called.
+    pub fn set_connections_modal(&mut self, connections: Entity<ConnectionManagerView>) {
+        self.connections_modal = Some(connections);
     }
 
     /// Follow `session`'s state/result live under `source_label`, e.g. for
@@ -657,10 +678,15 @@ impl ResultsView {
             }
             SessionState::Empty => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
-                "No connection configured",
-                "Set DATABASE_URL or connection.default_url in your zsql config, then restart.",
+                empty_state::TITLE,
+                empty_state::DETAIL,
                 active_theme,
-            ),
+            )
+            .child(empty_state::render_add_connection_cta(
+                self.connections_modal.clone(),
+                window,
+                cx,
+            )),
             SessionState::Connecting => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Connecting…",
@@ -2636,6 +2662,32 @@ mod tests {
         ] {
             let session = cx.new(|_cx| Session::new_for_render_test(state, ResultSet::default()));
             cx.add_window_view(|_window, cx| super::ResultsView::new(session, "public.orders", cx));
+        }
+    }
+
+    #[gpui::test]
+    fn only_the_empty_state_paints_the_add_connection_control(cx: &mut gpui::TestAppContext) {
+        for state in [
+            SessionState::Connecting,
+            SessionState::Connected,
+            SessionState::Running,
+            SessionState::Truncated {
+                elapsed: Duration::from_millis(5),
+                rows: 1,
+            },
+            SessionState::Error("connection refused".to_owned()),
+        ] {
+            let session = cx.new(|_cx| Session::new_for_render_test(state, sample_result()));
+            let (_view, vcx) = cx.add_window_view(|_window, cx| {
+                super::ResultsView::new(session, "public.orders", cx)
+            });
+            vcx.run_until_parked();
+
+            assert!(
+                vcx.debug_bounds(super::empty_state::ADD_CONNECTION_ID)
+                    .is_none(),
+                "only the Empty-state body should paint the Add connection control"
+            );
         }
     }
 
