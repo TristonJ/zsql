@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
-use zsql_core::RelationKind;
+use zsql_core::{RelationKind, ResultSet};
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
@@ -296,13 +296,29 @@ impl TabModel {
             return;
         }
 
-        let snapshot = tab.last_run.clone().unwrap_or_else(|| ResultsSnapshot {
-            source_label: label,
-            state: SessionState::Connected,
-            result: zsql_core::ResultSet::default(),
+        if let Some(snapshot) = tab.last_run.clone() {
+            self.results
+                .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
+            return;
+        }
+
+        let state = self.session.read(cx).state().clone();
+        if matches!(state, SessionState::Empty | SessionState::Connecting) {
+            self.results
+                .update(cx, |results, cx| results.show_live(label, cx));
+            return;
+        }
+
+        self.results.update(cx, |results, cx| {
+            results.show_snapshot(
+                ResultsSnapshot {
+                    source_label: label,
+                    state: SessionState::Connected,
+                    result: ResultSet::default(),
+                },
+                cx,
+            );
         });
-        self.results
-            .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
     }
 
     /// Dispatch `task` (a run just started for `id`, labeled `label`) as

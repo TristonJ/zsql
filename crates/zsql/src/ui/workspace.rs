@@ -132,6 +132,9 @@ impl WorkspaceView {
         let connections = cx.new(|cx| {
             ConnectionManagerView::new(session.clone(), connection_store, probe_timeout, cx)
         });
+        results.update(cx, |results, _cx| {
+            results.set_connections_modal(connections.clone());
+        });
         let footer = cx.new(|cx| ConnectionFooterView::new(session, connections.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
