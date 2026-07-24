@@ -61,12 +61,16 @@ fn a_freshly_loaded_store_lists_every_saved_connection(cx: &mut TestAppContext) 
         .add(ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://localhost/app".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
     store
         .add(ConnectionArgs {
             name: "local sqlite".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -433,12 +437,16 @@ fn deleting_a_connection_removes_it_from_the_list_and_persists(cx: &mut TestAppC
         .add(ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add first");
     store
         .add(ConnectionArgs {
             name: "second".to_owned(),
             url: "sqlite:///tmp/b.db".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add second");
 
@@ -467,12 +475,16 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
         .add(ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add first");
     store
         .add(ConnectionArgs {
             name: "second".to_owned(),
             url: "postgres://host/b".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add second");
 
@@ -529,6 +541,8 @@ async fn connect_and_close_connects_and_clears_is_open(cx: &mut TestAppContext) 
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -565,6 +579,8 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -610,6 +626,8 @@ async fn connect_updates_active_synchronously_before_the_connect_resolves(cx: &m
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -644,6 +662,8 @@ async fn connect_and_close_updates_active_synchronously_before_the_connect_resol
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -680,12 +700,16 @@ async fn a_failed_connect_does_not_revert_active_to_the_previous_connection(
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
     store
         .add(ConnectionArgs {
             name: "unrecognized".to_owned(),
             url: "cassandra://host/db".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -866,12 +890,16 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
         .add(ConnectionArgs {
             name: "mem".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
     store
         .add(ConnectionArgs {
             name: "other".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 
@@ -1122,6 +1150,8 @@ fn an_edit_event_from_the_real_form_updates_the_row_in_place(cx: &mut TestAppCon
         .add(ConnectionArgs {
             name: "first".to_owned(),
             url: "postgres://host/a".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add first");
 
@@ -1173,12 +1203,16 @@ fn the_closed_modal_renders_nothing_and_the_open_modal_renders_without_panicking
         .add(ConnectionArgs {
             name: "local pg".to_owned(),
             url: "postgres://localhost/app".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
     store
         .add(ConnectionArgs {
             name: "local sqlite".to_owned(),
             url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
         })
         .expect("add must succeed");
 

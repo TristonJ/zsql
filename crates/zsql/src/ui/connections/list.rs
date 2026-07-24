@@ -347,6 +347,8 @@ mod tests {
             connection: ConnectionArgs {
                 name: name.to_owned(),
                 url: url.to_owned(),
+                ssh: None,
+                ssh_secret: None,
             }
             .into_stored()
             .expect("into_stored must succeed for a well-formed url"),

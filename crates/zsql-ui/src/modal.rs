@@ -13,6 +13,10 @@ use crate::{
 pub const MODAL_CLOSE_ICON_SIZE: Pixels = px(13.0);
 const MODAL_CLOSE_HOVER_GROUP: &str = "modal-close-hover";
 
+/// The modal's close callback: invoked with no event payload, just window
+/// and app access to perform the close.
+type ModalCloseHandler = Rc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App)>;
+
 #[derive(IntoElement)]
 pub struct Modal<H: IntoElement + 'static, B: IntoElement + 'static> {
     id: ElementId,
@@ -20,7 +24,7 @@ pub struct Modal<H: IntoElement + 'static, B: IntoElement + 'static> {
     head: H,
     body: B,
     has_close_icon: bool,
-    on_close: Rc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App)>,
+    on_close: ModalCloseHandler,
     focus_handle: Option<FocusHandle>,
 }
 
@@ -29,18 +33,21 @@ pub enum ModalSize {
 }
 
 impl ModalSize {
+    #[must_use]
     pub fn width(&self) -> Pixels {
         match self {
             ModalSize::Small => px(468.0),
         }
     }
 
+    #[must_use]
     pub fn radius(&self) -> Pixels {
         match self {
             ModalSize::Small => px(10.0),
         }
     }
 
+    #[must_use]
     pub fn head_height(&self) -> Pixels {
         match self {
             ModalSize::Small => px(44.0),
@@ -62,6 +69,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         }
     }
 
+    #[must_use]
     pub fn size(mut self, size: ModalSize) -> Self {
         self.size = size;
         self
@@ -70,11 +78,13 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
     /// Track `focus_handle` on the modal's key-dispatch container so its
     /// keyboard handlers fire while it is focused. The caller is responsible
     /// for focusing this same handle when the modal opens
+    #[must_use]
     pub fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
         self.focus_handle = Some(focus_handle.clone());
         self
     }
 
+    #[must_use]
     pub fn on_close(
         mut self,
         on_close: impl Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static,
@@ -83,6 +93,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         self
     }
 
+    #[must_use]
     pub fn has_close_icon(mut self, has_close_icon: bool) -> Self {
         self.has_close_icon = has_close_icon;
         self

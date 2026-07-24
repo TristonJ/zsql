@@ -501,6 +501,8 @@ impl ConnectionManagerView {
         let connection = ConnectionArgs {
             name: name.to_string(),
             url,
+            ssh: None,
+            ssh_secret: None,
         };
         match self.store.add(connection) {
             Ok(()) => {
@@ -546,6 +548,8 @@ impl ConnectionManagerView {
         let args = ConnectionArgs {
             name: name.to_string(),
             url,
+            ssh: None,
+            ssh_secret: None,
         };
         match self.store.update(id, args) {
             Ok(()) => {
