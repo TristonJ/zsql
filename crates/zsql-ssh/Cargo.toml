@@ -1,0 +1,28 @@
+[package]
+name = "zsql-ssh"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The only crate in the workspace allowed to depend on tokio/russh. Both are
+# kept private: no tokio or russh type appears in this crate's public API, so
+# the rest of the (deliberately tokio-free) workspace never sees them.
+russh = "=0.62.4"
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+ssh-integration-tests = []

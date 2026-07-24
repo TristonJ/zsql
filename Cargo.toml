@@ -8,6 +8,7 @@ members = [
     "crates/zsql-mysql",
     "crates/zsql-ui",
     "crates/zsql-editor",
+    "crates/zsql-ssh",
     "crates/zsql",
 ]
 
