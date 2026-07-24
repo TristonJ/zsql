@@ -2,26 +2,16 @@
 //! [`SessionState`] and accumulated result set
 
 use std::ops::Range;
-use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, Font,
-    Hsla, KeyBinding, ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, Stateful,
-    StyledText, TextRun, UniformListScrollHandle, Window, actions, anchored, deferred, div, font,
-    point, prelude::*, px, rgb, rgba, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, Stateful, Window, actions, anchored, deferred, div, prelude::*, px, rgb, rgba,
 };
-use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
-use zsql_editor::{Highlighter, SqlHighlighter, StyleSpan, syntax_color};
+use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::button::ButtonSwitch;
 use zsql_ui::grid;
-use zsql_ui::scrollable::{
-    Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars, restrict_wheel_to_own_axis,
-};
-use zsql_ui::table::{
-    Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure,
-    row_number_cell_shell,
-};
+use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::connections::ConnectionManagerView;
@@ -30,10 +20,12 @@ use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{LivenessState, Session, SessionState};
 use crate::ui::format::{self, format_value_for_clipboard, group_thousands};
+use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::data::ValuePanelContent;
 use crate::ui::value_panel::{self, ValuePanel};
 
 mod empty_state;
+mod text_view;
 
 /// The key context the results grid's own key bindings are scoped to, so
 /// they only fire while the grid is focused.
@@ -150,41 +142,8 @@ pub struct ResultsView {
     /// afterward so a later re-render (more rows folding in, an unrelated
     /// notify) never overrides a manual Grid/Text choice.
     view_mode_defaulted: bool,
-    /// The Text view's selection, as the (anchor, cursor) document positions
-    /// in the order a click/drag/shift-click set them -- not necessarily
-    /// `anchor <= cursor`. `None` when nothing is selected.
-    text_selection: Option<(TextCaret, TextCaret)>,
-    /// Whether the mouse button is currently held down over the Text view,
-    /// extending `text_selection` as it moves. Sends a shift-click's fixed
-    /// jump-and-release through the same [`ResultsView::set_text_caret`]
-    /// path without leaving a drag in progress.
-    text_selecting: bool,
-    /// Derives syntax spans for the Text view's assembled document. Reused
-    /// across renders so an unchanged document skips reparsing (see
-    /// `SqlHighlighter::set_text`).
-    text_highlighter: SqlHighlighter,
-    /// Vertical scroll position shared by the Text view's virtualized gutter
-    /// and body lists while wrap is off, so scrolling either one scrolls
-    /// both in lockstep (mirrors the grid's own row-synced scrolling).
-    text_row_scroll_handle: UniformListScrollHandle,
-    /// Horizontal scroll position of the Text view's body pane while wrap is
-    /// off; the gutter never scrolls horizontally.
-    text_col_scroll_handle: ScrollHandle,
-    /// Backs the Text view body pane's horizontal scrollbar: its axis is
-    /// reconfigured each render from the current longest line's extent, and
-    /// [`WithScrollbars`] overlays the track+thumb the same way the grid's
-    /// `Table` does.
-    text_scroll_state: Entity<ScrollableState>,
-    /// Vertical scroll position of the Text view's single unified line list
-    /// while wrap is on, where lines are not virtualized (their heights vary
-    /// with how each wraps) and no horizontal axis is needed.
-    text_wrap_scroll_handle: ScrollHandle,
-    /// Cached widest-line pixel width backing the Text view's horizontal
-    /// scroll extent. Measured with real text shaping (see
-    /// [`ResultsView::measure_text_content_width`]) so it stays correct for a
-    /// proportional data font, not just a monospace one, and recomputed only
-    /// when the inputs that width depends on change.
-    text_content_extent: Option<TextContentExtent>,
+    /// The text view for results when they're displayed as a single text doc
+    text_view: Entity<TextView>,
 }
 
 /// A memoized Text-view content width plus the inputs it was measured from,
@@ -240,6 +199,7 @@ impl ResultsView {
         let focus_handle = cx.focus_handle();
         let value_panel =
             cx.new(|cx| ValuePanel::new(focus_handle.clone(), ValuePanelConfig::default(), cx));
+        let text_view = cx.new(|cx| TextView::new(cx));
 
         let mut view = Self {
             session,
@@ -266,14 +226,7 @@ impl ResultsView {
             value_panel_drag: None,
             view_mode: ViewMode::Grid,
             view_mode_defaulted: false,
-            text_selection: None,
-            text_selecting: false,
-            text_highlighter: SqlHighlighter::new(),
-            text_row_scroll_handle: UniformListScrollHandle::new(),
-            text_col_scroll_handle: ScrollHandle::new(),
-            text_wrap_scroll_handle: ScrollHandle::new(),
-            text_scroll_state: cx.new(ScrollableState::new),
-            text_content_extent: None,
+            text_view,
         };
         view.sync_dimensions(cx);
         view
@@ -312,7 +265,7 @@ impl ResultsView {
     pub fn show_live(&mut self, source_label: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.source_label = source_label.into();
         self.frozen = None;
-        self.reset_for_new_result();
+        self.reset_for_new_result(cx);
         self.sync_dimensions(cx);
         cx.notify();
     }
@@ -323,7 +276,7 @@ impl ResultsView {
     pub fn show_snapshot(&mut self, snapshot: ResultsSnapshot, cx: &mut Context<Self>) {
         self.source_label = snapshot.source_label.clone();
         self.frozen = Some(snapshot);
-        self.reset_for_new_result();
+        self.reset_for_new_result(cx);
         self.sync_dimensions(cx);
         cx.notify();
     }
@@ -335,22 +288,14 @@ impl ResultsView {
     /// onto stale per-column maxima), and the Text view's default/wrap/
     /// selection/scroll position, so nothing carries forward onto a
     /// different result.
-    fn reset_for_new_result(&mut self) {
+    fn reset_for_new_result(&mut self, cx: &mut Context<Self>) {
         self.column_widths = Vec::new();
         self.column_width_overrides = Vec::new();
         self.column_max_body_chars = Vec::new();
         self.folded_row_count = 0;
         self.view_mode = ViewMode::Grid;
         self.view_mode_defaulted = false;
-        self.text_selection = None;
-        self.text_selecting = false;
-        self.text_row_scroll_handle
-            .scroll_to_item(0, ScrollStrategy::Top);
-        self.text_col_scroll_handle
-            .set_offset(point(px(0.0), px(0.0)));
-        self.text_wrap_scroll_handle
-            .set_offset(point(px(0.0), px(0.0)));
-        self.text_content_extent = None;
+        self.text_view.update(cx, |tv, _c| tv.reset());
     }
 
     /// The result set this view currently renders: `session`'s live result
@@ -478,7 +423,7 @@ impl ResultsView {
     /// computed once from the whole result rather than from a
     /// still-streaming partial one, and a manual Grid/Text choice made
     /// after that point is never overridden by a later re-render.
-    fn apply_default_view_mode_if_terminal(&mut self, cx: &Context<Self>) {
+    fn apply_default_view_mode_if_terminal(&mut self, cx: &mut Context<Self>) {
         if self.view_mode_defaulted {
             return;
         }
@@ -503,14 +448,9 @@ impl ResultsView {
     /// copy and wrap controls. `text_document` is `Some` (Text active) with
     /// the same assembled document [`ResultsView::render_body`] renders,
     /// computed once per render rather than reassembled here.
-    fn render_bar(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        text_document: Option<&str>,
-    ) -> Div {
+    fn render_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let document_lines = text_document.map(document_line_count);
+        let document_lines = self.text_view.read(cx).line_count();
         let count_text = results_bar_count_text(
             self.effective_state(cx),
             self.effective_result(cx).rows.len(),
@@ -673,12 +613,7 @@ impl ResultsView {
     /// available, or a centered prompt/status message otherwise.
     /// `text_document` is `Some` exactly while `view_mode` is `Text`, so
     /// [`ResultsView::render_grid_or_text`] never reassembles it.
-    fn render_body(
-        &mut self,
-        text_document: Option<Rc<str>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active_theme = cx.theme();
         let state = self.effective_state(cx).clone();
         let has_columns = !self.effective_result(cx).columns.is_empty();
@@ -686,13 +621,11 @@ impl ResultsView {
         let inner = match state {
             SessionState::Results(_)
             | SessionState::Truncating { .. }
-            | SessionState::Truncated { .. } => self.render_grid_or_text(text_document, window, cx),
+            | SessionState::Truncated { .. } => self.render_grid_or_text(window, cx),
             // Once the streaming query's `Columns` event has arrived there
             // is a real (if partial) result set to paint, so switch to the
             // grid immediately rather than waiting for `Done`
-            SessionState::Running if has_columns => {
-                self.render_grid_or_text(text_document, window, cx)
-            }
+            SessionState::Running if has_columns => self.render_grid_or_text(window, cx),
             SessionState::Empty => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 empty_state::TITLE,
@@ -703,31 +636,36 @@ impl ResultsView {
                 self.connections_modal.clone(),
                 window,
                 cx,
-            )),
+            ))
+            .into_any_element(),
             SessionState::Connecting => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Connecting…",
                 "Establishing a connection to the configured database.",
                 active_theme,
-            ),
+            )
+            .into_any_element(),
             SessionState::Connected => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Connected",
                 "Run a query to see results here.",
                 active_theme,
-            ),
+            )
+            .into_any_element(),
             SessionState::Running => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
                 "Running query…",
                 "Streaming results from the database.",
                 active_theme,
-            ),
+            )
+            .into_any_element(),
             SessionState::Error(message) => Self::render_placeholder(
                 active_theme.colors.status_error,
                 "Query failed",
                 &message,
                 active_theme,
-            ),
+            )
+            .into_any_element(),
         };
 
         let value_panel = self.value_panel.read(cx);
@@ -742,7 +680,8 @@ impl ResultsView {
             .flex_row()
             .flex_1()
             .min_h_0()
-            .child(inner.flex_1().min_w_0())
+            // .child(inner.flex_1().min_w_0())
+            .child(inner)
             .child(self.render_value_panel_divider(cx))
             .child(
                 div()
@@ -751,6 +690,7 @@ impl ResultsView {
                     .w(self.value_panel_width)
                     .child(self.value_panel.clone()),
             )
+            .into_any_element()
     }
 
     /// The value panel's resize divider: a draggable strip on the panel's
@@ -844,271 +784,12 @@ impl ResultsView {
     /// falling back to the grid otherwise, so a stale `Text` selection left
     /// over from a differently-shaped result (or the interval before
     /// `sync_dimensions` next runs) never renders an empty document pane.
-    fn render_grid_or_text(
-        &mut self,
-        text_document: Option<Rc<str>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        if let Some(document) = text_document
-            && self.effective_result(cx).has_single_text_column()
-        {
-            self.render_text(&document, window, cx)
+    fn render_grid_or_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.view_mode == ViewMode::Text && self.text_view.read(cx).has_document() {
+            self.text_view.clone().into_any_element()
         } else {
-            self.render_grid(cx)
+            self.render_grid(cx).into_any_element()
         }
-    }
-
-    /// The read-only document viewer for a single-text-column result.
-    fn render_text(&mut self, document: &str, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        self.text_highlighter.set_text(document);
-        let lines: Rc<[String]> = document
-            .split('\n')
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-            .into();
-        let line_count = lines.len();
-
-        let active_theme = cx.theme();
-        let colors = active_theme.colors;
-        let style = Self::table_style(active_theme);
-        let gutter_width = measure::row_number_column_width(
-            line_count,
-            &style,
-            theme::CELL_CHAR_WIDTH,
-            theme::ROW_NUMBER_MIN_WIDTH,
-        );
-
-        let font_family: SharedString = active_theme.fonts.data.clone().into();
-        let run_font = font(active_theme.fonts.data.clone());
-        let base_color = Hsla::from(rgb(colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(active_theme)));
-        let selection = self.text_selection;
-        let line_runs: Rc<[Vec<TextRun>]> = lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                let spans = self.text_highlighter.spans_for_line(index);
-                let selection_range =
-                    selection.and_then(|sel| line_selection_range(sel, index, line.len()));
-                text_view_line_runs(
-                    line,
-                    spans,
-                    selection_range.as_ref(),
-                    &run_font,
-                    base_color,
-                    selection_bg,
-                    active_theme,
-                )
-            })
-            .collect::<Vec<_>>()
-            .into();
-
-        // Size the horizontal scroll extent from the widest line's real
-        // shaped width (memoized), so the scrollbar thumb and reach stay
-        // accurate for a proportional data font, not just a monospace one.
-        let content_width = self.text_content_width(
-            document.len(),
-            &font_family,
-            px(theme::TEXT_VIEW_FONT_SIZE),
-            &lines,
-            &line_runs,
-            window,
-        );
-        let content_extent = content_width + theme::TEXT_VIEW_CONTENT_EXTENT_SLACK;
-
-        let content = self.render_text_virtualized_body(
-            &lines,
-            &line_runs,
-            gutter_width,
-            content_extent,
-            &style,
-            cx,
-        );
-
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .bg(rgb(colors.bg_app))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
-                    view.end_text_selection_drag(cx);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
-                    view.end_text_selection_drag(cx);
-                }),
-            )
-            .child(content)
-    }
-
-    /// The widest Text-view line's shaped pixel width, memoized in
-    /// `text_content_extent` and recomputed only when the document length,
-    /// data font, or text size changes. A re-render that changes none of them
-    /// (scroll, hover, selection, an unrelated notify) reuses the cached
-    /// width rather than re-shaping every line.
-    fn text_content_width(
-        &mut self,
-        document_len: usize,
-        font_family: &SharedString,
-        font_size: Pixels,
-        lines: &[String],
-        line_runs: &[Vec<TextRun>],
-        window: &Window,
-    ) -> Pixels {
-        if let Some(cached) = &self.text_content_extent
-            && cached.document_len == document_len
-            && cached.font_family == *font_family
-            && cached.font_size == font_size
-        {
-            return cached.width;
-        }
-
-        let width = Self::measure_text_content_width(lines, line_runs, font_size, window);
-        self.text_content_extent = Some(TextContentExtent {
-            document_len,
-            font_family: font_family.clone(),
-            font_size,
-            width,
-        });
-        width
-    }
-
-    /// Shape every line with the same runs the body paints and return the
-    /// widest, so the horizontal scroll extent matches the text that is
-    /// actually drawn -- correct for a proportional data font (kerning,
-    /// ligatures, variable advances), not just a monospace one.
-    fn measure_text_content_width(
-        lines: &[String],
-        line_runs: &[Vec<TextRun>],
-        font_size: Pixels,
-        window: &Window,
-    ) -> Pixels {
-        let text_system = window.text_system();
-        let mut widest = px(0.0);
-        for (line, runs) in lines.iter().zip(line_runs) {
-            if line.is_empty() {
-                continue;
-            }
-            let width = text_system.layout_line(line, font_size, runs, None).width;
-            if width > widest {
-                widest = width;
-            }
-        }
-        widest
-    }
-
-    /// The Text view's body while wrap is off: a pinned, virtualized
-    /// line-number gutter beside a virtualized, horizontally scrolling body
-    /// list -- only the lines within (or near) the current viewport are ever
-    /// built into elements, mirroring the grid's own row virtualization.
-    /// Both lists share one vertical scroll position via
-    /// [`ResultsView::text_row_scroll_handle`].
-    fn render_text_virtualized_body(
-        &mut self,
-        lines: &Rc<[String]>,
-        line_runs: &Rc<[Vec<TextRun>]>,
-        gutter_width: Pixels,
-        content_extent: Pixels,
-        style: &zsql_ui::table::TableStyle,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let line_count = lines.len();
-        let gutter_style = *style;
-        let gutter_list = restrict_wheel_to_own_axis(
-            uniform_list(
-                "results-text-gutter-list",
-                line_count,
-                move |range: Range<usize>, _window: &mut Window, _cx: &mut App| {
-                    range
-                        .map(|index| {
-                            row_number_cell_shell(gutter_width, &gutter_style)
-                                .h(theme::TEXT_VIEW_LINE_HEIGHT)
-                                .child((index + 1).to_string())
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                },
-            )
-            .flex_1()
-            .track_scroll(self.text_row_scroll_handle.clone()),
-        );
-
-        let gutter = div()
-            .id("results-text-gutter")
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(gutter_width)
-            .h_full()
-            .child(gutter_list);
-
-        // Point the body pane's horizontal axis at the widest line's measured
-        // extent (see `text_content_width`). Only the horizontal axis is
-        // configured, so `with_scrollbars` paints just the bottom track -- the
-        // vertical list keeps its own native wheel scrolling with no vertical
-        // thumb, unchanged from before.
-        let col_scroll_handle = self.text_col_scroll_handle.clone();
-        self.text_scroll_state.update(cx, |state, _cx| {
-            state.horizontal(Axis::new(
-                ScrollSource::Container(col_scroll_handle),
-                f32::from(content_extent),
-            ));
-        });
-
-        let body_lines = lines.clone();
-        let body_runs = line_runs.clone();
-        let body_list = restrict_wheel_to_own_axis(
-            uniform_list(
-                "results-text-body-list",
-                line_count,
-                cx.processor(move |_this, range: Range<usize>, _window, cx| {
-                    range
-                        .map(|index| {
-                            let line = body_lines.get(index).map_or("", String::as_str);
-                            let runs = body_runs.get(index).cloned().unwrap_or_default();
-                            render_text_view_line(index, line, runs, false, cx)
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .flex_1()
-            .min_w(content_extent)
-            .with_sizing_behavior(ListSizingBehavior::Auto)
-            .track_scroll(self.text_row_scroll_handle.clone()),
-        );
-
-        let body = div()
-            .id("results-text-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .h_full()
-            .w_full()
-            .overflow_x_hidden()
-            .track_scroll(&self.text_col_scroll_handle)
-            .on_scroll_wheel(ScrollableState::wheel_handler(&self.text_scroll_state))
-            .font_family(&cx.theme().fonts.data)
-            .text_size(px(theme::TEXT_VIEW_FONT_SIZE))
-            .child(body_list)
-            .with_scrollbars(&self.text_scroll_state, ScrollbarStyle::default(), cx);
-
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .child(gutter)
-            .child(body)
-            .into_any_element()
     }
 
     /// The two-pane virtualized grid (pinned row numbers + horizontally
@@ -1251,7 +932,7 @@ impl ResultsView {
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time. `text_document` is the same document
     /// [`ResultsView::render_bar`] was given.
-    fn render_status_bar(&self, text_document: Option<&str>, cx: &Context<Self>) -> Div {
+    fn render_status_bar(&self, cx: &Context<Self>) -> Div {
         let active_theme = cx.theme();
         let colors = active_theme.colors;
         let (dot_color, label, error_message) = self.connection_status(cx);
@@ -1283,8 +964,8 @@ impl ResultsView {
         // tab's completed-query numbers are unrelated to the session's
         // current connection lifecycle.
         let effective_state = self.effective_state(cx);
-        let (metrics_count, metrics_unit) = match text_document {
-            Some(document) => (document_line_count(document), "lines"),
+        let (metrics_count, metrics_unit) = match self.text_view.read(cx).line_count() {
+            Some(lines) => (lines, "lines"),
             None => (self.effective_result(cx).rows.len(), "rows"),
         };
         if let Some((count_text, elapsed_text)) =
@@ -1594,11 +1275,14 @@ impl ResultsView {
     /// trailing separator added.
     #[tracing::instrument(name = "results_copy_text_document", skip_all)]
     fn copy_text_document(&self, cx: &mut Context<Self>, all: bool) {
-        let document = assemble_document(self.effective_result(cx));
         let document = if all {
-            document
+            self.text_view.read(cx).document().map(str::to_owned)
         } else {
-            self.get_selected_text(&document).unwrap_or_default()
+            self.text_view.read(cx).selected_text()
+        };
+        let Some(document) = document else {
+            tracing::trace!("copy invoked with no results text document; nothing to do");
+            return;
         };
 
         tracing::debug!(
@@ -1606,84 +1290,6 @@ impl ResultsView {
             "copied the results text view's document"
         );
         cx.write_to_clipboard(ClipboardItem::new_string(document));
-    }
-
-    /// Set the Text view's selection cursor to `(line, byte)`, extending from
-    /// the existing anchor when `extend` (a shift-click) -- otherwise
-    /// starting a fresh selection anchored at `(line, byte)` and arming it to
-    /// extend further as the mouse drags (see
-    /// [`ResultsView::extend_text_selection_while_dragging`]). A shift-click
-    /// is a discrete jump, not a drag: it does not arm dragging.
-    fn set_text_caret(&mut self, line: usize, byte: usize, extend: bool, cx: &mut Context<Self>) {
-        let cursor = TextCaret { line, byte };
-        let anchor = if extend {
-            self.text_selection.map_or(cursor, |(anchor, _)| anchor)
-        } else {
-            cursor
-        };
-        self.text_selection = Some((anchor, cursor));
-        self.text_selecting = !extend;
-        cx.notify();
-    }
-
-    /// Move the Text view's selection cursor to `(line, byte)` while a drag
-    /// begun by [`ResultsView::set_text_caret`] is in progress, keeping the
-    /// existing anchor. A no-op once the drag has ended.
-    fn extend_text_selection_while_dragging(
-        &mut self,
-        line: usize,
-        byte: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.text_selecting {
-            return;
-        }
-        let Some((anchor, _)) = self.text_selection else {
-            return;
-        };
-        self.text_selection = Some((anchor, TextCaret { line, byte }));
-        cx.notify();
-    }
-
-    /// End a Text view selection drag, leaving the selection itself in
-    /// place. A no-op if nothing was being dragged.
-    fn end_text_selection_drag(&mut self, cx: &mut Context<Self>) {
-        if !self.text_selecting {
-            return;
-        }
-        self.text_selecting = false;
-        cx.notify();
-    }
-
-    /// Get the slice of text in `document` that is currently selected, or `None` if
-    /// there is no selection.
-    fn get_selected_text(&self, document: &str) -> Option<String> {
-        let (anchor, cursor) = self.text_selection?;
-        let (start, end) = if anchor < cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        };
-        let selected_text = document
-            .lines()
-            .enumerate()
-            .filter_map(|(line_index, line)| {
-                if line_index < start.line || line_index > end.line {
-                    return None;
-                }
-                let start_byte = if line_index == start.line {
-                    start.byte.min(line.len())
-                } else {
-                    0
-                };
-                let end_byte = if line_index == end.line {
-                    end.byte.min(line.len())
-                } else {
-                    line.len()
-                };
-                Some(&line[start_byte..end_byte])
-            });
-        Some(join_document_lines(selected_text))
     }
 
     /// Switch the results pane's rendering between the grid and the Text
@@ -1799,11 +1405,9 @@ impl ResultsView {
 
 impl Render for ResultsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Assembled once here (rather than separately by the bar, status
-        // bar, and body) so a single render pass never re-joins the same
-        // result's rows into a document three times over.
-        let text_document: Option<Rc<str>> = (self.view_mode == ViewMode::Text)
-            .then(|| Rc::from(assemble_document(self.effective_result(cx))));
+        self.text_view.update(cx, |text_view, cx| {
+            text_view.update_document(self.effective_result(cx))
+        });
 
         div()
             .id("results-grid-pane")
@@ -1825,9 +1429,9 @@ impl Render for ResultsView {
             .flex_col()
             .size_full()
             .bg(rgb(cx.theme().colors.bg_app))
-            .child(self.render_bar(window, cx, text_document.as_deref()))
-            .child(self.render_body(text_document.clone(), window, cx))
-            .child(self.render_status_bar(text_document.as_deref(), cx))
+            .child(self.render_bar(window, cx))
+            .child(self.render_body(window, cx))
+            .child(self.render_status_bar(cx))
             .children(self.render_cell_context_menu(cx))
     }
 }
@@ -1952,220 +1556,6 @@ fn status_metrics(state: &SessionState, count: usize, unit: &str) -> Option<(Str
         )),
         _ => None,
     }
-}
-
-/// The text of `row`'s single column, or an empty string for a null or
-/// absent cell.
-fn document_cell_text(row: &Row) -> &str {
-    match row.0.first() {
-        Some(Value::Text(text)) => text.as_str(),
-        _ => "",
-    }
-}
-
-/// Join a single-text-column result's rows into one document: a lone row's
-/// value verbatim, or multiple rows joined with `'\n'`. If _every_ row
-/// in the result is terminated with a newline, and there is more than one
-/// row, we _don't_ join with an extra newline. This is to make displaying
-/// things like `sp_helptext` a bit more natural.
-fn assemble_document(result: &ResultSet) -> String {
-    match result.rows.as_slice() {
-        [] => String::new(),
-        [row] => document_cell_text(row).to_owned(),
-        rows => {
-            let iter = rows.iter().map(document_cell_text);
-            join_document_lines(iter)
-        }
-    }
-}
-
-fn join_document_lines<'a>(iter: impl Iterator<Item = &'a str>) -> String {
-    let mut all_have_newline = true;
-    let temp_vec = iter
-        .inspect(|txt| {
-            if all_have_newline {
-                all_have_newline = txt.ends_with('\n');
-            }
-        })
-        .collect::<Vec<_>>();
-    temp_vec.join(if all_have_newline { "" } else { "\n" })
-}
-
-/// Line count of `document`, matching the same `'\n'`-split convention
-/// `TextBuffer`/`SqlHighlighter` use: an empty document counts as 1 line,
-/// and a trailing newline yields one extra empty final line.
-fn document_line_count(document: &str) -> usize {
-    document.split('\n').count()
-}
-
-/// The byte sub-range of line `line_index` (of length `line_byte_len`) that
-/// `selection`'s ordered anchor/cursor covers, or `None` if the line falls
-/// outside the selection or the selection is empty (a plain click with no
-/// drag).
-fn line_selection_range(
-    (anchor, cursor): (TextCaret, TextCaret),
-    line_index: usize,
-    line_byte_len: usize,
-) -> Option<Range<usize>> {
-    let (start, end) = if anchor <= cursor {
-        (anchor, cursor)
-    } else {
-        (cursor, anchor)
-    };
-    if line_index < start.line || line_index > end.line {
-        return None;
-    }
-    let range_start = if line_index == start.line {
-        start.byte
-    } else {
-        0
-    };
-    let range_end = if line_index == end.line {
-        end.byte
-    } else {
-        line_byte_len
-    };
-    (range_start < range_end).then_some(range_start..range_end)
-}
-
-/// The byte offset of `line`'s `char_index`-th character, or `line`'s full
-/// byte length if `char_index` is at or past its end.
-fn char_byte_offset(line: &str, char_index: usize) -> usize {
-    line.char_indices()
-        .nth(char_index)
-        .map_or(line.len(), |(byte_index, _)| byte_index)
-}
-
-/// One Text view line's `TextRun`s: `spans`' char-indexed ranges converted to
-/// this line's own byte offsets and painted with
-/// `zsql_editor::syntax_color`'s token roles, with `selection`'s byte range
-/// (if any falls on this line) additionally shaded as a background.
-fn text_view_line_runs(
-    line: &str,
-    spans: &[StyleSpan],
-    selection: Option<&Range<usize>>,
-    run_font: &Font,
-    base_color: Hsla,
-    selection_bg: Hsla,
-    active_theme: &Theme,
-) -> Vec<TextRun> {
-    let line_len = line.len();
-    let span_byte_range = |span: &StyleSpan| {
-        let start = char_byte_offset(line, span.start).min(line_len);
-        let end = char_byte_offset(line, span.end).min(line_len);
-        start..end
-    };
-
-    let mut boundaries: Vec<usize> = vec![0, line_len];
-    for span in spans {
-        let range = span_byte_range(span);
-        boundaries.push(range.start);
-        boundaries.push(range.end);
-    }
-    if let Some(sel) = selection {
-        boundaries.push(sel.start.min(line_len));
-        boundaries.push(sel.end.min(line_len));
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut runs: Vec<TextRun> = Vec::new();
-    for window in boundaries.windows(2) {
-        let (start, end) = (window[0], window[1]);
-        if start >= end {
-            continue;
-        }
-        let color = spans
-            .iter()
-            .find(|span| {
-                let range = span_byte_range(span);
-                range.start <= start && end <= range.end
-            })
-            .map_or(base_color, |span| {
-                Hsla::from(rgb(syntax_color(active_theme, span.kind)))
-            });
-        let background_color = selection
-            .filter(|sel| sel.start <= start && end <= sel.end)
-            .map(|_| selection_bg);
-        let run = TextRun {
-            len: end - start,
-            font: run_font.clone(),
-            color,
-            background_color,
-            underline: None,
-            strikethrough: None,
-        };
-        match runs.last_mut() {
-            Some(last)
-                if last.color == run.color && last.background_color == run.background_color =>
-            {
-                last.len += run.len;
-            }
-            _ => runs.push(run),
-        }
-    }
-    if runs.is_empty() {
-        runs.push(TextRun {
-            len: line_len,
-            font: run_font.clone(),
-            color: base_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
-    }
-    runs
-}
-
-/// One line of the Text view's body: `line`'s text painted with `runs`,
-/// wrapped or not per `wrap`, and draggable/clickable to set the Text view's
-/// selection (shift-click extends from the existing anchor; a plain
-/// click-and-drag extends continuously as the mouse moves).
-fn render_text_view_line(
-    index: usize,
-    line: &str,
-    runs: Vec<TextRun>,
-    wrap: bool,
-    cx: &Context<ResultsView>,
-) -> AnyElement {
-    let styled = StyledText::new(line.to_owned()).with_runs(runs);
-    let layout_for_down = styled.layout().clone();
-    let layout_for_move = styled.layout().clone();
-
-    div()
-        .id(("results-text-line", index))
-        .flex()
-        .items_center()
-        .min_w_0()
-        .w_full()
-        .when(wrap, |el| {
-            el.whitespace_normal().min_h(theme::TEXT_VIEW_LINE_HEIGHT)
-        })
-        .when(!wrap, |el| {
-            el.flex_shrink_0()
-                .h(theme::TEXT_VIEW_LINE_HEIGHT)
-                .whitespace_nowrap()
-        })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
-                let byte = match layout_for_down.index_for_position(event.position) {
-                    Ok(b) | Err(b) => b,
-                };
-
-                view.set_text_caret(index, byte, event.modifiers.shift, cx);
-            }),
-        )
-        .on_mouse_move(
-            cx.listener(move |view, event: &MouseMoveEvent, _window, cx| {
-                let byte = match layout_for_move.index_for_position(event.position) {
-                    Ok(b) | Err(b) => b,
-                };
-                view.extend_text_selection_while_dragging(index, byte, cx);
-            }),
-        )
-        .child(styled)
-        .into_any_element()
 }
 
 /// Appended after the number when a total row count is a planner estimate
