@@ -292,18 +292,19 @@ impl Session {
         self.connect_url(url, None, cx)
     }
 
-    /// Connect to an explicitly chosen URL (e.g. a saved connection picked
-    /// from the connection manager), replacing whatever connection is
-    /// currently active. The driver is resolved from `url`'s scheme via
-    /// [`drivers::connect`]; this crate never picks a driver directly.
+    /// Connect to an explicitly chosen URL without a tunnel: a test
+    /// convenience for the common no-SSH case. Production connects go through
+    /// [`Session::connect_to_with_ssh`] (with `ssh` left `None` when there is
+    /// no tunnel), so this exists only in test builds.
+    #[cfg(test)]
     pub fn connect_to(&mut self, url: impl Into<String>, cx: &mut Context<Self>) -> Task<()> {
         self.connect_url(url.into(), None, cx)
     }
 
     /// Connect to `url` through an SSH tunnel described by `ssh`, replacing
-    /// whatever connection is currently active. `ssh` is `None` for a direct
-    /// connection (equivalent to [`Session::connect_to`]) or when the chosen
-    /// connection has no tunnel configured (or has one but it is disabled).
+    /// whatever connection is currently active. `ssh` is `None` for a direct,
+    /// tunnel-less connection, or when the chosen connection has no tunnel
+    /// configured (or has one but it is disabled).
     ///
     /// When `ssh` is `Some`, [`zsql_ssh::open_tunnel`] is awaited and must
     /// succeed before the driver's own connect is ever attempted; a tunnel
@@ -318,8 +319,8 @@ impl Session {
         self.connect_url(url.into(), ssh, cx)
     }
 
-    /// Shared implementation behind [`Session::connect`], [`Session::connect_to`],
-    /// and [`Session::connect_to_with_ssh`]: connect to `url` (through `ssh`'s
+    /// Shared implementation behind [`Session::connect`] and
+    /// [`Session::connect_to_with_ssh`]: connect to `url` (through `ssh`'s
     /// tunnel first, if given) via [`drivers::connect`]/[`drivers::connect_tunneled`],
     /// replacing the current connection and tunnel and (re)starting the
     /// liveliness probe loop on success.
@@ -797,13 +798,17 @@ fn row_limit_reached(accumulated: u64, limit: u64) -> bool {
 
 /// A successful connect's outcome: the live connection, and the tunnel it
 /// was opened through, if any.
-type TunneledConnectOutcome = (Box<dyn Connection>, Option<Box<dyn TunnelHandle>>);
+pub(crate) type TunneledConnectOutcome = (Box<dyn Connection>, Option<Box<dyn TunnelHandle>>);
 
 /// Opens `ssh`'s tunnel (if given) before connecting to `url`, so a bad SSH
 /// config surfaces as a connect failure before the driver is ever touched.
 /// With no `ssh` config, this is exactly [`drivers::connect`].
+///
+/// Shared with `ui::connections`'s own Test and unsaved-Connect paths, which
+/// need the identical tunnel-before-connect ordering outside of a
+/// [`Session`].
 #[tracing::instrument(name = "session_open_tunnel_before_connect", skip_all)]
-async fn open_tunnel_and_connect(
+pub(crate) async fn open_tunnel_and_connect(
     url: String,
     ssh: Option<zsql_ssh::SshConfig>,
 ) -> Result<TunneledConnectOutcome, CoreError> {

@@ -5,6 +5,7 @@
 //! buttons and Enter-to-submit emit.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
@@ -14,7 +15,8 @@ use gpui::{
 use uuid::Uuid;
 use zsql_ui::text_field::TextFieldEvent;
 
-use super::{ConnectionForm, ConnectionFormEvent};
+use super::{ConnectionForm, ConnectionFormEvent, HostKeyMode};
+use crate::connections::{HostKeyPolicy, SshAuthKind, StoredSsh};
 
 /// A plain-data mirror of [`ConnectionFormEvent`] a test can capture,
 /// compare, and print without requiring the production event type itself to
@@ -159,7 +161,6 @@ fn editing_the_url_field_reparses_every_driver_field(cx: &mut TestAppContext) {
         assert_eq!(form.user_field.read(cx).value().as_ref(), "sa");
         assert_eq!(form.password_field.read(cx).value().as_ref(), "pw");
         assert_eq!(form.database_field.read(cx).value().as_ref(), "zsql");
-        assert_eq!(form.tls_field.read(cx).value().as_ref(), "true");
         assert!(form.dim_reason().is_none());
     });
 }
@@ -227,20 +228,20 @@ fn editing_the_host_field_leaves_user_password_database_and_params_intact(cx: &m
 }
 
 #[gpui::test]
-fn clearing_the_tls_field_removes_the_param_instead_of_leaving_it_empty(cx: &mut TestAppContext) {
+fn selecting_tls_off_writes_the_disable_sslmode_value(cx: &mut TestAppContext) {
     let (form, _events) = build_form(cx);
     form.update(cx, |form, cx| {
         form.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=require", cx);
     });
-    let tls_field = form.read_with(cx, |form, _cx| form.tls_field.clone());
-    tls_field.update(cx, |field, cx| field.set_value("", cx));
+    form.update(cx, |form, cx| {
+        form.set_tls_mode("postgres", zsql_core::TlsVerify::Off, cx);
+    });
     form.read_with(cx, |form, cx| {
         let url = form.url_field.read(cx).value().to_string();
-        assert_eq!(
-            url, "postgres://app:s3cr3t@host:5432/app",
-            "clearing the TLS field must drop sslmode entirely, not leave 'sslmode='"
+        assert!(
+            url.contains("sslmode=disable"),
+            "selecting Off must write sslmode=disable, got {url}"
         );
-        assert!(!url.contains("sslmode"));
     });
 }
 
@@ -300,6 +301,8 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
             id,
             "staging".to_owned(),
             "postgres://app:s3cr3t@staging.internal:5432/app?sslmode=require".to_owned(),
+            None,
+            None,
             cx,
         );
     });
@@ -322,7 +325,6 @@ fn show_edit_form_prefills_name_url_and_the_driver_fields(cx: &mut TestAppContex
         assert_eq!(form.user_field.read(cx).value().as_ref(), "app");
         assert_eq!(form.password_field.read(cx).value().as_ref(), "s3cr3t");
         assert_eq!(form.database_field.read(cx).value().as_ref(), "app");
-        assert_eq!(form.tls_field.read(cx).value().as_ref(), "require");
     });
 }
 
@@ -334,6 +336,8 @@ fn show_edit_form_for_a_sqlite_url_prefills_only_the_path_field(cx: &mut TestApp
             Uuid::new_v4(),
             "reports".to_owned(),
             "sqlite:///tmp/reports.db".to_owned(),
+            None,
+            None,
             cx,
         );
     });
@@ -357,6 +361,8 @@ fn the_edit_form_renders_prefilled_without_panicking(cx: &mut TestAppContext) {
             Uuid::new_v4(),
             "staging".to_owned(),
             "postgres://app@staging.internal:5432/app".to_owned(),
+            None,
+            None,
             cx,
         );
     });
@@ -478,7 +484,8 @@ fn add_form_network_focus_chain(form: &ConnectionForm, cx: &gpui::App) -> Vec<Fo
         form.user_field.read(cx).focus_handle(cx),
         form.password_field.read(cx).focus_handle(cx),
         form.database_field.read(cx).focus_handle(cx),
-        form.tls_field.read(cx).focus_handle(cx),
+        form.tls_focus.clone(),
+        form.ssh_enabled_focus.clone(),
         form.cancel_focus.clone(),
         form.test_focus.clone(),
         form.connect_focus.clone(),
@@ -497,7 +504,8 @@ fn edit_form_network_focus_chain(form: &ConnectionForm, cx: &gpui::App) -> Vec<F
         form.user_field.read(cx).focus_handle(cx),
         form.password_field.read(cx).focus_handle(cx),
         form.database_field.read(cx).focus_handle(cx),
-        form.tls_field.read(cx).focus_handle(cx),
+        form.tls_focus.clone(),
+        form.ssh_enabled_focus.clone(),
         form.cancel_focus.clone(),
         form.test_focus.clone(),
         form.save_focus.clone(),
@@ -539,7 +547,14 @@ fn assert_edit_form_tab_order_covers_network_fields(cx: &mut TestAppContext, url
     let (host, vcx) = build_form_host(cx);
     host.update(vcx, |host, cx| {
         host.form.update(cx, |form, cx| {
-            form.begin_edit(Uuid::new_v4(), "db".to_owned(), url.to_owned(), cx);
+            form.begin_edit(
+                Uuid::new_v4(),
+                "db".to_owned(),
+                url.to_owned(),
+                None,
+                None,
+                cx,
+            );
         });
     });
     vcx.run_until_parked();
@@ -668,7 +683,14 @@ fn an_edit_event_from_the_form(cx: &mut TestAppContext) {
     let (form, vcx, events) = build_form_in_window(cx);
     let id = Uuid::new_v4();
     form.update(vcx, |form, cx| {
-        form.begin_edit(id, "first".to_owned(), "postgres://host/a".to_owned(), cx);
+        form.begin_edit(
+            id,
+            "first".to_owned(),
+            "postgres://host/a".to_owned(),
+            None,
+            None,
+            cx,
+        );
         form.set_name_input("renamed via footer", cx);
     });
     vcx.run_until_parked();
@@ -780,7 +802,14 @@ fn submitting_the_name_field_in_edit_mode_updates_the_row_in_place(cx: &mut Test
     let (form, events) = build_form(cx);
     let id = Uuid::new_v4();
     form.update(cx, |form, cx| {
-        form.begin_edit(id, "first".to_owned(), "postgres://host/a".to_owned(), cx);
+        form.begin_edit(
+            id,
+            "first".to_owned(),
+            "postgres://host/a".to_owned(),
+            None,
+            None,
+            cx,
+        );
         form.set_name_input("edited via enter", cx);
     });
     let name_field = form.read_with(cx, |form, _cx| form.name_field.clone());
@@ -802,7 +831,14 @@ fn submitting_the_url_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestA
     let (form, events) = build_form(cx);
     let id = Uuid::new_v4();
     form.update(cx, |form, cx| {
-        form.begin_edit(id, "first".to_owned(), "postgres://host/a".to_owned(), cx);
+        form.begin_edit(
+            id,
+            "first".to_owned(),
+            "postgres://host/a".to_owned(),
+            None,
+            None,
+            cx,
+        );
         form.set_name_input("edited via enter url", cx);
     });
     let url_field = form.read_with(cx, |form, _cx| form.url_field.clone());
@@ -817,4 +853,429 @@ fn submitting_the_url_field_in_edit_mode_updates_the_row_in_place(cx: &mut TestA
         }],
         "Enter in edit mode must submit the same as clicking Save changes"
     );
+}
+
+// ---- SSH section state ----------------------------------------------------
+
+fn sample_stored_ssh() -> StoredSsh {
+    StoredSsh {
+        enabled: true,
+        host: "bastion.example.com".to_owned(),
+        port: 2222,
+        user: "deploy".to_owned(),
+        auth_kind: SshAuthKind::Password,
+        key_path: None,
+        host_key_policy: HostKeyPolicy::AcceptNew,
+    }
+}
+
+#[gpui::test]
+fn begin_edit_populates_the_ssh_section_from_stored_password_auth(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.begin_edit(
+            Uuid::new_v4(),
+            "staging".to_owned(),
+            "postgres://app@staging.internal:5432/app".to_owned(),
+            Some(sample_stored_ssh()),
+            Some("tunnel-secret".to_owned()),
+            cx,
+        );
+    });
+    form.read_with(cx, |form, cx| {
+        assert!(form.ssh_enabled);
+        assert_eq!(
+            form.ssh_host_field.read(cx).value().as_ref(),
+            "bastion.example.com"
+        );
+        assert_eq!(form.ssh_port_field.read(cx).value().as_ref(), "2222");
+        assert_eq!(form.ssh_user_field.read(cx).value().as_ref(), "deploy");
+        assert!(matches!(form.ssh_auth_kind, SshAuthKind::Password));
+        assert_eq!(
+            form.ssh_password_field.read(cx).value().as_ref(),
+            "tunnel-secret"
+        );
+        assert!(form.ssh_key_passphrase_field.read(cx).value().is_empty());
+    });
+}
+
+#[gpui::test]
+fn begin_edit_populates_the_ssh_section_from_stored_key_auth(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    let ssh = StoredSsh {
+        auth_kind: SshAuthKind::Key,
+        key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+        host_key_policy: HostKeyPolicy::KnownHosts(PathBuf::from("/home/user/.ssh/known_hosts")),
+        ..sample_stored_ssh()
+    };
+    form.update(cx, |form, cx| {
+        form.begin_edit(
+            Uuid::new_v4(),
+            "staging".to_owned(),
+            "postgres://app@staging.internal:5432/app".to_owned(),
+            Some(ssh),
+            Some("key-passphrase".to_owned()),
+            cx,
+        );
+    });
+    form.read_with(cx, |form, cx| {
+        assert!(matches!(form.ssh_auth_kind, SshAuthKind::Key));
+        assert_eq!(
+            form.ssh_key_path_field.read(cx).value().as_ref(),
+            "/home/user/.ssh/id_ed25519"
+        );
+        assert_eq!(
+            form.ssh_key_passphrase_field.read(cx).value().as_ref(),
+            "key-passphrase"
+        );
+        assert!(form.ssh_password_field.read(cx).value().is_empty());
+        assert_eq!(form.ssh_host_key_mode, HostKeyMode::KnownHosts);
+        assert_eq!(
+            form.ssh_known_hosts_path_field.read(cx).value().as_ref(),
+            "/home/user/.ssh/known_hosts"
+        );
+    });
+}
+
+#[gpui::test]
+fn begin_edit_displays_a_stored_prompt_host_key_policy_as_accept_new(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    let ssh = StoredSsh {
+        host_key_policy: HostKeyPolicy::Prompt,
+        ..sample_stored_ssh()
+    };
+    form.update(cx, |form, cx| {
+        form.begin_edit(
+            Uuid::new_v4(),
+            "staging".to_owned(),
+            "postgres://app@staging.internal:5432/app".to_owned(),
+            Some(ssh),
+            None,
+            cx,
+        );
+    });
+    form.read_with(cx, |form, cx| {
+        assert_eq!(form.ssh_host_key_mode, HostKeyMode::AcceptNew);
+        assert!(form.ssh_known_hosts_path_field.read(cx).value().is_empty());
+    });
+}
+
+#[gpui::test]
+fn begin_edit_with_no_ssh_leaves_the_section_disabled(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.begin_edit(
+            Uuid::new_v4(),
+            "plain".to_owned(),
+            "postgres://app@host:5432/app".to_owned(),
+            None,
+            None,
+            cx,
+        );
+    });
+    form.read_with(cx, |form, cx| {
+        assert!(!form.ssh_enabled);
+        assert!(form.ssh_host_field.read(cx).value().is_empty());
+    });
+}
+
+#[gpui::test]
+fn begin_add_resets_a_previously_populated_ssh_section(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.begin_edit(
+            Uuid::new_v4(),
+            "staging".to_owned(),
+            "postgres://app@host:5432/app".to_owned(),
+            Some(sample_stored_ssh()),
+            Some("secret".to_owned()),
+            cx,
+        );
+        form.begin_add(cx);
+    });
+    form.read_with(cx, |form, cx| {
+        assert!(!form.ssh_enabled);
+        assert!(form.ssh_host_field.read(cx).value().is_empty());
+        assert!(form.ssh_password_field.read(cx).value().is_empty());
+        assert!(matches!(form.ssh_auth_kind, SshAuthKind::Agent));
+    });
+}
+
+#[gpui::test]
+fn ssh_state_is_none_while_the_toggle_is_off(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let (ssh, secret) = form.ssh_state(cx);
+        assert!(ssh.is_none());
+        assert!(secret.is_none());
+    });
+}
+
+#[gpui::test]
+fn ssh_state_reflects_agent_auth_with_no_secret(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+    });
+    let host_field = form.read_with(cx, |form, _cx| form.ssh_host_field.clone());
+    host_field.update(cx, |field, cx| field.set_value("bastion", cx));
+
+    form.read_with(cx, |form, cx| {
+        let (ssh, secret) = form.ssh_state(cx);
+        let ssh = ssh.expect("ssh must be Some while enabled");
+        assert_eq!(ssh.host, "bastion");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Agent));
+        assert!(secret.is_none());
+    });
+}
+
+#[gpui::test]
+fn ssh_state_reflects_password_auth_and_its_secret(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+    });
+    let password_field = form.read_with(cx, |form, _cx| form.ssh_password_field.clone());
+    password_field.update(cx, |field, cx| field.set_value("hunter2", cx));
+
+    form.read_with(cx, |form, cx| {
+        let (ssh, secret) = form.ssh_state(cx);
+        let ssh = ssh.expect("ssh must be Some while enabled");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Password));
+        assert_eq!(secret.as_deref(), Some("hunter2"));
+    });
+}
+
+#[gpui::test]
+fn ssh_state_reflects_key_auth_path_and_passphrase(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_ssh_auth_kind(SshAuthKind::Key, cx);
+    });
+    let key_path_field = form.read_with(cx, |form, _cx| form.ssh_key_path_field.clone());
+    key_path_field.update(cx, |field, cx| {
+        field.set_value("/home/user/.ssh/id_ed25519", cx);
+    });
+    let passphrase_field = form.read_with(cx, |form, _cx| form.ssh_key_passphrase_field.clone());
+    passphrase_field.update(cx, |field, cx| field.set_value("s3cr3t", cx));
+
+    form.read_with(cx, |form, cx| {
+        let (ssh, secret) = form.ssh_state(cx);
+        let ssh = ssh.expect("ssh must be Some while enabled");
+        assert!(matches!(ssh.auth_kind, SshAuthKind::Key));
+        assert_eq!(
+            ssh.key_path.as_deref(),
+            Some(std::path::Path::new("/home/user/.ssh/id_ed25519"))
+        );
+        assert_eq!(secret.as_deref(), Some("s3cr3t"));
+    });
+}
+
+#[gpui::test]
+fn ssh_state_reflects_known_hosts_host_key_policy(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_ssh_host_key_mode(HostKeyMode::KnownHosts, cx);
+    });
+    let known_hosts_field = form.read_with(cx, |form, _cx| form.ssh_known_hosts_path_field.clone());
+    known_hosts_field.update(cx, |field, cx| {
+        field.set_value("/home/user/.ssh/known_hosts", cx);
+    });
+
+    form.read_with(cx, |form, cx| {
+        let (ssh, _secret) = form.ssh_state(cx);
+        let ssh = ssh.expect("ssh must be Some while enabled");
+        assert_eq!(
+            ssh.host_key_policy,
+            HostKeyPolicy::KnownHosts(PathBuf::from("/home/user/.ssh/known_hosts"))
+        );
+    });
+}
+
+#[gpui::test]
+fn ssh_state_is_none_after_switching_the_url_to_sqlite_even_if_still_toggled_on(
+    cx: &mut TestAppContext,
+) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_url_input("sqlite::memory:", cx);
+    });
+    form.read_with(cx, |form, cx| {
+        // The SSH section unmounts for sqlite with no UI to clear a
+        // stranded `ssh_enabled`, so `ssh_state` itself must gate on the
+        // driver rather than reporting a tunnel for a sqlite connection.
+        let (ssh, secret) = form.ssh_state(cx);
+        assert!(ssh.is_none());
+        assert!(secret.is_none());
+    });
+}
+
+// ---- SSH section focus order -----------------------------------------------
+
+#[gpui::test]
+fn focus_order_includes_ssh_handles_after_tls_when_ssh_is_enabled(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_ssh_auth_kind(SshAuthKind::Key, cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let order = form.focus_order(cx);
+        let expected = vec![
+            form.name_field.read(cx).focus_handle(cx),
+            form.url_field.read(cx).focus_handle(cx),
+            form.host_field.read(cx).focus_handle(cx),
+            form.port_field.read(cx).focus_handle(cx),
+            form.user_field.read(cx).focus_handle(cx),
+            form.password_field.read(cx).focus_handle(cx),
+            form.database_field.read(cx).focus_handle(cx),
+            form.tls_focus.clone(),
+            form.ssh_enabled_focus.clone(),
+            form.ssh_host_field.read(cx).focus_handle(cx),
+            form.ssh_port_field.read(cx).focus_handle(cx),
+            form.ssh_user_field.read(cx).focus_handle(cx),
+            form.ssh_auth_focus.clone(),
+            form.ssh_key_path_field.read(cx).focus_handle(cx),
+            form.ssh_key_passphrase_field.read(cx).focus_handle(cx),
+            form.ssh_host_key_focus.clone(),
+            form.cancel_focus.clone(),
+            form.test_focus.clone(),
+            form.connect_focus.clone(),
+            form.save_focus.clone(),
+        ];
+        assert_eq!(order, expected);
+    });
+}
+
+#[gpui::test]
+fn tab_cycles_through_the_ssh_section_when_enabled(cx: &mut TestAppContext) {
+    let (host, vcx) = build_form_host(cx);
+    host.update(vcx, |host, cx| {
+        host.form.update(cx, |form, cx| {
+            form.set_url_input("postgres://app@host:5432/db", cx);
+            form.set_ssh_enabled(true, cx);
+            form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let order = host.read_with(vcx, |host, cx| host.form.read(cx).focus_order(cx));
+    assert!(
+        order.len() >= 3,
+        "SSH-enabled network form must expose more than name/url/footer"
+    );
+    assert_tab_cycles_through_in_order(vcx, &order);
+}
+
+#[gpui::test]
+fn focus_order_keeps_the_ssh_toggle_but_skips_its_sub_fields_while_disabled(
+    cx: &mut TestAppContext,
+) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let order = form.focus_order(cx);
+        assert!(order.contains(&form.tls_focus));
+        assert!(
+            order.contains(&form.ssh_enabled_focus),
+            "the SSH enable toggle must stay reachable even while off"
+        );
+        assert!(!order.contains(&form.ssh_host_field.read(cx).focus_handle(cx)));
+        assert!(!order.contains(&form.ssh_auth_focus));
+    });
+}
+
+#[gpui::test]
+fn focus_order_for_a_sqlite_url_never_includes_any_ssh_or_tls_handle(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("sqlite::memory:", cx);
+        form.set_ssh_enabled(true, cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let order = form.focus_order(cx);
+        assert!(!order.contains(&form.ssh_enabled_focus));
+        assert!(!order.contains(&form.tls_focus));
+    });
+}
+
+// ---- TLS control capped by an enabled SSH tunnel ---------------------------
+
+#[gpui::test]
+fn postgres_tls_control_drops_verify_full_while_ssh_is_enabled_and_restores_it_once_off(
+    cx: &mut TestAppContext,
+) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+    });
+    form.read_with(cx, |form, _cx| {
+        assert!(
+            form.tls_available_modes_for_test("postgres")
+                .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+    });
+
+    form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
+    form.read_with(cx, |form, _cx| {
+        assert!(
+            !form
+                .tls_available_modes_for_test("postgres")
+                .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+    });
+
+    form.update(cx, |form, cx| form.set_ssh_enabled(false, cx));
+    form.read_with(cx, |form, _cx| {
+        assert!(
+            form.tls_available_modes_for_test("postgres")
+                .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+    });
+}
+
+#[gpui::test]
+fn mysql_tls_control_is_also_capped_while_ssh_is_enabled(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("mysql://app@host:3306/db", cx);
+        form.set_ssh_enabled(true, cx);
+    });
+    form.read_with(cx, |form, _cx| {
+        assert!(
+            !form
+                .tls_available_modes_for_test("mysql")
+                .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+    });
+}
+
+#[gpui::test]
+fn mssql_tls_control_is_never_capped_by_ssh(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("mssql://sa:pw@dbhost:1433/db", cx);
+        form.set_ssh_enabled(true, cx);
+    });
+    form.read_with(cx, |form, _cx| {
+        assert!(
+            form.tls_available_modes_for_test("mssql")
+                .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+    });
 }

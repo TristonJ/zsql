@@ -184,27 +184,45 @@ impl StoredConnection {
         let Some(ssh) = self.ssh.as_ref().filter(|ssh| ssh.enabled) else {
             return Ok(None);
         };
-        let auth = match ssh.auth_kind {
-            SshAuthKind::Agent => zsql_ssh::SshAuth::Agent,
-            SshAuthKind::Password => zsql_ssh::SshAuth::Password(self.get_ssh_secret()?),
-            SshAuthKind::Key => zsql_ssh::SshAuth::Key {
-                path: ssh.key_path.clone().unwrap_or_default(),
-                // A key with no passphrase has no keyring entry at all
-                // (`ConnectionArgs::into_stored` only writes one when
-                // `ssh_secret` is set), so a missing entry here means
-                // "unprotected key", not an error.
-                passphrase: self.get_ssh_secret().ok(),
-            },
+        let secret = match ssh.auth_kind {
+            SshAuthKind::Agent => None,
+            SshAuthKind::Password => Some(self.get_ssh_secret()?),
+            // A key with no passphrase has no keyring entry at all
+            // (`ConnectionArgs::into_stored` only writes one when
+            // `ssh_secret` is set), so a missing entry here means
+            // "unprotected key", not an error.
+            SshAuthKind::Key => self.get_ssh_secret().ok(),
         };
-        let mut cfg = zsql_ssh::SshConfig::new(ssh.host.clone(), ssh.user.clone(), auth);
-        cfg.port = ssh.port;
-        cfg.host_key = match &ssh.host_key_policy {
-            HostKeyPolicy::KnownHosts(path) => zsql_ssh::HostKeyPolicy::KnownHosts(path.clone()),
-            HostKeyPolicy::AcceptNew => zsql_ssh::HostKeyPolicy::AcceptNew,
-            HostKeyPolicy::Prompt => zsql_ssh::HostKeyPolicy::Prompt,
-        };
-        Ok(Some(cfg))
+        Ok(Some(ssh_config_from_stored(ssh, secret)))
     }
+}
+
+/// Build the [`zsql_ssh::SshConfig`] `ssh` describes, given its secret
+/// (password or key passphrase) already resolved. `secret` is ignored for
+/// [`SshAuthKind::Agent`], and treated as "no passphrase" for
+/// [`SshAuthKind::Key`] when absent.
+///
+/// Shared between [`StoredConnection::ssh_config`] (which resolves `secret`
+/// from the keyring) and the connection form (which reads it straight from
+/// its own unsaved SSH fields).
+#[must_use]
+pub fn ssh_config_from_stored(ssh: &StoredSsh, secret: Option<String>) -> zsql_ssh::SshConfig {
+    let auth = match ssh.auth_kind {
+        SshAuthKind::Agent => zsql_ssh::SshAuth::Agent,
+        SshAuthKind::Password => zsql_ssh::SshAuth::Password(secret.unwrap_or_default()),
+        SshAuthKind::Key => zsql_ssh::SshAuth::Key {
+            path: ssh.key_path.clone().unwrap_or_default(),
+            passphrase: secret,
+        },
+    };
+    let mut cfg = zsql_ssh::SshConfig::new(ssh.host.clone(), ssh.user.clone(), auth);
+    cfg.port = ssh.port;
+    cfg.host_key = match &ssh.host_key_policy {
+        HostKeyPolicy::KnownHosts(path) => zsql_ssh::HostKeyPolicy::KnownHosts(path.clone()),
+        HostKeyPolicy::AcceptNew => zsql_ssh::HostKeyPolicy::AcceptNew,
+        HostKeyPolicy::Prompt => zsql_ssh::HostKeyPolicy::Prompt,
+    };
+    cfg
 }
 
 /// The on-disk shape of the connection store file: a single named array so
@@ -1477,6 +1495,51 @@ mod tests {
             cfg.host_key,
             zsql_ssh::HostKeyPolicy::KnownHosts(PathBuf::from("/home/user/.ssh/known_hosts"))
         );
+    }
+
+    // -- ssh_config_from_stored (no keyring involved) ------------------------
+
+    #[test]
+    fn ssh_config_from_stored_builds_agent_auth_with_no_secret() {
+        let ssh = StoredSsh {
+            auth_kind: SshAuthKind::Agent,
+            ..sample_ssh()
+        };
+        let cfg = super::ssh_config_from_stored(&ssh, None);
+        assert!(matches!(cfg.auth, zsql_ssh::SshAuth::Agent));
+        assert_eq!(cfg.host, ssh.host);
+        assert_eq!(cfg.port, ssh.port);
+        assert_eq!(cfg.user, ssh.user);
+    }
+
+    #[test]
+    fn ssh_config_from_stored_builds_password_auth_from_the_given_secret() {
+        let ssh = StoredSsh {
+            auth_kind: SshAuthKind::Password,
+            ..sample_ssh()
+        };
+        let cfg = super::ssh_config_from_stored(&ssh, Some("form-password".to_owned()));
+        assert!(matches!(
+            cfg.auth,
+            zsql_ssh::SshAuth::Password(ref pw) if pw == "form-password"
+        ));
+    }
+
+    #[test]
+    fn ssh_config_from_stored_builds_key_auth_with_the_given_passphrase() {
+        let ssh = StoredSsh {
+            auth_kind: SshAuthKind::Key,
+            key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
+            ..sample_ssh()
+        };
+        let cfg = super::ssh_config_from_stored(&ssh, Some("form-passphrase".to_owned()));
+        match cfg.auth {
+            zsql_ssh::SshAuth::Key { path, passphrase } => {
+                assert_eq!(path, PathBuf::from("/home/user/.ssh/id_ed25519"));
+                assert_eq!(passphrase.as_deref(), Some("form-passphrase"));
+            }
+            other => panic!("expected SshAuth::Key, got {other:?}"),
+        }
     }
 
     #[test]

@@ -87,11 +87,19 @@ pub fn detect_driver_name(url: &str) -> Result<&'static str, String> {
         .map_err(|err| err.to_string())
 }
 
+/// Whether `driver_id` names a network driver -- every registered driver
+/// except `sqlite`, which is file-based and has no host to open an SSH
+/// tunnel to or apply a TLS mode against.
+#[must_use]
+pub fn is_network(driver_id: &str) -> bool {
+    driver_id != "sqlite"
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{connect, registered_drivers};
+    use super::{connect, is_network, registered_drivers};
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         futures::executor::block_on(fut)
@@ -196,5 +204,15 @@ mod tests {
             Some(zsql_core::Value::Int(1)),
             "SELECT 1 through the selection-based connect path must actually return 1"
         );
+    }
+
+    #[test]
+    fn is_network_is_false_only_for_sqlite() {
+        assert!(!is_network("sqlite"));
+        assert!(is_network("postgres"));
+        assert!(is_network("mysql"));
+        assert!(is_network("mariadb"));
+        assert!(is_network("mssql"));
+        assert!(is_network("unregistered"));
     }
 }

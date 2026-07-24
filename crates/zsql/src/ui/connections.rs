@@ -18,9 +18,13 @@ use gpui::{App, Context, Entity, FocusHandle, KeyDownEvent, Task, Window, prelud
 use uuid::Uuid;
 use zsql_core::Connection;
 
-use crate::connections::{ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection};
-use crate::drivers::{self, detect_driver_id};
-use crate::session::{LivenessState, Session, SessionState, probe_connection};
+use crate::connections::{
+    ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection, ssh_config_from_stored,
+};
+use crate::drivers::detect_driver_id;
+use crate::session::{
+    LivenessState, Session, SessionState, open_tunnel_and_connect, probe_connection,
+};
 use crate::tab_session::ConnectionKey;
 use crate::ui::connections::form::{ConnectionForm, ConnectionFormEvent};
 use crate::ui::format::host_label;
@@ -370,11 +374,18 @@ impl ConnectionManagerView {
             }
         };
         let name = row.connection.name.clone();
+        let ssh = row.connection.ssh.clone();
+        let ssh_secret = if ssh.is_some() {
+            row.connection.get_ssh_secret().ok()
+        } else {
+            None
+        };
         let id = row.connection.id;
         self.view = ManagerView::Form;
         self.status = None;
-        self.form
-            .update(cx, |form, cx| form.begin_edit(id, name, url, cx));
+        self.form.update(cx, |form, cx| {
+            form.begin_edit(id, name, url, ssh, ssh_secret, cx);
+        });
         self.form.read(cx).name_focus_handle(cx).focus(window);
         cx.notify();
     }
@@ -498,11 +509,12 @@ impl ConnectionManagerView {
             cx.notify();
             return Ok(());
         }
+        let (ssh, ssh_secret) = self.form.read(cx).ssh_state(cx);
         let connection = ConnectionArgs {
             name: name.to_string(),
             url,
-            ssh: None,
-            ssh_secret: None,
+            ssh,
+            ssh_secret,
         };
         match self.store.add(connection) {
             Ok(()) => {
@@ -545,11 +557,12 @@ impl ConnectionManagerView {
             cx.notify();
             return Ok(());
         }
+        let (ssh, ssh_secret) = self.form.read(cx).ssh_state(cx);
         let args = ConnectionArgs {
             name: name.to_string(),
             url,
-            ssh: None,
-            ssh_secret: None,
+            ssh,
+            ssh_secret,
         };
         match self.store.update(id, args) {
             Ok(()) => {
@@ -724,7 +737,10 @@ impl ConnectionManagerView {
     /// Connect to the form's current URL through the session, without
     /// persisting it to the store. Rejects an empty or unrecognized-scheme
     /// URL the same way [`validate_new_connection`] does, without touching
-    /// the session.
+    /// the session. When the form's SSH section is enabled, opens its
+    /// tunnel first, through [`Session::connect_to_with_ssh`] -- the same
+    /// tunnel-before-connect path a saved connection's own [`Self::connect`]
+    /// uses.
     ///
     /// [`Self::active`] is updated to this URL synchronously, before the
     /// connect attempt itself runs (see [`Self::connect_index`]'s doc
@@ -757,9 +773,14 @@ impl ConnectionManagerView {
         });
         cx.notify();
 
-        let connect_task = self
-            .session
-            .update(cx, |session, cx| session.connect_to(url, cx));
+        let (ssh, ssh_secret) = self.form.read(cx).ssh_state(cx);
+        let ssh_cfg = ssh
+            .as_ref()
+            .map(|ssh| ssh_config_from_stored(ssh, ssh_secret));
+
+        let connect_task = self.session.update(cx, |session, cx| {
+            session.connect_to_with_ssh(url, ssh_cfg, cx)
+        });
         let session = self.session.clone();
         cx.spawn(async move |this, cx| {
             connect_task.await;
@@ -792,9 +813,12 @@ impl ConnectionManagerView {
 
     /// Open a real connection to the form's current URL and ping it, on
     /// [`Self::probe_timeout`], without saving anything or touching the
-    /// session's active connection. Pushes `Pending` into the form (see
-    /// [`ConnectionForm::set_test_outcome`]) immediately, then the final
-    /// result once the attempt settles.
+    /// session's active connection. When the form's SSH section is enabled,
+    /// its tunnel is opened first (the same tunnel-before-connect path
+    /// [`Session::connect_to_with_ssh`] uses); a tunnel failure surfaces as
+    /// `Failed` without the driver connect ever being attempted. Pushes
+    /// `Pending` into the form (see [`ConnectionForm::set_test_outcome`])
+    /// immediately, then the final result once the attempt settles.
     #[tracing::instrument(name = "connection_manager_test", skip_all)]
     pub fn run_test(&mut self, cx: &mut Context<Self>, url: String) -> Task<()> {
         if let Err(reason) = detect_driver_id(&url) {
@@ -809,12 +833,18 @@ impl ConnectionManagerView {
         });
         let timeout = self.probe_timeout;
         let form = self.form.clone();
+        let (ssh, ssh_secret) = self.form.read(cx).ssh_state(cx);
+        let ssh_cfg = ssh
+            .as_ref()
+            .map(|ssh| ssh_config_from_stored(ssh, ssh_secret));
 
         cx.spawn(async move |_this, cx| {
             let started = Instant::now();
-            let connect_result = cx.background_spawn(drivers::connect(url)).await;
+            let connect_result = cx
+                .background_spawn(open_tunnel_and_connect(url, ssh_cfg))
+                .await;
             let outcome = match connect_result {
-                Ok(conn) => {
+                Ok((conn, _tunnel)) => {
                     let conn: Arc<dyn Connection> = Arc::from(conn);
                     let executor = cx.background_executor().clone();
                     let probe_result = cx
