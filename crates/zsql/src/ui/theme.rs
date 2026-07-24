@@ -189,12 +189,6 @@ pub const GENERATED_HINT_TEXT_SIZE: f32 = 11.0;
 /// Text size of a tab's leading table-icon glyph.
 pub const TAB_ICON_TEXT_SIZE: f32 = 11.0;
 
-/// Width of the centered connection-manager modal panel.
-pub const MODAL_WIDTH: Pixels = px(468.0);
-/// Corner radius of the modal panel.
-pub const MODAL_RADIUS: f32 = 10.0;
-/// Height of the modal's title bar.
-pub const MODAL_HEAD_HEIGHT: Pixels = px(44.0);
 /// Tallest the modal's connection list is allowed to grow before it scrolls.
 pub const MODAL_LIST_MAX_HEIGHT: Pixels = px(300.0);
 /// Corner radius of a connection-list row.
@@ -213,17 +207,11 @@ pub const MODAL_ROW_CONNECTED_LABEL_TEXT_SIZE: f32 = 9.5;
 /// Vertical gap between a connection-list row's name line and its url line.
 pub const MODAL_ROW_INNER_GAP: Pixels = px(3.0);
 
-/// Size of the modal head's close icon.
-pub const MODAL_CLOSE_ICON_SIZE: Pixels = px(13.0);
 /// Size of a connection-list row's delete icon.
 pub const MODAL_DELETE_ICON_SIZE: Pixels = px(13.0);
 /// Size of the "Add connection" affordance's plus icon.
 pub const MODAL_ADD_ICON_SIZE: Pixels = px(12.0);
 
-/// `group()` name tying the modal close row's hitbox to its icon's
-/// `group_hover` tint, so hovering anywhere in the row -- not just the
-/// icon's own small hitbox -- lightens the close glyph.
-pub const MODAL_CLOSE_HOVER_GROUP: &str = "connection-modal-close-hover";
 /// Size of a connection-list row's edit (pencil) icon.
 pub const MODAL_EDIT_ICON_SIZE: Pixels = px(13.0);
 

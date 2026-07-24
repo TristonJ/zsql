@@ -175,6 +175,8 @@ pub struct ConnectionManagerView {
     /// indicator agree on what "unreachable" means.
     probe_timeout: Duration,
     form: Entity<ConnectionForm>,
+    /// We need to refocus the modal's own focus handle
+    refocus_modal: bool,
 }
 
 impl ConnectionManagerView {
@@ -210,6 +212,7 @@ impl ConnectionManagerView {
             status: None,
             probe_timeout,
             form,
+            refocus_modal: false,
         }
     }
 
@@ -382,6 +385,7 @@ impl ConnectionManagerView {
         self.view = ManagerView::List;
         self.form.update(cx, ConnectionForm::begin_add);
         self.status = None;
+        self.refocus_modal = true;
         cx.notify();
     }
 
@@ -505,6 +509,7 @@ impl ConnectionManagerView {
                 self.view = ManagerView::List;
                 self.form.update(cx, ConnectionForm::begin_add);
                 self.status = Some("connection saved".to_owned());
+                self.refocus_modal = true;
                 cx.notify();
                 Ok(())
             }
@@ -549,6 +554,7 @@ impl ConnectionManagerView {
                 self.view = ManagerView::List;
                 self.form.update(cx, ConnectionForm::begin_add);
                 self.status = Some("sonnection saved".to_owned());
+                self.refocus_modal = true;
                 cx.notify();
                 Ok(())
             }
