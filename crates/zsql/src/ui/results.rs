@@ -118,10 +118,7 @@ pub struct ResultsView {
     /// The right-click cell context menu, if one is open.
     cell_context_menu: Option<CellContextMenuState>,
     /// The connection-manager modal the Empty-state "Add connection" button
-    /// opens, wired in by [`ResultsView::set_connections_modal`]. `None`
-    /// until wired (e.g. a view built directly in a test other than one
-    /// exercising that button), in which case the button still renders but
-    /// clicking it is a no-op.
+    /// opens
     connections_modal: Option<Entity<ConnectionManagerView>>,
     /// The value panel
     value_panel: Entity<ValuePanel>,
@@ -296,12 +293,7 @@ impl ResultsView {
     }
 
     /// Wire the connection-manager modal the Empty-state "Add connection"
-    /// button opens, so clicking it opens the same shared instance the
-    /// connection footer's own click-to-connect affordance opens rather
-    /// than a second one. Called once by
-    /// [`crate::ui::workspace::WorkspaceView::new`] right after
-    /// construction; a view built directly (e.g. in a test) renders that
-    /// button inert until this is called.
+    /// button opens, so clicking it opens the same shared instance
     pub fn set_connections_modal(&mut self, connections: Entity<ConnectionManagerView>) {
         self.connections_modal = Some(connections);
     }
@@ -324,6 +316,15 @@ impl ResultsView {
     pub fn show_snapshot(&mut self, snapshot: ResultsSnapshot, cx: &mut Context<Self>) {
         self.source_label = snapshot.source_label.clone();
         self.frozen = Some(snapshot);
+        self.reset_for_new_result();
+        self.sync_dimensions(cx);
+        cx.notify();
+    }
+
+    /// Completely clear the view's derived state
+    pub fn show_empty(&mut self, cx: &mut Context<Self>) {
+        self.source_label = "".into();
+        self.frozen = None;
         self.reset_for_new_result();
         self.sync_dimensions(cx);
         cx.notify();

@@ -17,7 +17,7 @@ use zsql_editor::{EditorView, QueryRunner};
 use super::editor_adapter;
 use super::results::{ResultsSnapshot, ResultsView};
 use super::schema_view::SchemaTabView;
-use crate::session::{Session, SessionState};
+use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 
 /// Identifies one open tab, stable for its lifetime and never reused within
@@ -296,11 +296,10 @@ impl TabModel {
             return;
         }
 
-        let snapshot = tab.last_run.clone().unwrap_or_else(|| ResultsSnapshot {
-            source_label: label,
-            state: SessionState::Connected,
-            result: zsql_core::ResultSet::default(),
-        });
+        let Some(snapshot) = tab.last_run.clone() else {
+            self.results.update(cx, ResultsView::show_empty);
+            return;
+        };
         self.results
             .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
     }
