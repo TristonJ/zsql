@@ -2,6 +2,12 @@
 A lightweight developer-first SQL editor. Intended to be fast & simple, but provide useful features
 for a developer workflow.
 
+## Installing
+For now, you must clone the repo and use cargo to install the binary:
+```sh
+cargo install --path crates/zsql
+```
+
 ## Building
 The core binary is in `crates/zsql`. To build it in release mode:
 ```sh
