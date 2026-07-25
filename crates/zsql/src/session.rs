@@ -15,20 +15,6 @@ use zsql_core::{
 use crate::config::Config;
 use crate::drivers;
 
-/// The standard port a network driver's URL falls back to when it names no
-/// explicit port of its own, keyed by [`crate::drivers::detect_driver_id`]'s
-/// id. Only consulted when opening a tunnel: the tunnel's remote endpoint
-/// must be a concrete host and port even if the URL never spelled the port
-/// out.
-fn default_port_for_driver(driver_id: &str) -> Option<u16> {
-    match driver_id {
-        "postgres" => Some(5432),
-        "mysql" => Some(3306),
-        "mssql" => Some(1433),
-        _ => None,
-    }
-}
-
 /// Anything with the same drop-driven lifecycle contract as an open SSH
 /// tunnel: dropping it must tear the tunnel down, and it exposes the local
 /// loopback address a driver should dial instead of the real remote host.
@@ -855,12 +841,9 @@ fn remote_target(url: &str) -> Result<(String, u16), CoreError> {
     })?;
     let port = match parsed.port() {
         Some(port) => port,
-        None => drivers::detect_driver_id(url)
-            .ok()
-            .and_then(default_port_for_driver)
-            .ok_or_else(|| {
-                CoreError::Url("an SSH tunnel requires an explicit port for this URL".to_owned())
-            })?,
+        None => drivers::detect_driver_default_port(url)?.ok_or_else(|| {
+            CoreError::Url("an SSH tunnel requires an explicit port for this URL".to_owned())
+        })?,
     };
     Ok((host, port))
 }
@@ -1098,7 +1081,7 @@ mod tests {
 
     use super::{
         Config, FakeTunnel, Session, SessionState, TunnelHandle, connect_through_open_tunnel,
-        default_port_for_driver, remote_target,
+        remote_target,
     };
 
     fn session_with_no_url() -> Session {
@@ -1432,14 +1415,6 @@ mod tests {
         // default port) and the URL carries no explicit port, leaving nothing
         // for the tunnel to forward to.
         assert!(remote_target("redis://host/db").is_err());
-    }
-
-    #[test]
-    fn default_port_for_driver_covers_every_network_driver() {
-        assert_eq!(default_port_for_driver("postgres"), Some(5432));
-        assert_eq!(default_port_for_driver("mysql"), Some(3306));
-        assert_eq!(default_port_for_driver("mssql"), Some(1433));
-        assert_eq!(default_port_for_driver("sqlite"), None);
     }
 
     /// A tunnel that opened successfully but whose driver connect then fails

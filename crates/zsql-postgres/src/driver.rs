@@ -149,6 +149,14 @@ impl Driver for PostgresDriver {
         "PostgreSQL"
     }
 
+    fn default_port(&self) -> Option<u16> {
+        Some(5432)
+    }
+
+    fn url_schemes(&self) -> &[&'static str] {
+        &["postgres", "postgresql"]
+    }
+
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
         ConnConfig::from_url(url)
     }

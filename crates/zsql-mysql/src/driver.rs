@@ -137,6 +137,14 @@ impl Driver for MysqlDriver {
         "MySQL / MariaDB"
     }
 
+    fn default_port(&self) -> Option<u16> {
+        Some(3306)
+    }
+
+    fn url_schemes(&self) -> &[&'static str] {
+        &["mysql", "mariadb"]
+    }
+
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
         ConnConfig::from_url(url)
     }

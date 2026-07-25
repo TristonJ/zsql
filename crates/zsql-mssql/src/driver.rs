@@ -63,6 +63,14 @@ impl Driver for MssqlDriver {
         "Microsoft SQL Server"
     }
 
+    fn default_port(&self) -> Option<u16> {
+        Some(1433)
+    }
+
+    fn url_schemes(&self) -> &'static [&'static str] {
+        &["mssql", "sqlserver"]
+    }
+
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
         crate::url::parse(url)?;
         ConnConfig::from_url(url)

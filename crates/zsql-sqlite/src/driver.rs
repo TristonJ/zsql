@@ -101,6 +101,14 @@ impl Driver for SqliteDriver {
         "SQLite"
     }
 
+    fn default_port(&self) -> Option<u16> {
+        None
+    }
+
+    fn url_schemes(&self) -> &[&'static str] {
+        &["sqlite"]
+    }
+
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
         ConnConfig::from_url(url)
     }

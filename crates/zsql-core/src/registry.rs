@@ -1,13 +1,5 @@
 //! Driver selection: map a connection URL's scheme to one of a caller-
 //! supplied set of registered [`Driver`]s.
-//!
-//! This module owns the scheme-to-canonical-id table in
-//! [`driver_id_for_scheme`], which does name driver ids such as `"postgres"`
-//! and `"sqlite"` -- adding a backend with a new URL scheme means adding an
-//! arm there. What this module never does is reach past [`Driver::id`] into
-//! a concrete driver type (no `sqlx`, no backend-specific config): the final
-//! lookup that turns a canonical id into an actual [`Driver`] is a plain
-//! `id() == driver_id` match over whatever `drivers` the caller registered.
 
 use std::sync::Arc;
 
@@ -16,16 +8,13 @@ use crate::error::CoreError;
 
 /// Map a URL scheme to the canonical `Driver::id()` that should handle it.
 /// Several schemes may alias the same driver (e.g. `postgres`/`postgresql`).
-fn driver_id_for_scheme(scheme: &str) -> Option<&'static str> {
-    match scheme {
-        "postgres" | "postgresql" => Some("postgres"),
-        "sqlite" | "file" => Some("sqlite"),
-        "mssql" | "sqlserver" => Some("mssql"),
-        // One driver serves both: sqlx has no separate MariaDB backend, and
-        // MariaDB speaks the MySQL wire protocol.
-        "mysql" | "mariadb" => Some("mysql"),
-        _ => None,
+fn driver_id_for_scheme(drivers: &[Arc<dyn Driver>], scheme: &str) -> Option<&'static str> {
+    for driver in drivers {
+        if driver.url_schemes().contains(&scheme) {
+            return Some(driver.id());
+        }
     }
+    None
 }
 
 /// Extract the lowercased scheme prefix from `url` (the text before its
@@ -51,7 +40,7 @@ pub fn select_driver<'a>(
     url: &str,
 ) -> Result<&'a Arc<dyn Driver>, CoreError> {
     let scheme = scheme_of(url).ok_or_else(|| CoreError::Url("missing URL scheme".to_owned()))?;
-    let driver_id = driver_id_for_scheme(&scheme)
+    let driver_id = driver_id_for_scheme(drivers, &scheme)
         .ok_or_else(|| CoreError::Url(format!("unrecognized URL scheme '{scheme}'")))?;
     drivers
         .iter()
@@ -80,6 +69,20 @@ mod tests {
 
         fn display_name(&self) -> &'static str {
             self.0
+        }
+
+        fn default_port(&self) -> Option<u16> {
+            Some(1234)
+        }
+
+        fn url_schemes(&self) -> &[&'static str] {
+            match self.0 {
+                "postgres" => &["postgres", "postgresql"],
+                "sqlite" => &["sqlite", "file"],
+                "mssql" => &["mssql", "sqlserver"],
+                "mysql" => &["mysql", "mariadb"],
+                _ => &[],
+            }
         }
 
         fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
