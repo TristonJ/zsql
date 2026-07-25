@@ -26,8 +26,13 @@ pub struct Modal<H: IntoElement + 'static, B: IntoElement + 'static> {
     focus_handle: Option<FocusHandle>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalSize {
     Small,
+    /// A modal wide enough for two side-by-side content columns instead of
+    /// one -- e.g. the connection form once its SSH tunnel section opens a
+    /// second column beside the base connection fields.
+    Wide,
 }
 
 impl ModalSize {
@@ -35,20 +40,21 @@ impl ModalSize {
     pub fn width(&self) -> Pixels {
         match self {
             ModalSize::Small => px(468.0),
+            ModalSize::Wide => px(760.0),
         }
     }
 
     #[must_use]
     pub fn radius(&self) -> Pixels {
         match self {
-            ModalSize::Small => px(10.0),
+            ModalSize::Small | ModalSize::Wide => px(10.0),
         }
     }
 
     #[must_use]
     pub fn head_height(&self) -> Pixels {
         match self {
-            ModalSize::Small => px(44.0),
+            ModalSize::Small | ModalSize::Wide => px(44.0),
         }
     }
 }

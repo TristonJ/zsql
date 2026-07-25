@@ -28,7 +28,9 @@ impl ConnectionForm {
     /// The SSH tunnel section: an enable toggle, and -- while enabled --
     /// host/port/user fields, the auth-method selector with its conditional
     /// secret fields, and the host-key policy control. Only ever rendered
-    /// for a network driver by [`Self::render_network_fields`].
+    /// for a network driver -- inline as a trailing row of the single-column
+    /// layout while the tunnel is off, or as the two-column layout's own
+    /// right-hand column once it is on.
     pub(super) fn render_ssh_section(
         &self,
         colors: zsql_ui::theme::Colors,

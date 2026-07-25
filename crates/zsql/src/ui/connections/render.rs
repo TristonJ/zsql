@@ -4,7 +4,7 @@
 //! own `Render` impl).
 
 use gpui::{Context, Div, KeyDownEvent, Render, Window, div, prelude::*, px, rgb};
-use zsql_ui::modal::Modal;
+use zsql_ui::modal::{Modal, ModalSize};
 use zsql_ui::theme::ActiveTheme;
 
 use super::{ConnectionManagerView, ManagerView};
@@ -23,11 +23,16 @@ impl Render for ConnectionManagerView {
         let mut body = div().on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
             view.handle_modal_key_down(event, window, cx);
         }));
+        let modal_size = match self.current_view() {
+            ManagerView::List => ModalSize::Small,
+            ManagerView::Form => self.form.read(cx).modal_size(),
+        };
         body = body.child(match self.current_view() {
             ManagerView::List => self.render_modal_list(window, cx).into_any_element(),
             ManagerView::Form => self.render_modal_form(window, cx).into_any_element(),
         });
         Modal::<Div, Div>::new("connection-modal")
+            .size(modal_size)
             .track_focus(&self.modal_focus)
             .on_close(cx.listener(|view, (), _w, cx| view.close(cx)))
             .head(self.render_modal_head(cx))
