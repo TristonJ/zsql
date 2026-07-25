@@ -1,9 +1,11 @@
 //! The per-driver TLS-verification mode control: Off / Verify CA / Verify
-//! full for postgres and mysql/mariadb, Off / Verify full for mssql (no
-//! verify-ca -- `zsql_mssql` has no intermediate mode). Reads from and
-//! writes back to each driver's own query-parameter encoding on the form's
-//! `parsed_url`: `sslmode` for postgres, `ssl-mode` for mysql/mariadb, and
-//! `encrypt`/`trustServerCertificate` for mssql.
+//! full for postgres and mysql/mariadb; for mssql the middle slot instead
+//! means "encrypt but trust the server certificate" (`tiberius` has no
+//! chain-only verification mode of its own, so the slot is repurposed
+//! rather than left unused). Reads from and writes back to each driver's
+//! own query-parameter encoding on the form's `parsed_url`: `sslmode` for
+//! postgres, `ssl-mode` for mysql/mariadb, and `encrypt`/
+//! `trustServerCertificate` for mssql.
 
 use gpui::{Context, Div, Window, div, prelude::*, px, rgb};
 use zsql_core::{ConnectionUrl, TlsVerify};
@@ -54,13 +56,11 @@ pub(super) fn known_query_keys(driver_id: &str) -> Vec<&'static str> {
     }
 }
 
-/// The TLS modes `driver_id` supports at all, in display order.
-fn modes_for(driver_id: &str) -> &'static [TlsVerify] {
-    if driver_id == "mssql" {
-        &[TlsVerify::Off, TlsVerify::VerifyFull]
-    } else {
-        &[TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull]
-    }
+/// The TLS modes every driver's control offers, in display order. What the
+/// middle slot ([`TlsVerify::VerifyCa`]) means differs by driver -- see
+/// [`mode_label`] -- but the control always has three positions.
+fn modes_for() -> &'static [TlsVerify] {
+    &[TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull]
 }
 
 /// The TLS modes currently selectable for `driver_id`, given whether the
@@ -69,7 +69,7 @@ fn modes_for(driver_id: &str) -> &'static [TlsVerify] {
 /// tunneled connection's hostname -- mssql verifies the real hostname
 /// through its own tunnel handling regardless, so it is never capped.
 pub(super) fn available_modes(driver_id: &str, ssh_enabled: bool) -> Vec<TlsVerify> {
-    let modes = modes_for(driver_id);
+    let modes = modes_for();
     if ssh_enabled && (is_mysql_family(driver_id) || driver_id == "postgres") {
         modes
             .iter()
@@ -101,20 +101,27 @@ fn effective_selected_mode(
 /// Whether the SSH toggle currently caps `driver_id`'s TLS control (drops
 /// verify-full), i.e. whether the "capped to verify-ca" note is shown.
 fn tls_is_capped(driver_id: &str, ssh_enabled: bool) -> bool {
-    ssh_enabled && available_modes(driver_id, ssh_enabled).len() < modes_for(driver_id).len()
+    ssh_enabled && available_modes(driver_id, ssh_enabled).len() < modes_for().len()
 }
 
-fn mode_label(mode: TlsVerify) -> &'static str {
+/// The label `driver_id`'s control shows for `mode`. mssql's middle slot
+/// reads "trust cert" rather than "verify ca": it skips certificate
+/// verification entirely (the opposite of what "verify" would imply), so
+/// reusing postgres/mysql's label here would claim a guarantee mssql does
+/// not make.
+fn mode_label(driver_id: &str, mode: TlsVerify) -> &'static str {
     match mode {
         TlsVerify::Off => "off",
+        TlsVerify::VerifyCa if driver_id == "mssql" => "trust cert",
         TlsVerify::VerifyCa => "verify ca",
         TlsVerify::VerifyFull => "verify full",
     }
 }
 
-fn mode_element_id(mode: TlsVerify) -> &'static str {
+fn mode_element_id(driver_id: &str, mode: TlsVerify) -> &'static str {
     match mode {
         TlsVerify::Off => "connection-form-tls-off",
+        TlsVerify::VerifyCa if driver_id == "mssql" => "connection-form-tls-trust-cert",
         TlsVerify::VerifyCa => "connection-form-tls-verify-ca",
         TlsVerify::VerifyFull => "connection-form-tls-verify-full",
     }
@@ -199,14 +206,23 @@ fn mssql_param_ci(parsed: &ConnectionUrl, keys: &[&str]) -> Option<String> {
         .next_back()
 }
 
+/// mssql's mode, read off `parsed`'s `encrypt`/`trustServerCertificate`
+/// params: `encrypt=false` always wins as [`TlsVerify::Off`] regardless of
+/// `trustServerCertificate` (there is nothing left to trust once encryption
+/// itself is off); otherwise `trustServerCertificate=true` reads as the
+/// trust-cert mode (repurposing [`TlsVerify::VerifyCa`]'s slot -- see the
+/// module doc comment), and its absence as [`TlsVerify::VerifyFull`].
 fn read_mssql_mode(parsed: &ConnectionUrl) -> TlsVerify {
     let encrypt =
         mssql_param_ci(parsed, &[MSSQL_ENCRYPT_KEY]).is_none_or(|value| parse_bool_like(&value));
+    if !encrypt {
+        return TlsVerify::Off;
+    }
     let trust_server_certificate =
         mssql_param_ci(parsed, &[MSSQL_TRUST_CERT_KEY, MSSQL_TRUST_CERT_ALIAS_KEY])
             .is_some_and(|value| parse_bool_like(&value));
-    if !encrypt || trust_server_certificate {
-        TlsVerify::Off
+    if trust_server_certificate {
+        TlsVerify::VerifyCa
     } else {
         TlsVerify::VerifyFull
     }
@@ -217,10 +233,17 @@ fn write_mssql_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
         TlsVerify::Off => {
             parsed.set_query_param(MSSQL_ENCRYPT_KEY, "false");
             parsed.remove_query_param(MSSQL_TRUST_CERT_KEY);
+            parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
         }
-        TlsVerify::VerifyCa | TlsVerify::VerifyFull => {
+        TlsVerify::VerifyCa => {
+            parsed.remove_query_param(MSSQL_ENCRYPT_KEY);
+            parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
+            parsed.set_query_param(MSSQL_TRUST_CERT_KEY, "true");
+        }
+        TlsVerify::VerifyFull => {
             parsed.remove_query_param(MSSQL_ENCRYPT_KEY);
             parsed.remove_query_param(MSSQL_TRUST_CERT_KEY);
+            parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
         }
     }
 }
@@ -240,16 +263,16 @@ impl ConnectionForm {
         let selected_mode =
             effective_selected_mode(driver_id, self.parsed_url.as_ref(), self.ssh_enabled);
 
-        let mut switch = ButtonSwitch::new().selected(mode_element_id(selected_mode));
+        let mut switch = ButtonSwitch::new().selected(mode_element_id(driver_id, selected_mode));
         for mode in available.iter().copied() {
-            let driver_id = driver_id.to_owned();
+            let driver_id_owned = driver_id.to_owned();
             switch = switch.add_option(
                 window,
                 cx,
-                mode_element_id(mode),
-                mode_label(mode),
+                mode_element_id(driver_id, mode),
+                mode_label(driver_id, mode),
                 cx.listener(move |view, _event, _window, cx| {
-                    view.set_tls_mode(&driver_id, mode, cx);
+                    view.set_tls_mode(&driver_id_owned, mode, cx);
                 }),
             );
         }
@@ -306,7 +329,7 @@ mod tests {
 
     use super::{
         MSSQL_TRUST_CERT_ALIAS_KEY, available_modes, effective_selected_mode, known_query_keys,
-        read_mode, tls_is_capped, write_mode,
+        mode_label, read_mode, tls_is_capped, write_mode,
     };
 
     fn parse(url: &str) -> ConnectionUrl {
@@ -471,8 +494,8 @@ mod tests {
     }
 
     #[test]
-    fn mssql_round_trips_off_and_verify_full() {
-        for mode in [TlsVerify::Off, TlsVerify::VerifyFull] {
+    fn mssql_round_trips_all_three_modes() {
+        for mode in [TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull] {
             let mut url = parse("mssql://host/db");
             write_mode("mssql", &mut url, mode);
             assert_eq!(read_mode("mssql", &url), mode, "mode {mode:?} round-trip");
@@ -488,27 +511,52 @@ mod tests {
     }
 
     #[test]
-    fn mssql_trust_server_certificate_true_reads_as_off_even_when_encrypt_is_on() {
+    fn mssql_trust_cert_writes_exactly_trust_server_certificate_true_and_leaves_encrypt_default() {
+        let mut url = parse("mssql://host/db");
+        write_mode("mssql", &mut url, TlsVerify::VerifyCa);
+        assert_eq!(
+            url.query_param("trustServerCertificate").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            url.query_param("encrypt"),
+            None,
+            "encrypt is left at its default (true) rather than written explicitly"
+        );
+    }
+
+    #[test]
+    fn mssql_trust_server_certificate_true_reads_as_the_trust_cert_mode_when_encrypt_is_on() {
         let url = parse("mssql://host/db?encrypt=true&trustServerCertificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::Off);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
     }
 
     #[test]
-    fn mssql_reads_the_yes_spelling_of_trust_server_certificate_as_off() {
+    fn mssql_encrypt_false_wins_over_trust_server_certificate_true() {
+        let url = parse("mssql://host/db?encrypt=false&trustServerCertificate=true");
+        assert_eq!(
+            read_mode("mssql", &url),
+            TlsVerify::Off,
+            "nothing is left to trust once encryption itself is off"
+        );
+    }
+
+    #[test]
+    fn mssql_reads_the_yes_spelling_of_trust_server_certificate_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?trustServerCertificate=yes");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::Off);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
     }
 
     #[test]
-    fn mssql_reads_a_differently_cased_trust_server_certificate_key_as_off() {
+    fn mssql_reads_a_differently_cased_trust_server_certificate_key_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?TrustServerCertificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::Off);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
     }
 
     #[test]
-    fn mssql_reads_the_snake_case_trust_server_certificate_alias_as_off() {
+    fn mssql_reads_the_snake_case_trust_server_certificate_alias_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?trust_server_certificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::Off);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
     }
 
     #[test]
@@ -520,6 +568,19 @@ mod tests {
     #[test]
     fn mssql_known_query_keys_include_the_trust_server_certificate_alias() {
         assert!(known_query_keys("mssql").contains(&MSSQL_TRUST_CERT_ALIAS_KEY));
+    }
+
+    #[test]
+    fn mssql_trust_cert_mode_label_is_distinct_from_verify_ca() {
+        assert_eq!(mode_label("mssql", TlsVerify::VerifyCa), "trust cert");
+        assert_ne!(mode_label("mssql", TlsVerify::VerifyCa), "verify ca");
+    }
+
+    #[test]
+    fn postgres_and_mysql_keep_the_real_verify_ca_label() {
+        for driver_id in ["postgres", "mysql", "mariadb"] {
+            assert_eq!(mode_label(driver_id, TlsVerify::VerifyCa), "verify ca");
+        }
     }
 
     // -- capping while an SSH tunnel is enabled -----------------------------
@@ -556,8 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn mssql_never_offers_verify_ca() {
-        assert!(!available_modes("mssql", false).contains(&TlsVerify::VerifyCa));
-        assert!(!available_modes("mssql", true).contains(&TlsVerify::VerifyCa));
+    fn mssql_offers_a_third_mode_alongside_off_and_verify_full() {
+        // The slot rendered by `TlsVerify::VerifyCa` for mssql is the
+        // trust-cert mode (see `mode_label`), not real CA verification --
+        // but the control still offers three positions, regardless of SSH.
+        assert!(available_modes("mssql", false).contains(&TlsVerify::VerifyCa));
+        assert!(available_modes("mssql", true).contains(&TlsVerify::VerifyCa));
     }
 }

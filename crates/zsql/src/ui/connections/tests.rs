@@ -1255,6 +1255,57 @@ fn a_long_url_never_widens_the_modal_panel(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn enabling_the_ssh_tunnel_widens_the_modal_panel_and_disabling_it_narrows_it_back(
+    cx: &mut TestAppContext,
+) {
+    let temp = TempStorePath::new("render-ssh-width");
+    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    let session = cx.new(|_cx| session_with_no_url());
+    let (manager, vcx) = cx.add_window_view(|_window, cx| new_manager(cx, session, store));
+
+    manager.update_in(vcx, |view, window, cx| {
+        view.open(cx);
+        view.show_add_form(window, cx);
+        view.set_url_input("postgres://app@host:5432/app", cx);
+    });
+    vcx.run_until_parked();
+
+    let narrow = vcx
+        .debug_bounds("connection-modal-panel")
+        .expect("the modal panel must be tagged and painted");
+    assert_eq!(
+        narrow.size.width,
+        ModalSize::Small.width(),
+        "the SSH tunnel starts off, so the panel starts narrow"
+    );
+
+    let form = manager.read_with(vcx, |view, _app| view.form.clone());
+    form.update(vcx, |form, cx| form.set_ssh_enabled(true, cx));
+    vcx.run_until_parked();
+
+    let wide = vcx
+        .debug_bounds("connection-modal-panel")
+        .expect("the modal panel must be tagged and painted");
+    assert_eq!(
+        wide.size.width,
+        ModalSize::Wide.width(),
+        "enabling the tunnel for a network driver must widen the panel to the wide constant"
+    );
+
+    form.update(vcx, |form, cx| form.set_ssh_enabled(false, cx));
+    vcx.run_until_parked();
+
+    let narrow_again = vcx
+        .debug_bounds("connection-modal-panel")
+        .expect("the modal panel must be tagged and painted");
+    assert_eq!(
+        narrow_again.size.width,
+        ModalSize::Small.width(),
+        "disabling the tunnel must narrow the panel back to the small constant"
+    );
+}
+
 // ---- SSH round-trip through add_connection -------------------------------
 
 #[gpui::test]

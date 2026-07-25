@@ -13,6 +13,7 @@ use gpui::{
     TestAppContext, VisualTestContext, Window, div, prelude::*,
 };
 use uuid::Uuid;
+use zsql_ui::modal::ModalSize;
 use zsql_ui::text_field::TextFieldEvent;
 
 use super::{ConnectionForm, ConnectionFormEvent, HostKeyMode};
@@ -1278,4 +1279,111 @@ fn mssql_tls_control_is_never_capped_by_ssh(cx: &mut TestAppContext) {
                 .contains(&zsql_core::TlsVerify::VerifyFull)
         );
     });
+}
+
+// ---- one vs. two column layout --------------------------------------------
+
+#[gpui::test]
+fn modal_size_stays_small_until_ssh_is_enabled_for_a_network_driver(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.read_with(cx, |form, _cx| {
+        assert_eq!(form.modal_size(), ModalSize::Small, "no url yet");
+    });
+
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+    });
+    form.read_with(cx, |form, _cx| {
+        assert_eq!(form.modal_size(), ModalSize::Small, "ssh still off");
+    });
+
+    form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
+    form.read_with(cx, |form, _cx| {
+        assert_eq!(
+            form.modal_size(),
+            ModalSize::Wide,
+            "ssh on for a network driver opens the second column"
+        );
+    });
+
+    form.update(cx, |form, cx| form.set_ssh_enabled(false, cx));
+    form.read_with(cx, |form, _cx| {
+        assert_eq!(form.modal_size(), ModalSize::Small, "ssh off again");
+    });
+}
+
+#[gpui::test]
+fn modal_size_stays_small_for_sqlite_even_with_ssh_toggled_on(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+        form.set_url_input("sqlite::memory:", cx);
+    });
+    form.read_with(cx, |form, _cx| {
+        assert_eq!(
+            form.modal_size(),
+            ModalSize::Small,
+            "the SSH section never mounts for sqlite, so it must not widen the modal"
+        );
+    });
+}
+
+#[gpui::test]
+fn clicking_the_ssh_toggle_live_transitions_the_form_between_one_and_two_columns(
+    cx: &mut TestAppContext,
+) {
+    let (form, vcx, _events) = build_form_in_window(cx);
+    form.update(vcx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        form.read_with(vcx, |form, _cx| form.modal_size()),
+        ModalSize::Small
+    );
+
+    let on_bounds = vcx
+        .debug_bounds("connection-form-ssh-on")
+        .expect("the ssh-on segment must be painted");
+    vcx.simulate_click(on_bounds.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        form.read_with(vcx, |form, _cx| form.modal_size()),
+        ModalSize::Wide,
+        "the click must live-transition the form to two columns with no re-open"
+    );
+
+    let off_bounds = vcx
+        .debug_bounds("connection-form-ssh-off")
+        .expect("the ssh-off segment must be painted");
+    vcx.simulate_click(off_bounds.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        form.read_with(vcx, |form, _cx| form.modal_size()),
+        ModalSize::Small,
+        "toggling back off must live-transition the form back to one column"
+    );
+}
+
+#[gpui::test]
+fn the_footer_still_emits_cancel_once_the_form_is_two_columns(cx: &mut TestAppContext) {
+    let (form, vcx, events) = build_form_in_window(cx);
+    form.update(vcx, |form, cx| {
+        form.set_url_input("postgres://app@host:5432/db", cx);
+        form.set_ssh_enabled(true, cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        form.read_with(vcx, |form, _cx| form.modal_size()),
+        ModalSize::Wide
+    );
+
+    let bounds = vcx
+        .debug_bounds("connection-form-cancel")
+        .expect("the single, full-width footer's cancel button must still be tagged and painted");
+    vcx.simulate_click(bounds.center(), Modifiers::default());
+    vcx.run_until_parked();
+
+    assert_eq!(*events.borrow(), vec![CapturedEvent::Cancel]);
 }

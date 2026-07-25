@@ -4,11 +4,12 @@
 //! every button emits a [`ConnectionFormEvent`] for [`super::ConnectionManagerView`]
 //! (which owns the session and store) to act on.
 //!
-//! The SSH tunnel section ([`ssh`]) and the per-driver TLS control ([`tls`])
-//! are split into their own submodules to keep this file under the
-//! project's line-count convention; both extend [`ConnectionForm`] with
-//! `impl` blocks rather than owning a separate type, since their state and
-//! rendering are as much a part of the form as the driver fields above them.
+//! The SSH tunnel section ([`ssh`]), the per-driver TLS control ([`tls`]),
+//! and the one-vs-two-column layout it opens ([`layout`]) are split into
+//! their own submodules to keep this file under the project's line-count
+//! convention; all three extend [`ConnectionForm`] with `impl` blocks
+//! rather than owning a separate type, since their state and rendering are
+//! as much a part of the form as the driver fields above them.
 
 use gpui::{
     App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Window, div,
@@ -18,7 +19,6 @@ use uuid::Uuid;
 use zsql_core::ConnectionUrl;
 use zsql_ui::{
     button::{primary_button, secondary_button},
-    grid,
     text_field::{TextFieldEvent, TextFieldState},
     theme::ActiveTheme,
 };
@@ -30,9 +30,11 @@ use crate::{
     ui::{connections::driver_display_label, theme},
 };
 
+mod layout;
 mod ssh;
 mod tls;
 
+pub(crate) use layout::FormColumns;
 pub(crate) use ssh::HostKeyMode;
 
 /// The connection form's input fields, test-outcome banner, and footer.
@@ -396,8 +398,10 @@ impl ConnectionForm {
     }
 
     /// The Host/Port, User/Password, Database, and TLS fields shared by the
-    /// non-sqlite network drivers, followed by the SSH tunnel section,
-    /// appended onto `section`.
+    /// non-sqlite network drivers, appended onto `section`. The SSH tunnel
+    /// section is appended inline here only while it renders as a trailing
+    /// row rather than its own column (see [`Self::form_columns`]) -- the
+    /// two-column layout renders it separately once it does.
     fn render_network_fields(
         &self,
         section: Div,
@@ -406,7 +410,7 @@ impl ConnectionForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        section
+        let section = section
             .child(
                 div()
                     .flex()
@@ -440,8 +444,13 @@ impl ConnectionForm {
                 colors,
                 self.database_field.clone(),
             ))
-            .child(self.render_tls_control(driver_id, colors, window, cx))
-            .child(self.render_ssh_section(colors, window, cx))
+            .child(self.render_tls_control(driver_id, colors, window, cx));
+
+        if self.ssh_enabled {
+            section
+        } else {
+            section.child(self.render_ssh_section(colors, window, cx))
+        }
     }
 
     /// A read-only line listing any query parameters the URL carries beyond
@@ -905,43 +914,12 @@ impl Render for ConnectionForm {
             Err(_) => "unrecognized".to_owned(),
         };
 
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(theme::CONNECTION_FORM_FIELD_GAP)
-            .p_4()
-            .child(Self::labeled_field("Name", colors, self.name_field.clone()))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(theme::CONNECTION_FORM_LABEL_GAP)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .child(Self::field_label("URL", colors))
-                            .when(!driver_label.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .ml_auto()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_size(px(theme::CONNECTION_FORM_TOGGLE_TEXT_SIZE))
-                                        .text_color(rgb(colors.text_secondary))
-                                        .child(grid::status_dot(colors.accent))
-                                        .child(driver_label.clone()),
-                                )
-                            }),
-                    )
-                    .child(self.url_field.clone()),
-            );
-
-        body = body.child(self.render_driver_field_section(&driver_label, window, cx));
-        body = body.child(self.render_test_outcome(cx));
+        let body = match self.form_columns() {
+            FormColumns::Single => {
+                self.render_single_column_body(&driver_label, colors, window, cx)
+            }
+            FormColumns::Two => self.render_two_column_body(&driver_label, window, cx),
+        };
 
         div()
             .flex()
