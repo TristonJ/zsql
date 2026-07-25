@@ -33,6 +33,10 @@ pub enum ModalSize {
     /// one -- e.g. the connection form once its SSH tunnel section opens a
     /// second column beside the base connection fields.
     Wide,
+    /// A wider panel for content that needs room to breathe: a card grid or
+    /// a multi-column form, with a taller header that fits a subtitle line
+    /// under the title.
+    Large,
 }
 
 impl ModalSize {
@@ -41,6 +45,7 @@ impl ModalSize {
         match self {
             ModalSize::Small => px(468.0),
             ModalSize::Wide => px(760.0),
+            ModalSize::Large => px(880.0),
         }
     }
 
@@ -48,6 +53,7 @@ impl ModalSize {
     pub fn radius(&self) -> Pixels {
         match self {
             ModalSize::Small | ModalSize::Wide => px(10.0),
+            ModalSize::Large => px(12.0),
         }
     }
 
@@ -55,6 +61,7 @@ impl ModalSize {
     pub fn head_height(&self) -> Pixels {
         match self {
             ModalSize::Small | ModalSize::Wide => px(44.0),
+            ModalSize::Large => px(66.0),
         }
     }
 }

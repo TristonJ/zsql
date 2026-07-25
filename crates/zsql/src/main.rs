@@ -20,7 +20,7 @@ use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
 };
 use session::{Session, SessionState};
-use ui::workspace::WorkspaceView;
+use ui::workspace::{WorkspaceStartup, WorkspaceView};
 use zsql_ui::theme::{Theme, get_builtin_fonts};
 
 /// Default window size for the workspace.
@@ -85,7 +85,12 @@ fn main() -> anyhow::Result<()> {
                     let workspace_value_panel = cfg.value_panel.clone();
                     let probe_timeout = cfg.liveness.probe_timeout();
                     let batch_size = cfg.query.batch_size;
-                    let tab_sessions_path = Config::tab_sessions_path();
+                    let startup = WorkspaceStartup {
+                        tab_sessions_path: Config::tab_sessions_path(),
+                        active_theme_name: cfg.theme.name.clone(),
+                        themes_dir: Config::themes_dir(),
+                        config_path: Config::default_path(),
+                    };
                     let workspace = cx.new(|cx| {
                         WorkspaceView::new(
                             workspace_session,
@@ -94,7 +99,7 @@ fn main() -> anyhow::Result<()> {
                             connection_store,
                             probe_timeout,
                             batch_size,
-                            tab_sessions_path,
+                            startup,
                             cx,
                         )
                     });
@@ -108,6 +113,7 @@ fn main() -> anyhow::Result<()> {
                     // exit.
                     let quit_workspace = workspace.clone();
                     cx.on_app_quit(move |cx| {
+                        quit_workspace.update(cx, WorkspaceView::flush_theme_on_quit);
                         let task =
                             quit_workspace.update(cx, WorkspaceView::flush_tab_session_on_quit);
                         async move {

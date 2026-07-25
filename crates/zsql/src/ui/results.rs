@@ -12,6 +12,7 @@ use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+use super::appearance::AppearanceModalView;
 use super::connections::ConnectionManagerView;
 use super::format::{ValueKind, format_value};
 use super::tabs::ResultsSnapshot;
@@ -22,6 +23,7 @@ use crate::ui::format::format_value_for_clipboard;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
+mod appearance_trigger;
 mod cell_menu;
 mod empty_state;
 mod panel_host;
@@ -107,6 +109,8 @@ pub struct ResultsView {
     /// The connection-manager modal the Empty-state "Add connection" button
     /// opens
     connections_modal: Option<Entity<ConnectionManagerView>>,
+    /// The Appearance modal the status bar's theme trigger opens
+    appearance_modal: Option<Entity<AppearanceModalView>>,
     /// The value panel
     value_panel: Entity<ValuePanel>,
     /// The panel's current dock width, draggable between
@@ -178,6 +182,7 @@ impl ResultsView {
             focus_handle,
             cell_context_menu: None,
             connections_modal: None,
+            appearance_modal: None,
             value_panel,
             // A view built without `configure_value_panel` (any caller other
             // than `WorkspaceView::new`, e.g. a test) still opens to a
@@ -221,6 +226,13 @@ impl ResultsView {
     /// button opens, so clicking it opens the same shared instance
     pub fn set_connections_modal(&mut self, connections: Entity<ConnectionManagerView>) {
         self.connections_modal = Some(connections);
+    }
+
+    /// Wire the Appearance modal the status bar's theme trigger opens, so
+    /// clicking it opens this workspace's shared instance rather than
+    /// constructing a new one on each click.
+    pub fn set_appearance_modal(&mut self, appearance: Entity<AppearanceModalView>) {
+        self.appearance_modal = Some(appearance);
     }
 
     /// Follow `session`'s state/result live under `source_label`, e.g. for

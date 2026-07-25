@@ -13,6 +13,7 @@ use gpui::{
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::theme::ActiveTheme;
 
+use super::appearance::AppearanceModalView;
 use super::connections::ConnectionManagerView;
 use super::footer::ConnectionFooterView;
 use super::results::ResultsView;
@@ -46,6 +47,7 @@ enum DividerDrag {
 
 pub struct WorkspaceView {
     connections: Entity<ConnectionManagerView>,
+    appearance: Entity<AppearanceModalView>,
     footer: Entity<ConnectionFooterView>,
     sidebar: Entity<SidebarView>,
     tabs: Entity<TabModel>,
@@ -67,6 +69,27 @@ pub struct WorkspaceView {
     tab_session_store: TabSessionStore,
 }
 
+/// The persisted, path-shaped settings [`WorkspaceView::new`] otherwise
+/// could not accept as separate parameters without tripping the
+/// too-many-arguments lint: where per-connection tab sessions live, and
+/// where the Appearance modal starts from.
+pub struct WorkspaceStartup {
+    /// Where per-connection tab sessions are read from and saved to
+    /// (typically [`crate::config::Config::tab_sessions_path`]). `None`
+    /// disables tab-session persistence entirely.
+    pub tab_sessions_path: Option<PathBuf>,
+    /// The theme name the Appearance modal starts with its matching card
+    /// checked/active (typically `cfg.theme.name`).
+    pub active_theme_name: String,
+    /// Where the Appearance modal discovers user theme files (typically
+    /// [`crate::config::Config::themes_dir`]).
+    pub themes_dir: Option<PathBuf>,
+    /// Where the Appearance modal persists a selected theme name (typically
+    /// [`crate::config::Config::default_path`]). `None` disables persistence
+    /// for the session.
+    pub config_path: Option<PathBuf>,
+}
+
 impl WorkspaceView {
     /// Build a workspace over `session`, with pane sizes seeded from
     /// `layout` (also sizing the results grid's value panel dock),
@@ -76,9 +99,8 @@ impl WorkspaceView {
     /// `probe_timeout()`) bounding the connection-manager form's Test
     /// button, `batch_size` (typically [`crate::config::Config::query`]'s
     /// `batch_size`) sizing that Test button's connection's row-batching,
-    /// and `tab_sessions_path` (typically
-    /// [`crate::config::Config::tab_sessions_path`]) as where per-connection
-    /// tab sessions are read from and saved to.
+    /// and `startup` bundling the remaining persisted settings (see
+    /// [`WorkspaceStartup`]).
     #[must_use]
     // Every parameter is an independent, already-resolved piece of `Config`
     // this workspace's own descendants need at construction; grouping them
@@ -91,9 +113,15 @@ impl WorkspaceView {
         connection_store: ConnectionStore,
         probe_timeout: Duration,
         batch_size: usize,
-        tab_sessions_path: Option<PathBuf>,
+        startup: WorkspaceStartup,
         cx: &mut Context<Self>,
     ) -> Self {
+        let WorkspaceStartup {
+            tab_sessions_path,
+            active_theme_name,
+            themes_dir,
+            config_path,
+        } = startup;
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         results.update(cx, |results, cx| {
             results.configure_value_panel(cx, &layout, value_panel);
@@ -122,6 +150,11 @@ impl WorkspaceView {
         results.update(cx, |results, _cx| {
             results.set_connections_modal(connections.clone());
         });
+        let appearance =
+            cx.new(|cx| AppearanceModalView::new(active_theme_name, themes_dir, config_path, cx));
+        results.update(cx, |results, _cx| {
+            results.set_appearance_modal(appearance.clone());
+        });
         let footer = cx.new(|cx| ConnectionFooterView::new(session, connections.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
@@ -143,6 +176,14 @@ impl WorkspaceView {
             cx.notify();
         })
         .detach();
+        // Opening/closing the Appearance modal (or selecting a card while it
+        // stays open) lives entirely inside `appearance`'s own state; this
+        // workspace must still re-render to mount or unmount that entity as
+        // the modal overlay child below.
+        cx.observe(&appearance, |_this, _appearance, cx| {
+            cx.notify();
+        })
+        .detach();
         // Opening, reusing, converting, closing, or switching a tab lives
         // entirely inside `tabs`' own state; this workspace must still
         // re-render the tab bar and the active tab's body whenever any of
@@ -160,6 +201,7 @@ impl WorkspaceView {
 
         Self {
             connections,
+            appearance,
             footer,
             sidebar,
             tabs,
@@ -237,6 +279,15 @@ impl WorkspaceView {
     pub fn flush_tab_session_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
         self.dispatch_tab_session_save(cx)
             .unwrap_or_else(|| Task::ready(()))
+    }
+
+    /// Flush a theme selected in the Appearance modal but not yet committed to
+    /// disk (the modal persists on dismiss, so a choice made and then quit with
+    /// the modal still open would otherwise be lost). Used from `main.rs`'s
+    /// `App::on_app_quit` hook.
+    pub fn flush_theme_on_quit(&mut self, cx: &mut Context<Self>) {
+        self.appearance
+            .update(cx, |appearance, _cx| appearance.flush_theme_on_quit());
     }
 
     /// Build the active connection's current snapshot and spawn its write to
@@ -584,6 +635,7 @@ impl Render for WorkspaceView {
         let divider_thickness = self.layout.divider_thickness;
         let column_height = self.column_height.clone();
         let modal_open = self.connections.read(cx).is_open();
+        let appearance_open = self.appearance.read(cx).is_open();
         let colors = cx.theme().colors;
 
         div()
@@ -659,6 +711,7 @@ impl Render for WorkspaceView {
                     ),
             )
             .when(modal_open, |el| el.child(self.connections.clone()))
+            .when(appearance_open, |el| el.child(self.appearance.clone()))
     }
 }
 

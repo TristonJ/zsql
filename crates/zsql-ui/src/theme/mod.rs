@@ -25,10 +25,37 @@ pub struct Theme {
 
 impl gpui::Global for Theme {}
 
-/// The built-in [`Theme`] named `name` (one of the [`catppuccin`] flavor
-/// names), or `None` if `name` does not match a built-in.
+/// Config-facing name of the built-in zsql Dark theme: the app's original
+/// palette, reachable through the same lookup as every other built-in
+/// flavor instead of only as [`Colors::default`]'s fallback.
+pub const ZSQL_DARK_NAME: &str = "zsql-dark";
+
+/// Every built-in theme's config-facing name, in the order an enumeration UI
+/// should list them: the default zsql Dark palette first, then the four
+/// Catppuccin flavors light-to-dark.
+const BUILTIN_THEME_NAMES: [&str; 5] = [
+    ZSQL_DARK_NAME,
+    catppuccin::LATTE_NAME,
+    catppuccin::FRAPPE_NAME,
+    catppuccin::MACCHIATO_NAME,
+    catppuccin::MOCHA_NAME,
+];
+
+/// Every selectable built-in theme's config-facing name, in the documented
+/// display order (see [`BUILTIN_THEME_NAMES`]).
+#[must_use]
+pub fn builtin_theme_names() -> &'static [&'static str] {
+    &BUILTIN_THEME_NAMES
+}
+
+/// The built-in [`Colors`] palette named `name` (the zsql Dark default or
+/// one of the [`catppuccin`] flavors), or `None` if `name` does not match a
+/// built-in.
 #[must_use]
 pub fn built_in_theme(name: &str) -> Option<Colors> {
+    if name == ZSQL_DARK_NAME {
+        return Some(Colors::default());
+    }
     catppuccin::built_in_by_name(name)
 }
 
@@ -66,6 +93,43 @@ mod tests {
     fn default_theme_carries_the_default_colors() {
         let theme = Theme::default();
         assert_eq!(theme.colors, super::Colors::default());
+    }
+
+    #[test]
+    fn builtin_theme_names_lists_exactly_the_five_flavors_in_display_order() {
+        assert_eq!(
+            super::builtin_theme_names(),
+            [
+                "zsql-dark",
+                "catppuccin-latte",
+                "catppuccin-frappe",
+                "catppuccin-macchiato",
+                "catppuccin-mocha",
+            ]
+        );
+    }
+
+    #[test]
+    fn built_in_theme_resolves_zsql_dark_to_the_default_palette() {
+        assert_eq!(
+            super::built_in_theme(super::ZSQL_DARK_NAME),
+            Some(super::Colors::default())
+        );
+    }
+
+    #[test]
+    fn built_in_theme_still_resolves_every_catppuccin_flavor() {
+        for name in super::builtin_theme_names() {
+            assert!(
+                super::built_in_theme(name).is_some(),
+                "{name} must resolve to a built-in palette"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_theme_returns_none_for_an_unknown_name() {
+        assert_eq!(super::built_in_theme("not-a-real-theme"), None);
     }
 
     /// Every color a view paints with must come from the active [`Theme`],

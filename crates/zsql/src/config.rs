@@ -1,4 +1,4 @@
-//! Application configuration: theme placeholder, query limits, and the other
+//! Application configuration: theme, query limits, and the other
 //! constants
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub const DEFAULT_SSH_TUNNEL_PORT: u16 = 22;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Theme/appearance settings (placeholder until real theming lands).
+    /// Theme/appearance settings: the active theme name and data/UI fonts.
     pub theme: ThemeConfig,
     /// Query execution limits and defaults.
     pub query: QueryConfig,
@@ -53,7 +53,7 @@ pub struct FontConfig {
     pub ui: String,
 }
 
-/// Appearance settings. Placeholder for the eventual theming system.
+/// Appearance settings: the active theme name and data/UI fonts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
@@ -200,7 +200,7 @@ impl Default for ValuePanelLayout {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            name: "dark".to_owned(),
+            name: zsql_ui::theme::ZSQL_DARK_NAME.to_owned(),
             fonts: FontConfig::default(),
         }
     }
@@ -297,6 +297,36 @@ impl Config {
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
     }
+
+    /// Write the full config to `path`, creating its parent directory if
+    /// needed. Serializes every section (not just whichever one a caller
+    /// changed), so a caller that wants to change one setting must load,
+    /// mutate, then save, rather than losing the rest of the file.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] if the config cannot be serialized or the
+    /// file cannot be written.
+    #[tracing::instrument(name = "config_save", skip(self))]
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ConfigError::Write)?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(path, text).map_err(ConfigError::Write)?;
+        tracing::info!(path = %path.display(), "config saved");
+        Ok(())
+    }
+}
+
+/// Errors saving the top-level app config.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The in-memory config could not be serialized to TOML.
+    #[error("failed to serialize config: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    /// The config file could not be written.
+    #[error("failed to write config: {0}")]
+    Write(std::io::Error),
 }
 
 #[cfg(test)]
@@ -498,5 +528,93 @@ mod tests {
             parsed.value_panel.hex_bytes_per_row,
             Config::default().value_panel.hex_bytes_per_row
         );
+    }
+
+    #[test]
+    fn default_theme_name_matches_a_builtin_theme() {
+        assert!(
+            zsql_ui::theme::builtin_theme_names().contains(&Config::default().theme.name.as_str()),
+            "a fresh install's configured theme name must be a real built-in, \
+             so the Appearance modal can mark a card active on first run"
+        );
+    }
+
+    /// A temp file path this test owns exclusively, removed on drop so tests
+    /// never leak files into the real temp dir.
+    struct TempConfigPath(std::path::PathBuf);
+
+    impl TempConfigPath {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zsql-config-test-{label}-{}-{n}.toml",
+                std::process::id()
+            ));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfigPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn saving_then_loading_preserves_every_touched_section_not_just_theme() {
+        let temp = TempConfigPath::new("round-trip");
+
+        let mut cfg = Config::default();
+        cfg.theme.name = "catppuccin-mocha".to_owned();
+        cfg.query.max_result_rows = 42;
+        cfg.query.batch_size = 17;
+        cfg.layout.sidebar_default_width = gpui::px(321.0);
+        cfg.liveness.probe_interval_ms = 9_999;
+        cfg.value_panel.hex_bytes_per_row = 4;
+
+        cfg.save(&temp.0).expect("save must succeed");
+        let reloaded = Config::load_or_default(&temp.0).expect("reload must succeed");
+
+        assert_eq!(reloaded.theme.name, "catppuccin-mocha");
+        assert_eq!(reloaded.query.max_result_rows, 42);
+        assert_eq!(reloaded.query.batch_size, 17);
+        assert_eq!(reloaded.layout.sidebar_default_width, gpui::px(321.0));
+        assert_eq!(reloaded.liveness.probe_interval_ms, 9_999);
+        assert_eq!(reloaded.value_panel.hex_bytes_per_row, 4);
+    }
+
+    #[test]
+    fn saving_creates_missing_parent_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "zsql-config-test-nested-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join("nested").join("config.toml");
+
+        Config::default()
+            .save(&path)
+            .expect("save must create parent dirs");
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn saving_twice_overwrites_rather_than_appends() {
+        let temp = TempConfigPath::new("overwrite");
+
+        let mut first = Config::default();
+        first.theme.name = "catppuccin-latte".to_owned();
+        first.save(&temp.0).expect("first save must succeed");
+
+        let mut second = Config::default();
+        second.theme.name = "catppuccin-mocha".to_owned();
+        second.save(&temp.0).expect("second save must succeed");
+
+        let reloaded = Config::load_or_default(&temp.0).expect("reload must succeed");
+        assert_eq!(reloaded.theme.name, "catppuccin-mocha");
     }
 }
