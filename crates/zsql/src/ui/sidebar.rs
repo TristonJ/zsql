@@ -6,10 +6,11 @@ use std::collections::HashSet;
 
 use gpui::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, Stateful, UniformListScrollHandle, Window, anchored, deferred, div,
-    point, prelude::*, px, rgb, rgba, uniform_list,
+    Pixels, Point, Render, Stateful, UniformListScrollHandle, Window, div, point, prelude::*, px,
+    rgb, rgba, uniform_list,
 };
 use zsql_core::{RelationKind, SchemaTree};
+use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::icon_button::icon_button_secondary;
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
@@ -574,7 +575,6 @@ impl SidebarView {
     /// as activating whatever sits beneath it. Renders nothing when no menu
     /// is open.
     fn render_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let active_theme = cx.theme();
         let menu = self.context_menu.clone()?;
         let schema = menu.schema.clone();
         let relation = menu.relation.clone();
@@ -588,96 +588,41 @@ impl SidebarView {
         let view_schema_schema = schema.clone();
         let view_schema_relation = relation.clone();
 
-        let content = div()
-            .id("sidebar-context-menu")
-            .occlude()
-            .w(theme::CONTEXT_MENU_WIDTH)
-            .p(theme::CONTEXT_MENU_PADDING)
-            .bg(rgb(active_theme.colors.bg_raised))
-            .border_1()
-            .border_color(rgb(active_theme.colors.border))
-            .rounded(px(theme::CONTEXT_MENU_RADIUS))
-            .child(context_menu_item(
-                cx,
-                "Preview Data",
-                move |view, window, cx| {
+        let menu = ContextMenu::new("sidebar-context-menu")
+            .position(anchor)
+            .on_close(cx.listener(|view, _event, _window, cx| {
+                view.close_context_menu(cx);
+            }))
+            .add_item(ContextMenuItem::new("Preview Data").on_click(cx.listener(
+                move |view, _event, window, cx| {
                     view.preview(&preview_schema, &preview_relation, window, cx);
                     view.close_context_menu(cx);
                 },
-            ))
-            .child(context_menu_item(
-                cx,
-                "View Schema",
-                move |view, _window, cx| {
+            )))
+            .add_item(ContextMenuItem::new("View Schema").on_click(cx.listener(
+                move |view, _event, _window, cx| {
                     view.view_schema(&view_schema_schema, &view_schema_relation, kind, cx);
                     view.close_context_menu(cx);
                 },
-            ))
-            .child(context_menu_separator(active_theme))
-            .child(context_menu_item(cx, "Copy Name", |view, _window, cx| {
-                view.copy_name(cx);
-            }))
-            .child(context_menu_item(
-                cx,
-                "Copy Qualified Name",
-                |view, _window, cx| {
-                    view.copy_qualified_name(cx);
+            )))
+            .add_separator()
+            .add_item(ContextMenuItem::new("Copy Name").on_click(cx.listener(
+                |view, _event, _window, cx| {
+                    view.copy_name(cx);
+                    view.close_context_menu(cx);
                 },
-            ));
+            )))
+            .add_item(
+                ContextMenuItem::new("Copy Qualified Name").on_click(cx.listener(
+                    |view, _event, _window, cx| {
+                        view.copy_qualified_name(cx);
+                        view.close_context_menu(cx);
+                    },
+                )),
+            );
 
-        let backdrop = div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
-                    view.close_context_menu(cx);
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|view, _event: &MouseDownEvent, _window, cx| {
-                    view.close_context_menu(cx);
-                }),
-            )
-            .child(anchored().position(anchor).snap_to_window().child(content));
-
-        Some(deferred(backdrop).with_priority(1).into_any_element())
+        Some(menu.into_any_element())
     }
-}
-
-/// One context menu row.
-fn context_menu_item(
-    cx: &Context<SidebarView>,
-    label: &'static str,
-    on_click: impl Fn(&mut SidebarView, &mut Window, &mut Context<SidebarView>) + 'static,
-) -> Stateful<Div> {
-    let active_theme = cx.theme();
-    div()
-        .id(label)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(theme::CONTEXT_MENU_ITEM_HEIGHT)
-        .px(theme::CONTEXT_MENU_ITEM_PADDING_X)
-        .rounded(px(theme::CONTEXT_MENU_ITEM_RADIUS))
-        .cursor_pointer()
-        .text_size(px(theme::CONTEXT_MENU_ITEM_TEXT_SIZE))
-        .text_color(rgb(active_theme.colors.text_primary))
-        .hover(|el| el.bg(rgba(theme::sidebar_selected_bg(active_theme))))
-        .child(label)
-        .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-            on_click(view, window, cx);
-        }))
-}
-
-/// A thin horizontal divider between context menu item groups.
-fn context_menu_separator(active_theme: &Theme) -> Div {
-    div()
-        .h(theme::CONTEXT_MENU_SEPARATOR_HEIGHT)
-        .my(theme::CONTEXT_MENU_SEPARATOR_MARGIN_Y)
-        .bg(rgb(active_theme.colors.border_soft))
 }
 
 /// `schema.relation`, the text `Copy Qualified Name` writes to the
