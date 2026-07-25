@@ -7,6 +7,7 @@ use crate::error::CoreError;
 use crate::row_count::RowCount;
 use crate::schema::SchemaTree;
 use crate::schema_detail::RelationSchema;
+use crate::sql::SortDirection;
 use crate::value::{ColumnMeta, RowBatch};
 
 /// An incremental event emitted while a query streams to the UI.
@@ -145,6 +146,24 @@ pub trait Connection: Send + Sync {
     /// implementation is free to take as long as it needs. The default is a
     /// no-op for a backend with nothing to release deterministically.
     async fn close(&self) {}
+
+    /// The sort-and-page-windowed form of [`Connection::preview_query`]:
+    /// an optional `(column, direction)` sort plus a `LIMIT`/`OFFSET` page,
+    /// in this dialect's syntax. `sort`'s column must come from
+    /// [`crate::value::ColumnMeta::name`] (never free text typed by a
+    /// user), the same contract [`Connection::preview_query`] holds for
+    /// `schema`/`relation`. Synchronous and read-only, like
+    /// `preview_query`.
+    fn preview_query_windowed(
+        &self,
+        schema: &str,
+        relation: &str,
+        sort: Option<(&str, SortDirection)>,
+        limit: u64,
+        offset: u64,
+    ) -> String {
+        crate::sql::default_preview_query_windowed(schema, relation, sort, limit, offset)
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +220,15 @@ mod tests {
         // The default body is a genuine no-op: this only proves it resolves
         // and completes rather than panicking or hanging.
         futures::executor::block_on(connection.close());
+    }
+
+    #[test]
+    fn a_connection_with_no_windowed_override_falls_back_to_the_shared_windowed_default() {
+        let connection = DefaultOnlyConnection;
+        let sort = Some(("total_cents", crate::sql::SortDirection::Desc));
+        assert_eq!(
+            connection.preview_query_windowed("public", "orders", sort, 200, 200),
+            crate::sql::default_preview_query_windowed("public", "orders", sort, 200, 200)
+        );
     }
 }

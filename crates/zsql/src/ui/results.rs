@@ -8,7 +8,6 @@ use gpui::{
     MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount, group_thousands};
-use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
@@ -20,12 +19,14 @@ use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{LivenessState, Session, SessionState};
 use crate::ui::format::format_value_for_clipboard;
+use crate::ui::results::pager::PreviewControls;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
 mod appearance_trigger;
 mod cell_menu;
 mod empty_state;
+pub(crate) mod pager;
 mod panel_host;
 mod status_bar;
 mod text_view;
@@ -46,6 +47,8 @@ actions!(
         ToggleValuePanel,
         CloseValuePanel,
         FocusValuePanel,
+        PrevPage,
+        NextPage,
     ]
 );
 
@@ -61,6 +64,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("space", ToggleValuePanel, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", CloseValuePanel, Some(KEY_CONTEXT)),
         KeyBinding::new("tab", FocusValuePanel, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-[", PrevPage, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-]", NextPage, Some(KEY_CONTEXT)),
     ]);
     value_panel::init(cx);
 }
@@ -137,6 +142,15 @@ pub struct ResultsView {
     view_mode_defaulted: bool,
     /// The text view for results when they're displayed as a single text doc
     text_view: Entity<TextView>,
+    /// The active tab's sort/page state and control dispatcher, while it is
+    /// a live, unedited generated preview. `None` otherwise -- a script
+    /// tab, a schema tab, or a generated tab that has been edited -- which
+    /// is what renders the header sort affordance and pager bar inert
+    /// without hiding the grid itself. Set by
+    /// [`ResultsView::set_preview_controls`], called from
+    /// `ui::tabs::TabModel` whenever the active tab (or its dirty/kind
+    /// state) changes.
+    preview: Option<PreviewControls>,
 }
 
 /// A results grid cell's open right-click context menu: the triggering
@@ -197,6 +211,7 @@ impl ResultsView {
             view_mode: ViewMode::Grid,
             view_mode_defaulted: false,
             text_view,
+            preview: None,
         };
         view.sync_dimensions(cx);
         view
@@ -233,6 +248,47 @@ impl ResultsView {
     /// constructing a new one on each click.
     pub fn set_appearance_modal(&mut self, appearance: Entity<AppearanceModalView>) {
         self.appearance_modal = Some(appearance);
+    }
+
+    /// Set (or clear) the active tab's sort/page controls. Called by
+    /// `ui::tabs::TabModel` every time the active tab, or that tab's
+    /// dirty/kind state, changes -- see [`ResultsView::preview`]'s own doc
+    /// comment for what `None` renders.
+    pub fn set_preview_controls(
+        &mut self,
+        preview: Option<PreviewControls>,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview = preview;
+        cx.notify();
+    }
+
+    /// The last-page number the currently rendered pager snapshot would show,
+    /// or `None` when there are no active preview controls or the total is not
+    /// yet known. Lets a test assert the rendered snapshot -- not just the
+    /// owning tab -- reflects an asynchronously fetched row count.
+    #[cfg(test)]
+    pub(crate) fn preview_last_page_number_for_test(&self) -> Option<u64> {
+        self.preview
+            .as_ref()
+            .and_then(|preview| preview.state.last_page_number())
+    }
+
+    /// [`PrevPage`]'s handler: step the active preview's pager back one
+    /// page. A no-op with no visible side effect while `preview` is `None`
+    /// (the active tab is not a live generated preview) or already on page
+    /// 1, matching [`NextPage`]'s own symmetric behavior.
+    fn prev_page(&mut self, _action: &PrevPage, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = &self.preview {
+            (preview.dispatch.clone())(pager::PreviewAction::PrevPage, window, cx);
+        }
+    }
+
+    /// [`NextPage`]'s handler; see [`ResultsView::prev_page`].
+    fn next_page(&mut self, _action: &NextPage, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = &self.preview {
+            (preview.dispatch.clone())(pager::PreviewAction::NextPage, window, cx);
+        }
     }
 
     /// Follow `session`'s state/result live under `source_label`, e.g. for
@@ -541,23 +597,29 @@ impl ResultsView {
     /// falling back to the grid otherwise, so a stale `Text` selection left
     /// over from a differently-shaped result (or the interval before
     /// `sync_dimensions` next runs) never renders an empty document pane.
-    fn render_grid_or_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_grid_or_text(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.view_mode == ViewMode::Text && self.text_view.read(cx).has_document() {
             self.text_view.clone().into_any_element()
         } else {
-            self.render_grid(cx).flex_1().min_w_0().into_any_element()
+            self.render_grid(window, cx)
+                .flex_1()
+                .min_w_0()
+                .into_any_element()
         }
     }
 
     /// The two-pane virtualized grid (pinned row numbers + horizontally
     /// scrolling data columns), built by composing `zsql_ui::table::Table`.
-    fn render_grid(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let row_count = self.effective_result(cx).rows.len();
-        let active_theme = cx.theme();
-        let columns = self.build_columns(cx);
+        // Detached from `cx`'s borrow (rather than the usual `&Theme`) so it
+        // can still be read after `build_columns` needs `cx` mutably for its
+        // own header hover-state bookkeeping.
+        let active_theme = cx.theme().clone();
+        let columns = self.build_columns(window, cx);
 
         Table::new("results-grid", &self.table_state)
-            .style(Self::table_style(active_theme))
+            .style(Self::table_style(&active_theme))
             .columns(columns)
             .row_count(row_count)
             .gutter(Gutter::RowNumbers(RowNumberStyle {
@@ -606,14 +668,20 @@ impl ResultsView {
     }
 
     /// The data pane's columns: each column's cached width plus its header
-    /// content (name + type-tag badge).
-    fn build_columns(&self, cx: &Context<Self>) -> Vec<TableColumn> {
-        let active_theme = cx.theme();
-        let columns: &[ColumnMeta] = &self.effective_result(cx).columns;
+    /// content (name, type-tag badge, and the sort affordance from
+    /// [`ResultsView::preview`]).
+    fn build_columns(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<TableColumn> {
+        let active_theme = cx.theme().clone();
+        let preview = self.preview.as_ref();
+        let columns: Vec<ColumnMeta> = self.effective_result(cx).columns.clone();
         columns
             .iter()
             .zip(self.column_widths.iter())
-            .map(|(column, &width)| TableColumn::new(width, column_header(column, active_theme)))
+            .map(|(column, &width)| {
+                let header =
+                    pager::sortable_column_header(column, &active_theme, preview, window, cx);
+                TableColumn::new(width, header)
+            })
             .collect()
     }
 
@@ -801,6 +869,8 @@ impl Render for ResultsView {
             .on_action(cx.listener(Self::toggle_value_panel))
             .on_action(cx.listener(Self::close_value_panel))
             .on_action(cx.listener(Self::focus_value_panel))
+            .on_action(cx.listener(Self::prev_page))
+            .on_action(cx.listener(Self::next_page))
             .on_mouse_move(cx.listener(Self::value_panel_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
@@ -813,22 +883,6 @@ impl Render for ResultsView {
             .child(self.render_status_bar(cx))
             .children(self.render_cell_context_menu(cx))
     }
-}
-
-/// A data column's header content: its name plus a type-name badge.
-fn column_header(column: &ColumnMeta, active_theme: &Theme) -> AnyElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .text_color(rgb(active_theme.colors.text_primary))
-                .child(column.name.clone()),
-        )
-        .child(grid::type_tag_tertiary(&column.type_name, active_theme))
-        .into_any_element()
 }
 
 /// The bottom status bar's dot color and label for `state`. A `liveness` of

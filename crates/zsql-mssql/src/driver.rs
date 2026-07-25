@@ -30,7 +30,7 @@ use futures::{StreamExt as _, pin_mut};
 use tiberius::{Client, QueryItem};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
-    RowBatch, RowCount, SchemaTree,
+    RowBatch, RowCount, SchemaTree, SortDirection,
 };
 
 use crate::error::{map_connect_error, map_io_connect_error, map_query_error};
@@ -262,6 +262,43 @@ impl Connection for MssqlConnection {
     /// implement teardown here.
     #[tracing::instrument(name = "mssql_close", skip_all)]
     async fn close(&self) {}
+
+    /// The sort-and-page-windowed form of [`Connection::preview_query`]:
+    /// `OFFSET`/`FETCH NEXT`, the paging idiom `TOP` has no equivalent for.
+    ///
+    /// SQL Server rejects a bare `OFFSET` with no `ORDER BY` on the same
+    /// query, so when no explicit sort is active this still emits one:
+    /// `ORDER BY (SELECT NULL)`. This synchronous, no-I/O builder is never
+    /// given the relation's columns (unlike `describe_relation`, which would
+    /// require a round trip), so it cannot name a real column to sort by;
+    /// `(SELECT NULL)` is the standard idiom for "a syntactically valid
+    /// order the caller does not care about" and satisfies the OFFSET/FETCH
+    /// grammar without claiming a stable ordering guarantee this driver
+    /// cannot actually make.
+    fn preview_query_windowed(
+        &self,
+        schema: &str,
+        relation: &str,
+        sort: Option<(&str, SortDirection)>,
+        limit: u64,
+        offset: u64,
+    ) -> String {
+        let order_by = sort.map_or_else(
+            || "(SELECT NULL)".to_owned(),
+            |(column, direction)| {
+                format!(
+                    "{} {}",
+                    crate::quoting::bracket_quote_ident(column),
+                    direction.as_sql()
+                )
+            },
+        );
+        format!(
+            "SELECT * FROM {}.{} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY",
+            crate::quoting::bracket_quote_ident(schema),
+            crate::quoting::bracket_quote_ident(relation)
+        )
+    }
 }
 
 /// Look up `sys.dm_db_partition_stats` for `schema.relation`'s base table
@@ -465,7 +502,7 @@ async fn run_query(
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver};
+    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
 
     use super::{MssqlDriver, row_count_from_partition_stats};
 
@@ -705,6 +742,78 @@ mod tests {
         let conn = connection_for_test();
         let sql = conn.preview_query("dbo", "weird]name", 10);
         assert_eq!(sql, "SELECT TOP (10) * FROM [dbo].[weird]]name]");
+    }
+
+    #[test]
+    fn preview_query_windowed_with_a_sort_emits_offset_fetch_and_the_real_order_by() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query_windowed(
+                "dbo",
+                "orders",
+                Some(("total_cents", SortDirection::Desc)),
+                200,
+                200
+            ),
+            "SELECT * FROM [dbo].[orders] ORDER BY [total_cents] DESC \
+             OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_with_no_sort_still_produces_valid_offset_fetch_sql_for_page_two() {
+        // SQL Server requires an ORDER BY alongside OFFSET/FETCH; with no
+        // explicit sort selected this must still be present, not omitted.
+        let conn = connection_for_test();
+        let sql = conn.preview_query_windowed("dbo", "orders", None, 200, 200);
+        assert_eq!(
+            sql,
+            "SELECT * FROM [dbo].[orders] ORDER BY (SELECT NULL) \
+             OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
+        assert!(sql.contains("ORDER BY"), "OFFSET requires ORDER BY: {sql}");
+        assert!(sql.contains("OFFSET 200 ROWS"));
+        assert!(sql.contains("FETCH NEXT 200 ROWS ONLY"));
+    }
+
+    #[test]
+    fn preview_query_windowed_omits_no_offset_special_casing_page_one_still_has_offset_zero() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query_windowed("dbo", "orders", None, 200, 0);
+        assert!(
+            sql.contains("OFFSET 0 ROWS"),
+            "OFFSET/FETCH syntax always states the offset explicitly: {sql}"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_supports_every_configured_page_size() {
+        let conn = connection_for_test();
+        for page_size in [100_u64, 200, 500, 1000] {
+            let sql = conn.preview_query_windowed("dbo", "orders", None, page_size, 0);
+            assert!(
+                sql.contains(&format!("FETCH NEXT {page_size} ROWS ONLY")),
+                "page size {page_size}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query_windowed(
+            "dbo",
+            "orders",
+            Some(("total]; DROP TABLE users; --", SortDirection::Asc)),
+            200,
+            0,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM [dbo].[orders] ORDER BY [total]]; DROP TABLE users; --] ASC \
+             OFFSET 0 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
     }
 
     #[test]

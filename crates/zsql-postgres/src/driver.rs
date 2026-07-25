@@ -265,7 +265,7 @@ async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver};
+    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
 
     use super::{PgConnection, PostgresDriver};
 
@@ -400,6 +400,83 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_windowed_with_no_sort_and_no_offset_matches_the_plain_preview() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 0),
+            conn.preview_query("public", "orders", 200)
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_applies_ascending_and_descending_sorts() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query_windowed(
+                "public",
+                "orders",
+                Some(("total_cents", SortDirection::Asc)),
+                200,
+                0
+            ),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed(
+                "public",
+                "orders",
+                Some(("total_cents", SortDirection::Desc)),
+                200,
+                0
+            ),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" DESC LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_omits_offset_on_page_one_and_applies_it_from_page_two() {
+        let conn = connection_for_test();
+        let page_one = conn.preview_query_windowed("public", "orders", None, 200, 0);
+        assert!(!page_one.contains("OFFSET"), "page one: {page_one}");
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 800),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 800"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_supports_every_configured_page_size() {
+        let conn = connection_for_test();
+        for page_size in [100_u64, 200, 500, 1000] {
+            assert_eq!(
+                conn.preview_query_windowed("public", "orders", None, page_size, 0),
+                format!("SELECT * FROM \"public\".\"orders\" LIMIT {page_size}")
+            );
+        }
+    }
+
+    #[test]
+    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query_windowed(
+            "public",
+            "orders",
+            Some(("total\"; DROP TABLE users; --", SortDirection::Asc)),
+            200,
+            0,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total\"\"; DROP TABLE users; --\" ASC LIMIT 200"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
     }
@@ -1641,5 +1718,81 @@ mod database_tests {
                 Err(err) => panic!("ddl setup did not complete: {err:?}"),
             }
         }
+    }
+
+    /// Table name [`seed_sorted_preview_table`] creates.
+    const SORTED_PREVIEW_TABLE: &str = "zsql_test_sorted_preview";
+
+    /// Seeds a self-contained table of 25 rows with a distinct `n` value in
+    /// each (1..=25), for asserting exact ordered/windowed row content.
+    fn seed_sorted_preview_table(conn: &dyn zsql_core::Connection) {
+        let table = SORTED_PREVIEW_TABLE;
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(conn, &format!("CREATE TABLE {table} (n integer NOT NULL)"));
+        let values: Vec<String> = (1..=25).map(|n| format!("({n})")).collect();
+        run_ddl(
+            conn,
+            &format!("INSERT INTO {table} (n) VALUES {}", values.join(", ")),
+        );
+    }
+
+    /// Run `sql` to completion, collecting every row's cells into `Vec<Vec<zsql_core::Value>>`
+    /// in arrival order.
+    fn run_query_collecting_rows(
+        conn: &dyn zsql_core::Connection,
+        sql: &str,
+    ) -> Vec<Vec<zsql_core::Value>> {
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql.to_owned(), tx);
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Columns(_)) => {}
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    rows.extend(batch.rows.into_iter().map(|row| row.0));
+                }
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        rows
+    }
+
+    /// Opening a preview, then sorting it and stepping to page 2, must
+    /// return exactly the correct ordered, windowed subset of rows -- not
+    /// merely "a query ran". Seeds 25 rows (`n` = 1..=25), sorts descending
+    /// by `n` at a page size of 10, and asserts page 2 is exactly
+    /// `n` = 15..=6 in descending order.
+    #[test]
+    fn preview_query_windowed_returns_the_correct_sorted_windowed_rows_when_configured() {
+        let conn = live_connection();
+        seed_sorted_preview_table(&*conn);
+
+        let sql = conn.preview_query_windowed(
+            "public",
+            SORTED_PREVIEW_TABLE,
+            Some(("n", zsql_core::SortDirection::Desc)),
+            10,
+            10,
+        );
+        assert!(sql.contains("ORDER BY \"n\" DESC"), "{sql}");
+        assert!(sql.contains("OFFSET 10"), "{sql}");
+
+        let rows = run_query_collecting_rows(&*conn, &sql);
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|row| match &row[0] {
+                zsql_core::Value::Int(n) => *n,
+                other => panic!("expected an Int cell, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![15, 14, 13, 12, 11, 10, 9, 8, 7, 6],
+            "page 2 of a 10-row-page, n DESC preview must be exactly n=15..=6 in that order"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {SORTED_PREVIEW_TABLE}"));
     }
 }

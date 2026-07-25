@@ -5,12 +5,14 @@
 //! so this one driver serves both (see [`crate::url::normalize_for_sqlx`]
 //! for the `mariadb://` -> `mysql://` scheme rewrite this relies on).
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema, RowCount,
-    SchemaTree,
+    SchemaTree, SortDirection,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{
@@ -192,6 +194,37 @@ impl Connection for MySqlConnection {
     async fn close(&self) {
         self.0.close().await;
     }
+
+    /// The sort-and-page-windowed form of [`Connection::preview_query`]:
+    /// backtick-quoted identifiers, an optional `ORDER BY`, and `LIMIT` /
+    /// `OFFSET` (`MySQL`/`MariaDB` accept `OFFSET` directly after `LIMIT`).
+    fn preview_query_windowed(
+        &self,
+        schema: &str,
+        relation: &str,
+        sort: Option<(&str, SortDirection)>,
+        limit: u64,
+        offset: u64,
+    ) -> String {
+        let mut sql = format!(
+            "SELECT * FROM {}.{}",
+            backtick_quote_ident(schema),
+            backtick_quote_ident(relation)
+        );
+        if let Some((column, direction)) = sort {
+            let _ = write!(
+                sql,
+                " ORDER BY {} {}",
+                backtick_quote_ident(column),
+                direction.as_sql()
+            );
+        }
+        let _ = write!(sql, " LIMIT {limit}");
+        if offset > 0 {
+            let _ = write!(sql, " OFFSET {offset}");
+        }
+        sql
+    }
 }
 
 /// Look up `information_schema.TABLES.TABLE_ROWS` for `schema.relation`,
@@ -249,7 +282,7 @@ async fn exact_row_count(pool: &MySqlPool, schema: &str, relation: &str) -> Resu
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver};
+    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
 
     use super::{MySqlConnection, MysqlDriver};
 
@@ -373,6 +406,83 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM `zsql`.`orders``; DROP TABLE users; --` LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_windowed_with_no_sort_and_no_offset_matches_the_plain_preview() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query_windowed("zsql", "orders", None, 200, 0),
+            conn.preview_query("zsql", "orders", 200)
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_applies_ascending_and_descending_sorts() {
+        let conn = connection_for_test();
+        assert_eq!(
+            conn.preview_query_windowed(
+                "zsql",
+                "orders",
+                Some(("total_cents", SortDirection::Asc)),
+                200,
+                0
+            ),
+            "SELECT * FROM `zsql`.`orders` ORDER BY `total_cents` ASC LIMIT 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed(
+                "zsql",
+                "orders",
+                Some(("total_cents", SortDirection::Desc)),
+                200,
+                0
+            ),
+            "SELECT * FROM `zsql`.`orders` ORDER BY `total_cents` DESC LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_omits_offset_on_page_one_and_applies_it_from_page_two() {
+        let conn = connection_for_test();
+        let page_one = conn.preview_query_windowed("zsql", "orders", None, 200, 0);
+        assert!(!page_one.contains("OFFSET"), "page one: {page_one}");
+        assert_eq!(
+            conn.preview_query_windowed("zsql", "orders", None, 200, 200),
+            "SELECT * FROM `zsql`.`orders` LIMIT 200 OFFSET 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed("zsql", "orders", None, 200, 800),
+            "SELECT * FROM `zsql`.`orders` LIMIT 200 OFFSET 800"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_supports_every_configured_page_size() {
+        let conn = connection_for_test();
+        for page_size in [100_u64, 200, 500, 1000] {
+            assert_eq!(
+                conn.preview_query_windowed("zsql", "orders", None, page_size, 0),
+                format!("SELECT * FROM `zsql`.`orders` LIMIT {page_size}")
+            );
+        }
+    }
+
+    #[test]
+    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+        let conn = connection_for_test();
+        let sql = conn.preview_query_windowed(
+            "zsql",
+            "orders",
+            Some(("total`; DROP TABLE users; --", SortDirection::Asc)),
+            200,
+            0,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM `zsql`.`orders` ORDER BY `total``; DROP TABLE users; --` ASC LIMIT 200"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
     }

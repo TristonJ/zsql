@@ -35,6 +35,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: Config::default().query.preview_limit,
+            preview_page_sizes: Config::default().query.preview_page_sizes,
             batch_size: Config::default().query.batch_size,
             max_result_rows: Config::default().query.max_result_rows,
             active_query: None,

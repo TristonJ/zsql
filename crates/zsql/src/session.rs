@@ -51,6 +51,9 @@ pub struct Session {
     /// [`Config::query`]'s `batch_size`, threaded into
     /// [`tunnel::open_tunnel_and_connect`] on every connect attempt.
     batch_size: usize,
+    /// Page-size choices a generated preview's pager cycles through, from
+    /// [`Config::query`]'s `preview_page_sizes`.
+    preview_page_sizes: Vec<u64>,
     /// Upper bound on rows accumulated for the query currently streaming,
     /// from [`Config::query`]. Reaching this many rows moves `state` to
     /// [`SessionState::Truncating`]; see [`Session::apply_query_event`].
@@ -103,6 +106,7 @@ impl Session {
             schema_generation: 0,
             preview_limit: cfg.query.preview_limit,
             batch_size: cfg.query.batch_size,
+            preview_page_sizes: cfg.query.preview_page_sizes.clone(),
             max_result_rows: cfg.query.max_result_rows,
             active_query: None,
             accumulator: zsql_core::ResultAccumulator::new(cfg.query.max_result_rows),
@@ -169,6 +173,45 @@ impl Session {
         self.connection.as_ref().map_or_else(
             || zsql_core::default_preview_query(schema, relation, self.preview_limit),
             |connection| connection.preview_query(schema, relation, self.preview_limit),
+        )
+    }
+
+    /// The configured default preview row limit (`Config::query`'s
+    /// `preview_limit`), and the page size a fresh generated tab's pager
+    /// starts at.
+    #[must_use]
+    pub fn preview_limit(&self) -> u64 {
+        self.preview_limit
+    }
+
+    /// The page sizes a generated preview's pager cycles through, from
+    /// `Config::query`'s `preview_page_sizes`.
+    #[must_use]
+    pub fn preview_page_sizes(&self) -> &[u64] {
+        &self.preview_page_sizes
+    }
+
+    /// [`Session::preview_sql`], windowed by an optional `(column,
+    /// direction)` sort and a `LIMIT`/`OFFSET` page, in the active
+    /// connection's dialect (or the shared default when there is none). The
+    /// sort column must come from [`zsql_core::ColumnMeta::name`], the same
+    /// contract [`Session::preview_sql`] holds for `schema`/`relation`.
+    ///
+    /// This is the single source of a sort/page-driven rerun's SQL text:
+    /// both [`Session::preview_relation_windowed`] (what actually executes)
+    /// and the generated tab's rewritten buffer are built from it.
+    #[must_use]
+    pub fn preview_sql_windowed(
+        &self,
+        schema: &str,
+        relation: &str,
+        sort: Option<(&str, zsql_core::SortDirection)>,
+        limit: u64,
+        offset: u64,
+    ) -> String {
+        self.connection.as_ref().map_or_else(
+            || zsql_core::default_preview_query_windowed(schema, relation, sort, limit, offset),
+            |connection| connection.preview_query_windowed(schema, relation, sort, limit, offset),
         )
     }
 
@@ -425,6 +468,32 @@ impl Session {
         }
 
         preview_task
+    }
+
+    /// Re-run a live generated preview after a sort or page change, via
+    /// [`Session::preview_sql_windowed`].
+    ///
+    /// Unlike [`Session::preview_relation`], this never issues its own
+    /// `count_rows` fetch: a sort or page step previews the same relation
+    /// the initial `preview_relation` call already counted, so that total
+    /// is still valid and is restored after [`Session::run_query`] (which
+    /// unconditionally clears [`Session::row_count`] for the general case
+    /// of an unrelated query replacing it) rather than re-querying
+    /// `COUNT(*)` on every pager click.
+    pub fn preview_relation_windowed(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        sort: Option<(&str, zsql_core::SortDirection)>,
+        limit: u64,
+        offset: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let sql = self.preview_sql_windowed(schema, relation, sort, limit, offset);
+        let row_count = self.row_count;
+        let task = self.run_query(sql, cx);
+        self.row_count = row_count;
+        task
     }
 
     /// Fetch `schema.relation`'s full structural detail (columns, indexes,

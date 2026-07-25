@@ -7,9 +7,9 @@ use gpui::{
 use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
 use super::{
-    CellDown, CellLeft, CellRight, CellUp, Copy, ResultsView, SessionState, ViewMode,
-    column_width_from_parts, format_total_row_count, results_bar_count_text, status_indicator,
-    status_metrics,
+    CellDown, CellLeft, CellRight, CellUp, Copy, NextPage, PrevPage, ResultsView, SessionState,
+    ViewMode, column_width_from_parts, format_total_row_count, results_bar_count_text,
+    status_indicator, status_metrics,
 };
 
 use crate::session::{LivenessState, Session};
@@ -2202,4 +2202,64 @@ mod value_panel_view_tests {
             "moving the mouse after mouse-up must not resume resizing the panel"
         );
     }
+}
+
+fn recording_preview_controls() -> (
+    super::pager::PreviewControls,
+    std::rc::Rc<std::cell::RefCell<Vec<super::pager::PreviewAction>>>,
+) {
+    let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorded_for_dispatch = recorded.clone();
+    let controls = super::pager::PreviewControls {
+        state: zsql_core::preview_state::PreviewQueryState::new(200),
+        dispatch: std::rc::Rc::new(move |action, _window, _cx| {
+            recorded_for_dispatch.borrow_mut().push(action);
+        }),
+    };
+    (controls, recorded)
+}
+
+#[gpui::test]
+fn prev_page_and_next_page_actions_are_no_ops_with_no_active_preview_controls(
+    cx: &mut gpui::TestAppContext,
+) {
+    let session =
+        cx.new(|_cx| Session::new_for_render_test(SessionState::Connected, ResultSet::default()));
+    let (view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+
+    // No `set_preview_controls` call: `preview` stays `None`, matching a
+    // script tab, a schema tab, or a "no results" state. Neither action
+    // must panic or otherwise have a visible effect.
+    view.update_in(vcx, |view, window, cx| {
+        view.prev_page(&PrevPage, window, cx);
+        view.next_page(&NextPage, window, cx);
+    });
+}
+
+#[gpui::test]
+fn prev_page_and_next_page_actions_reach_the_active_tabs_preview_dispatch(
+    cx: &mut gpui::TestAppContext,
+) {
+    let session =
+        cx.new(|_cx| Session::new_for_render_test(SessionState::Connected, ResultSet::default()));
+    let (view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+
+    let (controls, recorded) = recording_preview_controls();
+    view.update(vcx, |view, cx| {
+        view.set_preview_controls(Some(controls), cx);
+    });
+
+    view.update_in(vcx, |view, window, cx| {
+        view.prev_page(&PrevPage, window, cx);
+        view.next_page(&NextPage, window, cx);
+    });
+
+    let recorded = recorded.borrow();
+    assert_eq!(
+        recorded.as_slice(),
+        [
+            super::pager::PreviewAction::PrevPage,
+            super::pager::PreviewAction::NextPage
+        ]
+    );
 }

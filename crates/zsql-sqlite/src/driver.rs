@@ -400,6 +400,96 @@ mod tests {
     }
 
     #[test]
+    fn preview_query_windowed_with_no_sort_and_no_offset_matches_the_plain_preview() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 0),
+            conn.preview_query("public", "orders", 200)
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_applies_ascending_and_descending_sorts() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        assert_eq!(
+            conn.preview_query_windowed(
+                "public",
+                "orders",
+                Some(("total_cents", zsql_core::SortDirection::Asc)),
+                200,
+                0
+            ),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed(
+                "public",
+                "orders",
+                Some(("total_cents", zsql_core::SortDirection::Desc)),
+                200,
+                0
+            ),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" DESC LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_omits_offset_on_page_one_and_applies_it_from_page_two() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let page_one = conn.preview_query_windowed("public", "orders", None, 200, 0);
+        assert!(!page_one.contains("OFFSET"), "page one: {page_one}");
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 200),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 200"
+        );
+        assert_eq!(
+            conn.preview_query_windowed("public", "orders", None, 200, 800),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 800"
+        );
+    }
+
+    #[test]
+    fn preview_query_windowed_supports_every_configured_page_size() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        for page_size in [100_u64, 200, 500, 1000] {
+            assert_eq!(
+                conn.preview_query_windowed("public", "orders", None, page_size, 0),
+                format!("SELECT * FROM \"public\".\"orders\" LIMIT {page_size}")
+            );
+        }
+    }
+
+    #[test]
+    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let sql = conn.preview_query_windowed(
+            "public",
+            "orders",
+            Some((
+                "total\"; DROP TABLE users; --",
+                zsql_core::SortDirection::Asc,
+            )),
+            200,
+            0,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total\"\"; DROP TABLE users; --\" ASC LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
     fn close_shuts_down_the_underlying_pool_through_the_trait_object() {
         let pool = block_on(
             sqlx::sqlite::SqlitePoolOptions::new()
