@@ -118,6 +118,7 @@ pub struct ContextMenuItem {
 }
 
 impl ContextMenuItem {
+    #[must_use]
     pub fn new(label: &'static str) -> Self {
         Self::with_id(SharedString::from(label), label)
     }
@@ -193,7 +194,7 @@ impl RenderOnce for ContextMenu {
             })
             .child(
                 anchored()
-                    .when_some(self.position, |el, position| el.position(position))
+                    .when_some(self.position, gpui::Anchored::position)
                     .snap_to_window()
                     .child(menu),
             );

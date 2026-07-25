@@ -24,56 +24,41 @@ use crate::ui::{
 
 pub struct TextView {
     /// The current text document, assembled from the result.
-    text_document: Option<Rc<str>>,
+    document: Option<Rc<str>>,
     /// The Text view's selection, as the (anchor, cursor) document positions
-    /// in the order a click/drag/shift-click set them -- not necessarily
-    /// `anchor <= cursor`. `None` when nothing is selected.
-    text_selection: Option<(TextCaret, TextCaret)>,
+    /// in the order a click/drag/shift-click set them. `None` when nothing
+    /// is selected.
+    selection: Option<(TextCaret, TextCaret)>,
     /// Whether the mouse button is currently held down over the Text view,
-    /// extending `text_selection` as it moves. Sends a shift-click's fixed
-    /// jump-and-release through the same [`ResultsView::set_text_caret`]
-    /// path without leaving a drag in progress.
-    text_selecting: bool,
-    /// Derives syntax spans for the Text view's assembled document. Reused
-    /// across renders so an unchanged document skips reparsing (see
-    /// `SqlHighlighter::set_text`).
-    text_highlighter: SqlHighlighter,
-    /// Vertical scroll position shared by the Text view's virtualized gutter
-    /// and body lists while wrap is off, so scrolling either one scrolls
-    /// both in lockstep (mirrors the grid's own row-synced scrolling).
-    text_row_scroll_handle: UniformListScrollHandle,
-    /// Horizontal scroll position of the Text view's body pane while wrap is
-    /// off; the gutter never scrolls horizontally.
-    text_col_scroll_handle: ScrollHandle,
+    /// extending `text_selection` as it moves.
+    selecting: bool,
+    /// Derives syntax spans for the Text view's assembled document
+    highlighter: SqlHighlighter,
+    /// Vertical scroll position shared by the virtualized gutter and body
+    row_scroll_handle: UniformListScrollHandle,
+    /// Horizontal scroll position
+    col_scroll_handle: ScrollHandle,
     /// Backs the Text view body pane's scrollbars: its vertical axis follows
     /// the shared row list and its horizontal axis the current longest line's
-    /// extent, both reconfigured each render, and [`WithScrollbars`] overlays
-    /// the tracks+thumbs the same way the grid's `Table` does.
-    text_scroll_state: Entity<ScrollableState>,
-    /// Vertical scroll position of the Text view's single unified line list
-    /// while wrap is on, where lines are not virtualized (their heights vary
-    /// with how each wraps) and no horizontal axis is needed.
-    text_wrap_scroll_handle: ScrollHandle,
+    /// extent
+    scroll_state: Entity<ScrollableState>,
     /// Cached widest-line pixel width backing the Text view's horizontal
     /// scroll extent. Measured with real text shaping (see
-    /// [`ResultsView::measure_text_content_width`]) so it stays correct for a
-    /// proportional data font, not just a monospace one, and recomputed only
-    /// when the inputs that width depends on change.
-    text_content_extent: Option<TextContentExtent>,
+    /// [`ResultsView::measure_text_content_width`])
+    content_extent: Option<TextContentExtent>,
 }
 
 impl TextView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            text_document: None,
-            text_selection: None,
-            text_selecting: false,
-            text_highlighter: SqlHighlighter::new(),
-            text_row_scroll_handle: UniformListScrollHandle::new(),
-            text_col_scroll_handle: ScrollHandle::new(),
-            text_wrap_scroll_handle: ScrollHandle::new(),
-            text_scroll_state: cx.new(ScrollableState::new),
-            text_content_extent: None,
+            document: None,
+            selection: None,
+            selecting: false,
+            highlighter: SqlHighlighter::new(),
+            row_scroll_handle: UniformListScrollHandle::new(),
+            col_scroll_handle: ScrollHandle::new(),
+            scroll_state: cx.new(ScrollableState::new),
+            content_extent: None,
         }
     }
 
@@ -83,53 +68,48 @@ impl TextView {
     #[tracing::instrument(level = "debug", skip(self, result), fields(result_rows = result.rows.len()))]
     pub fn update_document(&mut self, result: &ResultSet) -> bool {
         if !result.is_document_shaped() {
-            self.text_document = None;
+            self.document = None;
             return false;
         }
 
         let Some(doc) = assemble_document(result) else {
-            self.text_document = None;
+            self.document = None;
             return false;
         };
-        self.text_document = Some(Rc::from(doc));
+        self.document = Some(Rc::from(doc));
         true
     }
 
     /// Get the Text view's current document, if any.
     pub fn document(&self) -> Option<&str> {
-        self.text_document.as_deref()
+        self.document.as_deref()
     }
 
     /// Whether this view currently has a valid text document
     pub fn has_document(&self) -> bool {
-        self.text_document.is_some()
+        self.document.is_some()
     }
 
     /// Get the currently selected text, if any, from the view's document
     pub fn selected_text(&self) -> Option<String> {
-        let Some(document) = self.text_document.as_deref() else {
-            return None;
-        };
+        let document = self.document.as_deref()?;
         self.get_selected_text(document)
     }
 
     /// The current line count of the Text view's document
     pub fn line_count(&self) -> Option<usize> {
-        self.text_document.as_ref().map(|d| d.split('\n').count())
+        self.document.as_deref().map(document_line_count)
     }
 
     /// Reset the state - clears selection scroll, etc.
     pub fn reset(&mut self) {
-        self.text_document = None;
-        self.text_selection = None;
-        self.text_selecting = false;
-        self.text_row_scroll_handle
+        self.document = None;
+        self.selection = None;
+        self.selecting = false;
+        self.row_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
-        self.text_col_scroll_handle
-            .set_offset(point(px(0.0), px(0.0)));
-        self.text_wrap_scroll_handle
-            .set_offset(point(px(0.0), px(0.0)));
-        self.text_content_extent = None;
+        self.col_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+        self.content_extent = None;
     }
 
     /// The widest Text-view line's shaped pixel width, memoized in
@@ -146,7 +126,7 @@ impl TextView {
         line_runs: &[Vec<TextRun>],
         window: &Window,
     ) -> Pixels {
-        if let Some(cached) = &self.text_content_extent
+        if let Some(cached) = &self.content_extent
             && cached.document_len == document_len
             && cached.font_family == *font_family
             && cached.font_size == font_size
@@ -155,7 +135,7 @@ impl TextView {
         }
 
         let width = Self::measure_text_content_width(lines, line_runs, font_size, window);
-        self.text_content_extent = Some(TextContentExtent {
+        self.content_extent = Some(TextContentExtent {
             document_len,
             font_family: font_family.clone(),
             font_size,
@@ -221,7 +201,7 @@ impl TextView {
                 },
             )
             .flex_1()
-            .track_scroll(self.text_row_scroll_handle.clone()),
+            .track_scroll(self.row_scroll_handle.clone()),
         );
 
         let gutter = div()
@@ -233,12 +213,12 @@ impl TextView {
             .h_full()
             .child(gutter_list);
 
-        let col_scroll_handle = self.text_col_scroll_handle.clone();
-        let row_scroll_handle = self.text_row_scroll_handle.clone();
+        let col_scroll_handle = self.col_scroll_handle.clone();
+        let row_scroll_handle = self.row_scroll_handle.clone();
         // line counts stay far below f32's exact-integer range
         #[allow(clippy::cast_precision_loss)]
         let vertical_extent = line_count as f32 * f32::from(theme::TEXT_VIEW_LINE_HEIGHT);
-        self.text_scroll_state.update(cx, |state, _cx| {
+        self.scroll_state.update(cx, |state, _cx| {
             state.vertical(Axis::new(
                 ScrollSource::UniformList(row_scroll_handle),
                 vertical_extent,
@@ -268,7 +248,7 @@ impl TextView {
             .flex_1()
             .min_w(content_extent)
             .with_sizing_behavior(ListSizingBehavior::Auto)
-            .track_scroll(self.text_row_scroll_handle.clone()),
+            .track_scroll(self.row_scroll_handle.clone()),
         );
 
         let body = div()
@@ -281,12 +261,12 @@ impl TextView {
             .h_full()
             .w_full()
             .overflow_x_hidden()
-            .track_scroll(&self.text_col_scroll_handle)
-            .on_scroll_wheel(ScrollableState::wheel_handler(&self.text_scroll_state))
+            .track_scroll(&self.col_scroll_handle)
+            .on_scroll_wheel(ScrollableState::wheel_handler(&self.scroll_state))
             .font_family(&cx.theme().fonts.data)
             .text_size(px(theme::TEXT_VIEW_FONT_SIZE))
             .child(body_list)
-            .with_scrollbars(&self.text_scroll_state, ScrollbarStyle::default(), cx);
+            .with_scrollbars(&self.scroll_state, ScrollbarStyle::default(), cx);
 
         div()
             .flex()
@@ -308,12 +288,12 @@ impl TextView {
     fn set_text_caret(&mut self, line: usize, byte: usize, extend: bool, cx: &mut Context<Self>) {
         let cursor = TextCaret { line, byte };
         let anchor = if extend {
-            self.text_selection.map_or(cursor, |(anchor, _)| anchor)
+            self.selection.map_or(cursor, |(anchor, _)| anchor)
         } else {
             cursor
         };
-        self.text_selection = Some((anchor, cursor));
-        self.text_selecting = !extend;
+        self.selection = Some((anchor, cursor));
+        self.selecting = !extend;
         cx.notify();
     }
 
@@ -326,30 +306,30 @@ impl TextView {
         byte: usize,
         cx: &mut Context<Self>,
     ) {
-        if !self.text_selecting {
+        if !self.selecting {
             return;
         }
-        let Some((anchor, _)) = self.text_selection else {
+        let Some((anchor, _)) = self.selection else {
             return;
         };
-        self.text_selection = Some((anchor, TextCaret { line, byte }));
+        self.selection = Some((anchor, TextCaret { line, byte }));
         cx.notify();
     }
 
     /// End a Text view selection drag, leaving the selection itself in
     /// place. A no-op if nothing was being dragged.
     fn end_text_selection_drag(&mut self, cx: &mut Context<Self>) {
-        if !self.text_selecting {
+        if !self.selecting {
             return;
         }
-        self.text_selecting = false;
+        self.selecting = false;
         cx.notify();
     }
 
     /// Get the slice of text in `document` that is currently selected, or `None` if
     /// there is no selection.
     fn get_selected_text(&self, document: &str) -> Option<String> {
-        let (anchor, cursor) = self.text_selection?;
+        let (anchor, cursor) = self.selection?;
         let (start, end) = if anchor < cursor {
             (anchor, cursor)
         } else {
@@ -380,12 +360,12 @@ impl TextView {
 
 impl Render for TextView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(document) = self.text_document.as_ref() else {
+        let Some(document) = self.document.as_ref() else {
             tracing::warn!("Attempted to render a TextView with an empty document");
             return div();
         };
 
-        self.text_highlighter.set_text(document);
+        self.highlighter.set_text(document);
         let lines: Rc<[String]> = document
             .split('\n')
             .map(str::to_owned)
@@ -407,12 +387,12 @@ impl Render for TextView {
         let run_font = font(active_theme.fonts.data.clone());
         let base_color = Hsla::from(rgb(colors.text_primary));
         let selection_bg = Hsla::from(rgb(theme::text_selection_bg(active_theme)));
-        let selection = self.text_selection;
+        let selection = self.selection;
         let line_runs: Rc<[Vec<TextRun>]> = lines
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                let spans = self.text_highlighter.spans_for_line(index);
+                let spans = self.highlighter.spans_for_line(index);
                 let selection_range =
                     selection.and_then(|sel| line_selection_range(sel, index, line.len()));
                 text_view_line_runs(
@@ -592,6 +572,13 @@ fn document_cell_text(row: &Row) -> &str {
     }
 }
 
+/// The number of lines in `document` under the split-on-newline convention:
+/// an empty document is still one line, and a trailing newline yields one
+/// extra empty final line.
+fn document_line_count(document: &str) -> usize {
+    document.split('\n').count()
+}
+
 /// One Text view line's `TextRun`s: `spans`' char-indexed ranges converted to
 /// this line's own byte offsets and painted with
 /// `zsql_editor::syntax_color`'s token roles, with `selection`'s byte range
@@ -679,4 +666,348 @@ fn char_byte_offset(line: &str, char_index: usize) -> usize {
     line.char_indices()
         .nth(char_index)
         .map_or(line.len(), |(byte_index, _)| byte_index)
+}
+
+/// Test-only accessors used by `ui::results`'s tests, which drive the Text
+/// view's selection through the [`ResultsView`]'s copy and reset paths.
+#[cfg(test)]
+impl TextView {
+    pub(crate) fn set_text_caret_for_test(
+        &mut self,
+        line: usize,
+        byte: usize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_text_caret(line, byte, extend, cx);
+    }
+
+    /// The Text view's current selection as `((anchor_line, anchor_byte),
+    /// (cursor_line, cursor_byte))`.
+    pub(crate) fn text_selection_for_test(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.selection
+            .map(|(anchor, cursor)| ((anchor.line, anchor.byte), (cursor.line, cursor.byte)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{AppContext as _, Hsla, TestAppContext, font, rgb};
+    use zsql_core::{ColumnMeta, ResultSet, Row, Value};
+    use zsql_editor::{HighlightKind, StyleSpan, syntax_color};
+    use zsql_ui::theme::Theme;
+
+    use super::{
+        TextCaret, TextView, assemble_document, document_line_count, line_selection_range,
+        text_view_line_runs,
+    };
+    use crate::ui::theme;
+
+    fn column(name: &str, type_name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: false,
+        }
+    }
+
+    fn text_column_result(rows: Vec<Row>) -> ResultSet {
+        ResultSet {
+            columns: vec![column("Text", "nvarchar")],
+            rows,
+            affected: None,
+            notices: Vec::new(),
+        }
+    }
+
+    // -- Assembling the document -------------------------------------------
+
+    #[test]
+    fn assemble_document_uses_a_single_rows_value_verbatim() {
+        let result = text_column_result(vec![Row(vec![Value::Text(
+            "CREATE PROCEDURE p\nAS\nBEGIN\nEND".to_owned(),
+        )])]);
+        assert_eq!(
+            assemble_document(&result).as_deref(),
+            Some("CREATE PROCEDURE p\nAS\nBEGIN\nEND"),
+            "a single row's value must pass through unmodified, not be re-split/rejoined"
+        );
+    }
+
+    #[test]
+    fn assemble_document_joins_multiple_rows_with_newlines() {
+        let result = text_column_result(vec![
+            Row(vec![Value::Text("CREATE PROCEDURE p".to_owned())]),
+            Row(vec![Value::Text("AS".to_owned())]),
+            Row(vec![Value::Text("BEGIN".to_owned())]),
+        ]);
+        assert_eq!(
+            assemble_document(&result).as_deref(),
+            Some("CREATE PROCEDURE p\nAS\nBEGIN")
+        );
+    }
+
+    #[test]
+    fn assemble_document_renders_a_null_row_as_an_empty_line() {
+        let result = text_column_result(vec![
+            Row(vec![Value::Text("a".to_owned())]),
+            Row(vec![Value::Null]),
+            Row(vec![Value::Text("c".to_owned())]),
+        ]);
+        assert_eq!(assemble_document(&result).as_deref(), Some("a\n\nc"));
+    }
+
+    #[test]
+    fn assemble_document_is_none_for_zero_rows() {
+        assert_eq!(
+            assemble_document(&text_column_result(Vec::new())),
+            None,
+            "an empty result yields no document, so the view falls back to the grid"
+        );
+    }
+
+    #[test]
+    fn document_line_count_matches_the_split_on_newline_convention() {
+        assert_eq!(
+            document_line_count(""),
+            1,
+            "an empty document is still 1 line"
+        );
+        assert_eq!(document_line_count("one line"), 1);
+        assert_eq!(document_line_count("a\nb\nc"), 3);
+        assert_eq!(
+            document_line_count("a\nb\n"),
+            3,
+            "a trailing newline yields one extra empty final line"
+        );
+    }
+
+    // -- Line runs ----------------------------------------------------------
+
+    #[test]
+    fn text_view_line_runs_with_no_spans_or_selection_is_one_base_colored_run() {
+        let theme = Theme::default();
+        let run_font = font(theme.fonts.data.clone());
+        let base = Hsla::from(rgb(theme.colors.text_primary));
+        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+
+        let line = "select 1";
+        let runs = text_view_line_runs(line, &[], None, &run_font, base, selection_bg, &theme);
+
+        assert_eq!(runs.len(), 1, "a plain line is a single run");
+        assert_eq!(runs[0].len, line.len());
+        assert_eq!(runs[0].color, base);
+        assert_eq!(runs[0].background_color, None);
+    }
+
+    #[test]
+    fn text_view_line_runs_converts_char_spans_to_byte_offsets_on_a_multibyte_line() {
+        let theme = Theme::default();
+        let run_font = font(theme.fonts.data.clone());
+        let base = Hsla::from(rgb(theme.colors.text_primary));
+        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+
+        // A lowercase e with an acute accent is two bytes, so char index 1 is
+        // byte 2: a span over chars 1..3 must start after the whole accented
+        // char, never split it mid-codepoint.
+        let line = "\u{e9}12";
+        let spans = [StyleSpan {
+            start: 1,
+            end: 3,
+            kind: HighlightKind::Number,
+        }];
+        let runs = text_view_line_runs(line, &spans, None, &run_font, base, selection_bg, &theme);
+
+        let number = Hsla::from(rgb(syntax_color(&theme, HighlightKind::Number)));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0].len,
+            "\u{e9}".len(),
+            "the multibyte char before the span stays one whole base-colored run"
+        );
+        assert_eq!(runs[0].color, base);
+        assert_eq!(runs[1].color, number);
+        assert_eq!(
+            runs[1].len, 2,
+            "the span covers exactly the two ASCII digits"
+        );
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, line.len(), "runs must tile the whole line exactly");
+    }
+
+    #[test]
+    fn text_view_line_runs_shades_only_the_selected_byte_range() {
+        let theme = Theme::default();
+        let run_font = font(theme.fonts.data.clone());
+        let base = Hsla::from(rgb(theme.colors.text_primary));
+        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+
+        let line = "select";
+        let selection = 2..4;
+        let runs = text_view_line_runs(
+            line,
+            &[],
+            Some(&selection),
+            &run_font,
+            base,
+            selection_bg,
+            &theme,
+        );
+
+        let shaded: Vec<_> = runs
+            .iter()
+            .filter(|r| r.background_color == Some(selection_bg))
+            .collect();
+        assert_eq!(shaded.len(), 1, "exactly the selected range carries the bg");
+        assert_eq!(shaded[0].len, 2);
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, line.len());
+        let unshaded: usize = runs
+            .iter()
+            .filter(|r| r.background_color.is_none())
+            .map(|r| r.len)
+            .sum();
+        assert_eq!(
+            unshaded,
+            line.len() - 2,
+            "nothing outside the selection is shaded"
+        );
+    }
+
+    #[test]
+    fn text_view_line_runs_merges_adjacent_runs_of_the_same_color() {
+        let theme = Theme::default();
+        let run_font = font(theme.fonts.data.clone());
+        let base = Hsla::from(rgb(theme.colors.text_primary));
+        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+
+        // Two touching spans of the same kind must collapse into one run.
+        let line = "abcd";
+        let spans = [
+            StyleSpan {
+                start: 0,
+                end: 2,
+                kind: HighlightKind::Keyword,
+            },
+            StyleSpan {
+                start: 2,
+                end: 4,
+                kind: HighlightKind::Keyword,
+            },
+        ];
+        let runs = text_view_line_runs(line, &spans, None, &run_font, base, selection_bg, &theme);
+
+        assert_eq!(
+            runs.len(),
+            1,
+            "adjacent same-color windows merge into one run"
+        );
+        assert_eq!(runs[0].len, line.len());
+    }
+
+    // -- Selection byte ranges ---------------------------------------------
+
+    #[test]
+    fn line_selection_range_covers_only_the_lines_and_bytes_between_anchor_and_cursor() {
+        let selection = (
+            TextCaret { line: 0, byte: 2 },
+            TextCaret { line: 2, byte: 1 },
+        );
+        assert_eq!(
+            line_selection_range(selection, 0, 5),
+            Some(2..5),
+            "the anchor's own line is selected from its byte to the line's end"
+        );
+        assert_eq!(
+            line_selection_range(selection, 1, 5),
+            Some(0..5),
+            "a line strictly between anchor and cursor is selected in full"
+        );
+        assert_eq!(
+            line_selection_range(selection, 2, 5),
+            Some(0..1),
+            "the cursor's own line is selected from its start to its byte"
+        );
+        assert_eq!(
+            line_selection_range(selection, 3, 5),
+            None,
+            "a line outside the selection's line range is not selected"
+        );
+    }
+
+    #[test]
+    fn line_selection_range_is_none_for_a_collapsed_selection() {
+        let caret = TextCaret { line: 1, byte: 3 };
+        assert_eq!(
+            line_selection_range((caret, caret), 1, 10),
+            None,
+            "a plain click with no drag selects nothing to highlight"
+        );
+    }
+
+    // -- Character-granular selection --------------------------------------
+
+    #[gpui::test]
+    fn clicking_then_shift_clicking_extends_the_selection_from_the_original_anchor(
+        cx: &mut TestAppContext,
+    ) {
+        let view = cx.new(TextView::new);
+
+        view.update(cx, |tv, cx| tv.set_text_caret(0, 1, false, cx));
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((0, 1), (0, 1)))
+        );
+
+        view.update(cx, |tv, cx| tv.set_text_caret(2, 2, true, cx));
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((0, 1), (2, 2))),
+            "a shift-click must extend from the existing anchor rather than starting a new one"
+        );
+
+        view.update(cx, |tv, cx| tv.set_text_caret(1, 0, false, cx));
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((1, 0), (1, 0))),
+            "a plain click (no shift) must start a fresh selection at the clicked position"
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_after_a_click_extends_the_selection_but_a_shift_click_does_not_arm_dragging(
+        cx: &mut TestAppContext,
+    ) {
+        let view = cx.new(TextView::new);
+
+        view.update(cx, |tv, cx| tv.set_text_caret(0, 0, false, cx));
+        view.update(cx, |tv, cx| {
+            tv.extend_text_selection_while_dragging(1, 2, cx);
+        });
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((0, 0), (1, 2))),
+            "a drag begun by a plain click must extend the live selection as the mouse moves"
+        );
+
+        view.update(cx, TextView::end_text_selection_drag);
+        view.update(cx, |tv, cx| {
+            tv.extend_text_selection_while_dragging(0, 1, cx);
+        });
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((0, 0), (1, 2))),
+            "extending after the drag has ended must be a no-op"
+        );
+
+        view.update(cx, |tv, cx| tv.set_text_caret(0, 2, true, cx));
+        view.update(cx, |tv, cx| {
+            tv.extend_text_selection_while_dragging(1, 1, cx);
+        });
+        assert_eq!(
+            view.update(cx, |tv, _| tv.text_selection_for_test()),
+            Some(((0, 0), (0, 2))),
+            "a shift-click does not arm dragging, so a subsequent move must not extend it"
+        );
+    }
 }

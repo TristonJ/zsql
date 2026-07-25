@@ -6,7 +6,7 @@ use std::ops::Range;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    SharedString, Stateful, Window, actions, anchored, deferred, div, prelude::*, px, rgb, rgba,
+    SharedString, Stateful, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
 use zsql_ui::button::ButtonSwitch;
@@ -200,7 +200,7 @@ impl ResultsView {
         let focus_handle = cx.focus_handle();
         let value_panel =
             cx.new(|cx| ValuePanel::new(focus_handle.clone(), ValuePanelConfig::default(), cx));
-        let text_view = cx.new(|cx| TextView::new(cx));
+        let text_view = cx.new(TextView::new);
 
         let mut view = Self {
             session,
@@ -681,8 +681,6 @@ impl ResultsView {
             .flex_row()
             .flex_1()
             .min_h_0()
-            // .child(inner.flex_1().min_w_0())
-            // .child(div().min_h_0().flex_1().min_w_0().child(inner))
             .child(inner)
             .child(self.render_value_panel_divider(cx))
             .child(
@@ -1254,10 +1252,13 @@ impl ResultsView {
     /// trailing separator added.
     #[tracing::instrument(name = "results_copy_text_document", skip_all)]
     fn copy_text_document(&self, cx: &mut Context<Self>, all: bool) {
+        let text_view = self.text_view.read(cx);
         let document = if all {
-            self.text_view.read(cx).document().map(str::to_owned)
+            text_view.document().map(str::to_owned)
         } else {
-            self.text_view.read(cx).selected_text()
+            text_view
+                .document()
+                .map(|_| text_view.selected_text().unwrap_or_default())
         };
         let Some(document) = document else {
             tracing::trace!("copy invoked with no results text document; nothing to do");
@@ -1360,25 +1361,8 @@ impl ResultsView {
         self.view_mode
     }
 
-    /// The Text view's current selection as `((anchor_line, anchor_byte),
-    /// (cursor_line, cursor_byte))`.
-    pub(crate) fn text_selection_for_test(&self) -> Option<((usize, usize), (usize, usize))> {
-        self.text_selection
-            .map(|(anchor, cursor)| ((anchor.line, anchor.byte), (cursor.line, cursor.byte)))
-    }
-
     pub(crate) fn set_view_mode_for_test(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         self.set_view_mode(mode, cx);
-    }
-
-    pub(crate) fn set_text_caret_for_test(
-        &mut self,
-        line: usize,
-        byte: usize,
-        extend: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_text_caret(line, byte, extend, cx);
     }
 }
 
@@ -1558,20 +1542,19 @@ mod tests {
     use std::time::Duration;
 
     use gpui::{
-        AppContext as _, Focusable as _, Hsla, Modifiers, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, font, point, px, rgb,
+        AppContext as _, Focusable as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, point, px,
     };
     use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
     use super::{
         CellDown, CellLeft, CellRight, CellUp, Copy, ResultsView, SessionState, ViewMode,
-        assemble_document, column_width_from_parts, document_line_count, format_total_row_count,
-        results_bar_count_text, status_indicator, status_metrics, text_view_line_runs,
+        column_width_from_parts, format_total_row_count, results_bar_count_text, status_indicator,
+        status_metrics,
     };
 
     use crate::session::{LivenessState, Session};
     use crate::ui::theme;
-    use zsql_editor::{HighlightKind, StyleSpan, syntax_color};
     use zsql_ui::scrollable::horizontal_thumb_debug_selector;
     use zsql_ui::table::{body_first_cell_debug_selector, column_resize_handle_debug_selector};
     use zsql_ui::theme::Theme;
@@ -2864,7 +2847,7 @@ mod tests {
         );
     }
 
-    // -- Text view: assembling the document -------------------------------
+    // -- Text view: shared result fixture ---------------------------------
 
     fn text_column_result(rows: Vec<Row>) -> ResultSet {
         ResultSet {
@@ -2873,59 +2856,6 @@ mod tests {
             affected: None,
             notices: Vec::new(),
         }
-    }
-
-    #[test]
-    fn assemble_document_uses_a_single_rows_value_verbatim() {
-        let result = text_column_result(vec![Row(vec![Value::Text(
-            "CREATE PROCEDURE p\nAS\nBEGIN\nEND".to_owned(),
-        )])]);
-        assert_eq!(
-            assemble_document(&result),
-            "CREATE PROCEDURE p\nAS\nBEGIN\nEND",
-            "a single row's value must pass through unmodified, not be re-split/rejoined"
-        );
-    }
-
-    #[test]
-    fn assemble_document_joins_multiple_rows_with_newlines() {
-        let result = text_column_result(vec![
-            Row(vec![Value::Text("CREATE PROCEDURE p".to_owned())]),
-            Row(vec![Value::Text("AS".to_owned())]),
-            Row(vec![Value::Text("BEGIN".to_owned())]),
-        ]);
-        assert_eq!(assemble_document(&result), "CREATE PROCEDURE p\nAS\nBEGIN");
-    }
-
-    #[test]
-    fn assemble_document_renders_a_null_row_as_an_empty_line() {
-        let result = text_column_result(vec![
-            Row(vec![Value::Text("a".to_owned())]),
-            Row(vec![Value::Null]),
-            Row(vec![Value::Text("c".to_owned())]),
-        ]);
-        assert_eq!(assemble_document(&result), "a\n\nc");
-    }
-
-    #[test]
-    fn assemble_document_is_empty_for_zero_rows() {
-        assert_eq!(assemble_document(&text_column_result(Vec::new())), "");
-    }
-
-    #[test]
-    fn document_line_count_matches_the_split_on_newline_convention() {
-        assert_eq!(
-            document_line_count(""),
-            1,
-            "an empty document is still 1 line"
-        );
-        assert_eq!(document_line_count("one line"), 1);
-        assert_eq!(document_line_count("a\nb\nc"), 3);
-        assert_eq!(
-            document_line_count("a\nb\n"),
-            3,
-            "a trailing newline yields one extra empty final line"
-        );
     }
 
     // -- Text view: results bar count text ---------------------------------
@@ -3093,129 +3023,6 @@ mod tests {
              yet from a still-partial result"
         );
     }
-    // -- Text view: line runs ------------------------------------------
-
-    #[test]
-    fn text_view_line_runs_with_no_spans_or_selection_is_one_base_colored_run() {
-        let theme = Theme::default();
-        let run_font = font(theme.fonts.data.clone());
-        let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
-
-        let line = "select 1";
-        let runs = text_view_line_runs(line, &[], None, &run_font, base, selection_bg, &theme);
-
-        assert_eq!(runs.len(), 1, "a plain line is a single run");
-        assert_eq!(runs[0].len, line.len());
-        assert_eq!(runs[0].color, base);
-        assert_eq!(runs[0].background_color, None);
-    }
-
-    #[test]
-    fn text_view_line_runs_converts_char_spans_to_byte_offsets_on_a_multibyte_line() {
-        let theme = Theme::default();
-        let run_font = font(theme.fonts.data.clone());
-        let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
-
-        // A lowercase e with an acute accent is two bytes, so char index 1 is
-        // byte 2: a span over chars 1..3 must start after the whole accented
-        // char, never split it mid-codepoint.
-        let line = "\u{e9}12";
-        let spans = [StyleSpan {
-            start: 1,
-            end: 3,
-            kind: HighlightKind::Number,
-        }];
-        let runs = text_view_line_runs(line, &spans, None, &run_font, base, selection_bg, &theme);
-
-        let number = Hsla::from(rgb(syntax_color(&theme, HighlightKind::Number)));
-        assert_eq!(runs.len(), 2);
-        assert_eq!(
-            runs[0].len,
-            "\u{e9}".len(),
-            "the multibyte char before the span stays one whole base-colored run"
-        );
-        assert_eq!(runs[0].color, base);
-        assert_eq!(runs[1].color, number);
-        assert_eq!(
-            runs[1].len, 2,
-            "the span covers exactly the two ASCII digits"
-        );
-        let total: usize = runs.iter().map(|r| r.len).sum();
-        assert_eq!(total, line.len(), "runs must tile the whole line exactly");
-    }
-
-    #[test]
-    fn text_view_line_runs_shades_only_the_selected_byte_range() {
-        let theme = Theme::default();
-        let run_font = font(theme.fonts.data.clone());
-        let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
-
-        let line = "select";
-        let selection = 2..4;
-        let runs = text_view_line_runs(
-            line,
-            &[],
-            Some(&selection),
-            &run_font,
-            base,
-            selection_bg,
-            &theme,
-        );
-
-        let shaded: Vec<_> = runs
-            .iter()
-            .filter(|r| r.background_color == Some(selection_bg))
-            .collect();
-        assert_eq!(shaded.len(), 1, "exactly the selected range carries the bg");
-        assert_eq!(shaded[0].len, 2);
-        let total: usize = runs.iter().map(|r| r.len).sum();
-        assert_eq!(total, line.len());
-        let unshaded: usize = runs
-            .iter()
-            .filter(|r| r.background_color.is_none())
-            .map(|r| r.len)
-            .sum();
-        assert_eq!(
-            unshaded,
-            line.len() - 2,
-            "nothing outside the selection is shaded"
-        );
-    }
-
-    #[test]
-    fn text_view_line_runs_merges_adjacent_runs_of_the_same_color() {
-        let theme = Theme::default();
-        let run_font = font(theme.fonts.data.clone());
-        let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
-
-        // Two touching spans of the same kind must collapse into one run.
-        let line = "abcd";
-        let spans = [
-            StyleSpan {
-                start: 0,
-                end: 2,
-                kind: HighlightKind::Keyword,
-            },
-            StyleSpan {
-                start: 2,
-                end: 4,
-                kind: HighlightKind::Keyword,
-            },
-        ];
-        let runs = text_view_line_runs(line, &spans, None, &run_font, base, selection_bg, &theme);
-
-        assert_eq!(
-            runs.len(),
-            1,
-            "adjacent same-color windows merge into one run"
-        );
-        assert_eq!(runs[0].len, line.len());
-    }
-
     // -- Text view: switch disabled state ------------------------------
 
     #[gpui::test]
@@ -3353,11 +3160,13 @@ mod tests {
             ViewMode::Text
         );
 
+        view.update(vcx, |view, cx| {
+            view.text_view.update(cx, |text_view, cx| {
+                text_view.set_text_caret_for_test(0, 7, false, cx);
+                text_view.set_text_caret_for_test(1, 4, true, cx);
+            });
+        });
         view.update_in(vcx, |view, window, cx| {
-            view.text_selection = Some((
-                super::TextCaret { line: 0, byte: 7 },
-                super::TextCaret { line: 1, byte: 4 },
-            ));
             view.copy_focused_cell(&Copy, window, cx);
         });
 
@@ -3394,126 +3203,7 @@ mod tests {
         );
     }
 
-    // -- Text view: character-granular selection -----------------------------
-
-    #[gpui::test]
-    fn clicking_then_shift_clicking_extends_the_selection_from_the_original_anchor(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let result = text_column_result(vec![
-            Row(vec![Value::Text("aaa".to_owned())]),
-            Row(vec![Value::Text("bbb".to_owned())]),
-            Row(vec![Value::Text("ccc".to_owned())]),
-        ]);
-        let (view, vcx) = view_with_results(cx, result);
-        vcx.run_until_parked();
-
-        view.update(vcx, |view, cx| {
-            view.set_text_caret_for_test(0, 1, false, cx);
-        });
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((0, 1), (0, 1)))
-        );
-
-        view.update(vcx, |view, cx| view.set_text_caret_for_test(2, 2, true, cx));
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((0, 1), (2, 2))),
-            "a shift-click must extend from the existing anchor rather than starting a new one"
-        );
-
-        view.update(vcx, |view, cx| {
-            view.set_text_caret_for_test(1, 0, false, cx);
-        });
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((1, 0), (1, 0))),
-            "a plain click (no shift) must start a fresh selection at the clicked position"
-        );
-    }
-
-    #[gpui::test]
-    fn dragging_after_a_click_extends_the_selection_but_a_shift_click_does_not_arm_dragging(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let result = text_column_result(vec![
-            Row(vec![Value::Text("aaa".to_owned())]),
-            Row(vec![Value::Text("bbb".to_owned())]),
-        ]);
-        let (view, vcx) = view_with_results(cx, result);
-        vcx.run_until_parked();
-
-        view.update(vcx, |view, cx| {
-            view.set_text_caret_for_test(0, 0, false, cx);
-        });
-        view.update(vcx, |view, cx| {
-            view.extend_text_selection_while_dragging(1, 2, cx);
-        });
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((0, 0), (1, 2))),
-            "a drag begun by a plain click must extend the live selection as the mouse moves"
-        );
-
-        view.update(vcx, ResultsView::end_text_selection_drag);
-        view.update(vcx, |view, cx| {
-            view.extend_text_selection_while_dragging(0, 1, cx);
-        });
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((0, 0), (1, 2))),
-            "extending after the drag has ended must be a no-op"
-        );
-
-        view.update(vcx, |view, cx| view.set_text_caret_for_test(0, 2, true, cx));
-        view.update(vcx, |view, cx| {
-            view.extend_text_selection_while_dragging(1, 1, cx);
-        });
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
-            Some(((0, 0), (0, 2))),
-            "a shift-click does not arm dragging, so a subsequent move must not extend it"
-        );
-    }
-
-    #[test]
-    fn line_selection_range_covers_only_the_lines_and_bytes_between_anchor_and_cursor() {
-        let selection = (
-            super::TextCaret { line: 0, byte: 2 },
-            super::TextCaret { line: 2, byte: 1 },
-        );
-        assert_eq!(
-            super::line_selection_range(selection, 0, 5),
-            Some(2..5),
-            "the anchor's own line is selected from its byte to the line's end"
-        );
-        assert_eq!(
-            super::line_selection_range(selection, 1, 5),
-            Some(0..5),
-            "a line strictly between anchor and cursor is selected in full"
-        );
-        assert_eq!(
-            super::line_selection_range(selection, 2, 5),
-            Some(0..1),
-            "the cursor's own line is selected from its start to its byte"
-        );
-        assert_eq!(
-            super::line_selection_range(selection, 3, 5),
-            None,
-            "a line outside the selection's line range is not selected"
-        );
-    }
-
-    #[test]
-    fn line_selection_range_is_none_for_a_collapsed_selection() {
-        let caret = super::TextCaret { line: 1, byte: 3 };
-        assert_eq!(
-            super::line_selection_range((caret, caret), 1, 10),
-            None,
-            "a plain click with no drag selects nothing to highlight"
-        );
-    }
+    // -- Text view: selection reset on a new result -----------------------
 
     #[gpui::test]
     fn switching_to_a_new_result_clears_any_text_selection(cx: &mut gpui::TestAppContext) {
@@ -3524,10 +3214,15 @@ mod tests {
         let (view, vcx) = view_with_results(cx, result);
         vcx.run_until_parked();
         view.update(vcx, |view, cx| {
-            view.set_text_caret_for_test(0, 0, false, cx);
+            view.text_view.update(cx, |text_view, cx| {
+                text_view.set_text_caret_for_test(0, 0, false, cx);
+            });
         });
         assert!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test())
+            view.read_with(vcx, |v, app| v
+                .text_view
+                .read(app)
+                .text_selection_for_test())
                 .is_some()
         );
 
@@ -3542,7 +3237,10 @@ mod tests {
             );
         });
         assert_eq!(
-            view.read_with(vcx, |v, _app| v.text_selection_for_test()),
+            view.read_with(vcx, |v, app| v
+                .text_view
+                .read(app)
+                .text_selection_for_test()),
             None
         );
     }
