@@ -1044,8 +1044,12 @@ mod tests {
     use gpui::AppContext as _;
     use zsql_core::{ColumnMeta, Value};
 
-    use super::{JsonLoad, ValuePanel, ValuePanelContent};
+    use super::{
+        CopyTreeNodePath, CopyTreeNodeValue, JsonLoad, TreeCollapse, TreeDown, TreeExpand, TreeUp,
+        ValuePanel, ValuePanelContent,
+    };
     use crate::config::ValuePanelConfig;
+    use crate::ui::value_panel::data::{self, PathSegment};
 
     fn json_content(id: usize, text: &str) -> ValuePanelContent {
         ValuePanelContent::new(
@@ -1131,5 +1135,205 @@ mod tests {
                 "a new target's JSON must re-parse, not keep showing the prior value"
             );
         });
+    }
+
+    /// A focused, docked-open panel in its own test window, so the keyboard
+    /// actions its render registers can be dispatched to it directly.
+    fn panel_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<ValuePanel>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            let parent = cx.focus_handle();
+            let panel = ValuePanel::new(parent, ValuePanelConfig::default(), cx);
+            window.focus(panel.focus_handle());
+            panel
+        })
+    }
+
+    fn content(id: usize, value: Value, type_name: &str) -> ValuePanelContent {
+        ValuePanelContent::new(
+            id,
+            value,
+            ColumnMeta {
+                name: "col".to_owned(),
+                type_name: type_name.to_owned(),
+                nullable: true,
+            },
+        )
+    }
+
+    #[gpui::test]
+    fn tree_keyboard_actions_move_selection_and_expand_collapse_nodes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, r#"{"items":[{"sku":"A1"}]}"#)));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().selected_tree_path(),
+                &[] as &[PathSegment]
+            );
+        });
+
+        vcx.dispatch_action(TreeExpand);
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                p.state_for_test()
+                    .is_tree_node_expanded(&[] as &[PathSegment]),
+                "TreeExpand on the root object must expand it"
+            );
+        });
+
+        vcx.dispatch_action(TreeDown);
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().selected_tree_path(),
+                [PathSegment::Key("items".to_owned())],
+                "TreeDown must move selection to the root's first revealed child"
+            );
+        });
+
+        vcx.dispatch_action(TreeExpand);
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                p.state_for_test()
+                    .is_tree_node_expanded(&[PathSegment::Key("items".to_owned())])
+            );
+        });
+
+        vcx.dispatch_action(TreeCollapse);
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                !p.state_for_test()
+                    .is_tree_node_expanded(&[PathSegment::Key("items".to_owned())]),
+                "TreeCollapse must collapse the selected node"
+            );
+        });
+
+        vcx.dispatch_action(TreeUp);
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().selected_tree_path(),
+                &[] as &[PathSegment],
+                "TreeUp must move selection back to the previous visible row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copy_tree_node_value_and_path_target_the_selected_nested_node(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, r#"{"items":[{"sku":"A1"}]}"#)));
+            p.state_mut_for_test().select_tree_path(vec![
+                PathSegment::Key("items".to_owned()),
+                PathSegment::Index(0),
+                PathSegment::Key("sku".to_owned()),
+            ]);
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied_value = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied_value.as_deref(),
+            Some("\"A1\""),
+            "Cmd/Ctrl-C must copy the selected node's own value, not the whole document"
+        );
+
+        vcx.dispatch_action(CopyTreeNodePath);
+        let copied_path = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied_path.as_deref(), Some("$.items[0].sku"));
+    }
+
+    /// A JSON cell's panel renders in every mode without panicking, covering
+    /// the JSON tree/pretty/raw paths and the invalid-JSON fallback path
+    /// together in one render smoke test.
+    #[gpui::test]
+    fn renders_the_panel_for_every_json_state_without_panicking(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(
+                0,
+                r#"{"items":[{"sku":"A1"},{"sku":"B2"}]}"#,
+            )));
+        });
+        for mode in data::JSON_MODES {
+            panel.update(vcx, |p, cx| {
+                p.state_mut_for_test().set_json_mode(mode);
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        // A `Value::Json` that fails to parse must still render (the Raw
+        // fallback) rather than panicking.
+        panel.update(vcx, |p, _cx| {
+            p.update_content(Some(json_content(1, "not json")));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(matches!(p.json_load_for_test(), Some(JsonLoad::Invalid(_))));
+        });
+    }
+
+    /// The non-JSON renderers (Bytes, Timestamp, Bool, Unknown, Null, and an
+    /// empty-text cell) each render in every mode without panicking, mirroring
+    /// [`renders_the_panel_for_every_json_state_without_panicking`]'s coverage
+    /// of the JSON renderer.
+    #[gpui::test]
+    fn renders_the_panel_for_non_json_cells_without_panicking(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, super::ValuePanel::open);
+
+        panel.update(vcx, |p, _cx| {
+            p.update_content(Some(content(
+                0,
+                Value::Bytes(vec![0x00, 0x41, 0xff, 0x10]),
+                "bytea",
+            )));
+        });
+        for mode in data::BYTES_MODES {
+            panel.update(vcx, |p, cx| {
+                p.state_mut_for_test().set_bytes_mode(mode);
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        panel.update(vcx, |p, _cx| {
+            p.update_content(Some(content(
+                1,
+                Value::Timestamp("2026-07-14T09:12:31+02:00".to_owned()),
+                "timestamptz",
+            )));
+        });
+        for mode in data::TIMESTAMP_MODES {
+            panel.update(vcx, |p, cx| {
+                p.state_mut_for_test().set_timestamp_mode(mode);
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+
+        for (id, value, type_name) in [
+            (2usize, Value::Bool(true), "bool"),
+            (3, Value::Unknown("(1,2)".to_owned()), "point"),
+            (4, Value::Null, "text"),
+            (5, Value::Text(String::new()), "text"),
+        ] {
+            panel.update(vcx, |p, _cx| {
+                p.update_content(Some(content(id, value, type_name)));
+            });
+            vcx.run_until_parked();
+        }
     }
 }

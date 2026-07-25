@@ -698,6 +698,20 @@ mod tests {
     }
 
     #[test]
+    fn renderer_for_distinguishes_null_from_empty_text() {
+        assert_eq!(
+            renderer_for(&Value::Null, "text"),
+            RendererKind::Null,
+            "a Null cell must render the explicit NULL state, not the Text renderer"
+        );
+        assert_eq!(
+            renderer_for(&Value::Text(String::new()), "text"),
+            RendererKind::Text,
+            "an empty-string cell must still render as Text, not Null"
+        );
+    }
+
+    #[test]
     fn renderer_for_never_offers_json_for_text_holding_json_looking_content() {
         // Type-gated, not content-sniffed: a Text value must render as Text
         // even when its content parses as JSON.
