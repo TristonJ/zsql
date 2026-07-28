@@ -1,0 +1,301 @@
+//! Shared utilities for drivers that depend on `sqlx`.
+
+use std::marker::PhantomData;
+
+use futures::StreamExt as _;
+use sqlx::{AssertSqlSafe, Database, Executor, Row as _, SqlSafeStr as _, Statement as _};
+use zsql_core::{BatchSink, CoreError, QueryEvent, QueryHandle, RowBatch};
+
+/// Rows are grouped into batches of at most this many rows before a
+/// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
+/// set streams to the UI incrementally instead of arriving as one huge
+/// allocation. This is an internal placeholder default
+pub const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
+
+/// Backend-specific hooks [`run_query`] needs from each sqlx-based driver.
+///
+/// Implemented on a zero-sized marker type per driver crate; every method is
+/// associated (no `self`), so the type only selects the implementation.
+pub trait SqlxZsqlDriver<DB: Database>: 'static {
+    /// Short backend name recorded on tracing spans (e.g. `"postgres"`).
+    const NAME: &'static str;
+
+    /// Backend-specific data captured up front that later lets
+    /// [`run_query`] cancel the in-flight query from a second connection.
+    type Cancel: CancelHandle<DB>;
+
+    /// Build the `Columns` metadata for a result set's own column list.
+    fn column_metas(columns: &[DB::Column]) -> Vec<zsql_core::ColumnMeta>;
+
+    /// Decode a sqlx row into an engine-neutral [`zsql_core::Row`]
+    fn decode_row(row: &DB::Row) -> zsql_core::Row;
+
+    /// How many rows were affected by a statement
+    fn rows_affected(result: &DB::QueryResult) -> u64;
+
+    /// Get a cancel handle that can be used to cancel an in-flight query from
+    /// a separate connection.
+    fn cancel_handle(
+        conn: &mut DB::Connection,
+    ) -> impl Future<Output = Result<Self::Cancel, sqlx::Error>> + Send;
+
+    fn map_query_error(err: sqlx::Error) -> CoreError;
+}
+
+/// Backend-specific data needed to cancel an in-flight query from a second
+/// connection (e.g. a postgres backend pid, a mysql connection id).
+pub trait CancelHandle<DB: Database>: Send + 'static {
+    /// Issue the server-side cancel on a connection drawn from
+    /// `cancel_pool`, never the pool running the query itself (which may be
+    /// blocked server-side and unable to service another statement).
+    fn cancel(
+        self,
+        cancel_pool: &sqlx::Pool<DB>,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
+}
+
+/// [`CancelHandle`] for backends with no server-side cancel mechanism
+/// (sqlite): acquisition always succeeds and cancelling is a no-op, leaving
+/// only cooperative cancellation via the `cancel_rx` channel.
+pub struct NoServerSideCancel;
+
+impl<DB: Database> CancelHandle<DB> for NoServerSideCancel {
+    async fn cancel(self, _cancel_pool: &sqlx::Pool<DB>) -> Result<(), sqlx::Error> {
+        tracing::info!(
+            "server-side cancel requested, but backend has no server-side cancel mechanism; query will only be cancelled cooperatively"
+        );
+        Ok(())
+    }
+}
+
+/// The pool trio backing one sqlx-based driver connection, plus the shared
+/// query-streaming entry point. Drivers embed this and delegate
+/// [`zsql_core::Connection::stream_query`] to [`Self::stream_query`].
+pub struct SqlxConnection<DB: Database, D> {
+    pool: sqlx::Pool<DB>,
+    /// Separate, independently-bounded pool used only for server-side
+    /// cancellation
+    cancel_pool: sqlx::Pool<DB>,
+    /// Separate, independently-bounded pool used only for the liveness
+    /// probe, so a probe can never be blocked behind an in-flight query or a
+    /// cancel request, nor block either of those in turn.
+    probe_pool: sqlx::Pool<DB>,
+
+    driver: PhantomData<D>,
+}
+
+impl<DB, D> SqlxConnection<DB, D>
+where
+    DB: Database,
+    D: SqlxZsqlDriver<DB>,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+{
+    #[must_use]
+    pub fn new(
+        pool: sqlx::Pool<DB>,
+        cancel_pool: sqlx::Pool<DB>,
+        probe_pool: sqlx::Pool<DB>,
+    ) -> Self {
+        Self {
+            pool,
+            cancel_pool,
+            probe_pool,
+            driver: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn pool(&self) -> &sqlx::Pool<DB> {
+        &self.pool
+    }
+
+    #[must_use]
+    pub fn probe_pool(&self) -> &sqlx::Pool<DB> {
+        &self.probe_pool
+    }
+
+    #[must_use]
+    pub fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        let pool = self.pool.clone();
+        let cancel_pool = self.cancel_pool.clone();
+        // Run on the smol-based executor sqlx's `runtime-smol` feature uses.
+        async_global_executor::spawn(run_query::<DB, D>(pool, cancel_pool, sql, sink, cancel_rx))
+            .detach();
+        QueryHandle::new(cancel_tx)
+    }
+}
+
+/// Stream a query's results into `sink`. `sql` may hold several statements;
+/// each result-producing statement emits its own [`QueryEvent::Columns`]
+/// followed by that set's [`QueryEvent::Batch`]es, and the whole stream ends
+/// with exactly one [`QueryEvent::Done`] - or, on any failure, a single `Err`
+/// in place of `Done`. Every statement still executes (so all side effects
+/// happen); a fresh `Columns` event marks each set boundary so the consumer
+/// can keep only the last set rather than concatenating mismatched rows.
+///
+/// Runs on a single connection acquired from `pool` for the lifetime of this
+/// call (not the pool directly), so the backend's cancel handle can be
+/// captured via [`SqlxZsqlDriver::cancel_handle`] *before* the row-streaming
+/// loop below ever starts checking `cancel_rx`.
+#[tracing::instrument(
+    name = "stream_query",
+    skip_all,
+    fields(driver = D::NAME, pool_size = pool.size())
+)]
+#[allow(clippy::too_many_lines)] // one streaming state machine; splitting scatters the per-statement latches
+pub async fn run_query<DB, D>(
+    pool: sqlx::Pool<DB>,
+    cancel_pool: sqlx::Pool<DB>,
+    sql: String,
+    sink: BatchSink,
+    cancel_rx: flume::Receiver<()>,
+) where
+    DB: Database,
+    D: SqlxZsqlDriver<DB>,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+{
+    // The SQL text itself carries no connection secrets (those live only in
+    // the URL, never logged here), so it is fine to record at debug level.
+    tracing::debug!(sql = %sql, "streaming query");
+
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            let _ = sink.send_async(Err(D::map_query_error(err))).await;
+            return;
+        }
+    };
+
+    let cancel_handle = match D::cancel_handle(&mut conn).await {
+        Ok(h) => {
+            tracing::debug!("dedicated connection backend cancel handle acquired");
+            Some(h)
+        }
+        Err(err) => {
+            // Cooperative cancellation still works, so this is not fatal to the query.
+            tracing::warn!(
+                error = %err,
+                "failed to acquire dedicated connection backend cancel handle; server-side cancel unavailable for this query"
+            );
+            None
+        }
+    };
+
+    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&mut *conn);
+    let mut batch = RowBatch::new();
+    let mut affected: u64 = 0;
+    // Whether the statement currently streaming has already announced its
+    // columns. Reset at each statement boundary so a following statement
+    // starts a new result set.
+    let mut columns_sent = false;
+    // Whether any statement in `sql` produced columns at all.
+    let mut any_columns_sent = false;
+
+    loop {
+        let step = futures::future::select(cancel_rx.recv_async(), rows.next());
+        match step.await {
+            futures::future::Either::Left(_) => {
+                // Cancelled: either an explicit `cancel()` call or every
+                // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
+                tracing::debug!("query cancelled");
+                if let Some(h) = cancel_handle {
+                    spawn_server_side_cancel(&cancel_pool, h);
+                }
+                return;
+            }
+            futures::future::Either::Right((None, _)) => break,
+            futures::future::Either::Right((Some(Ok(sqlx::Either::Right(row))), _)) => {
+                if !columns_sent {
+                    let columns = D::column_metas(row.columns());
+                    if sink
+                        .send_async(Ok(QueryEvent::Columns(columns)))
+                        .await
+                        .is_err()
+                    {
+                        // Receiver already gone; no one left to stream rows to.
+                        return;
+                    }
+                    columns_sent = true;
+                    any_columns_sent = true;
+                }
+                batch.push(D::decode_row(&row));
+                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
+                    let full = std::mem::take(&mut batch);
+                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            futures::future::Either::Right((Some(Ok(sqlx::Either::Left(result))), _)) => {
+                // End of one statement. Flush its rows and reset the per-set
+                // latch so a following statement's rows form a new result set
+                // (the consumer keeps only the last) instead of being appended
+                // onto this one's columns.
+                if !batch.is_empty() {
+                    let full = std::mem::take(&mut batch);
+                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
+                        return;
+                    }
+                }
+                affected += D::rows_affected(&result);
+                columns_sent = false;
+            }
+            futures::future::Either::Right((Some(Err(err)), _)) => {
+                let _ = sink.send_async(Err(D::map_query_error(err))).await;
+                return;
+            }
+        }
+    }
+
+    // A statement with no output columns (DDL, or DML without `RETURNING`)
+    // reports its row count as `affected` in `Done`. A statement that does
+    // produce columns (SELECT, or DML with `RETURNING`) instead lets the
+    // caller derive a count from the rows it already streamed, and reports
+    // `affected: None`
+    let reports_affected = if any_columns_sent {
+        false
+    } else {
+        let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
+            Ok(statement) => D::column_metas(statement.columns()),
+            Err(_) => Vec::new(),
+        };
+        let reports_affected = columns.is_empty();
+        if sink
+            .send_async(Ok(QueryEvent::Columns(columns)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        reports_affected
+    };
+
+    if !batch.is_empty() && sink.send_async(Ok(QueryEvent::Batch(batch))).await.is_err() {
+        return;
+    }
+
+    let affected = reports_affected.then_some(affected);
+    let _ = sink.send_async(Ok(QueryEvent::Done { affected })).await;
+}
+
+/// Spawn [`CancelHandle::cancel`] as a detached background task so neither
+/// the query task (which may itself be about to return) nor the caller of
+/// `cancel()` has to wait for the cancel round-trip to complete.
+fn spawn_server_side_cancel<DB: Database, C: CancelHandle<DB>>(
+    cancel_pool: &sqlx::Pool<DB>,
+    handle: C,
+) {
+    let cancel_pool = cancel_pool.clone();
+    async_global_executor::spawn(async move {
+        match handle.cancel(&cancel_pool).await {
+            Ok(()) => {
+                tracing::info!("server-side cancel issued");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "server-side cancel request failed");
+            }
+        }
+    })
+    .detach();
+}

@@ -5,22 +5,16 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt as _;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
+use sqlx::{AssertSqlSafe, Column, Postgres, Row as _, TypeInfo};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
-    RowBatch, RowCount, SchemaTree, quote_ident,
+    BatchSink, ColumnMeta, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema,
+    RowCount, SchemaTree, quote_ident,
 };
+use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
 use crate::error::{map_connect_error, map_query_error};
-use crate::values::{column_metas, decode_row};
-
-/// Rows are grouped into batches of at most this many rows before a
-/// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
-/// set streams to the UI incrementally instead of arriving as one huge
-/// allocation. This is an internal placeholder default
-const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
+use crate::values::decode_row;
 
 /// Bounded pool size for a single desktop client. Small on purpose: this app
 /// drives at most a handful of concurrent operations (one running query plus
@@ -180,81 +174,74 @@ impl Driver for PostgresDriver {
         let cancel_pool = Self::build_side_pool(&url, CANCEL_POOL_CONNECTIONS)?;
         let probe_pool = Self::build_probe_pool(&url)?;
         tracing::info!("postgres connection established");
-        Ok(Box::new(PgConnection {
+        Ok(Box::new(PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        }))
+        ))))
     }
 }
 
-/// A live Postgres connection, backed by a bounded sqlx connection pool.
-pub struct PgConnection {
-    pool: PgPool,
-    /// Separate, independently-bounded pool used only for server-side
-    /// cancellation (`SELECT pg_cancel_backend($pid)`)
-    cancel_pool: PgPool,
-    /// Separate, independently-bounded pool used only for the liveness
-    /// probe (see [`PgConnection::ping`]), so a probe can never be blocked
-    /// behind an in-flight query or a cancel request, nor block either of
-    /// those in turn.
-    probe_pool: PgPool,
-}
+impl SqlxZsqlDriver<Postgres> for PostgresDriver {
+    const NAME: &'static str = "postgres";
 
-/// Issue `SELECT pg_cancel_backend($pid)` on a connection acquired fresh
-/// from `cancel_pool`.
-/// Best-effort: any failure (including the target backend having
-/// already finished on its own) is logged and swallowed here.
-#[tracing::instrument(name = "pg_cancel_backend", skip(cancel_pool))]
-async fn issue_server_side_cancel(cancel_pool: &PgPool, pid: i32) {
-    match sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
-        .bind(pid)
-        .fetch_one(cancel_pool)
-        .await
-    {
-        Ok(signalled) => {
-            tracing::info!(pid, signalled, "server-side cancel issued");
-        }
-        Err(err) => {
-            tracing::warn!(pid, error = %err, "server-side cancel request failed");
-        }
+    type Cancel = PgCancelHandle;
+
+    fn column_metas(columns: &[<Postgres as sqlx::Database>::Column]) -> Vec<ColumnMeta> {
+        columns
+            .iter()
+            .map(|column| ColumnMeta {
+                name: column.name().to_owned(),
+                type_name: column.type_info().name().to_owned(),
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn decode_row(row: &<Postgres as sqlx::Database>::Row) -> zsql_core::Row {
+        decode_row(row)
+    }
+
+    fn rows_affected(result: &<Postgres as sqlx::Database>::QueryResult) -> u64 {
+        result.rows_affected()
+    }
+
+    async fn cancel_handle(
+        conn: &mut <Postgres as sqlx::Database>::Connection,
+    ) -> Result<Self::Cancel, sqlx::Error> {
+        let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await?;
+        Ok(PgCancelHandle { pid })
+    }
+
+    fn map_query_error(err: sqlx::Error) -> CoreError {
+        map_query_error(err)
     }
 }
 
-/// Spawn [`issue_server_side_cancel`] as a detached background task so
-/// neither the query task (which may itself be about to return) nor the
-/// caller of `cancel()` has to wait for the cancel round-trip to complete.
-fn spawn_server_side_cancel(cancel_pool: &PgPool, pid: i32) {
-    let cancel_pool = cancel_pool.clone();
-    async_global_executor::spawn(async move { issue_server_side_cancel(&cancel_pool, pid).await })
-        .detach();
-}
+pub struct PgConnection(zsql_sqlx::SqlxConnection<Postgres, PostgresDriver>);
 
 #[async_trait]
 impl Connection for PgConnection {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
-        let (cancel_tx, cancel_rx) = flume::unbounded();
-        let pool = self.pool.clone();
-        let cancel_pool = self.cancel_pool.clone();
-        // Run on the smol-based executor sqlx's `runtime-smol` feature
-        async_global_executor::spawn(run_query(pool, cancel_pool, sql, sink, cancel_rx)).detach();
-        QueryHandle::new(cancel_tx)
+        self.0.stream_query(sql, sink)
     }
 
-    #[tracing::instrument(name = "pg_introspect", skip_all, fields(pool_size = self.pool.size()))]
+    #[tracing::instrument(name = "pg_introspect", skip_all, fields(pool_size = self.0.pool().size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        crate::introspect::introspect(&self.pool).await
+        crate::introspect::introspect(&self.0.pool()).await
     }
 
-    #[tracing::instrument(name = "pg_ping", skip_all, fields(pool_size = self.probe_pool.size()))]
+    #[tracing::instrument(name = "pg_ping", skip_all, fields(pool_size = self.0.probe_pool().size()))]
     async fn ping(&self) -> Result<(), CoreError> {
-        liveness_check(&self.probe_pool).await?;
+        liveness_check(&self.0.probe_pool()).await?;
         Ok(())
     }
 
-    #[tracing::instrument(name = "pg_count_rows", skip(self), fields(pool_size = self.pool.size()))]
+    #[tracing::instrument(name = "pg_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(reltuples) = fetch_reltuples(&self.pool, schema, relation).await? {
+        if let Some(reltuples) = fetch_reltuples(&self.0.pool(), schema, relation).await? {
             if reltuples_is_reliable(reltuples) {
                 tracing::debug!(reltuples, "using planner row-count estimate");
                 return Ok(RowCount::Estimated(reltuples_to_row_count(reltuples)));
@@ -267,21 +254,35 @@ impl Connection for PgConnection {
         } else {
             tracing::debug!("no pg_class row found; falling back to an exact count");
         }
-        let exact = exact_row_count(&self.pool, schema, relation).await?;
+        let exact = exact_row_count(&self.0.pool(), schema, relation).await?;
         Ok(RowCount::Exact(exact))
     }
 
     #[tracing::instrument(
         name = "pg_describe_relation",
         skip(self),
-        fields(pool_size = self.pool.size())
+        fields(pool_size = self.0.pool().size())
     )]
     async fn describe_relation(
         &self,
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
-        crate::describe::describe_relation(&self.pool, schema, relation).await
+        crate::describe::describe_relation(&self.0.pool(), schema, relation).await
+    }
+}
+
+pub struct PgCancelHandle {
+    pid: i32,
+}
+
+impl CancelHandle<Postgres> for PgCancelHandle {
+    async fn cancel(self, cancel_pool: &sqlx::Pool<Postgres>) -> Result<(), sqlx::Error> {
+        sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+            .bind(self.pid)
+            .fetch_one(cancel_pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -358,183 +359,6 @@ async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-/// Stream a query's results into `sink`. `sql` may hold several statements;
-/// each result-producing statement emits its own [`QueryEvent::Columns`]
-/// followed by that set's [`QueryEvent::Batch`]es, and the whole stream ends
-/// with exactly one [`QueryEvent::Done`] - or, on any failure, a single `Err`
-/// in place of `Done`. Every statement still executes (so all side effects
-/// happen); a fresh `Columns` event marks each set boundary so the consumer
-/// can keep only the last set rather than concatenating mismatched rows.
-///
-/// Runs on a single connection acquired from `pool` for the lifetime of this
-/// call (not the pool directly), so that connection's backend PID can be
-/// captured via `SELECT pg_backend_pid()` *before* the row-streaming loop
-/// below ever starts checking `cancel_rx`.
-///
-/// Column metadata for `Columns` is therefore taken from the first row any
-/// statement in `sql` produces (a [`sqlx::postgres::PgRow`] carries its own
-/// column list), not from an upfront describe. If no statement ever produces
-/// a row (DDL, DML without `RETURNING`, or a zero-row `SELECT`), a describe
-/// is run as a fallback *after* execution has already completed successfully,
-/// purely to recover a zero-row `SELECT`'s column list; if that fallback
-/// describe itself fails (for instance because `sql` was multiple statements
-/// and none of them produced a row), the query has already succeeded, so this
-/// degrades to reporting no columns rather than failing an
-/// otherwise-successful query.
-#[tracing::instrument(name = "pg_stream_query", skip_all, fields(pool_size = pool.size()))]
-#[allow(clippy::too_many_lines)]
-async fn run_query(
-    pool: PgPool,
-    cancel_pool: PgPool,
-    sql: String,
-    sink: BatchSink,
-    cancel_rx: flume::Receiver<()>,
-) {
-    // The SQL text itself carries no connection secrets (those live only in
-    // the URL, never logged here), so it is fine to record at debug level.
-    tracing::debug!(sql = %sql, "streaming query");
-
-    let mut conn = match pool.acquire().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            let _ = sink.send_async(Err(map_query_error(err))).await;
-            return;
-        }
-    };
-
-    // Capture this connection's backend PID so a later cancel can target it
-    // via `pg_cancel_backend` on `cancel_pool`
-    let pid = match sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-        .fetch_one(&mut *conn)
-        .await
-    {
-        Ok(pid) => {
-            tracing::debug!(pid, "dedicated connection backend pid captured");
-            Some(pid)
-        }
-        Err(err) => {
-            // Cooperative cancellation (the `select` loop below) still
-            // works without a known pid; only the server-side
-            // `pg_cancel_backend` path is unavailable for this one query.
-            // Never fatal to the query itself.
-            tracing::warn!(
-                error = %err,
-                "failed to capture backend pid; server-side cancel unavailable for this query"
-            );
-            None
-        }
-    };
-
-    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&mut *conn);
-    let mut batch = RowBatch::new();
-    let mut affected: u64 = 0;
-    // Whether the statement currently streaming has already announced its
-    // columns. Reset at each statement boundary so a following statement
-    // starts a new result set.
-    let mut columns_sent = false;
-    // Whether any statement in `sql` produced columns at all.
-    let mut any_columns_sent = false;
-
-    loop {
-        let step = futures::future::select(cancel_rx.recv_async(), rows.next());
-        match step.await {
-            futures::future::Either::Left(_) => {
-                // Cancelled: either an explicit `cancel()` call or every
-                // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
-                tracing::debug!("query cancelled");
-                if let Some(pid) = pid {
-                    spawn_server_side_cancel(&cancel_pool, pid);
-                }
-                return;
-            }
-            futures::future::Either::Right((None, _)) => break,
-            futures::future::Either::Right((Some(Ok(sqlx::Either::Right(row))), _)) => {
-                if !columns_sent {
-                    let columns = column_metas(row.columns());
-                    if sink
-                        .send_async(Ok(QueryEvent::Columns(columns)))
-                        .await
-                        .is_err()
-                    {
-                        // Receiver already gone; no one left to stream rows to.
-                        return;
-                    }
-                    columns_sent = true;
-                    any_columns_sent = true;
-                }
-                batch.push(decode_row(&row));
-                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
-                    let full = std::mem::take(&mut batch);
-                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            futures::future::Either::Right((Some(Ok(sqlx::Either::Left(result))), _)) => {
-                // End of one statement. Flush its rows and reset the per-set
-                // latch so a following statement's rows form a new result set
-                // (the consumer keeps only the last) instead of being appended
-                // onto this one's columns.
-                if !batch.is_empty() {
-                    let full = std::mem::take(&mut batch);
-                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
-                        return;
-                    }
-                }
-                affected += result.rows_affected();
-                columns_sent = false;
-            }
-            futures::future::Either::Right((Some(Err(err)), _)) => {
-                let _ = sink.send_async(Err(map_query_error(err))).await;
-                return;
-            }
-        }
-    }
-
-    // A statement with no output columns (DDL, or DML without `RETURNING`)
-    // reports its row count as `affected` in `Done`. A statement that does
-    // produce columns (SELECT, or DML with `RETURNING`) instead lets the
-    // caller derive a count from the rows it already streamed, and reports
-    // `affected: None`
-    let reports_affected = if any_columns_sent {
-        false
-    } else {
-        let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
-            Ok(statement) => column_metas(statement.columns()),
-            Err(_) => Vec::new(),
-        };
-        let reports_affected = columns.is_empty();
-        if sink
-            .send_async(Ok(QueryEvent::Columns(columns)))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        reports_affected
-    };
-
-    if !batch.is_empty() && sink.send_async(Ok(QueryEvent::Batch(batch))).await.is_err() {
-        return;
-    }
-
-    let affected = reports_affected.then_some(affected);
-    let _ = sink.send_async(Ok(QueryEvent::Done { affected })).await;
-}
-
-/// Build a pool for `url` and run a trivial liveness query. Returns
-/// the value of `SELECT 1`
-///
-/// # Errors
-/// Returns an error if the connection or query fails.
-#[tracing::instrument(skip_all)]
-pub async fn spike_select_one(url: &str) -> anyhow::Result<i64> {
-    let pool = PostgresDriver::build_pool(url).await?;
-    let one = liveness_check(&pool).await?;
-    pool.close().await;
-    Ok(one)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -595,11 +419,11 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
-        let conn = PgConnection {
+        let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        };
+        ));
 
         let result = block_on(conn.introspect());
         match result {
@@ -618,11 +442,11 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
-        let conn = PgConnection {
+        let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        };
+        ));
 
         let result = block_on(conn.ping());
         match result {
@@ -644,11 +468,11 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
-        PgConnection {
+        PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        }
+        ))
     }
 
     #[test]
@@ -678,11 +502,11 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
-        let conn = PgConnection {
+        let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        };
+        ));
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1".to_owned(), tx);
@@ -1333,7 +1157,7 @@ mod database_tests {
     fn stream_query_batches_large_result_sets_when_configured() {
         let conn = live_connection();
 
-        let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let row_count = zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query(
             format!("SELECT g FROM generate_series(1, {row_count}) AS g"),
@@ -1351,7 +1175,7 @@ mod database_tests {
             match recv(&rx) {
                 Ok(zsql_core::QueryEvent::Batch(batch)) => {
                     assert!(
-                        batch.len() <= super::DEFAULT_QUERY_BATCH_SIZE,
+                        batch.len() <= zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE,
                         "batch of {} rows exceeds the bound",
                         batch.len()
                     );
@@ -1371,7 +1195,7 @@ mod database_tests {
             batch_count >= 3,
             "expected at least 3 batches for {row_count} rows at a bound of \
              {}, got {batch_count}",
-            super::DEFAULT_QUERY_BATCH_SIZE
+            zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE
         );
     }
 

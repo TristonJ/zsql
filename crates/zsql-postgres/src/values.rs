@@ -1,28 +1,10 @@
 //! Mapping from Postgres wire values to the engine-neutral [`zsql_core::Value`].
 
-use sqlx::postgres::{PgColumn, PgRow, PgValueFormat};
+use sqlx::postgres::{PgRow, PgValueFormat};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{BigDecimal, Json, JsonRawValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
-use zsql_core::{ColumnMeta, Row as CoreRow, Value};
-
-/// Build the `Columns` metadata for a prepared statement's output columns.
-///
-/// Postgres does not report column nullability from a plain `Describe`
-/// (that would require walking `pg_attribute` per column, which this
-/// mapping layer does not do), so every column is conservatively reported as
-/// nullable: it is never wrong to say a column *might* be null, only to
-/// claim one *can't* be when it can.
-pub(crate) fn column_metas(columns: &[PgColumn]) -> Vec<ColumnMeta> {
-    columns
-        .iter()
-        .map(|column| ColumnMeta {
-            name: column.name().to_owned(),
-            type_name: column.type_info().name().to_owned(),
-            nullable: true,
-        })
-        .collect()
-}
+use zsql_core::{Row as CoreRow, Value};
 
 /// Decode one Postgres row into an engine-neutral [`CoreRow`].
 pub(crate) fn decode_row(row: &PgRow) -> CoreRow {
