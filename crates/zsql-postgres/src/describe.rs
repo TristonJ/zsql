@@ -104,20 +104,34 @@ async fn columns(pool: &PgPool, oid: Oid) -> Result<Vec<(i16, ColumnDetail)>, Co
         let default: Option<String> = row
             .try_get("default_expr")
             .map_err(map_sqlx_introspect_error)?;
-        columns.push((
-            attnum,
-            ColumnDetail {
-                name,
-                type_name,
-                nullable,
-                default,
-                is_primary_key: false,
-                is_unique: false,
-                foreign_key: None,
-            },
-        ));
+        columns.push(column_detail(attnum, name, type_name, nullable, default));
     }
     Ok(columns)
+}
+
+/// Build a [`ColumnDetail`] (paired with its `attnum`) from a row's
+/// already-decoded plain values, with its key/foreign-key flags left at
+/// their default (the caller fills those in separately once every column
+/// has been read).
+fn column_detail(
+    attnum: i16,
+    name: String,
+    type_name: String,
+    nullable: bool,
+    default: Option<String>,
+) -> (i16, ColumnDetail) {
+    (
+        attnum,
+        ColumnDetail {
+            name,
+            type_name,
+            nullable,
+            default,
+            is_primary_key: false,
+            is_unique: false,
+            foreign_key: None,
+        },
+    )
 }
 
 /// Every column `attnum` that is (part of) `oid`'s primary key, and every
@@ -142,8 +156,7 @@ async fn key_flag_attnums(
     .await
     .map_err(map_sqlx_introspect_error)?;
 
-    let mut primary_key_attnums = HashSet::new();
-    let mut unique_attnums = HashSet::new();
+    let mut flag_rows = Vec::with_capacity(rows.len());
     for row in &rows {
         let is_primary: bool = row
             .try_get("is_primary")
@@ -152,13 +165,28 @@ async fn key_flag_attnums(
             .try_get("is_unique")
             .map_err(map_sqlx_introspect_error)?;
         let indkey: Vec<i16> = row.try_get("indkey").map_err(map_sqlx_introspect_error)?;
+        flag_rows.push((is_primary, is_unique, indkey));
+    }
+    Ok(derive_key_flags(flag_rows))
+}
+
+/// Derive the primary-key and unique `attnum` sets from every index's raw
+/// `(is_primary, is_unique, indkey)` shape: every `attnum` in a primary
+/// key's `indkey` is collected regardless of column count, but a unique
+/// index only contributes to the unique set when it has exactly one key
+/// column (a composite unique index does not mark any single column unique
+/// on its own).
+fn derive_key_flags(rows: Vec<(bool, bool, Vec<i16>)>) -> (HashSet<i16>, HashSet<i16>) {
+    let mut primary_key_attnums = HashSet::new();
+    let mut unique_attnums = HashSet::new();
+    for (is_primary, is_unique, indkey) in rows {
         if is_primary {
             primary_key_attnums.extend(indkey);
         } else if is_unique && let [attnum] = indkey[..] {
             unique_attnums.insert(attnum);
         }
     }
-    Ok((primary_key_attnums, unique_attnums))
+    (primary_key_attnums, unique_attnums)
 }
 
 /// Every local column `attnum` of `oid` that participates in a foreign key,
@@ -179,7 +207,7 @@ async fn foreign_keys(pool: &PgPool, oid: Oid) -> Result<HashMap<i16, ForeignKey
     .await
     .map_err(map_sqlx_introspect_error)?;
 
-    let mut by_attnum = HashMap::new();
+    let mut constraints = Vec::with_capacity(rows.len());
     for row in &rows {
         let local_attnums: Vec<i16> = row.try_get("conkey").map_err(map_sqlx_introspect_error)?;
         let ref_attnums: Vec<i16> = row.try_get("confkey").map_err(map_sqlx_introspect_error)?;
@@ -192,20 +220,41 @@ async fn foreign_keys(pool: &PgPool, oid: Oid) -> Result<HashMap<i16, ForeignKey
             .map_err(map_sqlx_introspect_error)?;
 
         let ref_column_names = attribute_names(pool, ref_oid, &ref_attnums).await?;
-        let columns = ref_attnums
-            .iter()
-            .filter_map(|attnum| ref_column_names.get(attnum).cloned())
-            .collect();
         let target = ForeignKeyRef {
             schema: ref_schema,
             table: ref_table,
-            columns,
+            columns: resolve_ref_columns(&ref_attnums, &ref_column_names),
         };
+        constraints.push((local_attnums, target));
+    }
+    Ok(group_foreign_keys(constraints))
+}
+
+/// Resolve every referenced `attnum` to its column name, in the foreign
+/// key's own order, dropping any `attnum` [`attribute_names`] did not
+/// resolve (a dropped column so far never occurs in practice, since every
+/// `attnum` in `confkey` names a real column of the referenced relation).
+fn resolve_ref_columns(
+    ref_attnums: &[i16],
+    ref_column_names: &HashMap<i16, String>,
+) -> Vec<String> {
+    ref_attnums
+        .iter()
+        .filter_map(|attnum| ref_column_names.get(attnum).cloned())
+        .collect()
+}
+
+/// Flatten every foreign key's `(local attnums, target)` pair into a
+/// per-local-column map: a multi-column foreign key attaches the same
+/// [`ForeignKeyRef`] to each of its local columns.
+fn group_foreign_keys(constraints: Vec<(Vec<i16>, ForeignKeyRef)>) -> HashMap<i16, ForeignKeyRef> {
+    let mut by_attnum = HashMap::new();
+    for (local_attnums, target) in constraints {
         for attnum in local_attnums {
             by_attnum.insert(attnum, target.clone());
         }
     }
-    Ok(by_attnum)
+    by_attnum
 }
 
 /// Resolve every `attnum` in `attnums` to its column name on relation `oid`.
@@ -319,8 +368,11 @@ fn constraint_kind(contype: &str) -> Option<ConstraintKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::constraint_kind;
-    use zsql_core::ConstraintKind;
+    use super::{
+        column_detail, constraint_kind, derive_key_flags, group_foreign_keys, resolve_ref_columns,
+    };
+    use std::collections::HashMap;
+    use zsql_core::{ConstraintKind, ForeignKeyRef};
 
     #[test]
     fn maps_every_constraint_kind_code_this_module_cares_about() {
@@ -334,5 +386,119 @@ mod tests {
             "an exclusion constraint has no ConstraintKind mapping"
         );
         assert_eq!(constraint_kind(""), None, "empty code maps to nothing");
+    }
+
+    #[test]
+    fn column_detail_reports_no_default_as_none() {
+        let (attnum, column) = column_detail(1, "id".to_owned(), "int4".to_owned(), false, None);
+        assert_eq!(attnum, 1);
+        assert_eq!(column.default, None);
+    }
+
+    #[test]
+    fn column_detail_carries_a_non_trivial_default_expression() {
+        let (_, column) = column_detail(
+            2,
+            "id".to_owned(),
+            "int4".to_owned(),
+            false,
+            Some("nextval('users_id_seq'::regclass)".to_owned()),
+        );
+        assert_eq!(
+            column.default,
+            Some("nextval('users_id_seq'::regclass)".to_owned())
+        );
+    }
+
+    #[test]
+    fn column_detail_starts_with_no_key_flags_or_foreign_key() {
+        let (_, column) = column_detail(1, "id".to_owned(), "int4".to_owned(), false, None);
+        assert!(!column.is_primary_key);
+        assert!(!column.is_unique);
+        assert!(column.foreign_key.is_none());
+    }
+
+    #[test]
+    fn derive_key_flags_is_empty_for_no_indexes() {
+        let (primary, unique) = derive_key_flags(vec![]);
+        assert!(primary.is_empty());
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn derive_key_flags_is_empty_when_there_is_no_primary_key() {
+        let (primary, unique) = derive_key_flags(vec![(false, true, vec![5])]);
+        assert!(primary.is_empty());
+        assert_eq!(unique, hashset_from([5]));
+    }
+
+    #[test]
+    fn derive_key_flags_collects_every_column_of_a_composite_primary_key() {
+        let (primary, unique) = derive_key_flags(vec![(true, false, vec![1, 2])]);
+        assert_eq!(primary, hashset_from([1, 2]));
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn derive_key_flags_marks_a_single_column_unique_index() {
+        let (_, unique) = derive_key_flags(vec![(false, true, vec![3])]);
+        assert_eq!(unique, hashset_from([3]));
+    }
+
+    #[test]
+    fn derive_key_flags_does_not_mark_a_composite_unique_indexs_columns_unique() {
+        let (_, unique) = derive_key_flags(vec![(false, true, vec![4, 5])]);
+        assert!(
+            unique.is_empty(),
+            "a composite unique index must not mark any single column unique on its own"
+        );
+    }
+
+    fn hashset_from<const N: usize>(items: [i16; N]) -> std::collections::HashSet<i16> {
+        items.into_iter().collect()
+    }
+
+    #[test]
+    fn resolve_ref_columns_resolves_every_attnum_in_order() {
+        let names = HashMap::from([(1i16, "order_id".to_owned()), (2i16, "item_id".to_owned())]);
+        assert_eq!(
+            resolve_ref_columns(&[1, 2], &names),
+            vec!["order_id".to_owned(), "item_id".to_owned()]
+        );
+    }
+
+    #[test]
+    fn resolve_ref_columns_drops_an_unresolved_attnum() {
+        let names = HashMap::from([(1i16, "id".to_owned())]);
+        assert_eq!(resolve_ref_columns(&[1, 99], &names), vec!["id".to_owned()]);
+    }
+
+    #[test]
+    fn group_foreign_keys_attaches_the_same_target_to_every_local_column_of_a_multi_column_key() {
+        let target = ForeignKeyRef {
+            schema: "app".to_owned(),
+            table: "order_items".to_owned(),
+            columns: vec!["order_id".to_owned(), "item_id".to_owned()],
+        };
+        let by_attnum = group_foreign_keys(vec![(vec![10, 11], target.clone())]);
+        assert_eq!(by_attnum.get(&10), Some(&target));
+        assert_eq!(by_attnum.get(&11), Some(&target));
+    }
+
+    #[test]
+    fn group_foreign_keys_keeps_separate_constraints_independent() {
+        let a = ForeignKeyRef {
+            schema: "app".to_owned(),
+            table: "a".to_owned(),
+            columns: vec!["id".to_owned()],
+        };
+        let b = ForeignKeyRef {
+            schema: "app".to_owned(),
+            table: "b".to_owned(),
+            columns: vec!["id".to_owned()],
+        };
+        let by_attnum = group_foreign_keys(vec![(vec![1], a.clone()), (vec![2], b.clone())]);
+        assert_eq!(by_attnum.get(&1), Some(&a));
+        assert_eq!(by_attnum.get(&2), Some(&b));
     }
 }
