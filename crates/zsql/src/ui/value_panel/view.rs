@@ -1329,5 +1329,12 @@ mod tests {
             });
             vcx.run_until_parked();
         }
+
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                p.state_for_test().is_open(),
+                "the panel must stay open across every non-JSON cell it renders"
+            );
+        });
     }
 }
