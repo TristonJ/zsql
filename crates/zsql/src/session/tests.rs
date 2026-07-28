@@ -38,9 +38,11 @@ impl Session {
             batch_size: Config::default().query.batch_size,
             max_result_rows: Config::default().query.max_result_rows,
             active_query: None,
-            accumulating: result,
+            accumulator: zsql_core::ResultAccumulator::with_result(
+                Config::default().query.max_result_rows,
+                result,
+            ),
             row_count: None,
-            query_started_at: None,
             query_generation: 0,
             liveness: LivenessState::Unknown,
             connection_generation: 0,
@@ -53,7 +55,7 @@ impl Session {
     /// Replace the accumulated result set in place, simulating another
     /// batch (or a fresh result)
     pub(crate) fn set_result_for_test(&mut self, result: ResultSet) {
-        self.accumulating = result;
+        self.accumulator = zsql_core::ResultAccumulator::with_result(self.max_result_rows, result);
     }
 
     /// Set the exposed row count directly, simulating a completed (or
@@ -439,15 +441,15 @@ fn an_error_event_produces_a_readable_error_state() {
 #[test]
 fn row_limit_reached_compares_accumulated_against_the_limit() {
     assert!(
-        !super::row_limit_reached(4, 5),
+        !zsql_core::row_limit_reached(4, 5),
         "an accumulated count below the limit must not be reached"
     );
     assert!(
-        super::row_limit_reached(5, 5),
+        zsql_core::row_limit_reached(5, 5),
         "an accumulated count exactly at the limit must count as reached"
     );
     assert!(
-        super::row_limit_reached(6, 5),
+        zsql_core::row_limit_reached(6, 5),
         "an accumulated count above the limit must count as reached"
     );
 }
@@ -1652,9 +1654,9 @@ mod gpui_tests {
                 "a stale event from the superseded query must not produce a result"
             );
             assert!(
-                session.accumulating.columns.is_empty(),
+                session.accumulator.result().columns.is_empty(),
                 "a stale event must not be folded into the current query's accumulating state, got {:?}",
-                session.accumulating.columns
+                session.accumulator.result().columns
             );
         });
 

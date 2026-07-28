@@ -1,6 +1,7 @@
 //! `zsql-core`: UI- and driver-agnostic domain types plus the pluggable driver
 //! contract
 
+pub mod accumulate;
 pub mod config;
 pub mod connection_url;
 pub mod driver;
@@ -13,6 +14,7 @@ pub mod sql;
 pub mod tls_verify;
 pub mod value;
 
+pub use accumulate::{AccumulateStatus, ResultAccumulator, row_limit_reached};
 pub use config::{ConnConfig, DEFAULT_QUERY_BATCH_SIZE};
 pub use connection_url::{
     ConnectionUrl, SslModeSpelling, rewrite_for_tunnel, tunneled_connect_url_capping_verify_full,
