@@ -7,6 +7,7 @@ pub mod format;
 pub mod results;
 pub mod schema_view;
 pub mod sidebar;
+pub mod tab_bar;
 pub mod tabs;
 pub mod theme;
 pub mod value_panel;
