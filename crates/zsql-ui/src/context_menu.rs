@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, MouseButton, Pixels, Point, RenderOnce, SharedString, Window, anchored,
+    App, ClickEvent, Div, MouseButton, Pixels, Point, RenderOnce, SharedString, Window, anchored,
     deferred, div, prelude::*, px, rgb, rgba,
 };
 
@@ -99,11 +99,12 @@ impl ContextMenu {
         self
     }
 
-    fn render_separator(style: &ContextMenuStyle, theme: &Theme) -> impl IntoElement {
+    fn render_separator(style: &ContextMenuStyle, theme: &Theme, selector: String) -> Div {
         div()
             .h(style.separator_height)
             .my(style.separator_margin_y)
             .bg(rgb(theme.colors.border_soft))
+            .debug_selector(move || selector)
     }
 }
 
@@ -157,8 +158,13 @@ impl ContextMenuItem {
 impl RenderOnce for ContextMenu {
     fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let theme = cx.theme();
+        let menu_selector = self.id.to_string();
         let mut menu = div()
             .id(self.id)
+            .debug_selector({
+                let menu_selector = menu_selector.clone();
+                move || menu_selector
+            })
             .occlude()
             .w(self.style.width)
             .p(self.style.padding)
@@ -170,7 +176,8 @@ impl RenderOnce for ContextMenu {
         for (i, item) in self.items.into_iter().enumerate() {
             for separator_index in &self.separators {
                 if *separator_index == i {
-                    menu = menu.child(Self::render_separator(&style, theme));
+                    let separator_selector = format!("{menu_selector}-separator-{i}");
+                    menu = menu.child(Self::render_separator(&style, theme, separator_selector));
                 }
             }
             menu = menu.child(item.style(self.style));
@@ -206,8 +213,10 @@ impl RenderOnce for ContextMenu {
 impl RenderOnce for ContextMenuItem {
     fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let theme = cx.theme();
+        let selector = self.id.to_string();
         div()
             .id(self.id)
+            .debug_selector(move || selector)
             .flex()
             .flex_row()
             .items_center()
@@ -222,3 +231,6 @@ impl RenderOnce for ContextMenuItem {
             .when_some(self.on_click, |el, on_click| el.on_click(on_click))
     }
 }
+
+#[cfg(test)]
+mod tests;

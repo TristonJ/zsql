@@ -134,10 +134,6 @@ impl ButtonSwitch {
     ) -> Self {
         let id = id.into();
         let label = label.into();
-        // Tag each segment with its id as a debug selector so render tests can
-        // look up its painted bounds via `VisualTestContext::debug_bounds`
-        // (a no-op in release builds).
-        let selector = id.to_string();
         let (btn, hovered) = button_base(id.clone(), window, cx);
         let btn = btn
             .font_family(cx.theme().fonts.data.clone())
@@ -150,8 +146,7 @@ impl ButtonSwitch {
             .border_color(rgb(cx.theme().colors.border))
             .when(*hovered.read(cx), |b| {
                 b.text_color(rgb(cx.theme().colors.text_primary))
-            })
-            .debug_selector(move || selector);
+            });
         self.options.push((id, btn, Box::new(on_click)));
         self
     }
@@ -170,6 +165,15 @@ impl RenderOnce for ButtonSwitch {
             let is_first = i == 0;
             let is_last = i == num_options - 1;
             let is_selected = self.selected.as_ref() == Some(&id);
+            // Tag each segment with its id (suffixed when selected) as a debug
+            // selector so render tests can look up its painted bounds and
+            // selected state via `VisualTestContext::debug_bounds` (a no-op
+            // in release builds).
+            let selector = if is_selected {
+                format!("{id}-selected")
+            } else {
+                id.to_string()
+            };
             let option = match (is_selected, self.is_disabled) {
                 (true, disabled) => option
                     .bg(rgba(theme.colors.accent_wash()))
@@ -188,10 +192,15 @@ impl RenderOnce for ButtonSwitch {
                 (false, true) => option.border_l_0().rounded_l(px(0.0)).rounded_r(px(7.0)),
                 (true, true) => option.rounded(px(7.0)),
             };
-            let option = option.when(!self.is_disabled, |b| b.on_click(on_click));
+            let option = option
+                .when(!self.is_disabled, |b| b.on_click(on_click))
+                .debug_selector(move || selector);
             parent = parent.child(option);
         }
 
         parent
     }
 }
+
+#[cfg(test)]
+mod tests;
