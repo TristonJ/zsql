@@ -6,21 +6,17 @@
 //! forwards to) for how to bring the fixtures up.
 #![cfg(all(test, feature = "ssh-integration-tests"))]
 
-use std::env;
 use std::time::Duration;
 
 use gpui::{AppContext as _, TestAppContext};
+use zsql_ssh::test_fixtures::{
+    MSSQL_DB_DEFAULT, MSSQL_PASSWORD_DEFAULT, MSSQL_PORT_DEFAULT, MYSQL_DB_DEFAULT,
+    MYSQL_PASSWORD_DEFAULT, MYSQL_PORT_DEFAULT, PG_DB_DEFAULT, PG_PASSWORD_DEFAULT,
+    PG_PORT_DEFAULT, SSH_HOST_DEFAULT, SSH_PORT_DEFAULT, env_or, required_env,
+};
 use zsql_ssh::{HostKeyPolicy, SshAuth, SshConfig};
 
 use crate::session::{LivenessState, Session, SessionState};
-
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
-fn required_env(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| panic!("{key} must be set to run ssh-integration-tests"))
-}
 
 /// The SSH config every test tunnels through: the dev sshd provisioned by
 /// `scripts/ssh-dev.sh`, authenticating with a password (key/agent auth are
@@ -28,10 +24,10 @@ fn required_env(key: &str) -> String {
 /// `ssh-integration-tests`; this suite's job is proving the tunnel carries a
 /// real driver connection end to end, not re-covering auth methods).
 fn ssh_config() -> SshConfig {
-    let host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let host = env_or("ZSQL_TEST_SSH_HOST", SSH_HOST_DEFAULT);
     let user = required_env("ZSQL_TEST_SSH_USER");
     let password = required_env("ZSQL_TEST_SSH_PASSWORD");
-    let port: u16 = env_or("ZSQL_TEST_SSH_PORT", "2222")
+    let port: u16 = env_or("ZSQL_TEST_SSH_PORT", SSH_PORT_DEFAULT)
         .parse()
         .expect("ZSQL_TEST_SSH_PORT must be a valid port number");
 
@@ -46,9 +42,9 @@ fn ssh_config() -> SshConfig {
 /// `scripts/ssh-dev.sh`'s `--add-host`), never `localhost` -- from inside
 /// that container, `localhost` would mean the container itself.
 fn postgres_url() -> String {
-    let password = env_or("ZSQL_PG_PASSWORD", "zsql");
-    let db = env_or("ZSQL_PG_DB", "zsql");
-    let port = env_or("ZSQL_PG_PORT", "5432");
+    let password = env_or("ZSQL_PG_PASSWORD", PG_PASSWORD_DEFAULT);
+    let db = env_or("ZSQL_PG_DB", PG_DB_DEFAULT);
+    let port = env_or("ZSQL_PG_PORT", PG_PORT_DEFAULT);
     format!("postgres://postgres:{password}@host.docker.internal:{port}/{db}")
 }
 
@@ -64,25 +60,25 @@ fn postgres_verify_full_url() -> String {
 }
 
 fn mysql_url() -> String {
-    let password = env_or("ZSQL_MYSQL_PASSWORD", "zsql");
-    let db = env_or("ZSQL_MYSQL_DB", "zsql");
-    let port = env_or("ZSQL_MYSQL_PORT", "3306");
+    let password = env_or("ZSQL_MYSQL_PASSWORD", MYSQL_PASSWORD_DEFAULT);
+    let db = env_or("ZSQL_MYSQL_DB", MYSQL_DB_DEFAULT);
+    let port = env_or("ZSQL_MYSQL_PORT", MYSQL_PORT_DEFAULT);
     format!("mysql://root:{password}@host.docker.internal:{port}/{db}")
 }
 
 fn mssql_url() -> String {
-    let password = env_or("ZSQL_MSSQL_PASSWORD", "zSql!DevPassw0rd");
-    let db = env_or("ZSQL_MSSQL_DB", "zsql");
-    let port = env_or("ZSQL_MSSQL_PORT", "1433");
+    let password = env_or("ZSQL_MSSQL_PASSWORD", MSSQL_PASSWORD_DEFAULT);
+    let db = env_or("ZSQL_MSSQL_DB", MSSQL_DB_DEFAULT);
+    let port = env_or("ZSQL_MSSQL_PORT", MSSQL_PORT_DEFAULT);
     format!("mssql://sa:{password}@host.docker.internal:{port}/{db}?trustServerCertificate=true")
 }
 
 /// A verify-full-requesting MSSQL URL, trusting the CA `scripts/mssql-dev.sh`
 /// generates via the CA file path it prints as `ZSQL_TEST_MSSQL_SSLROOTCERT`.
 fn mssql_verify_full_url() -> String {
-    let password = env_or("ZSQL_MSSQL_PASSWORD", "zSql!DevPassw0rd");
-    let db = env_or("ZSQL_MSSQL_DB", "zsql");
-    let port = env_or("ZSQL_MSSQL_PORT", "1433");
+    let password = env_or("ZSQL_MSSQL_PASSWORD", MSSQL_PASSWORD_DEFAULT);
+    let db = env_or("ZSQL_MSSQL_DB", MSSQL_DB_DEFAULT);
+    let port = env_or("ZSQL_MSSQL_PORT", MSSQL_PORT_DEFAULT);
     let ca_path = required_env("ZSQL_TEST_MSSQL_SSLROOTCERT");
     format!("mssql://sa:{password}@host.docker.internal:{port}/{db}?sslrootcert={ca_path}")
 }

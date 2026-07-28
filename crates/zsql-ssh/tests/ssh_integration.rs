@@ -4,13 +4,18 @@
 //! real Postgres started with `scripts/pg-dev.sh`.
 #![cfg(feature = "ssh-integration-tests")]
 
-use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use zsql_ssh::test_fixtures::{
+    PG_PORT_DEFAULT, SSH_HOST_DEFAULT, SSH_PORT_DEFAULT, env_or, required_env,
+};
 use zsql_ssh::{HostKeyPolicy, SshAuth, SshConfig, open_tunnel};
+
+mod support;
+use support::ThrowawayAgent;
 
 /// Postgres's `SSLRequest` startup packet: a 4-byte length prefix followed
 /// by the fixed SSL-negotiation request code. Sending it and reading the
@@ -25,23 +30,15 @@ fn fixture_key_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/id_ed25519")
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
-}
-
-fn required_env(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| panic!("{key} must be set to run ssh-integration-tests"))
-}
-
 fn ssh_port() -> u16 {
-    env_or("ZSQL_TEST_SSH_PORT", "2222")
+    env_or("ZSQL_TEST_SSH_PORT", SSH_PORT_DEFAULT)
         .parse()
         .expect("ZSQL_TEST_SSH_PORT must be a valid port number")
 }
 
 fn remote_target() -> (String, u16) {
     let host = env_or("ZSQL_TEST_SSH_REMOTE_HOST", "host.docker.internal");
-    let port = env_or("ZSQL_TEST_SSH_REMOTE_PORT", "5432")
+    let port = env_or("ZSQL_TEST_SSH_REMOTE_PORT", PG_PORT_DEFAULT)
         .parse()
         .expect("ZSQL_TEST_SSH_REMOTE_PORT must be a valid port number");
     (host, port)
@@ -102,7 +99,7 @@ fn assert_tunnel_forwards_to_postgres(cfg: SshConfig) {
 
 #[test]
 fn tunnel_forwards_bytes_to_the_real_postgres_server_with_password_auth() {
-    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", SSH_HOST_DEFAULT);
     let ssh_user = required_env("ZSQL_TEST_SSH_USER");
     let ssh_password = required_env("ZSQL_TEST_SSH_PASSWORD");
 
@@ -120,7 +117,7 @@ fn tunnel_forwards_bytes_to_the_real_postgres_server_with_password_auth() {
 /// longer exists.
 #[test]
 fn dropping_the_tunnel_closes_an_already_open_forwarded_connection() {
-    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", SSH_HOST_DEFAULT);
     let ssh_user = required_env("ZSQL_TEST_SSH_USER");
     let ssh_password = required_env("ZSQL_TEST_SSH_PASSWORD");
     let (remote_host, remote_port) = remote_target();
@@ -193,7 +190,7 @@ fn dropping_the_tunnel_closes_an_already_open_forwarded_connection() {
 
 #[test]
 fn tunnel_forwards_bytes_to_the_real_postgres_server_with_key_auth() {
-    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", SSH_HOST_DEFAULT);
     let ssh_user = required_env("ZSQL_TEST_SSH_USER");
 
     let mut cfg = SshConfig::new(
@@ -210,19 +207,15 @@ fn tunnel_forwards_bytes_to_the_real_postgres_server_with_key_auth() {
     assert_tunnel_forwards_to_postgres(cfg);
 }
 
-/// Agent auth needs a real ssh-agent with a matching key loaded, which is
-/// impractical to provision in CI. Run this manually:
-///
-///   1. `scripts/ssh-dev.sh up` (provisions the same key fixture used above)
-///   2. `eval "$(ssh-agent -s)"`
-///   3. `ssh-add crates/zsql-ssh/tests/fixtures/id_ed25519`
-///   4. `ZSQL_TEST_SSH_USER=zsql cargo test -p zsql-ssh --features
-///      ssh-integration-tests --test ssh_integration -- --ignored
-///      tunnel_forwards_bytes_to_the_real_postgres_server_with_agent_auth`
+/// Spawns its own throwaway `ssh-agent` loaded with the fixture key (torn
+/// down on drop, including on panic), so agent auth gets the same
+/// unattended coverage as password and key auth above rather than needing
+/// an operator-provisioned agent.
 #[test]
-#[ignore = "needs a real ssh-agent with the fixture key loaded; see doc comment"]
 fn tunnel_forwards_bytes_to_the_real_postgres_server_with_agent_auth() {
-    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", "127.0.0.1");
+    let _agent = ThrowawayAgent::spawn(&fixture_key_path());
+
+    let ssh_host = env_or("ZSQL_TEST_SSH_HOST", SSH_HOST_DEFAULT);
     let ssh_user = required_env("ZSQL_TEST_SSH_USER");
 
     let mut cfg = SshConfig::new(ssh_host, ssh_user, SshAuth::Agent);

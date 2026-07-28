@@ -780,11 +780,20 @@ mod database_tests {
         let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
-        let handle = conn.stream_query("WAITFOR DELAY '00:00:03'".to_owned(), tx);
-
-        // Let the wait actually start server-side before probing, so the
-        // ping genuinely races a query that is mid-flight.
-        std::thread::sleep(Duration::from_millis(300));
+        // A fast marker SELECT ahead of the delay gives an observable
+        // signal (its `Columns` event) that the batch has actually been
+        // dispatched and is executing server-side, so the ping below
+        // genuinely races a query that is mid-flight rather than one not
+        // yet sent. `WAITFOR DELAY` alone streams nothing until it
+        // completes, so it offers no such signal by itself.
+        let handle = conn.stream_query(
+            "SELECT 1 AS marker; WAITFOR DELAY '00:00:03'".to_owned(),
+            tx,
+        );
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(_)) => {}
+            other => panic!("expected the marker SELECT's Columns first, got {other:?}"),
+        }
 
         let ping_started = std::time::Instant::now();
         block_on(conn.ping()).expect("ping must succeed independently of the slow query");
