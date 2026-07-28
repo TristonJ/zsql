@@ -19,8 +19,12 @@ pub fn new_tab_editor_view(run_query: QueryRunner, cx: &mut Context<EditorView>)
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
+    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, Timer, VisualTestContext};
+    use std::time::Duration;
     use zsql_editor::{QueryRunner, RunQuery};
+
+    use crate::config::Config;
+    use crate::session::{Session, SessionState};
 
     use super::new_tab_editor_view;
 
@@ -55,20 +59,8 @@ mod tests {
             ["select * from orders"]
         );
     }
-}
 
-#[cfg(test)]
-mod live_tests {
-    use std::time::Duration;
-
-    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, Timer};
-    use zsql_editor::{QueryRunner, RunQuery};
-
-    use super::new_tab_editor_view;
-    use crate::config::Config;
-    use crate::session::{Session, SessionState};
-
-    fn live_database_url() -> String {
+    fn in_memory_database_url() -> String {
         "sqlite::memory:".to_owned()
     }
 
@@ -97,7 +89,7 @@ mod live_tests {
     /// state -- the type-and-run loop end to end.
     #[gpui::test]
     async fn dispatching_run_query_reaches_live_results_when_configured(cx: &mut TestAppContext) {
-        let url = live_database_url();
+        let url = in_memory_database_url();
         cx.executor().allow_parking();
         let _guard = crate::test_support::serialize_real_io();
 

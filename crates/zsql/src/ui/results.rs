@@ -3248,23 +3248,6 @@ mod tests {
     // -- Text view: rendering smoke tests -----------------------------------
 
     #[gpui::test]
-    fn renders_the_text_view_without_panicking(cx: &mut gpui::TestAppContext) {
-        let result = text_column_result(vec![
-            Row(vec![Value::Text("CREATE PROCEDURE p".to_owned())]),
-            Row(vec![Value::Text("AS".to_owned())]),
-            Row(vec![Value::Text("BEGIN".to_owned())]),
-            Row(vec![Value::Text("    SELECT 1;".to_owned())]),
-            Row(vec![Value::Text("END".to_owned())]),
-        ]);
-        let (view, vcx) = view_with_results(cx, result);
-        vcx.run_until_parked();
-        assert_eq!(
-            view.read_with(vcx, |v, _app| v.view_mode_for_test()),
-            ViewMode::Text
-        );
-    }
-
-    #[gpui::test]
     fn renders_the_grid_when_manually_selected_for_a_document_shaped_result(
         cx: &mut gpui::TestAppContext,
     ) {

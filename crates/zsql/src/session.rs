@@ -1473,8 +1473,9 @@ mod tests {
 mod gpui_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use zsql_core::{
         BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
         RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
@@ -3090,20 +3091,9 @@ mod gpui_tests {
 
         task.await;
     }
-}
-
-/// Live-database end-to-end tests
-#[cfg(test)]
-mod live_tests {
-    use std::time::Duration;
-
-    use gpui::{AppContext as _, Entity, TestAppContext};
-    use zsql_core::Value;
-
-    use super::{Config, LivenessState, SchemaState, Session, SessionState};
 
     /// In-memory driver for the live end-to-end tests
-    fn live_database_url() -> String {
+    fn in_memory_database_url() -> String {
         "sqlite::memory:".to_string()
     }
 
@@ -3165,7 +3155,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3231,7 +3221,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3292,7 +3282,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3316,7 +3306,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3356,7 +3346,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3425,7 +3415,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
