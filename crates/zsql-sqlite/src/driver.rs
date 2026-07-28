@@ -19,8 +19,8 @@ use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
     RowBatch, RowCount, SchemaTree, quote_ident,
 };
+use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
 
-use crate::error::{map_connect_error, map_query_error};
 use crate::values::{column_metas, decode_row};
 
 /// Rows are grouped into batches of at most this many rows before a
@@ -66,7 +66,7 @@ impl SqliteDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(map_connect_error)?;
+            .map_err(map_sqlx_connection_error)?;
         liveness_check(&pool).await?;
         Ok(pool)
     }
@@ -86,8 +86,8 @@ async fn liveness_check(pool: &SqlitePool) -> Result<i64, CoreError> {
     let row = sqlx::query("SELECT 1 AS one")
         .fetch_one(&mut *connection)
         .await
-        .map_err(map_connect_error)?;
-    let one: i64 = row.try_get("one").map_err(map_connect_error)?;
+        .map_err(map_sqlx_connection_error)?;
+    let one: i64 = row.try_get("one").map_err(map_sqlx_connection_error)?;
     Ok(one)
 }
 
@@ -99,6 +99,14 @@ impl Driver for SqliteDriver {
 
     fn display_name(&self) -> &'static str {
         "SQLite"
+    }
+
+    fn default_port(&self) -> Option<u16> {
+        None
+    }
+
+    fn url_schemes(&self) -> &[&'static str] {
+        &["sqlite"]
     }
 
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
@@ -171,7 +179,7 @@ impl Connection for SqliteConnectionImpl {
         let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
             .fetch_one(&self.pool)
             .await
-            .map_err(map_query_error)?;
+            .map_err(map_sqlx_query_error)?;
         Ok(RowCount::Exact(u64::try_from(count).unwrap_or(0)))
     }
 
@@ -230,7 +238,7 @@ async fn run_query(pool: SqlitePool, sql: String, sink: BatchSink, cancel_rx: fl
     let mut conn = match pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
-            let _ = sink.send_async(Err(map_query_error(err))).await;
+            let _ = sink.send_async(Err(map_sqlx_query_error(err))).await;
             return;
         }
     };
@@ -292,7 +300,7 @@ async fn run_query(pool: SqlitePool, sql: String, sink: BatchSink, cancel_rx: fl
                 columns_sent = false;
             }
             futures::future::Either::Right((Some(Err(err)), _)) => {
-                let _ = sink.send_async(Err(map_query_error(err))).await;
+                let _ = sink.send_async(Err(map_sqlx_query_error(err))).await;
                 return;
             }
         }
@@ -468,8 +476,8 @@ mod tests {
         let cfg = ConnConfig::from_url(&unopenable_url()).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unopenable path must fail"),
@@ -485,8 +493,8 @@ mod tests {
 
         let result = block_on(conn.introspect());
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(_) => panic!("introspecting an unopenable path must fail"),
@@ -734,8 +742,8 @@ mod tests {
 
         let result = block_on(conn.describe_relation("main", "does_not_exist"));
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(detail) => panic!("describing a nonexistent relation must fail, got {detail:?}"),
@@ -820,8 +828,8 @@ mod tests {
 
         let result = block_on(conn.count_rows("main", "zsql_test_relation_that_does_not_exist"));
         match result {
-            Err(zsql_core::CoreError::Query(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Query { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Query, got {other:?}"),
             Ok(row_count) => {
@@ -843,7 +851,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("stream_query must push exactly one event, not hang");
         match evt {
-            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            Err(zsql_core::CoreError::Query { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a single CoreError::Query, got {other:?}"),
         }
 

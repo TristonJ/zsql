@@ -12,8 +12,7 @@ use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, CoreError, ForeignKeyRef, IndexInfo,
     RelationSchema,
 };
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// Build a [`RelationSchema`] for `schema.relation`.
 ///
@@ -63,14 +62,14 @@ async fn relation_oid(pool: &PgPool, schema: &str, relation: &str) -> Result<Oid
     .bind(relation)
     .fetch_optional(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let Some(row) = row else {
-        return Err(CoreError::Introspection(format!(
+        return Err(CoreError::introspection(format!(
             "relation not found: {schema}.{relation}"
         )));
     };
-    row.try_get("oid").map_err(map_introspect_error)
+    row.try_get("oid").map_err(map_sqlx_introspect_error)
 }
 
 /// Every live column of `oid`, in ordinal position, paired with its
@@ -92,15 +91,19 @@ async fn columns(pool: &PgPool, oid: Oid) -> Result<Vec<(i16, ColumnDetail)>, Co
     .bind(oid)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
-        let attnum: i16 = row.try_get("attnum").map_err(map_introspect_error)?;
-        let name: String = row.try_get("attname").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("type_name").map_err(map_introspect_error)?;
-        let nullable: bool = row.try_get("nullable").map_err(map_introspect_error)?;
-        let default: Option<String> = row.try_get("default_expr").map_err(map_introspect_error)?;
+        let attnum: i16 = row.try_get("attnum").map_err(map_sqlx_introspect_error)?;
+        let name: String = row.try_get("attname").map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row
+            .try_get("type_name")
+            .map_err(map_sqlx_introspect_error)?;
+        let nullable: bool = row.try_get("nullable").map_err(map_sqlx_introspect_error)?;
+        let default: Option<String> = row
+            .try_get("default_expr")
+            .map_err(map_sqlx_introspect_error)?;
         columns.push((
             attnum,
             ColumnDetail {
@@ -137,14 +140,18 @@ async fn key_flag_attnums(
     .bind(oid)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut primary_key_attnums = HashSet::new();
     let mut unique_attnums = HashSet::new();
     for row in &rows {
-        let is_primary: bool = row.try_get("is_primary").map_err(map_introspect_error)?;
-        let is_unique: bool = row.try_get("is_unique").map_err(map_introspect_error)?;
-        let indkey: Vec<i16> = row.try_get("indkey").map_err(map_introspect_error)?;
+        let is_primary: bool = row
+            .try_get("is_primary")
+            .map_err(map_sqlx_introspect_error)?;
+        let is_unique: bool = row
+            .try_get("is_unique")
+            .map_err(map_sqlx_introspect_error)?;
+        let indkey: Vec<i16> = row.try_get("indkey").map_err(map_sqlx_introspect_error)?;
         if is_primary {
             primary_key_attnums.extend(indkey);
         } else if is_unique && let [attnum] = indkey[..] {
@@ -170,15 +177,19 @@ async fn foreign_keys(pool: &PgPool, oid: Oid) -> Result<HashMap<i16, ForeignKey
     .bind(oid)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut by_attnum = HashMap::new();
     for row in &rows {
-        let local_attnums: Vec<i16> = row.try_get("conkey").map_err(map_introspect_error)?;
-        let ref_attnums: Vec<i16> = row.try_get("confkey").map_err(map_introspect_error)?;
-        let ref_oid: Oid = row.try_get("ref_oid").map_err(map_introspect_error)?;
-        let ref_schema: String = row.try_get("ref_schema").map_err(map_introspect_error)?;
-        let ref_table: String = row.try_get("ref_table").map_err(map_introspect_error)?;
+        let local_attnums: Vec<i16> = row.try_get("conkey").map_err(map_sqlx_introspect_error)?;
+        let ref_attnums: Vec<i16> = row.try_get("confkey").map_err(map_sqlx_introspect_error)?;
+        let ref_oid: Oid = row.try_get("ref_oid").map_err(map_sqlx_introspect_error)?;
+        let ref_schema: String = row
+            .try_get("ref_schema")
+            .map_err(map_sqlx_introspect_error)?;
+        let ref_table: String = row
+            .try_get("ref_table")
+            .map_err(map_sqlx_introspect_error)?;
 
         let ref_column_names = attribute_names(pool, ref_oid, &ref_attnums).await?;
         let columns = ref_attnums
@@ -212,12 +223,12 @@ async fn attribute_names(
     .bind(attnums)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut names = HashMap::with_capacity(rows.len());
     for row in &rows {
-        let attnum: i16 = row.try_get("attnum").map_err(map_introspect_error)?;
-        let name: String = row.try_get("attname").map_err(map_introspect_error)?;
+        let attnum: i16 = row.try_get("attnum").map_err(map_sqlx_introspect_error)?;
+        let name: String = row.try_get("attname").map_err(map_sqlx_introspect_error)?;
         names.insert(attnum, name);
     }
     Ok(names)
@@ -238,14 +249,18 @@ async fn indexes(pool: &PgPool, oid: Oid) -> Result<Vec<IndexInfo>, CoreError> {
     .bind(oid)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut indexes = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
-        let method: String = row.try_get("method").map_err(map_introspect_error)?;
-        let unique: bool = row.try_get("is_unique").map_err(map_introspect_error)?;
-        let definition: String = row.try_get("definition").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
+        let method: String = row.try_get("method").map_err(map_sqlx_introspect_error)?;
+        let unique: bool = row
+            .try_get("is_unique")
+            .map_err(map_sqlx_introspect_error)?;
+        let definition: String = row
+            .try_get("definition")
+            .map_err(map_sqlx_introspect_error)?;
         indexes.push(IndexInfo {
             name,
             method,
@@ -270,16 +285,18 @@ async fn constraints(pool: &PgPool, oid: Oid) -> Result<Vec<ConstraintInfo>, Cor
     .bind(oid)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut constraints = Vec::with_capacity(rows.len());
     for row in &rows {
-        let contype: String = row.try_get("contype").map_err(map_introspect_error)?;
+        let contype: String = row.try_get("contype").map_err(map_sqlx_introspect_error)?;
         let Some(kind) = constraint_kind(&contype) else {
             continue;
         };
-        let name: String = row.try_get("conname").map_err(map_introspect_error)?;
-        let definition: String = row.try_get("definition").map_err(map_introspect_error)?;
+        let name: String = row.try_get("conname").map_err(map_sqlx_introspect_error)?;
+        let definition: String = row
+            .try_get("definition")
+            .map_err(map_sqlx_introspect_error)?;
         constraints.push(ConstraintInfo {
             name,
             kind,

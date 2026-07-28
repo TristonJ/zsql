@@ -10,8 +10,7 @@ use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, CoreError, ForeignKeyRef, IndexInfo,
     RelationSchema,
 };
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// MySQL/MariaDB's fixed name for the index (and constraint) backing a
 /// table's primary key. Unlike every other index or constraint name, this
@@ -103,10 +102,10 @@ async fn ensure_relation_exists(
     .bind(relation)
     .fetch_optional(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     if row.is_none() {
-        return Err(CoreError::Introspection(format!(
+        return Err(CoreError::introspection(format!(
             "relation not found: {schema}.{relation}"
         )));
     }
@@ -131,16 +130,22 @@ async fn columns(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("COLUMN_NAME").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("COLUMN_TYPE").map_err(map_introspect_error)?;
-        let is_nullable: String = row.try_get("IS_NULLABLE").map_err(map_introspect_error)?;
+        let name: String = row
+            .try_get("COLUMN_NAME")
+            .map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row
+            .try_get("COLUMN_TYPE")
+            .map_err(map_sqlx_introspect_error)?;
+        let is_nullable: String = row
+            .try_get("IS_NULLABLE")
+            .map_err(map_sqlx_introspect_error)?;
         let default: Option<String> = row
             .try_get("COLUMN_DEFAULT")
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
         columns.push(ColumnDetail {
             name,
             type_name,
@@ -196,14 +201,22 @@ async fn raw_indexes(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut indexes: Vec<RawIndex> = Vec::new();
     for row in &rows {
-        let name: String = row.try_get("INDEX_NAME").map_err(map_introspect_error)?;
-        let non_unique: i64 = row.try_get("NON_UNIQUE").map_err(map_introspect_error)?;
-        let method: String = row.try_get("INDEX_TYPE").map_err(map_introspect_error)?;
-        let column: String = row.try_get("COLUMN_NAME").map_err(map_introspect_error)?;
+        let name: String = row
+            .try_get("INDEX_NAME")
+            .map_err(map_sqlx_introspect_error)?;
+        let non_unique: i64 = row
+            .try_get("NON_UNIQUE")
+            .map_err(map_sqlx_introspect_error)?;
+        let method: String = row
+            .try_get("INDEX_TYPE")
+            .map_err(map_sqlx_introspect_error)?;
+        let column: String = row
+            .try_get("COLUMN_NAME")
+            .map_err(map_sqlx_introspect_error)?;
 
         match indexes.last_mut() {
             Some(last) if last.name == name => last.columns.push(column),
@@ -262,23 +275,25 @@ async fn raw_foreign_keys(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut foreign_keys: Vec<RawForeignKey> = Vec::new();
     for row in &rows {
         let constraint_name: String = row
             .try_get("CONSTRAINT_NAME")
-            .map_err(map_introspect_error)?;
-        let local_column: String = row.try_get("COLUMN_NAME").map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
+        let local_column: String = row
+            .try_get("COLUMN_NAME")
+            .map_err(map_sqlx_introspect_error)?;
         let ref_schema: String = row
             .try_get("REFERENCED_TABLE_SCHEMA")
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
         let ref_table: String = row
             .try_get("REFERENCED_TABLE_NAME")
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
         let ref_column: String = row
             .try_get("REFERENCED_COLUMN_NAME")
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
 
         match foreign_keys.last_mut() {
             Some(last) if last.constraint_name == constraint_name => {
@@ -334,14 +349,16 @@ async fn unique_constraints(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
     for row in &rows {
         let name: String = row
             .try_get("CONSTRAINT_NAME")
-            .map_err(map_introspect_error)?;
-        let column: String = row.try_get("COLUMN_NAME").map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
+        let column: String = row
+            .try_get("COLUMN_NAME")
+            .map_err(map_sqlx_introspect_error)?;
         match grouped.last_mut() {
             Some((last_name, columns)) if *last_name == name => columns.push(column),
             _ => grouped.push((name, vec![column])),
@@ -380,14 +397,16 @@ async fn check_constraints(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut constraints = Vec::with_capacity(rows.len());
     for row in &rows {
         let name: String = row
             .try_get("CONSTRAINT_NAME")
-            .map_err(map_introspect_error)?;
-        let check_clause: String = row.try_get("CHECK_CLAUSE").map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
+        let check_clause: String = row
+            .try_get("CHECK_CLAUSE")
+            .map_err(map_sqlx_introspect_error)?;
         constraints.push(ConstraintInfo {
             name,
             kind: ConstraintKind::Check,

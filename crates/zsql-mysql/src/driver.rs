@@ -8,23 +8,17 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt as _;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
+use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
-    RowBatch, RowCount, SchemaTree,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema, RowCount,
+    SchemaTree,
 };
+use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
+use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
-use crate::error::{map_connect_error, map_query_error};
 use crate::quoting::backtick_quote_ident;
 use crate::values::{column_metas, decode_row};
-
-/// Rows are grouped into batches of at most this many rows before a
-/// [`QueryEvent::Batch`] is pushed into the sink. Mirrors `zsql-postgres`'s
-/// batch bound; bounded so a large result set streams to the UI
-/// incrementally instead of arriving as one huge allocation.
-const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
 
 /// Bounded pool size for a single desktop client. Mirrors
 /// `zsql-postgres::MAX_POOL_CONNECTIONS`: this app drives at most a handful
@@ -68,7 +62,7 @@ impl MysqlDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect(&url)
             .await
-            .map_err(map_connect_error)?;
+            .map_err(map_sqlx_connection_error)?;
         liveness_check(&pool).await?;
         Ok(pool)
     }
@@ -89,7 +83,7 @@ impl MysqlDriver {
             .max_connections(max_connections)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(&url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 
     /// Build the small dedicated pool [`MySqlConnection::ping`] draws from.
@@ -112,7 +106,7 @@ impl MysqlDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .test_before_acquire(false)
             .connect_lazy(&url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 }
 
@@ -122,8 +116,8 @@ async fn liveness_check(pool: &MySqlPool) -> Result<i64, CoreError> {
     let row = sqlx::query("SELECT 1 AS one")
         .fetch_one(pool)
         .await
-        .map_err(map_connect_error)?;
-    let one: i32 = row.try_get("one").map_err(map_connect_error)?;
+        .map_err(map_sqlx_connection_error)?;
+    let one: i32 = row.try_get("one").map_err(map_sqlx_connection_error)?;
     Ok(i64::from(one))
 }
 
@@ -135,6 +129,14 @@ impl Driver for MysqlDriver {
 
     fn display_name(&self) -> &'static str {
         "MySQL / MariaDB"
+    }
+
+    fn default_port(&self) -> Option<u16> {
+        Some(3306)
+    }
+
+    fn url_schemes(&self) -> &[&'static str] {
+        &["mysql", "mariadb"]
     }
 
     fn parse_url(&self, url: &str) -> Result<ConnConfig, CoreError> {
@@ -160,81 +162,83 @@ impl Driver for MysqlDriver {
         let cancel_pool = Self::build_side_pool(&url, CANCEL_POOL_CONNECTIONS)?;
         let probe_pool = Self::build_probe_pool(&url)?;
         tracing::info!("mysql connection established");
-        Ok(Box::new(MySqlConnection {
+        Ok(Box::new(MySqlConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        }))
+        ))))
+    }
+}
+
+impl SqlxZsqlDriver<MySql> for MysqlDriver {
+    const NAME: &'static str = "mysql";
+
+    type Cancel = MySqlCancelHandle;
+
+    fn column_metas(columns: &[<MySql as sqlx::Database>::Column]) -> Vec<zsql_core::ColumnMeta> {
+        column_metas(columns)
+    }
+
+    fn decode_row(row: &<MySql as sqlx::Database>::Row) -> zsql_core::Row {
+        decode_row(row)
+    }
+
+    fn rows_affected(result: &<MySql as sqlx::Database>::QueryResult) -> u64 {
+        result.rows_affected()
+    }
+
+    async fn cancel_handle(
+        conn: &mut <MySql as sqlx::Database>::Connection,
+    ) -> Result<Self::Cancel, sqlx::Error> {
+        let connection_id = sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *conn)
+            .await?;
+        Ok(MySqlCancelHandle { connection_id })
     }
 }
 
 /// A live MySQL/MariaDB connection, backed by a bounded sqlx connection pool.
-pub struct MySqlConnection {
-    pool: MySqlPool,
-    /// Separate, independently-bounded pool used only for server-side
-    /// cancellation (`KILL QUERY`).
-    cancel_pool: MySqlPool,
-    /// Separate, independently-bounded pool used only for the liveness
-    /// probe (see [`MySqlConnection::ping`]), so a probe can never be
-    /// blocked behind an in-flight query or a cancel request, nor block
-    /// either of those in turn.
-    probe_pool: MySqlPool,
+pub struct MySqlConnection(zsql_sqlx::SqlxConnection<MySql, MysqlDriver>);
+
+pub struct MySqlCancelHandle {
+    connection_id: u64,
 }
 
-/// Issue `KILL QUERY <id>` on a connection acquired fresh from
-/// `cancel_pool`. Best-effort: any failure (including the target connection
-/// having already finished on its own) is logged and swallowed here.
-#[tracing::instrument(name = "mysql_kill_query", skip(cancel_pool))]
-async fn issue_server_side_cancel(cancel_pool: &MySqlPool, connection_id: u64) {
-    // `KILL QUERY` is a server admin command, not reliably preparable as a
-    // parameterized statement across both engines, so `connection_id` (a
-    // `u64` this driver itself just read back from `SELECT CONNECTION_ID()`,
-    // never externally supplied text) is formatted directly into the raw SQL
-    // text instead of bound.
-    let sql = format!("KILL QUERY {connection_id}");
-    match sqlx::raw_sql(AssertSqlSafe(sql)).execute(cancel_pool).await {
-        Ok(_) => tracing::info!(connection_id, "server-side cancel issued"),
-        Err(err) => {
-            tracing::warn!(connection_id, error = %err, "server-side cancel request failed");
-        }
+impl CancelHandle<MySql> for MySqlCancelHandle {
+    async fn cancel(self, cancel_pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
+        // `KILL QUERY` is a server admin command, not reliably preparable as a
+        // parameterized statement across both engines, so `connection_id` (a
+        // `u64` this driver itself just read back from `SELECT CONNECTION_ID()`,
+        // never externally supplied text) is formatted directly into the raw SQL
+        // text instead of bound.
+        let sql = format!("KILL QUERY {}", self.connection_id);
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(cancel_pool)
+            .await?;
+        Ok(())
     }
-}
-
-/// Spawn [`issue_server_side_cancel`] as a detached background task so
-/// neither the query task (which may itself be about to return) nor the
-/// caller of `cancel()` has to wait for the cancel round-trip to complete.
-fn spawn_server_side_cancel(cancel_pool: &MySqlPool, connection_id: u64) {
-    let cancel_pool = cancel_pool.clone();
-    async_global_executor::spawn(async move {
-        issue_server_side_cancel(&cancel_pool, connection_id).await;
-    })
-    .detach();
 }
 
 #[async_trait]
 impl Connection for MySqlConnection {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
-        let (cancel_tx, cancel_rx) = flume::unbounded();
-        let pool = self.pool.clone();
-        let cancel_pool = self.cancel_pool.clone();
-        async_global_executor::spawn(run_query(pool, cancel_pool, sql, sink, cancel_rx)).detach();
-        QueryHandle::new(cancel_tx)
+        self.0.stream_query(sql, sink)
     }
 
-    #[tracing::instrument(name = "mysql_introspect", skip_all, fields(pool_size = self.pool.size()))]
+    #[tracing::instrument(name = "mysql_introspect", skip_all, fields(pool_size = self.0.pool().size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        crate::introspect::introspect(&self.pool).await
+        crate::introspect::introspect(self.0.pool()).await
     }
 
-    #[tracing::instrument(name = "mysql_ping", skip_all, fields(pool_size = self.probe_pool.size()))]
+    #[tracing::instrument(name = "mysql_ping", skip_all, fields(pool_size = self.0.probe_pool().size()))]
     async fn ping(&self) -> Result<(), CoreError> {
-        liveness_check(&self.probe_pool).await?;
+        liveness_check(self.0.probe_pool()).await?;
         Ok(())
     }
 
-    #[tracing::instrument(name = "mysql_count_rows", skip(self), fields(pool_size = self.pool.size()))]
+    #[tracing::instrument(name = "mysql_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(estimate) = fetch_table_rows_estimate(&self.pool, schema, relation).await? {
+        if let Some(estimate) = fetch_table_rows_estimate(self.0.pool(), schema, relation).await? {
             tracing::debug!(
                 estimate,
                 "using information_schema.TABLES row-count estimate"
@@ -245,21 +249,21 @@ impl Connection for MySqlConnection {
             "no reliable TABLE_ROWS estimate (view, or relation not found); \
              falling back to an exact count"
         );
-        let exact = exact_row_count(&self.pool, schema, relation).await?;
+        let exact = exact_row_count(self.0.pool(), schema, relation).await?;
         Ok(RowCount::Exact(exact))
     }
 
     #[tracing::instrument(
         name = "mysql_describe_relation",
         skip(self),
-        fields(pool_size = self.pool.size())
+        fields(pool_size = self.0.pool().size())
     )]
     async fn describe_relation(
         &self,
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
-        crate::describe::describe_relation(&self.pool, schema, relation).await
+        crate::describe::describe_relation(self.0.pool(), schema, relation).await
     }
 
     /// The click-to-preview query for `relation` in `schema`, capped at
@@ -292,12 +296,12 @@ async fn fetch_table_rows_estimate(
     .bind(relation)
     .fetch_optional(pool)
     .await
-    .map_err(map_query_error)?;
+    .map_err(map_sqlx_query_error)?;
 
     let Some(row) = row else {
         return Ok(None);
     };
-    let table_rows: Option<u64> = row.try_get("TABLE_ROWS").map_err(map_query_error)?;
+    let table_rows: Option<u64> = row.try_get("TABLE_ROWS").map_err(map_sqlx_query_error)?;
     Ok(table_rows)
 }
 
@@ -320,171 +324,8 @@ async fn exact_row_count(pool: &MySqlPool, schema: &str, relation: &str) -> Resu
     let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
-        .map_err(map_query_error)?;
+        .map_err(map_sqlx_query_error)?;
     Ok(u64::try_from(count).unwrap_or(0))
-}
-
-/// Stream a query's results into `sink`. `sql` may hold several statements;
-/// each result-producing statement emits its own [`QueryEvent::Columns`]
-/// followed by that set's [`QueryEvent::Batch`]es, and the whole stream ends
-/// with exactly one [`QueryEvent::Done`] -- or, on any failure, a single
-/// `Err` in place of `Done`. Every statement still executes (so all side
-/// effects happen); a fresh `Columns` event marks each set boundary so the
-/// consumer can keep only the last set rather than concatenating mismatched
-/// rows.
-///
-/// Runs on a single connection acquired from `pool` for the lifetime of this
-/// call (not the pool directly), so that connection's own id can be captured
-/// via `SELECT CONNECTION_ID()` *before* the row-streaming loop below ever
-/// starts checking `cancel_rx`.
-///
-/// Column metadata for `Columns` is taken from the first row any statement
-/// in `sql` produces. If no statement ever produces a row (DDL, DML without
-/// an output, or a zero-row `SELECT`), `MySQL`'s own wire protocol never sends
-/// column metadata separately from a row, so a describe is run as a
-/// fallback *after* execution has already completed successfully, purely to
-/// recover a zero-row `SELECT`'s column list; if that fallback describe
-/// itself fails, the query has already succeeded, so this degrades to
-/// reporting no columns rather than failing an otherwise-successful query.
-#[tracing::instrument(name = "mysql_stream_query", skip_all, fields(pool_size = pool.size()))]
-#[allow(clippy::too_many_lines)]
-async fn run_query(
-    pool: MySqlPool,
-    cancel_pool: MySqlPool,
-    sql: String,
-    sink: BatchSink,
-    cancel_rx: flume::Receiver<()>,
-) {
-    // The SQL text itself carries no connection secrets (those live only in
-    // the URL, never logged here), so it is fine to record at debug level.
-    tracing::debug!(sql = %sql, "streaming query");
-
-    let mut conn = match pool.acquire().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            let _ = sink.send_async(Err(map_query_error(err))).await;
-            return;
-        }
-    };
-
-    // Capture this connection's own id so a later cancel can target it via
-    // `KILL QUERY` on `cancel_pool`.
-    let connection_id = match sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
-        .fetch_one(&mut *conn)
-        .await
-    {
-        Ok(id) => {
-            tracing::debug!(connection_id = id, "dedicated connection id captured");
-            Some(id)
-        }
-        Err(err) => {
-            // Cooperative cancellation (the `select` loop below) still works
-            // without a known id; only the server-side `KILL QUERY` path is
-            // unavailable for this one query. Never fatal to the query
-            // itself.
-            tracing::warn!(
-                error = %err,
-                "failed to capture connection id; server-side cancel unavailable for this query"
-            );
-            None
-        }
-    };
-
-    let mut rows = sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_many(&mut *conn);
-    let mut batch = RowBatch::new();
-    let mut affected: u64 = 0;
-    // Whether the statement currently streaming has already announced its
-    // columns. Reset at each statement boundary so a following statement
-    // starts a new result set.
-    let mut columns_sent = false;
-    // Whether any statement in `sql` produced columns at all.
-    let mut any_columns_sent = false;
-
-    loop {
-        let step = futures::future::select(cancel_rx.recv_async(), rows.next());
-        match step.await {
-            futures::future::Either::Left(_) => {
-                // Cancelled: either an explicit `cancel()` call or every
-                // `QueryHandle` clone (hence every `cancel_tx`) was dropped.
-                tracing::debug!("query cancelled");
-                if let Some(connection_id) = connection_id {
-                    spawn_server_side_cancel(&cancel_pool, connection_id);
-                }
-                return;
-            }
-            futures::future::Either::Right((None, _)) => break,
-            futures::future::Either::Right((Some(Ok(sqlx::Either::Right(row))), _)) => {
-                if !columns_sent {
-                    let columns = column_metas(row.columns());
-                    if sink
-                        .send_async(Ok(QueryEvent::Columns(columns)))
-                        .await
-                        .is_err()
-                    {
-                        // Receiver already gone; no one left to stream rows to.
-                        return;
-                    }
-                    columns_sent = true;
-                    any_columns_sent = true;
-                }
-                batch.push(decode_row(&row));
-                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
-                    let full = std::mem::take(&mut batch);
-                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            futures::future::Either::Right((Some(Ok(sqlx::Either::Left(result))), _)) => {
-                // End of one statement. Flush its rows and reset the per-set
-                // latch so a following statement's rows form a new result
-                // set (the consumer keeps only the last) instead of being
-                // appended onto this one's columns.
-                if !batch.is_empty() {
-                    let full = std::mem::take(&mut batch);
-                    if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
-                        return;
-                    }
-                }
-                affected += result.rows_affected();
-                columns_sent = false;
-            }
-            futures::future::Either::Right((Some(Err(err)), _)) => {
-                let _ = sink.send_async(Err(map_query_error(err))).await;
-                return;
-            }
-        }
-    }
-
-    // A statement with no output columns (DDL, or DML without an output
-    // clause) reports its row count as `affected` in `Done`. A statement
-    // that does produce columns (SELECT, or DML with an output clause)
-    // instead lets the caller derive a count from the rows it already
-    // streamed, and reports `affected: None`.
-    let reports_affected = if any_columns_sent {
-        false
-    } else {
-        let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
-            Ok(statement) => column_metas(statement.columns()),
-            Err(_) => Vec::new(),
-        };
-        let reports_affected = columns.is_empty();
-        if sink
-            .send_async(Ok(QueryEvent::Columns(columns)))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        reports_affected
-    };
-
-    if !batch.is_empty() && sink.send_async(Ok(QueryEvent::Batch(batch))).await.is_err() {
-        return;
-    }
-
-    let affected = reports_affected.then_some(affected);
-    let _ = sink.send_async(Ok(QueryEvent::Done { affected })).await;
 }
 
 #[cfg(test)]
@@ -507,8 +348,8 @@ mod tests {
         let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
@@ -521,7 +362,10 @@ mod tests {
         let cfg = ConnConfig::from_url("mariadb://user:pass@zsql-test-nonexistent-host.invalid/db")
             .unwrap();
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
+        assert!(matches!(
+            result,
+            Err(zsql_core::CoreError::Connection { .. })
+        ));
     }
 
     #[test]
@@ -532,7 +376,10 @@ mod tests {
             tunnel_local_addr: None,
         };
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
+        assert!(matches!(
+            result,
+            Err(zsql_core::CoreError::Connection { .. })
+        ));
     }
 
     #[test]
@@ -553,8 +400,8 @@ mod tests {
         let conn = connection_for_test();
         let result = block_on(conn.introspect());
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(_) => panic!("introspecting an unreachable host must fail"),
@@ -566,8 +413,8 @@ mod tests {
         let conn = connection_for_test();
         let result = block_on(conn.ping());
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(()) => panic!("pinging an unreachable host must fail"),
@@ -584,11 +431,11 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
-        MySqlConnection {
+        MySqlConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
-        }
+        ))
     }
 
     #[test]
@@ -622,7 +469,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("stream_query must push exactly one event, not hang");
         match evt {
-            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            Err(zsql_core::CoreError::Query { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a single CoreError::Query, got {other:?}"),
         }
 
@@ -874,7 +721,7 @@ mod database_tests {
     fn stream_query_batches_large_result_sets_when_configured() {
         let conn = live_connection();
 
-        let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let row_count = zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let table = "zsql_test_batch_rows";
         seed_cross_join_source_table(&*conn, table);
         // A 4-way cross join of the 10-row helper table yields 10^4 =
@@ -894,7 +741,7 @@ mod database_tests {
             match recv(&rx) {
                 Ok(zsql_core::QueryEvent::Batch(batch)) => {
                     assert!(
-                        batch.len() <= super::DEFAULT_QUERY_BATCH_SIZE,
+                        batch.len() <= zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE,
                         "batch of {} rows exceeds the bound",
                         batch.len()
                     );
@@ -914,7 +761,7 @@ mod database_tests {
             batch_count >= 3,
             "expected at least 3 batches for {row_count} rows at a bound of \
              {}, got {batch_count}",
-            super::DEFAULT_QUERY_BATCH_SIZE
+            zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE
         );
 
         run_ddl(&*conn, &format!("DROP TABLE {table}"));
@@ -1411,7 +1258,7 @@ mod database_tests {
 
         let result = block_on(conn.describe_relation("zsql", "zsql_test_describe_missing"));
         assert!(
-            matches!(result, Err(zsql_core::CoreError::Introspection(_))),
+            matches!(result, Err(zsql_core::CoreError::Introspection { .. })),
             "expected a CoreError::Introspection, got {result:?}"
         );
     }

@@ -9082,6 +9082,7 @@ dependencies = [
  "sqlx",
  "tracing",
  "zsql-core",
+ "zsql-sqlx",
 ]
 
 [[package]]
@@ -9096,6 +9097,7 @@ dependencies = [
  "sqlx",
  "tracing",
  "zsql-core",
+ "zsql-sqlx",
 ]
 
 [[package]]
@@ -9104,6 +9106,19 @@ version = "0.0.0"
 dependencies = [
  "async-global-executor",
  "async-trait",
+ "flume 0.11.1",
+ "futures",
+ "sqlx",
+ "tracing",
+ "zsql-core",
+ "zsql-sqlx",
+]
+
+[[package]]
+name = "zsql-sqlx"
+version = "0.1.0"
+dependencies = [
+ "async-global-executor",
  "flume 0.11.1",
  "futures",
  "sqlx",

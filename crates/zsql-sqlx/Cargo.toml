@@ -1,22 +1,17 @@
 [package]
-name = "zsql-mysql"
-version = "0.0.0"
+name = "zsql-sqlx"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
 zsql-core = { path = "../zsql-core" }
-zsql-sqlx = { path = "../zsql-sqlx" }
 sqlx = { workspace = true }
-async-trait = { workspace = true }
-tracing = { workspace = true }
 flume = { workspace = true }
-futures = { workspace = true }
 async-global-executor = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
 
 [lints]
 workspace = true
-
-[features]
-driver-integration-tests = []

@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 zsql-core = { path = "../zsql-core" }
+zsql-sqlx = { path = "../zsql-sqlx" }
 # Own feature list, deliberately narrower than the workspace-shared `sqlx`
 # entry (which pulls in postgres + tls-rustls + chrono/uuid/json/bigdecimal
 # for zsql-postgres): SQLite is file-based with no network/TLS surface, and

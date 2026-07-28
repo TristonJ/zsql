@@ -377,7 +377,7 @@ impl ConnectionForm {
     pub fn ssh_state(&self, cx: &App) -> (Option<StoredSsh>, Option<String>) {
         let is_network_driver = self
             .pending_driver_id()
-            .is_ok_and(crate::drivers::is_network);
+            .is_ok_and(|id| crate::drivers::is_network(id).unwrap_or_default());
         if !self.ssh_enabled || !is_network_driver {
             return (None, None);
         }

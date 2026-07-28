@@ -55,6 +55,18 @@ pub trait Driver: Send + Sync {
     /// Human-readable backend name, e.g. `"PostgreSQL"`.
     fn display_name(&self) -> &'static str;
 
+    /// What port does this backend use by default? None - for backends that don't use a
+    /// network port
+    fn default_port(&self) -> Option<u16>;
+
+    /// Specify if this driver is networked - defaults to `default_port().is_some()`
+    fn is_networked(&self) -> bool {
+        self.default_port().is_some()
+    }
+
+    /// What URL scheme's does this backend recognize? e.g. `["postgres", "postgresql"]`.
+    fn url_schemes(&self) -> &[&'static str];
+
     /// Parse a URL into a [`ConnConfig`] for this backend.
     ///
     /// # Errors

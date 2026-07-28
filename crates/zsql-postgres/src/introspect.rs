@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use sqlx::postgres::{PgConnection, PgPool};
 use sqlx::{AssertSqlSafe, Row as _};
 use zsql_core::{Catalog, ColumnMeta, CoreError, Relation, RelationKind, SchemaNs, SchemaTree};
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// Shared `WHERE` fragment excluding system schemas from every query below:
 /// the system catalog itself, the SQL-standard `information_schema` view
@@ -24,7 +23,7 @@ const NAMESPACE_FILTER: &str = "n.nspname NOT IN ('pg_catalog', 'information_sch
 /// Returns [`CoreError::Introspection`] if opening the snapshot transaction,
 /// any of the underlying queries, or committing that transaction fails.
 pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
-    let mut tx = pool.begin().await.map_err(map_introspect_error)?;
+    let mut tx = pool.begin().await.map_err(map_sqlx_introspect_error)?;
     // Plain `BEGIN` defaults to READ WRITE READ COMMITTED, which lets each
     // statement in the transaction see a fresh (and potentially different)
     // snapshot of the catalog. REPEATABLE READ pins one snapshot for every
@@ -32,7 +31,7 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let catalog_name = current_database(&mut tx).await?;
     let schema_names = schema_names(&mut tx).await?;
@@ -41,7 +40,7 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
 
     // The transaction only ever read, so commit vs. rollback would leave the
     // database in the same state either way
-    tx.rollback().await.map_err(map_introspect_error)?;
+    tx.rollback().await.map_err(map_sqlx_introspect_error)?;
 
     let schemas = schema_names
         .into_iter()
@@ -71,7 +70,7 @@ async fn current_database(conn: &mut PgConnection) -> Result<String, CoreError> 
     sqlx::query_scalar("SELECT current_database()")
         .fetch_one(conn)
         .await
-        .map_err(map_introspect_error)
+        .map_err(map_sqlx_introspect_error)
 }
 
 /// Every non-system schema, sorted by name
@@ -88,7 +87,7 @@ async fn schema_names(conn: &mut PgConnection) -> Result<Vec<String>, CoreError>
     sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
-        .map_err(map_introspect_error)
+        .map_err(map_sqlx_introspect_error)
 }
 
 /// Every table, view, and materialized view across all non-system schemas,
@@ -107,13 +106,13 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let mut grouped: HashMap<String, Vec<Relation>> = HashMap::new();
     for row in &rows {
-        let schema: String = row.try_get("nspname").map_err(map_introspect_error)?;
-        let name: String = row.try_get("relname").map_err(map_introspect_error)?;
-        let relkind: String = row.try_get("relkind").map_err(map_introspect_error)?;
+        let schema: String = row.try_get("nspname").map_err(map_sqlx_introspect_error)?;
+        let name: String = row.try_get("relname").map_err(map_sqlx_introspect_error)?;
+        let relkind: String = row.try_get("relkind").map_err(map_sqlx_introspect_error)?;
         let Some(kind) = relation_kind(&relkind) else {
             continue;
         };
@@ -159,15 +158,17 @@ async fn columns(
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(conn)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let mut grouped: HashMap<(String, String), Vec<ColumnMeta>> = HashMap::new();
     for row in &rows {
-        let schema: String = row.try_get("nspname").map_err(map_introspect_error)?;
-        let relation: String = row.try_get("relname").map_err(map_introspect_error)?;
-        let name: String = row.try_get("attname").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("type_name").map_err(map_introspect_error)?;
-        let nullable: bool = row.try_get("nullable").map_err(map_introspect_error)?;
+        let schema: String = row.try_get("nspname").map_err(map_sqlx_introspect_error)?;
+        let relation: String = row.try_get("relname").map_err(map_sqlx_introspect_error)?;
+        let name: String = row.try_get("attname").map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row
+            .try_get("type_name")
+            .map_err(map_sqlx_introspect_error)?;
+        let nullable: bool = row.try_get("nullable").map_err(map_sqlx_introspect_error)?;
         grouped
             .entry((schema, relation))
             .or_default()

@@ -1,16 +1,19 @@
-//! Mapping from `sqlx::Error` to the driver-agnostic [`zsql_core::CoreError`].
+use std::sync::Arc;
 
 use zsql_core::CoreError;
 
-/// Convert a `sqlx::Error` encountered while establishing (or verifying) a
-/// connection into a [`CoreError::Connection`], with a short, useful
-/// description.
-pub(crate) fn map_connect_error(err: sqlx::Error) -> CoreError {
-    CoreError::Connection(describe(err))
+/// Map a [`sqlx::Error`] into a [`CoreError::Connection`]
+#[must_use]
+pub fn map_sqlx_connection_error(err: sqlx::Error) -> CoreError {
+    CoreError::Connection {
+        message: describe_connection_error(&err),
+        transient: is_connection_error_transient(&err),
+        source: Some(Arc::new(err)),
+    }
 }
 
 /// Render a short, useful description of a connect-phase sqlx error.
-fn describe(err: sqlx::Error) -> String {
+fn describe_connection_error(err: &sqlx::Error) -> String {
     match err {
         sqlx::Error::Database(db_err) => {
             format!("database rejected connection: {}", db_err.message())
@@ -27,14 +30,33 @@ fn describe(err: sqlx::Error) -> String {
     }
 }
 
-/// Convert a `sqlx::Error` encountered while streaming a query's results
-/// into a [`CoreError::Query`], with a short, useful description.
-pub(crate) fn map_query_error(err: sqlx::Error) -> CoreError {
-    CoreError::Query(describe_query(err))
+/// Whether a connection error is possibly transient
+fn is_connection_error_transient(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::WorkerCrashed
+    )
+}
+
+/// Convert a [`sqlx::Error`] into a [`CoreError::Query`]
+#[must_use]
+pub fn map_sqlx_query_error(err: sqlx::Error) -> CoreError {
+    CoreError::Query {
+        message: describe_query_error(&err),
+        code: err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.to_string()),
+        position: query_error_position(&err),
+        source: Some(Arc::new(err)),
+    }
 }
 
 /// Render a short, useful description of a query-phase sqlx error.
-fn describe_query(err: sqlx::Error) -> String {
+fn describe_query_error(err: &sqlx::Error) -> String {
     match err {
         sqlx::Error::Database(db_err) => {
             format!("database rejected query: {}", db_err.message())
@@ -53,14 +75,33 @@ fn describe_query(err: sqlx::Error) -> String {
     }
 }
 
+/// Try to get the character offset of the error from a [`sqlx::Error`], if available.
+fn query_error_position(err: &sqlx::Error) -> Option<usize> {
+    if let Some(pg_err) = err
+        .as_database_error()
+        .and_then(|e| e.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+    {
+        return pg_err.position().map(|pos| match pos {
+            sqlx::postgres::PgErrorPosition::Original(n) => n,
+            sqlx::postgres::PgErrorPosition::Internal { position, .. } => position,
+        });
+    }
+
+    None
+}
+
 /// Convert a `sqlx::Error` encountered while introspecting the schema into a
 /// [`CoreError::Introspection`], with a short, useful description.
-pub(crate) fn map_introspect_error(err: sqlx::Error) -> CoreError {
-    CoreError::Introspection(describe_introspect(err))
+#[must_use]
+pub fn map_sqlx_introspect_error(err: sqlx::Error) -> CoreError {
+    CoreError::Introspection {
+        message: describe_introspect_error(&err),
+        source: Some(Arc::new(err)),
+    }
 }
 
 /// Render a short, useful description of an introspection-phase sqlx error.
-fn describe_introspect(err: sqlx::Error) -> String {
+fn describe_introspect_error(err: &sqlx::Error) -> String {
     match err {
         sqlx::Error::Database(db_err) => {
             format!(
@@ -84,32 +125,34 @@ fn describe_introspect(err: sqlx::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_connect_error, map_introspect_error, map_query_error};
+    use crate::error::map_sqlx_query_error;
+
+    use super::{map_sqlx_connection_error, map_sqlx_introspect_error};
     use zsql_core::CoreError;
 
     #[test]
     fn pool_timed_out_maps_to_connection_error_with_useful_message() {
-        let mapped = map_connect_error(sqlx::Error::PoolTimedOut);
+        let mapped = map_sqlx_connection_error(sqlx::Error::PoolTimedOut);
         match mapped {
-            CoreError::Connection(msg) => assert!(msg.contains("timed out")),
+            CoreError::Connection { message, .. } => assert!(message.contains("timed out")),
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
     }
 
     #[test]
     fn pool_closed_maps_to_connection_error() {
-        let mapped = map_connect_error(sqlx::Error::PoolClosed);
-        assert!(matches!(mapped, CoreError::Connection(_)));
+        let mapped = map_sqlx_connection_error(sqlx::Error::PoolClosed);
+        assert!(matches!(mapped, CoreError::Connection { .. }));
     }
 
     #[test]
     fn io_error_maps_to_connection_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
-        let mapped = map_connect_error(sqlx::Error::Io(io_err));
+        let mapped = map_sqlx_connection_error(sqlx::Error::Io(io_err));
         match mapped {
-            CoreError::Connection(msg) => {
-                assert_eq!(msg, "network error: connect failed: connection refused");
-                assert!(!msg.contains("mysql://"));
+            CoreError::Connection { message, .. } => {
+                assert_eq!(message, "network error: connect failed: connection refused");
+                assert!(!message.contains("postgres://"));
             }
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
@@ -118,27 +161,29 @@ mod tests {
     #[test]
     fn configuration_error_maps_to_connection_error() {
         let cfg_err: sqlx::error::BoxDynError = "bad ssl mode".into();
-        let mapped = map_connect_error(sqlx::Error::Configuration(cfg_err));
+        let mapped = map_sqlx_connection_error(sqlx::Error::Configuration(cfg_err));
         match mapped {
-            CoreError::Connection(msg) => assert!(msg.contains("invalid connection configuration")),
+            CoreError::Connection { message, .. } => {
+                assert!(message.contains("invalid connection configuration"));
+            }
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
     }
 
     #[test]
     fn row_not_found_maps_to_query_error() {
-        let mapped = map_query_error(sqlx::Error::RowNotFound);
+        let mapped = map_sqlx_query_error(sqlx::Error::RowNotFound);
         match mapped {
-            CoreError::Query(msg) => assert!(msg.contains("no rows")),
+            CoreError::Query { message, .. } => assert!(message.contains("no rows")),
             other => panic!("expected CoreError::Query, got {other:?}"),
         }
     }
 
     #[test]
     fn column_not_found_maps_to_query_error_with_column_name() {
-        let mapped = map_query_error(sqlx::Error::ColumnNotFound("email".to_owned()));
+        let mapped = map_sqlx_query_error(sqlx::Error::ColumnNotFound("email".to_owned()));
         match mapped {
-            CoreError::Query(msg) => assert!(msg.contains("email")),
+            CoreError::Query { message, .. } => assert!(message.contains("email")),
             other => panic!("expected CoreError::Query, got {other:?}"),
         }
     }
@@ -146,11 +191,11 @@ mod tests {
     #[test]
     fn io_error_maps_to_query_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
-        let mapped = map_query_error(sqlx::Error::Io(io_err));
+        let mapped = map_sqlx_query_error(sqlx::Error::Io(io_err));
         match mapped {
-            CoreError::Query(msg) => {
-                assert_eq!(msg, "network error: connect failed: connection refused");
-                assert!(!msg.contains("mysql://"));
+            CoreError::Query { message, .. } => {
+                assert_eq!(message, "network error: connect failed: connection refused");
+                assert!(!message.contains("postgres://"));
             }
             other => panic!("expected CoreError::Query, got {other:?}"),
         }
@@ -158,15 +203,15 @@ mod tests {
 
     #[test]
     fn pool_timed_out_maps_to_query_error() {
-        let mapped = map_query_error(sqlx::Error::PoolTimedOut);
-        assert!(matches!(mapped, CoreError::Query(_)));
+        let mapped = map_sqlx_query_error(sqlx::Error::PoolTimedOut);
+        assert!(matches!(mapped, CoreError::Query { .. }));
     }
 
     #[test]
     fn pool_timed_out_maps_to_introspection_error_with_useful_message() {
-        let mapped = map_introspect_error(sqlx::Error::PoolTimedOut);
+        let mapped = map_sqlx_introspect_error(sqlx::Error::PoolTimedOut);
         match mapped {
-            CoreError::Introspection(msg) => assert!(msg.contains("timed out")),
+            CoreError::Introspection { message, .. } => assert!(message.contains("timed out")),
             other => panic!("expected CoreError::Introspection, got {other:?}"),
         }
     }
@@ -174,11 +219,11 @@ mod tests {
     #[test]
     fn io_error_maps_to_introspection_error_with_network_prefix_and_no_added_url() {
         let io_err = std::io::Error::other("connect failed: connection refused");
-        let mapped = map_introspect_error(sqlx::Error::Io(io_err));
+        let mapped = map_sqlx_introspect_error(sqlx::Error::Io(io_err));
         match mapped {
-            CoreError::Introspection(msg) => {
-                assert_eq!(msg, "network error: connect failed: connection refused");
-                assert!(!msg.contains("mysql://"));
+            CoreError::Introspection { message, .. } => {
+                assert_eq!(message, "network error: connect failed: connection refused");
+                assert!(!message.contains("postgres://"));
             }
             other => panic!("expected CoreError::Introspection, got {other:?}"),
         }

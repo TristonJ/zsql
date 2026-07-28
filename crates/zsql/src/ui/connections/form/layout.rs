@@ -40,7 +40,9 @@ impl ConnectionForm {
     /// How many columns the form currently renders as -- see
     /// [`form_columns`].
     pub(crate) fn form_columns(&self) -> FormColumns {
-        let is_network_driver = self.pending_driver_id().is_ok_and(is_network);
+        let is_network_driver = self
+            .pending_driver_id()
+            .is_ok_and(|d| is_network(d).unwrap_or_default());
         form_columns(self.ssh_enabled, is_network_driver)
     }
 

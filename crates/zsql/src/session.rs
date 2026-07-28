@@ -15,20 +15,6 @@ use zsql_core::{
 use crate::config::Config;
 use crate::drivers;
 
-/// The standard port a network driver's URL falls back to when it names no
-/// explicit port of its own, keyed by [`crate::drivers::detect_driver_id`]'s
-/// id. Only consulted when opening a tunnel: the tunnel's remote endpoint
-/// must be a concrete host and port even if the URL never spelled the port
-/// out.
-fn default_port_for_driver(driver_id: &str) -> Option<u16> {
-    match driver_id {
-        "postgres" => Some(5432),
-        "mysql" => Some(3306),
-        "mssql" => Some(1433),
-        _ => None,
-    }
-}
-
 /// Anything with the same drop-driven lifecycle contract as an open SSH
 /// tunnel: dropping it must tear the tunnel down, and it exposes the local
 /// loopback address a driver should dial instead of the real remote host.
@@ -652,8 +638,9 @@ impl Session {
         cx: &Context<Self>,
     ) -> Task<Result<RelationSchema, CoreError>> {
         let Some(connection) = self.connection.clone() else {
-            return Task::ready(Err(CoreError::Connection(
+            return Task::ready(Err(CoreError::connection(
                 "cannot describe relation: not connected".to_owned(),
+                false,
             )));
         };
         let schema = schema.to_owned();
@@ -675,8 +662,9 @@ impl Session {
         cx: &Context<Self>,
     ) -> Task<Result<RowCount, CoreError>> {
         let Some(connection) = self.connection.clone() else {
-            return Task::ready(Err(CoreError::Connection(
+            return Task::ready(Err(CoreError::connection(
                 "cannot fetch row count: not connected".to_owned(),
+                false,
             )));
         };
         let schema = schema.to_owned();
@@ -821,7 +809,7 @@ pub(crate) async fn open_tunnel_and_connect(
     tracing::info!("opening ssh tunnel before connect");
     let tunnel = zsql_ssh::open_tunnel(ssh_cfg, remote_host, remote_port)
         .await
-        .map_err(|err| CoreError::Connection(err.to_string()))?;
+        .map_err(|err| CoreError::connection(err.to_string(), false))?;
 
     let (conn, tunnel) = connect_through_open_tunnel(url, Box::new(tunnel)).await?;
     Ok((conn, Some(tunnel)))
@@ -855,12 +843,9 @@ fn remote_target(url: &str) -> Result<(String, u16), CoreError> {
     })?;
     let port = match parsed.port() {
         Some(port) => port,
-        None => drivers::detect_driver_id(url)
-            .ok()
-            .and_then(default_port_for_driver)
-            .ok_or_else(|| {
-                CoreError::Url("an SSH tunnel requires an explicit port for this URL".to_owned())
-            })?,
+        None => drivers::detect_driver_default_port(url)?.ok_or_else(|| {
+            CoreError::Url("an SSH tunnel requires an explicit port for this URL".to_owned())
+        })?,
     };
     Ok((host, port))
 }
@@ -1098,7 +1083,7 @@ mod tests {
 
     use super::{
         Config, FakeTunnel, Session, SessionState, TunnelHandle, connect_through_open_tunnel,
-        default_port_for_driver, remote_target,
+        remote_target,
     };
 
     fn session_with_no_url() -> Session {
@@ -1297,7 +1282,7 @@ mod tests {
         let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
-        session.apply_query_event(Err(CoreError::Query(
+        session.apply_query_event(Err(CoreError::query(
             "syntax error at or near \"selct\"".to_owned(),
         )));
 
@@ -1434,14 +1419,6 @@ mod tests {
         assert!(remote_target("redis://host/db").is_err());
     }
 
-    #[test]
-    fn default_port_for_driver_covers_every_network_driver() {
-        assert_eq!(default_port_for_driver("postgres"), Some(5432));
-        assert_eq!(default_port_for_driver("mysql"), Some(3306));
-        assert_eq!(default_port_for_driver("mssql"), Some(1433));
-        assert_eq!(default_port_for_driver("sqlite"), None);
-    }
-
     /// A tunnel that opened successfully but whose driver connect then fails
     /// must be torn down as part of that same failed attempt: the returned
     /// error must not carry the tunnel forward, and the fake's drop must
@@ -1496,8 +1473,9 @@ mod tests {
 mod gpui_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use zsql_core::{
         BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
         RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
@@ -1975,17 +1953,19 @@ mod gpui_tests {
             match &self.introspect_outcome {
                 FakeIntrospectOutcome::Ready(tree) => Ok(tree.clone()),
                 FakeIntrospectOutcome::Failed(message) => {
-                    Err(CoreError::Introspection(message.clone()))
+                    Err(CoreError::introspection(message.clone()))
                 }
             }
         }
 
         async fn ping(&self) -> Result<(), CoreError> {
             self.ping_calls.fetch_add(1, Ordering::SeqCst);
-            self.ping_rx
-                .recv_async()
-                .await
-                .unwrap_or_else(|_| Err(CoreError::Connection("fake connection closed".to_owned())))
+            self.ping_rx.recv_async().await.unwrap_or_else(|_| {
+                Err(CoreError::connection(
+                    "fake connection closed".to_owned(),
+                    false,
+                ))
+            })
         }
 
         async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
@@ -2002,7 +1982,7 @@ mod gpui_tests {
                 .lock()
                 .expect("count_outcome lock poisoned")
                 .clone()
-                .map_err(CoreError::Query)
+                .map_err(CoreError::query)
         }
 
         async fn describe_relation(
@@ -2135,7 +2115,10 @@ mod gpui_tests {
         });
 
         ping_sender
-            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .send(Err(CoreError::connection(
+                "connection reset".to_owned(),
+                false,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2173,7 +2156,10 @@ mod gpui_tests {
         });
 
         ping_sender
-            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .send(Err(CoreError::connection(
+                "connection reset".to_owned(),
+                true,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2354,7 +2340,10 @@ mod gpui_tests {
 
         // The fresh connection's own first tick, however, must be honored.
         fresh_ping
-            .send(Err(CoreError::Connection("fresh probe failed".to_owned())))
+            .send(Err(CoreError::connection(
+                "fresh probe failed".to_owned(),
+                false,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2552,7 +2541,7 @@ mod gpui_tests {
             let sinks = sinks.lock().expect("sinks lock poisoned");
             sinks[0].clone()
         };
-        sink.send(Err(CoreError::Query("syntax error".to_owned())))
+        sink.send(Err(CoreError::query("syntax error".to_owned())))
             .expect("sink send failed");
         cx.run_until_parked();
 
@@ -3102,20 +3091,9 @@ mod gpui_tests {
 
         task.await;
     }
-}
-
-/// Live-database end-to-end tests
-#[cfg(test)]
-mod live_tests {
-    use std::time::Duration;
-
-    use gpui::{AppContext as _, Entity, TestAppContext};
-    use zsql_core::Value;
-
-    use super::{Config, LivenessState, SchemaState, Session, SessionState};
 
     /// In-memory driver for the live end-to-end tests
-    fn live_database_url() -> String {
+    fn in_memory_database_url() -> String {
         "sqlite::memory:".to_string()
     }
 
@@ -3177,7 +3155,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3243,7 +3221,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3304,7 +3282,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3328,7 +3306,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3368,7 +3346,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 
@@ -3437,7 +3415,7 @@ mod live_tests {
         let session = cx.new(|_cx| Session::new(&cfg));
         session
             .update(cx, |session, cx| {
-                session.connect_to(live_database_url(), cx)
+                session.connect_to(in_memory_database_url(), cx)
             })
             .await;
 

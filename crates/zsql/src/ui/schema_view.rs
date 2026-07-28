@@ -1204,7 +1204,7 @@ mod render_tests {
         ) -> Result<RelationSchema, zsql_core::CoreError> {
             self.outcome
                 .clone()
-                .map_err(zsql_core::CoreError::Introspection)
+                .map_err(zsql_core::CoreError::introspection)
         }
     }
 

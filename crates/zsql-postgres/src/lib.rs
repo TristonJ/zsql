@@ -2,9 +2,8 @@
 
 mod describe;
 mod driver;
-mod error;
 mod introspect;
 mod tunnel;
 mod values;
 
-pub use driver::{PgConnection, PostgresDriver, spike_select_one};
+pub use driver::{PgConnection, PostgresDriver};

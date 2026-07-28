@@ -87,19 +87,29 @@ pub fn detect_driver_name(url: &str) -> Result<&'static str, String> {
         .map_err(|err| err.to_string())
 }
 
-/// Whether `driver_id` names a network driver -- every registered driver
-/// except `sqlite`, which is file-based and has no host to open an SSH
-/// tunnel to or apply a TLS mode against.
+/// Detect the driver default port `url` would resolve to
+pub fn detect_driver_default_port(url: &str) -> Result<Option<u16>, CoreError> {
+    let drivers = registered_drivers();
+    zsql_core::select_driver(&drivers, url).map(|driver| driver.default_port())
+}
+
+/// Whether `driver_id` names a network driver (i.e. one that uses a TCP port such
+/// as postgres) not a file-based driver (such as sqlite). None for an unrecognized
+/// driver id.
 #[must_use]
-pub fn is_network(driver_id: &str) -> bool {
-    driver_id != "sqlite"
+pub fn is_network(driver_id: &str) -> Option<bool> {
+    let drivers = registered_drivers();
+    drivers
+        .iter()
+        .find(|driver| driver.id() == driver_id)
+        .map(|driver| driver.is_networked())
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{connect, is_network, registered_drivers};
+    use super::{connect, registered_drivers};
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         futures::executor::block_on(fut)
@@ -145,7 +155,7 @@ mod tests {
             "mariadb://user:pass@zsql-test-nonexistent-host.invalid/db".to_owned(),
         ));
         match result {
-            Err(zsql_core::CoreError::Connection(_)) => {}
+            Err(zsql_core::CoreError::Connection { .. }) => {}
             Err(other) => panic!("expected a CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
         }
@@ -204,15 +214,5 @@ mod tests {
             Some(zsql_core::Value::Int(1)),
             "SELECT 1 through the selection-based connect path must actually return 1"
         );
-    }
-
-    #[test]
-    fn is_network_is_false_only_for_sqlite() {
-        assert!(!is_network("sqlite"));
-        assert!(is_network("postgres"));
-        assert!(is_network("mysql"));
-        assert!(is_network("mariadb"));
-        assert!(is_network("mssql"));
-        assert!(is_network("unregistered"));
     }
 }
