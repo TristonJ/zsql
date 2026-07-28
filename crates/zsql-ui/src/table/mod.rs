@@ -12,9 +12,11 @@
 
 mod builder;
 mod column;
+mod debug;
 mod gutter;
 mod layout;
 pub mod measure;
+mod render;
 mod resize;
 mod row;
 mod state;
@@ -28,7 +30,7 @@ pub use state::TableState;
 pub use style::{TableBorders, TableStyle};
 
 #[cfg(any(test, feature = "test-support"))]
-pub use builder::{
+pub use debug::{
     body_first_cell_debug_selector, gutter_first_cell_debug_selector,
     header_first_cell_debug_selector,
 };

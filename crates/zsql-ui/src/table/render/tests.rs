@@ -7,15 +7,13 @@ use gpui::{
     TouchPhase, Window, div, point, prelude::*, px,
 };
 
-use super::{
-    Table, body_first_cell_debug_selector, gutter_first_cell_debug_selector,
-    header_first_cell_debug_selector,
-};
 use crate::scrollable::{
     ScrollbarStyle, horizontal_thumb_debug_selector, vertical_thumb_debug_selector,
 };
 use crate::table::{
-    Gutter, RowNumberStyle, TableBorders, TableColumn, TableRow, TableState, TableStyle,
+    Gutter, RowNumberStyle, Table, TableBorders, TableColumn, TableRow, TableState, TableStyle,
+    body_first_cell_debug_selector, gutter_first_cell_debug_selector,
+    header_first_cell_debug_selector,
 };
 
 const COLUMN_WIDTH: f32 = 300.0;
