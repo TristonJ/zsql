@@ -31,7 +31,9 @@ pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
     REGISTERED_DRIVERS.clone()
 }
 
-/// Resolve `url`'s scheme to a registered driver and connect through it.
+/// Resolve `url`'s scheme to a registered driver and connect through it,
+/// with the resulting connection's row-batching set to `batch_size`
+/// (typically the app's configured `query.batch_size`).
 ///
 /// `url` is taken by value (rather than `&str`) so the returned future is
 /// self-contained and can be driven on a background executor without
@@ -42,19 +44,21 @@ pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
 /// registered driver, or whatever error the selected driver's own
 /// `parse_url`/`connect` returns.
 #[tracing::instrument(name = "connect_via_selected_driver", skip_all)]
-pub async fn connect(url: String) -> Result<Box<dyn Connection>, CoreError> {
+pub async fn connect(url: String, batch_size: usize) -> Result<Box<dyn Connection>, CoreError> {
     let drivers = registered_drivers();
     let driver = zsql_core::select_driver(&drivers, &url)?;
     tracing::info!(driver = driver.id(), "driver selected for connection");
-    let cfg = driver.parse_url(&url)?;
+    let mut cfg = driver.parse_url(&url)?;
+    cfg.batch_size = batch_size;
     driver.connect(&cfg).await
 }
 
 /// Resolve `url`'s scheme to a registered driver and connect through it,
 /// dialing `tunnel_addr` (an already-open local tunnel's loopback address)
-/// instead of `url`'s own host:port. Each registered driver translates this
-/// into its own client library's terms -- see each driver crate's `tunnel`
-/// module for the specifics.
+/// instead of `url`'s own host:port, with the resulting connection's
+/// row-batching set to `batch_size`. Each registered driver translates the
+/// tunnel dial into its own client library's terms -- see each driver
+/// crate's `tunnel` module for the specifics.
 ///
 /// # Errors
 /// Returns [`CoreError::Url`] if `url` is empty or its scheme has no
@@ -64,6 +68,7 @@ pub async fn connect(url: String) -> Result<Box<dyn Connection>, CoreError> {
 pub async fn connect_tunneled(
     url: String,
     tunnel_addr: SocketAddr,
+    batch_size: usize,
 ) -> Result<Box<dyn Connection>, CoreError> {
     let drivers = registered_drivers();
     let driver = zsql_core::select_driver(&drivers, &url)?;
@@ -73,6 +78,7 @@ pub async fn connect_tunneled(
     );
     let mut cfg = driver.parse_url(&url)?;
     cfg.tunnel_local_addr = Some(tunnel_addr);
+    cfg.batch_size = batch_size;
     driver.connect(&cfg).await
 }
 
@@ -148,8 +154,11 @@ mod tests {
     #[test]
     fn connect_opens_a_sqlite_in_memory_database_through_selection() {
         let _guard = crate::test_support::serialize_real_io();
-        let conn = block_on(connect("sqlite::memory:".to_owned()))
-            .expect("sqlite connect through selection should succeed");
+        let conn = block_on(connect(
+            "sqlite::memory:".to_owned(),
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+        ))
+        .expect("sqlite connect through selection should succeed");
         drop(conn);
     }
 
@@ -162,6 +171,7 @@ mod tests {
         // failed to actually reach the host.
         let result = block_on(connect(
             "mariadb://user:pass@zsql-test-nonexistent-host.invalid/db".to_owned(),
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ));
         match result {
             Err(zsql_core::CoreError::Connection { .. }) => {}
@@ -172,7 +182,10 @@ mod tests {
 
     #[test]
     fn connect_rejects_an_unrecognized_scheme_without_naming_the_full_url() {
-        let result = block_on(connect("cassandra://secret-password@host/db".to_owned()));
+        let result = block_on(connect(
+            "cassandra://secret-password@host/db".to_owned(),
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+        ));
         match result {
             Err(zsql_core::CoreError::Url(message)) => {
                 assert!(message.contains("cassandra"), "message: {message}");
@@ -190,7 +203,7 @@ mod tests {
 
     #[test]
     fn connect_rejects_an_empty_url_with_a_url_error() {
-        let result = block_on(connect(String::new()));
+        let result = block_on(connect(String::new(), zsql_core::DEFAULT_QUERY_BATCH_SIZE));
         assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));
     }
 
@@ -200,7 +213,8 @@ mod tests {
         let url = "sqlite::memory:".to_string();
         let _guard = crate::test_support::serialize_real_io();
 
-        let conn = block_on(connect(url)).expect("connect through selection should succeed");
+        let conn = block_on(connect(url, zsql_core::DEFAULT_QUERY_BATCH_SIZE))
+            .expect("connect through selection should succeed");
 
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query("SELECT 1 AS one".to_owned(), tx);

@@ -13,8 +13,10 @@ pub mod sql;
 pub mod tls_verify;
 pub mod value;
 
-pub use config::ConnConfig;
-pub use connection_url::{ConnectionUrl, rewrite_for_tunnel};
+pub use config::{ConnConfig, DEFAULT_QUERY_BATCH_SIZE};
+pub use connection_url::{
+    ConnectionUrl, SslModeSpelling, rewrite_for_tunnel, tunneled_connect_url_capping_verify_full,
+};
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
 pub use registry::select_driver;

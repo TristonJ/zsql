@@ -17,6 +17,7 @@
 //! so has no host/port/user/password/database fields at all.
 
 use crate::error::CoreError;
+use crate::tls_verify::TlsVerify;
 
 /// A parsed connection URL, editable field-by-field and always
 /// reserializable back to a URL string.
@@ -386,9 +387,93 @@ pub fn rewrite_for_tunnel(
     Ok(parsed.to_url_string())
 }
 
+/// The TLS-verification query parameter a network driver's connect URL uses,
+/// and the value spellings it recognizes. Different drivers accept
+/// different names and value spellings for the same underlying two intents
+/// (verify the certificate chain and the hostname, or the chain only), so
+/// [`tunneled_connect_url_capping_verify_full`] takes this rather than
+/// hard-coding either.
+#[derive(Debug, Clone, Copy)]
+pub struct SslModeSpelling {
+    /// Query parameter names accepted for this intent, in priority order: the
+    /// first one present on the URL wins. A driver that accepts more than one
+    /// spelling (e.g. a current name plus a legacy alias) lists both.
+    pub param_names: &'static [&'static str],
+    /// The value meaning "verify the certificate chain and the hostname".
+    pub verify_full: &'static str,
+    /// The value meaning "verify the certificate chain only".
+    pub verify_ca: &'static str,
+}
+
+impl SslModeSpelling {
+    /// Read whichever of [`Self::param_names`] is present first off `url`
+    /// and translate its value to a [`TlsVerify`] intent. Value comparison is
+    /// case-insensitive. Anything other than [`Self::verify_full`]/
+    /// [`Self::verify_ca`] (including no matching parameter at all) is
+    /// [`TlsVerify::Off`]: those modes either use no TLS or accept whatever
+    /// certificate the server presents, so there is nothing extra to
+    /// preserve for them here.
+    #[must_use]
+    fn requested_verify(&self, url: &ConnectionUrl) -> TlsVerify {
+        let value = self
+            .param_names
+            .iter()
+            .find_map(|name| url.query_param(name))
+            .map(|value| value.to_ascii_lowercase());
+        match value.as_deref() {
+            Some(v) if v == self.verify_full => TlsVerify::VerifyFull,
+            Some(v) if v == self.verify_ca => TlsVerify::VerifyCa,
+            _ => TlsVerify::Off,
+        }
+    }
+}
+
+/// Build the URL a network driver should actually connect with when
+/// `original` requested a tunnel whose local address is `tunnel_addr`, and
+/// report which [`TlsVerify`] level that URL will end up requesting.
+///
+/// Several sqlx-based client libraries resolve a connect URL's host to a
+/// single dial target that is also the identity a `verify-full`-style
+/// certificate check runs against, with no hook to dial one address while
+/// verifying identity against another. A tunneled connection that requested
+/// full identity verification is therefore capped to certificate-chain-only
+/// verification instead of silently losing verification entirely: the SSH
+/// transport itself already authenticates the server being tunneled to.
+/// Every other request (absent, disabled, or already chain-only) uses the
+/// plain fallback rewrite of host and port via [`rewrite_for_tunnel`],
+/// unchanged beyond that.
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `original` cannot be parsed, or has no host.
+pub fn tunneled_connect_url_capping_verify_full(
+    original: &str,
+    tunnel_addr: std::net::SocketAddr,
+    sslmode: &SslModeSpelling,
+) -> Result<(String, TlsVerify), CoreError> {
+    let parsed = ConnectionUrl::parse(original)?;
+    let requested = sslmode.requested_verify(&parsed);
+
+    match requested {
+        TlsVerify::VerifyFull => {
+            let mut url = parsed;
+            url.set_host(&tunnel_addr.ip().to_string())?;
+            url.set_port(Some(tunnel_addr.port()))?;
+            url.set_query_param(sslmode.param_names[0], sslmode.verify_ca);
+            Ok((url.to_url_string(), TlsVerify::VerifyCa))
+        }
+        TlsVerify::VerifyCa | TlsVerify::Off => {
+            Ok((rewrite_for_tunnel(original, tunnel_addr)?, requested))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionUrl, rewrite_for_tunnel};
+    use super::{
+        ConnectionUrl, SslModeSpelling, rewrite_for_tunnel,
+        tunneled_connect_url_capping_verify_full,
+    };
+    use crate::tls_verify::TlsVerify;
 
     // -- parse failures ----------------------------------------------------
 
@@ -721,5 +806,130 @@ mod tests {
     fn rewrite_for_tunnel_rejects_a_sqlite_url() {
         let tunnel_addr = "127.0.0.1:1".parse().unwrap();
         assert!(rewrite_for_tunnel("sqlite::memory:", tunnel_addr).is_err());
+    }
+
+    // -- tunneled_connect_url_capping_verify_full ---------------------------
+
+    /// A postgres-shaped spelling: single `sslmode` parameter,
+    /// `verify-full`/`verify-ca` values.
+    const POSTGRES_SSLMODE: SslModeSpelling = SslModeSpelling {
+        param_names: &["sslmode"],
+        verify_full: "verify-full",
+        verify_ca: "verify-ca",
+    };
+
+    /// A mysql-shaped spelling: two accepted parameter names (a primary and a
+    /// legacy alias), `verify_identity`/`verify_ca` values.
+    const MYSQL_SSLMODE: SslModeSpelling = SslModeSpelling {
+        param_names: &["ssl-mode", "sslmode"],
+        verify_full: "verify_identity",
+        verify_ca: "verify_ca",
+    };
+
+    #[test]
+    fn no_sslmode_falls_back_to_the_plain_host_port_rewrite() {
+        let addr = "127.0.0.1:54321".parse().unwrap();
+        let (url, verify) = tunneled_connect_url_capping_verify_full(
+            "postgres://app:pw@db.internal:5432/app",
+            addr,
+            &POSTGRES_SSLMODE,
+        )
+        .unwrap();
+        assert_eq!(verify, TlsVerify::Off);
+        assert_eq!(url, "postgres://app:pw@127.0.0.1:54321/app");
+    }
+
+    #[test]
+    fn verify_full_is_capped_to_verify_ca_and_rewrites_host_and_port() {
+        let addr = "127.0.0.1:54321".parse().unwrap();
+        let (url, verify) = tunneled_connect_url_capping_verify_full(
+            "postgres://app:pw@db.internal:5432/app?sslmode=verify-full",
+            addr,
+            &POSTGRES_SSLMODE,
+        )
+        .unwrap();
+        assert_eq!(
+            verify,
+            TlsVerify::VerifyCa,
+            "verify-full must be capped to verify-ca, not silently dropped"
+        );
+        let parsed = ConnectionUrl::parse(&url).unwrap();
+        assert_eq!(parsed.host().as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.port(), Some(54321));
+        assert_eq!(parsed.query_param("sslmode").as_deref(), Some("verify-ca"));
+    }
+
+    #[test]
+    fn verify_ca_is_preserved_and_functional_through_the_tunnel() {
+        let addr = "127.0.0.1:9999".parse().unwrap();
+        let (url, verify) = tunneled_connect_url_capping_verify_full(
+            "postgres://app@db.internal/app?sslmode=verify-ca",
+            addr,
+            &POSTGRES_SSLMODE,
+        )
+        .unwrap();
+        assert_eq!(verify, TlsVerify::VerifyCa);
+        let parsed = ConnectionUrl::parse(&url).unwrap();
+        assert_eq!(parsed.host().as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.port(), Some(9999));
+        assert_eq!(
+            parsed.query_param("sslmode").as_deref(),
+            Some("verify-ca"),
+            "an already-verify-ca request must not be altered"
+        );
+    }
+
+    #[test]
+    fn extra_query_parameters_are_preserved_through_a_capped_rewrite() {
+        let addr = "127.0.0.1:54321".parse().unwrap();
+        let (url, _verify) = tunneled_connect_url_capping_verify_full(
+            "postgres://db.internal/app?sslmode=verify-full&application_name=zsql",
+            addr,
+            &POSTGRES_SSLMODE,
+        )
+        .unwrap();
+        let parsed = ConnectionUrl::parse(&url).unwrap();
+        assert_eq!(
+            parsed.query_param("application_name").as_deref(),
+            Some("zsql")
+        );
+    }
+
+    #[test]
+    fn an_invalid_url_is_a_typed_error() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            tunneled_connect_url_capping_verify_full("not-a-url", addr, &POSTGRES_SSLMODE).is_err()
+        );
+    }
+
+    #[test]
+    fn a_second_accepted_parameter_name_is_read_when_the_primary_is_absent() {
+        let addr = "127.0.0.1:54321".parse().unwrap();
+        let (url, verify) = tunneled_connect_url_capping_verify_full(
+            "mysql://root:pw@db.internal:3306/app?sslmode=verify_identity",
+            addr,
+            &MYSQL_SSLMODE,
+        )
+        .unwrap();
+        assert_eq!(verify, TlsVerify::VerifyCa);
+        let parsed = ConnectionUrl::parse(&url).unwrap();
+        assert_eq!(
+            parsed.query_param("ssl-mode").as_deref(),
+            Some("verify_ca"),
+            "the capped value is written back under the primary parameter name"
+        );
+    }
+
+    #[test]
+    fn value_comparison_is_case_insensitive() {
+        let addr = "127.0.0.1:54321".parse().unwrap();
+        let (_url, verify) = tunneled_connect_url_capping_verify_full(
+            "mysql://root@db.internal/app?ssl-mode=VERIFY_IDENTITY",
+            addr,
+            &MYSQL_SSLMODE,
+        )
+        .unwrap();
+        assert_eq!(verify, TlsVerify::VerifyCa);
     }
 }

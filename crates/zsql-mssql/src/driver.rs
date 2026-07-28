@@ -553,6 +553,7 @@ mod tests {
         let cfg = ConnConfig {
             url: "not a valid url".to_owned(),
             tunnel_local_addr: None,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(result, Err(zsql_core::CoreError::Url(_))));

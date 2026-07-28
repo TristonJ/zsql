@@ -9,12 +9,7 @@ use zsql_core::{BatchSink, QueryEvent, QueryHandle, RowBatch};
 use crate::error::map_sqlx_query_error;
 
 pub mod error;
-
-/// Rows are grouped into batches of at most this many rows before a
-/// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
-/// set streams to the UI incrementally instead of arriving as one huge
-/// allocation. This is an internal placeholder default
-pub const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
+pub mod pool;
 
 /// Backend-specific hooks [`run_query`] needs from each sqlx-based driver.
 ///
@@ -82,6 +77,10 @@ pub struct SqlxConnection<DB: Database, D> {
     /// probe, so a probe can never be blocked behind an in-flight query or a
     /// cancel request, nor block either of those in turn.
     probe_pool: sqlx::Pool<DB>,
+    /// Rows grouped into one [`QueryEvent::Batch`] at a time by
+    /// [`run_query`], set at construction from the app's configured
+    /// `query.batch_size`.
+    batch_size: usize,
 
     driver: PhantomData<D>,
 }
@@ -97,11 +96,13 @@ where
         pool: sqlx::Pool<DB>,
         cancel_pool: sqlx::Pool<DB>,
         probe_pool: sqlx::Pool<DB>,
+        batch_size: usize,
     ) -> Self {
         Self {
             pool,
             cancel_pool,
             probe_pool,
+            batch_size,
             driver: PhantomData,
         }
     }
@@ -121,9 +122,17 @@ where
         let (cancel_tx, cancel_rx) = flume::unbounded();
         let pool = self.pool.clone();
         let cancel_pool = self.cancel_pool.clone();
+        let batch_size = self.batch_size;
         // Run on the smol-based executor sqlx's `runtime-smol` feature uses.
-        async_global_executor::spawn(run_query::<DB, D>(pool, cancel_pool, sql, sink, cancel_rx))
-            .detach();
+        async_global_executor::spawn(run_query::<DB, D>(
+            pool,
+            cancel_pool,
+            sql,
+            sink,
+            cancel_rx,
+            batch_size,
+        ))
+        .detach();
         QueryHandle::new(cancel_tx)
     }
 }
@@ -143,7 +152,7 @@ where
 #[tracing::instrument(
     name = "stream_query",
     skip_all,
-    fields(driver = D::NAME, pool_size = pool.size())
+    fields(driver = D::NAME, pool_size = pool.size(), batch_size)
 )]
 #[allow(clippy::too_many_lines)] // one streaming state machine; splitting scatters the per-statement latches
 pub async fn run_query<DB, D>(
@@ -152,6 +161,7 @@ pub async fn run_query<DB, D>(
     sql: String,
     sink: BatchSink,
     cancel_rx: flume::Receiver<()>,
+    batch_size: usize,
 ) where
     DB: Database,
     D: SqlxZsqlDriver<DB>,
@@ -222,7 +232,7 @@ pub async fn run_query<DB, D>(
                     any_columns_sent = true;
                 }
                 batch.push(D::decode_row(&row));
-                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
+                if batch.len() >= batch_size {
                     let full = std::mem::take(&mut batch);
                     if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
                         return;

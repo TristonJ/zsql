@@ -1,38 +1,26 @@
 //! Translates a connect URL plus an already-open tunnel's local address into
 //! the URL this driver actually connects with, per the requested TLS
-//! verification. Pure and network-free: every function here only builds a
-//! string.
-//!
-//! sqlx-postgres resolves a URL's `host` and `hostaddr` to a single dial
-//! target that it also verifies a `verify-full` certificate's hostname
-//! against, with no hook to dial one address while verifying identity
-//! against another. A tunneled connection that requested full identity
-//! verification is therefore capped to CA-chain verification instead of
-//! silently losing verification entirely: the SSH transport itself already
-//! authenticates the server being tunneled to.
+//! verification. A thin wrapper over
+//! [`zsql_core::tunneled_connect_url_capping_verify_full`] naming this
+//! dialect's own `sslmode` spelling.
 
 use std::net::SocketAddr;
 
-use zsql_core::{ConnectionUrl, CoreError, TlsVerify, rewrite_for_tunnel};
+use zsql_core::{CoreError, SslModeSpelling, TlsVerify, tunneled_connect_url_capping_verify_full};
 
-/// The `sslmode` value requesting full certificate-chain and hostname
-/// verification, matching libpq's own spelling.
-const SSLMODE_VERIFY_FULL: &str = "verify-full";
-/// The `sslmode` value requesting certificate-chain verification without
-/// checking the hostname -- what a tunneled `verify-full` request is capped
-/// to.
-const SSLMODE_VERIFY_CA: &str = "verify-ca";
+/// libpq's own `sslmode` query parameter and its `verify-full`/`verify-ca`
+/// value spellings.
+const SSLMODE: SslModeSpelling = SslModeSpelling {
+    param_names: &["sslmode"],
+    verify_full: "verify-full",
+    verify_ca: "verify-ca",
+};
 
 /// Build the URL this driver should actually connect with when `original`
 /// requested a tunnel whose local address is `tunnel_addr`, and report which
-/// [`TlsVerify`] level that URL will end up requesting.
-///
-/// A requested `verify-full` is capped to `verify-ca`: the certificate chain
-/// is still checked, but not the hostname (which cannot be, once the dial
-/// target is rewritten to the tunnel's loopback address). Every other mode
-/// (absent, `disable`, `allow`, `prefer`, `require`, or an already-`verify-ca`
-/// request) uses the plain fallback rewrite of host and port via
-/// [`zsql_core::rewrite_for_tunnel`], unchanged beyond that.
+/// [`TlsVerify`] level that URL will end up requesting. See
+/// [`zsql_core::tunneled_connect_url_capping_verify_full`] for the capping
+/// rationale.
 ///
 /// # Errors
 /// Returns [`CoreError::Url`] if `original` cannot be parsed, or has no
@@ -41,34 +29,7 @@ pub fn tunneled_connect_url(
     original: &str,
     tunnel_addr: SocketAddr,
 ) -> Result<(String, TlsVerify), CoreError> {
-    let parsed = ConnectionUrl::parse(original)?;
-    let requested = detect_requested_verify(&parsed);
-
-    match requested {
-        TlsVerify::VerifyFull => {
-            let mut url = parsed;
-            url.set_host(&tunnel_addr.ip().to_string())?;
-            url.set_port(Some(tunnel_addr.port()))?;
-            url.set_query_param("sslmode", SSLMODE_VERIFY_CA);
-            Ok((url.to_url_string(), TlsVerify::VerifyCa))
-        }
-        TlsVerify::VerifyCa | TlsVerify::Off => {
-            Ok((rewrite_for_tunnel(original, tunnel_addr)?, requested))
-        }
-    }
-}
-
-/// Read `sslmode` off `url` and translate it to a [`TlsVerify`] intent.
-/// Anything other than `verify-full`/`verify-ca` (including no `sslmode` at
-/// all) is treated as [`TlsVerify::Off`]: those modes either use no TLS or
-/// accept whatever certificate the server presents, so this driver's tunnel
-/// translation has nothing extra to preserve for them.
-fn detect_requested_verify(url: &ConnectionUrl) -> TlsVerify {
-    match url.query_param("sslmode").as_deref() {
-        Some(SSLMODE_VERIFY_FULL) => TlsVerify::VerifyFull,
-        Some(SSLMODE_VERIFY_CA) => TlsVerify::VerifyCa,
-        _ => TlsVerify::Off,
-    }
+    tunneled_connect_url_capping_verify_full(original, tunnel_addr, &SSLMODE)
 }
 
 #[cfg(test)]

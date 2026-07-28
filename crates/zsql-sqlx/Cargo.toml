@@ -12,6 +12,11 @@ async-global-executor = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 
+[dev-dependencies]
+sqlx = { version = "0.9", default-features = false, features = [
+    "sqlite",
+    "runtime-smol",
+] }
 
 [lints]
 workspace = true

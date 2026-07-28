@@ -109,6 +109,10 @@ pub struct Session {
     schema_generation: u64,
     /// Row limit applied to [`Session::preview_relation`]'s generated query.
     preview_limit: u64,
+    /// Rows a connection's query stream batches at a time, from
+    /// [`Config::query`]'s `batch_size`, threaded into
+    /// [`open_tunnel_and_connect`] on every connect attempt.
+    batch_size: usize,
     /// Upper bound on rows accumulated for the query currently streaming,
     /// from [`Config::query`]. Reaching this many rows cancels the query and
     /// moves `state` to [`SessionState::Limited`]; see [`Session::apply_query_event`].
@@ -174,6 +178,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: cfg.query.preview_limit,
+            batch_size: cfg.query.batch_size,
             max_result_rows: cfg.query.max_result_rows,
             active_query: None,
             accumulating: ResultSet::default(),
@@ -330,10 +335,13 @@ impl Session {
         self.connection_generation = self.connection_generation.wrapping_add(1);
         self.probe_in_flight = false;
         let generation = self.connection_generation;
+        let batch_size = self.batch_size;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let outcome = cx.background_spawn(open_tunnel_and_connect(url, ssh)).await;
+            let outcome = cx
+                .background_spawn(open_tunnel_and_connect(url, ssh, batch_size))
+                .await;
 
             let connected = this.update(cx, |session, cx| {
                 // A newer connect attempt may have superseded this one while its
@@ -781,7 +789,9 @@ pub(crate) type TunneledConnectOutcome = (Box<dyn Connection>, Option<Box<dyn Tu
 
 /// Opens `ssh`'s tunnel (if given) before connecting to `url`, so a bad SSH
 /// config surfaces as a connect failure before the driver is ever touched.
-/// With no `ssh` config, this is exactly [`drivers::connect`].
+/// With no `ssh` config, this is exactly [`drivers::connect`]. `batch_size`
+/// (typically [`Config::query`]'s `batch_size`) is threaded onto the
+/// resulting connection.
 ///
 /// Shared with `ui::connections`'s own Test and unsaved-Connect paths, which
 /// need the identical tunnel-before-connect ordering outside of a
@@ -790,9 +800,10 @@ pub(crate) type TunneledConnectOutcome = (Box<dyn Connection>, Option<Box<dyn Tu
 pub(crate) async fn open_tunnel_and_connect(
     url: String,
     ssh: Option<zsql_ssh::SshConfig>,
+    batch_size: usize,
 ) -> Result<TunneledConnectOutcome, CoreError> {
     let Some(ssh_cfg) = ssh else {
-        let conn = drivers::connect(url).await?;
+        let conn = drivers::connect(url, batch_size).await?;
         return Ok((conn, None));
     };
 
@@ -802,21 +813,22 @@ pub(crate) async fn open_tunnel_and_connect(
         .await
         .map_err(|err| CoreError::connection(err.to_string(), false))?;
 
-    let (conn, tunnel) = connect_through_open_tunnel(url, Box::new(tunnel)).await?;
+    let (conn, tunnel) = connect_through_open_tunnel(url, Box::new(tunnel), batch_size).await?;
     Ok((conn, Some(tunnel)))
 }
 
-/// Connects to `url` through `tunnel`'s already-open local address. On
-/// failure, `tunnel` is dropped as part of this same attempt (it is not
-/// returned in the `Err` case), so a driver connect failure after a
-/// successfully opened tunnel never leaves that tunnel outliving the failed
-/// attempt.
+/// Connects to `url` through `tunnel`'s already-open local address, with the
+/// resulting connection's row-batching set to `batch_size`. On failure,
+/// `tunnel` is dropped as part of this same attempt (it is not returned in
+/// the `Err` case), so a driver connect failure after a successfully opened
+/// tunnel never leaves that tunnel outliving the failed attempt.
 async fn connect_through_open_tunnel(
     url: String,
     tunnel: Box<dyn TunnelHandle>,
+    batch_size: usize,
 ) -> Result<(Box<dyn Connection>, Box<dyn TunnelHandle>), CoreError> {
     let tunnel_addr = tunnel.local_addr();
-    let conn = drivers::connect_tunneled(url, tunnel_addr).await?;
+    let conn = drivers::connect_tunneled(url, tunnel_addr, batch_size).await?;
     Ok((conn, tunnel))
 }
 

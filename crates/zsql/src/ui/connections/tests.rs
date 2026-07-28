@@ -16,6 +16,12 @@ fn test_probe_timeout() -> Duration {
     crate::config::Config::default().liveness.probe_timeout()
 }
 
+/// The batch size every test builds its manager with, unless a test
+/// specifically cares about the value itself.
+fn test_batch_size() -> usize {
+    crate::config::Config::default().query.batch_size
+}
+
 /// A temp store path this test owns exclusively, removed on drop.
 struct TempStorePath(std::path::PathBuf);
 
@@ -47,7 +53,7 @@ fn new_manager(
     session: Entity<Session>,
     store: ConnectionStore,
 ) -> ConnectionManagerView {
-    ConnectionManagerView::new(session, store, test_probe_timeout(), cx)
+    ConnectionManagerView::new(session, store, test_probe_timeout(), test_batch_size(), cx)
 }
 
 #[gpui::test]

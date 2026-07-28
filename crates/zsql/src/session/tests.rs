@@ -34,6 +34,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: Config::default().query.preview_limit,
+            batch_size: Config::default().query.batch_size,
             max_result_rows: Config::default().query.max_result_rows,
             active_query: None,
             accumulating: result,
@@ -523,6 +524,7 @@ fn a_failed_connect_through_an_open_tunnel_tears_the_tunnel_down() {
     let result = block_on(connect_through_open_tunnel(
         "cassandra://host/db".to_owned(),
         tunnel,
+        zsql_core::DEFAULT_QUERY_BATCH_SIZE,
     ));
 
     assert!(
