@@ -17,10 +17,31 @@ use zsql_ui::{
     theme::{ActiveTheme, Theme},
 };
 
-use crate::ui::{
-    results::{TextCaret, TextContentExtent},
-    theme,
-};
+use crate::ui::theme;
+
+/// A memoized Text-view content width plus the inputs it was measured from,
+/// so a re-render that changes none of them (scroll, hover, selection, an
+/// unrelated notify) reuses the width instead of re-shaping every line.
+struct TextContentExtent {
+    /// Document byte length -- a new or still-streaming document changes it,
+    /// which is what invalidates the cache.
+    document_len: usize,
+    /// The data font family the width was measured in.
+    font_family: SharedString,
+    /// The text size the width was measured at.
+    font_size: Pixels,
+    /// The widest line's shaped width, before slack is added.
+    width: Pixels,
+}
+
+/// One position within the Text view's assembled document: a 0-based source
+/// line index and a byte offset into that line's own text. Ordered
+/// lexicographically by `(line, byte)`, matching reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextCaret {
+    line: usize,
+    byte: usize,
+}
 
 pub struct TextView {
     /// The current text document, assembled from the result.

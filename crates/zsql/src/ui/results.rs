@@ -4,13 +4,10 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    SharedString, Stateful, Window, actions, div, prelude::*, px, rgb,
+    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
+    MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, ResultSet, RowCount};
-use zsql_ui::button::ButtonSwitch;
-use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -20,13 +17,16 @@ use super::format::{ValueKind, format_value};
 use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{LivenessState, Session, SessionState};
-use crate::ui::format::{self, format_value_for_clipboard, group_thousands};
+use crate::ui::format::{format_value_for_clipboard, group_thousands};
 use crate::ui::results::text_view::TextView;
-use crate::ui::value_panel::data::ValuePanelContent;
 use crate::ui::value_panel::{self, ValuePanel};
 
+mod cell_menu;
 mod empty_state;
+mod panel_host;
+mod status_bar;
 mod text_view;
+mod toolbar;
 
 /// The key context the results grid's own key bindings are scoped to, so
 /// they only fire while the grid is focused.
@@ -147,21 +147,6 @@ pub struct ResultsView {
     text_view: Entity<TextView>,
 }
 
-/// A memoized Text-view content width plus the inputs it was measured from,
-/// so a re-render that changes none of them (scroll, hover, selection, an
-/// unrelated notify) reuses the width instead of re-shaping every line.
-struct TextContentExtent {
-    /// Document byte length -- a new or still-streaming document changes it,
-    /// which is what invalidates the cache.
-    document_len: usize,
-    /// The data font family the width was measured in.
-    font_family: SharedString,
-    /// The text size the width was measured at.
-    font_size: Pixels,
-    /// The widest line's shaped width, before slack is added.
-    width: Pixels,
-}
-
 /// A results grid cell's open right-click context menu: the triggering
 /// click position it anchors to. Which cell it targets is not tracked here
 /// -- opening the menu already selects that cell (see
@@ -170,15 +155,6 @@ struct TextContentExtent {
 #[derive(Debug, Clone)]
 struct CellContextMenuState {
     position: Point<Pixels>,
-}
-
-/// One position within the Text view's assembled document: a 0-based source
-/// line index and a byte offset into that line's own text. Ordered
-/// lexicographically by `(line, byte)`, matching reading order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TextCaret {
-    line: usize,
-    byte: usize,
 }
 
 impl ResultsView {
@@ -444,172 +420,6 @@ impl ResultsView {
         tracing::debug!(view_mode = ?self.view_mode, "defaulted the results pane view for a new result");
     }
 
-    /// The results header bar: row/line count + source/relation label, plus
-    /// (always) the Grid|Text view switch and, while Text is active, the
-    /// copy and wrap controls. `text_document` is `Some` (Text active) with
-    /// the same assembled document [`ResultsView::render_body`] renders,
-    /// computed once per render rather than reassembled here.
-    fn render_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let colors = cx.theme().colors;
-        let document_lines = self.text_view.read(cx).line_count();
-        let count_text = results_bar_count_text(
-            self.effective_state(cx),
-            self.effective_result(cx).rows.len(),
-            document_lines,
-        );
-
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .flex_shrink_0()
-            .gap_3()
-            .h(theme::RESULTS_BAR_HEIGHT)
-            .px_3()
-            .bg(rgb(colors.bg_panel))
-            .border_b_1()
-            .border_color(rgb(colors.border_soft))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_baseline()
-                            .gap_2()
-                            .flex_shrink_0()
-                            .text_size(px(theme::RESULTS_TAB_TEXT_SIZE))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(colors.text_primary))
-                                    .child("Results"),
-                            )
-                            .child(
-                                div()
-                                    .font_family(&cx.theme().fonts.data)
-                                    .text_color(rgb(colors.accent))
-                                    .child(count_text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .font_family(&cx.theme().fonts.data)
-                            .text_size(px(theme::RESULTS_META_TEXT_SIZE))
-                            .text_color(rgb(colors.text_tertiary))
-                            .min_w_0()
-                            .truncate()
-                            .child(self.source_label.clone()),
-                    ),
-            )
-            .child(self.render_bar_right(window, cx))
-    }
-
-    /// The results bar's trailing controls: the copy/wrap buttons while
-    /// Text is active, then the Grid|Text switch, which is always rendered
-    /// regardless of the current result's shape.
-    fn render_bar_right(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let active_theme = cx.theme();
-        let switch_enabled = self.effective_result(cx).has_single_text_column();
-
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_shrink_0()
-            .gap(theme::RESULTS_BAR_RIGHT_GAP);
-
-        if self.view_mode == ViewMode::Text {
-            row = row.child(Self::render_icon_button(
-                "results-text-copy",
-                "copy all",
-                false,
-                active_theme,
-                cx.listener(|view, _: &ClickEvent, _window, cx| view.copy_text_document(cx, true)),
-            ));
-        }
-
-        row.child(self.render_view_switch(window, cx, switch_enabled))
-    }
-
-    /// A small text button for the results bar's trailing controls (copy,
-    /// wrap), styled like the plain-text icon affordances elsewhere in the
-    /// app. `active` paints it with the view switch's active-segment colors
-    /// so a toggle (wrap) shows its on/off state; the copy button, which has
-    /// no on/off state, always passes `false`.
-    fn render_icon_button(
-        id: &'static str,
-        label: &'static str,
-        active: bool,
-        active_theme: &Theme,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> gpui::Stateful<Div> {
-        let colors = active_theme.colors;
-        let mut button = div()
-            .id(id)
-            .cursor_pointer()
-            .px(theme::RESULTS_ICON_BUTTON_PADDING_X)
-            .py(theme::RESULTS_ICON_BUTTON_PADDING_Y)
-            .rounded(px(theme::RESULTS_ICON_BUTTON_RADIUS))
-            .text_size(px(theme::RESULTS_ICON_BUTTON_TEXT_SIZE))
-            .child(label)
-            .on_click(on_click);
-
-        if active {
-            button = button
-                .bg(rgb(theme::view_switch_active_bg(active_theme)))
-                .text_color(rgb(theme::view_switch_active_text(active_theme)));
-        } else {
-            button = button
-                .text_color(rgb(colors.text_tertiary))
-                .hover(|el| el.text_color(rgb(colors.text_secondary)));
-        }
-        button
-    }
-
-    /// The Grid|Text segmented view switch
-    fn render_view_switch(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        text_enabled: bool,
-    ) -> impl IntoElement {
-        let grid_id = "results-view-grid";
-        let text_id = "results-view-text";
-        let selected = match self.view_mode {
-            ViewMode::Grid => grid_id,
-            ViewMode::Text => text_id,
-        };
-
-        ButtonSwitch::new()
-            .selected(selected)
-            .disabled(!text_enabled)
-            .add_option(
-                window,
-                cx,
-                grid_id,
-                "grid",
-                cx.listener(|view, _e, _w, cx| {
-                    view.set_view_mode(ViewMode::Grid, cx);
-                }),
-            )
-            .add_option(
-                window,
-                cx,
-                text_id,
-                "text",
-                cx.listener(|view, _e, _w, cx| {
-                    view.set_view_mode(ViewMode::Text, cx);
-                }),
-            )
-    }
-
     /// The main content area: the virtualized grid when results are
     /// available, or a centered prompt/status message otherwise.
     /// `text_document` is `Some` exactly while `view_mode` is `Text`, so
@@ -691,61 +501,6 @@ impl ResultsView {
                     .child(self.value_panel.clone()),
             )
             .into_any_element()
-    }
-
-    /// The value panel's resize divider: a draggable strip on the panel's
-    /// left edge, clamped between `value_panel_min_width`/`max_width`.
-    fn render_value_panel_divider(&self, cx: &Context<Self>) -> Stateful<Div> {
-        let colors = cx.theme().colors;
-        div()
-            .id("value-panel-divider")
-            .debug_selector(|| "value-panel-divider".to_owned())
-            .flex_shrink_0()
-            .w(self.value_panel_divider_thickness)
-            .h_full()
-            .cursor(gpui::CursorStyle::ResizeLeftRight)
-            .bg(rgb(colors.border))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_value_panel_drag))
-    }
-
-    fn start_value_panel_drag(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.value_panel_drag = Some((event.position.x, self.value_panel_width));
-        cx.notify();
-    }
-
-    fn end_value_panel_drag(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.value_panel_drag.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Resize the panel while its divider is being dragged: moving the
-    /// pointer left (toward the grid) grows it, since it docks on the right
-    /// edge -- clamped to `value_panel_min_width`/`max_width`, a no-op if no
-    /// drag is in progress.
-    fn value_panel_drag_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((origin_x, start_width)) = self.value_panel_drag else {
-            return;
-        };
-        let delta = origin_x - event.position.x;
-        self.value_panel_width =
-            (start_width + delta).clamp(self.value_panel_min_width, self.value_panel_max_width);
-        cx.notify();
     }
 
     /// A centered title + detail message shown in place of the grid for any
@@ -901,320 +656,6 @@ impl ResultsView {
                 TableRow::new(cells)
             })
             .collect()
-    }
-
-    /// The status bar's connection-lifecycle dot color, label, and trailing
-    /// error text (if any), from the session's real state and liveness --
-    /// never [`ResultsView::effective_state`]'s frozen tab snapshot. A tab
-    /// frozen to an older, successful result must not keep showing
-    /// "Connected" while the session itself is `Connecting` to a different
-    /// target, has errored, or has gone unreachable; conversely the label
-    /// and error text are always computed from the same state, so they can
-    /// never disagree.
-    ///
-    /// [`SessionState::Connected`] alone is enough for the "Connected"
-    /// label: every registered driver's `connect()` already performs a real
-    /// pool connection plus a synchronous liveness check before resolving,
-    /// so `Connected` already implies a verified-reachable connection.
-    /// Waiting for the recurring probe's first [`LivenessState::Healthy`]
-    /// result on top of that would only add a probe-interval-sized delay
-    /// with no correctness benefit.
-    fn connection_status(&self, cx: &Context<Self>) -> (u32, &'static str, Option<String>) {
-        let session = self.session.read(cx);
-        let state = session.state();
-        let liveness = session.liveness();
-        let (dot_color, label) = status_indicator(state, liveness, cx.theme());
-        let error_message = match state {
-            SessionState::Error(message) => Some(message.clone()),
-            _ => None,
-        };
-        (dot_color, label, error_message)
-    }
-
-    /// The bottom connection/status bar: connection state + label, row
-    /// count, and elapsed query time. `text_document` is the same document
-    /// [`ResultsView::render_bar`] was given.
-    fn render_status_bar(&self, cx: &Context<Self>) -> Div {
-        let active_theme = cx.theme();
-        let colors = active_theme.colors;
-        let (dot_color, label, error_message) = self.connection_status(cx);
-
-        let mut bar = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_shrink_0()
-            .gap_4()
-            .h(theme::STATUS_BAR_HEIGHT)
-            .px_3()
-            .bg(rgb(colors.bg_panel))
-            .border_t_1()
-            .border_color(rgb(colors.border))
-            .font_family(&cx.theme().fonts.data)
-            .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
-            .text_color(rgb(colors.text_secondary))
-            .child(grid::status_dot(dot_color))
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(colors.text_primary))
-                    .child(label),
-            );
-
-        // Query metrics (row/line count, elapsed time) keep coming from the
-        // displayed tab's own effective state, frozen or live: a frozen
-        // tab's completed-query numbers are unrelated to the session's
-        // current connection lifecycle.
-        let effective_state = self.effective_state(cx);
-        let (metrics_count, metrics_unit) = match self.text_view.read(cx).line_count() {
-            Some(lines) => (lines, "lines"),
-            None => (self.effective_result(cx).rows.len(), "rows"),
-        };
-        if let Some((count_text, elapsed_text)) =
-            status_metrics(effective_state, metrics_count, metrics_unit)
-        {
-            bar = bar.child(count_text).child(elapsed_text);
-        }
-
-        if let Some(total_row_count_text) =
-            format_total_row_count(self.session.read(cx).row_count())
-        {
-            bar = bar.child(total_row_count_text);
-        }
-
-        if let Some(message) = error_message {
-            bar = bar.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(rgb(colors.status_error))
-                    .child(message),
-            );
-        }
-
-        bar
-    }
-
-    // ---- cell context menu -----------------------------------------
-
-    /// Open the right-click context menu for `(row, col)`, anchored at
-    /// `position` (the triggering click, in window coordinates), and select
-    /// that cell -- so the menu's `Copy value`/`Copy row as JSON`/`Copy
-    /// column name` items, which all act on the focused cell, target the
-    /// cell that was actually right-clicked.
-    fn open_cell_context_menu(
-        &mut self,
-        row: usize,
-        col: usize,
-        position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        self.table_state.update(cx, |state, cx| {
-            state.set_focused_cell(row, col);
-            cx.notify();
-        });
-        self.cell_context_menu = Some(CellContextMenuState { position });
-        cx.notify();
-    }
-
-    fn close_cell_context_menu(&mut self, cx: &mut Context<Self>) {
-        if self.cell_context_menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// `View value`: open the value panel for the context menu's cell (the
-    /// cell was already selected when the menu was opened, see
-    /// [`ResultsView::open_cell_context_menu`]), then close the menu.
-    #[tracing::instrument(name = "results_view_value_from_menu", skip_all)]
-    fn view_value_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.value_panel.update(cx, ValuePanel::open);
-        let cell = self.table_state.read(cx).focused_cell();
-        tracing::debug!(?cell, "opened the value panel from the cell context menu");
-        self.close_cell_context_menu(cx);
-        cx.notify();
-    }
-
-    /// `Copy row as JSON`: serialize every cell of the focused row, each via
-    /// its own [`Value`]'s JSON representation (not `format_value`'s display
-    /// text) keyed by column name, and write it to the clipboard. A no-op
-    /// while nothing is selected.
-    #[tracing::instrument(name = "results_copy_row_as_json", skip_all)]
-    fn copy_row_as_json(&mut self, cx: &mut Context<Self>) {
-        let Some((row, _col)) = self.table_state.read(cx).focused_cell() else {
-            tracing::trace!(
-                "copy-row-as-json invoked with no results grid selection; nothing to do"
-            );
-            return;
-        };
-        let result = self.effective_result(cx);
-        let Some(row_data) = result.rows.get(row) else {
-            return;
-        };
-        let text = format::row_as_json_string(row_data, &result.columns);
-        tracing::debug!(row, "copied a results grid row as JSON to the clipboard");
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-    }
-
-    /// `Copy column name`: write the focused column's exact
-    /// [`ColumnMeta::name`] to the clipboard. A no-op while nothing is
-    /// selected.
-    #[tracing::instrument(name = "results_copy_column_name", skip_all)]
-    fn copy_column_name(&mut self, cx: &mut Context<Self>) {
-        let Some((_row, col)) = self.table_state.read(cx).focused_cell() else {
-            tracing::trace!(
-                "copy-column-name invoked with no results grid selection; nothing to do"
-            );
-            return;
-        };
-        let Some(name) = self
-            .effective_result(cx)
-            .columns
-            .get(col)
-            .map(|column| column.name.clone())
-        else {
-            return;
-        };
-        tracing::debug!(col, "copied a results grid column name to the clipboard");
-        cx.write_to_clipboard(ClipboardItem::new_string(name));
-    }
-
-    /// The right-click cell context menu overlay: `View value`, `Copy
-    /// value`, `Copy row as JSON`, a separator, then `Copy column name`,
-    /// anchored at the triggering click. A full-window backdrop behind it
-    /// absorbs off-menu clicks, mirroring the sidebar's relation-row context
-    /// menu. Renders nothing when no menu is open.
-    fn render_cell_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let menu_state = self.cell_context_menu.as_ref()?;
-        let menu = ContextMenu::new("results-cell-context-menu")
-            .position(menu_state.position)
-            .on_close(cx.listener(|view, _event, _window, cx| {
-                view.close_cell_context_menu(cx);
-            }))
-            .add_item(ContextMenuItem::new("View value").on_click(cx.listener(
-                |view, _event, _window, cx| {
-                    view.view_value_from_menu(cx);
-                },
-            )))
-            .add_item(ContextMenuItem::new("Copy value").on_click(cx.listener(
-                |view, _event, window, cx| {
-                    view.copy_focused_cell(&Copy, window, cx);
-                    view.close_cell_context_menu(cx);
-                },
-            )))
-            .add_item(
-                ContextMenuItem::new("Copy row as JSON").on_click(cx.listener(
-                    |view, _event, _window, cx| {
-                        view.copy_row_as_json(cx);
-                        view.close_cell_context_menu(cx);
-                    },
-                )),
-            )
-            .add_separator()
-            .add_item(
-                ContextMenuItem::new("Copy column name").on_click(cx.listener(
-                    |view, _event, _window, cx| {
-                        view.copy_column_name(cx);
-                        view.close_cell_context_menu(cx);
-                    },
-                )),
-            );
-
-        Some(menu.into_any_element())
-    }
-
-    // ---- value panel: open/close/pin/follow-selection ----------------
-
-    /// Toggle the value panel for the focused cell (the grid's `space`
-    /// binding). A no-op while nothing is selected.
-    #[tracing::instrument(name = "results_toggle_value_panel", skip_all)]
-    fn toggle_value_panel(
-        &mut self,
-        _: &ToggleValuePanel,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(cell) = self.table_state.read(cx).focused_cell() else {
-            return;
-        };
-        self.value_panel.update(cx, ValuePanel::toggle);
-        self.sync_value_panel_content(cx, Some(cell));
-        cx.notify();
-    }
-
-    /// `esc` while the grid has focus: close the panel, leaving grid focus
-    /// (and the focused cell) untouched.
-    fn close_value_panel(
-        &mut self,
-        _: &CloseValuePanel,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.value_panel.update(cx, |p, cx| {
-            if p.is_open() {
-                p.close(cx);
-            }
-        });
-    }
-
-    /// `tab` while the grid has focus: move keyboard focus onto the panel,
-    /// if it is open.
-    fn focus_value_panel(
-        &mut self,
-        _: &FocusValuePanel,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = self.value_panel.read(cx);
-        if panel.is_open() {
-            window.focus(panel.focus_handle());
-        }
-    }
-
-    /// Double-click on a data cell (see [`ResultsView::render_data_row_cells`]):
-    /// select it and open the value panel directly.
-    #[tracing::instrument(name = "results_open_value_panel_for", skip_all)]
-    fn open_value_panel_for(
-        &mut self,
-        row: usize,
-        col: usize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.table_state.update(cx, |state, cx| {
-            state.set_focused_cell(row, col);
-            cx.notify();
-        });
-        self.value_panel.update(cx, ValuePanel::open);
-        tracing::debug!(row, col, "opened the value panel via double-click");
-        cx.notify();
-    }
-
-    /// Bring `value_panel_json` up to date with the provided cell
-    fn sync_value_panel_content(&mut self, cx: &mut Context<Self>, cell: Option<(usize, usize)>) {
-        let content = cell.and_then(|(row, col)| {
-            let id = 31 * row + col;
-            let value = self
-                .effective_result(cx)
-                .rows
-                .get(row)
-                .and_then(|r| r.0.get(col))?;
-            let column = self.effective_result(cx).columns.get(col)?;
-            Some((id, value, column))
-        });
-        if !self
-            .value_panel
-            .read(cx)
-            .would_update_content(content.map(|c| c.0))
-        {
-            return;
-        }
-
-        let content = content
-            .map(|(id, value, column)| ValuePanelContent::new(id, value.clone(), column.clone()));
-        self.value_panel
-            .update(cx, |p, _cx| p.update_content(content));
     }
 
     /// Copy the selected cell's full formatted value to the system
