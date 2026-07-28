@@ -148,10 +148,10 @@ impl<H: IntoElement, B: IntoElement> Modal<H, B> {
     fn render_close_icon(&self, cx: &mut gpui::App) -> Stateful<Div> {
         let colors = cx.theme().colors;
         let close_listener = self.on_close.clone();
-        let selector = format!("{}-{}", self.id, "close-icon");
+        let id = self.id.clone();
         div()
             .id((self.id.clone(), "close-icon"))
-            .debug_selector(move || selector)
+            .debug_selector(move || format!("{id}-close-icon"))
             .group(MODAL_CLOSE_HOVER_GROUP)
             .ml_auto()
             .cursor_pointer()
