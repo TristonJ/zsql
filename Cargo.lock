@@ -9111,6 +9111,7 @@ dependencies = [
  "sqlx",
  "tracing",
  "zsql-core",
+ "zsql-sqlx",
 ]
 
 [[package]]

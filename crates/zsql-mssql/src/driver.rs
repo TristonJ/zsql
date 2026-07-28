@@ -164,10 +164,13 @@ async fn open_client(
     pin_mut!(connect);
     match futures::future::select(connect, Timer::after(CONNECT_TIMEOUT)).await {
         Either::Left((result, _timer)) => result,
-        Either::Right(_) => Err(CoreError::Connection(format!(
-            "connecting to the server timed out after {} seconds",
-            CONNECT_TIMEOUT.as_secs()
-        ))),
+        Either::Right(_) => Err(CoreError::connection(
+            format!(
+                "connecting to the server timed out after {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            ),
+            true,
+        )),
     }
 }
 
@@ -182,10 +185,10 @@ async fn liveness_check(client: &mut Client<TcpStream>) -> Result<i32, CoreError
         .into_row()
         .await
         .map_err(map_connect_error)?
-        .ok_or_else(|| CoreError::Connection("liveness query returned no row".to_owned()))?;
+        .ok_or_else(|| CoreError::connection("liveness query returned no row".to_owned(), true))?;
     row.try_get::<i32, _>("one")
         .map_err(map_connect_error)?
-        .ok_or_else(|| CoreError::Connection("liveness query returned NULL".to_owned()))
+        .ok_or_else(|| CoreError::connection("liveness query returned NULL".to_owned(), true))
 }
 
 /// A live MSSQL "connection": really just the config needed to open one, per
@@ -317,11 +320,11 @@ async fn exact_row_count(
         .into_row()
         .await
         .map_err(map_query_error)?
-        .ok_or_else(|| CoreError::Query("COUNT_BIG(*) returned no row".to_owned()))?;
+        .ok_or_else(|| CoreError::query("COUNT_BIG(*) returned no row".to_owned()))?;
     let count: i64 = row
         .try_get(0)
         .map_err(map_query_error)?
-        .ok_or_else(|| CoreError::Query("COUNT_BIG(*) returned NULL".to_owned()))?;
+        .ok_or_else(|| CoreError::query("COUNT_BIG(*) returned NULL".to_owned()))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -536,8 +539,8 @@ mod tests {
         let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
@@ -712,7 +715,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("stream_query must push exactly one event, not hang");
         match evt {
-            Err(zsql_core::CoreError::Connection(msg)) => assert!(!msg.is_empty()),
+            Err(zsql_core::CoreError::Connection { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a single CoreError::Connection, got {other:?}"),
         }
         assert!(
@@ -1510,7 +1513,7 @@ mod database_tests {
 
         let result = block_on(conn.describe_relation("dbo", "zsql_test_describe_missing"));
         assert!(
-            matches!(result, Err(zsql_core::CoreError::Introspection(_))),
+            matches!(result, Err(zsql_core::CoreError::Introspection { .. })),
             "expected a CoreError::Introspection, got {result:?}"
         );
     }

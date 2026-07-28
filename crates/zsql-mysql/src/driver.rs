@@ -14,9 +14,9 @@ use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema, RowCount,
     SchemaTree,
 };
+use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
 use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
-use crate::error::{map_connect_error, map_query_error};
 use crate::quoting::backtick_quote_ident;
 use crate::values::{column_metas, decode_row};
 
@@ -62,7 +62,7 @@ impl MysqlDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect(&url)
             .await
-            .map_err(map_connect_error)?;
+            .map_err(map_sqlx_connection_error)?;
         liveness_check(&pool).await?;
         Ok(pool)
     }
@@ -83,7 +83,7 @@ impl MysqlDriver {
             .max_connections(max_connections)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(&url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 
     /// Build the small dedicated pool [`MySqlConnection::ping`] draws from.
@@ -106,7 +106,7 @@ impl MysqlDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .test_before_acquire(false)
             .connect_lazy(&url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 }
 
@@ -116,8 +116,8 @@ async fn liveness_check(pool: &MySqlPool) -> Result<i64, CoreError> {
     let row = sqlx::query("SELECT 1 AS one")
         .fetch_one(pool)
         .await
-        .map_err(map_connect_error)?;
-    let one: i32 = row.try_get("one").map_err(map_connect_error)?;
+        .map_err(map_sqlx_connection_error)?;
+    let one: i32 = row.try_get("one").map_err(map_sqlx_connection_error)?;
     Ok(i64::from(one))
 }
 
@@ -194,10 +194,6 @@ impl SqlxZsqlDriver<MySql> for MysqlDriver {
             .fetch_one(&mut *conn)
             .await?;
         Ok(MySqlCancelHandle { connection_id })
-    }
-
-    fn map_query_error(err: sqlx::Error) -> CoreError {
-        map_query_error(err)
     }
 }
 
@@ -300,12 +296,12 @@ async fn fetch_table_rows_estimate(
     .bind(relation)
     .fetch_optional(pool)
     .await
-    .map_err(map_query_error)?;
+    .map_err(map_sqlx_query_error)?;
 
     let Some(row) = row else {
         return Ok(None);
     };
-    let table_rows: Option<u64> = row.try_get("TABLE_ROWS").map_err(map_query_error)?;
+    let table_rows: Option<u64> = row.try_get("TABLE_ROWS").map_err(map_sqlx_query_error)?;
     Ok(table_rows)
 }
 
@@ -328,7 +324,7 @@ async fn exact_row_count(pool: &MySqlPool, schema: &str, relation: &str) -> Resu
     let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
-        .map_err(map_query_error)?;
+        .map_err(map_sqlx_query_error)?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -352,8 +348,8 @@ mod tests {
         let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
@@ -366,7 +362,10 @@ mod tests {
         let cfg = ConnConfig::from_url("mariadb://user:pass@zsql-test-nonexistent-host.invalid/db")
             .unwrap();
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
+        assert!(matches!(
+            result,
+            Err(zsql_core::CoreError::Connection { .. })
+        ));
     }
 
     #[test]
@@ -377,7 +376,10 @@ mod tests {
             tunnel_local_addr: None,
         };
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
+        assert!(matches!(
+            result,
+            Err(zsql_core::CoreError::Connection { .. })
+        ));
     }
 
     #[test]
@@ -398,8 +400,8 @@ mod tests {
         let conn = connection_for_test();
         let result = block_on(conn.introspect());
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(_) => panic!("introspecting an unreachable host must fail"),
@@ -411,8 +413,8 @@ mod tests {
         let conn = connection_for_test();
         let result = block_on(conn.ping());
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(()) => panic!("pinging an unreachable host must fail"),
@@ -467,7 +469,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("stream_query must push exactly one event, not hang");
         match evt {
-            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            Err(zsql_core::CoreError::Query { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a single CoreError::Query, got {other:?}"),
         }
 
@@ -1256,7 +1258,7 @@ mod database_tests {
 
         let result = block_on(conn.describe_relation("zsql", "zsql_test_describe_missing"));
         assert!(
-            matches!(result, Err(zsql_core::CoreError::Introspection(_))),
+            matches!(result, Err(zsql_core::CoreError::Introspection { .. })),
             "expected a CoreError::Introspection, got {result:?}"
         );
     }

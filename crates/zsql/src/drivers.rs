@@ -155,7 +155,7 @@ mod tests {
             "mariadb://user:pass@zsql-test-nonexistent-host.invalid/db".to_owned(),
         ));
         match result {
-            Err(zsql_core::CoreError::Connection(_)) => {}
+            Err(zsql_core::CoreError::Connection { .. }) => {}
             Err(other) => panic!("expected a CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
         }

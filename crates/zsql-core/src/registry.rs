@@ -90,9 +90,11 @@ mod tests {
         }
 
         async fn connect(&self, _cfg: &ConnConfig) -> Result<Box<dyn Connection>, CoreError> {
-            Err(CoreError::Connection(
-                "fake driver never connects".to_owned(),
-            ))
+            Err(CoreError::Connection {
+                message: "fake driver never connects".to_owned(),
+                transient: false,
+                source: None,
+            })
         }
     }
 

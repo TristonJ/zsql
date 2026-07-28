@@ -2,7 +2,6 @@
 
 mod describe;
 mod driver;
-mod error;
 mod introspect;
 mod tunnel;
 mod values;

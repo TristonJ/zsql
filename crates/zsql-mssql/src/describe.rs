@@ -112,7 +112,7 @@ async fn relation_object_id(
         .await
         .map_err(map_introspect_error)?;
     let Some(row) = row else {
-        return Err(CoreError::Introspection(format!(
+        return Err(CoreError::introspection(format!(
             "relation not found: {schema}.{relation}"
         )));
     };
@@ -515,7 +515,7 @@ fn text(row: &tiberius::Row, column: &str) -> Result<String, CoreError> {
         .map_err(map_introspect_error)?
         .map(str::to_owned)
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -532,7 +532,7 @@ fn boolean(row: &tiberius::Row, column: &str) -> Result<bool, CoreError> {
     row.try_get::<bool, _>(column)
         .map_err(map_introspect_error)?
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -541,7 +541,7 @@ fn int32(row: &tiberius::Row, column: &str) -> Result<i32, CoreError> {
     row.try_get::<i32, _>(column)
         .map_err(map_introspect_error)?
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -550,7 +550,7 @@ fn int16(row: &tiberius::Row, column: &str) -> Result<i16, CoreError> {
     row.try_get::<i16, _>(column)
         .map_err(map_introspect_error)?
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -559,7 +559,7 @@ fn tiny_uint(row: &tiberius::Row, column: &str) -> Result<u8, CoreError> {
     row.try_get::<u8, _>(column)
         .map_err(map_introspect_error)?
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 

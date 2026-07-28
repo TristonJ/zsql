@@ -19,8 +19,7 @@ use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, CoreError, ForeignKeyRef, IndexInfo,
     RelationSchema,
 };
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// The access method every `SQLite` index reports, since `SQLite` has no
 /// access-method concept of its own (see the module doc comment).
@@ -79,9 +78,9 @@ async fn ensure_relation_exists(pool: &SqlitePool, relation: &str) -> Result<(),
             .bind(relation)
             .fetch_optional(pool)
             .await
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
     if row.is_none() {
-        return Err(CoreError::Introspection(format!(
+        return Err(CoreError::introspection(format!(
             "relation not found: {relation}"
         )));
     }
@@ -102,7 +101,7 @@ async fn columns(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut columns = Vec::with_capacity(rows.len());
     // `(pk position, column name)`, sorted by position below so a composite
@@ -110,11 +109,13 @@ async fn columns(
     // not `pragma_table_info`'s own `cid` (ordinal-position) order.
     let mut pk_positions: Vec<(i64, String)> = Vec::new();
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("type").map_err(map_introspect_error)?;
-        let not_null: i64 = row.try_get("not_null").map_err(map_introspect_error)?;
-        let default: Option<String> = row.try_get("dflt_value").map_err(map_introspect_error)?;
-        let pk: i64 = row.try_get("pk").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row.try_get("type").map_err(map_sqlx_introspect_error)?;
+        let not_null: i64 = row.try_get("not_null").map_err(map_sqlx_introspect_error)?;
+        let default: Option<String> = row
+            .try_get("dflt_value")
+            .map_err(map_sqlx_introspect_error)?;
+        let pk: i64 = row.try_get("pk").map_err(map_sqlx_introspect_error)?;
         if pk > 0 {
             pk_positions.push((pk, name.clone()));
         }
@@ -150,13 +151,15 @@ async fn index_list(pool: &SqlitePool, relation: &str) -> Result<Vec<IndexListRo
             .bind(relation)
             .fetch_all(pool)
             .await
-            .map_err(map_introspect_error)?;
+            .map_err(map_sqlx_introspect_error)?;
 
     let mut list = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
-        let is_unique: i64 = row.try_get("is_unique").map_err(map_introspect_error)?;
-        let origin: String = row.try_get("origin").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
+        let is_unique: i64 = row
+            .try_get("is_unique")
+            .map_err(map_sqlx_introspect_error)?;
+        let origin: String = row.try_get("origin").map_err(map_sqlx_introspect_error)?;
         list.push(IndexListRow {
             name,
             unique: is_unique != 0,
@@ -173,11 +176,11 @@ async fn index_columns(pool: &SqlitePool, index_name: &str) -> Result<Vec<String
         .bind(index_name)
         .fetch_all(pool)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
         columns.push(name);
     }
     Ok(columns)
@@ -218,15 +221,15 @@ async fn foreign_keys(
     .bind(relation)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     // Grouped by `id`: `(referenced table, local columns, referenced columns)`.
     let mut groups: HashMap<i64, (String, Vec<String>, Vec<String>)> = HashMap::new();
     for row in &rows {
-        let id: i64 = row.try_get("id").map_err(map_introspect_error)?;
-        let table: String = row.try_get("table").map_err(map_introspect_error)?;
-        let from: String = row.try_get("from").map_err(map_introspect_error)?;
-        let to: String = row.try_get("to").map_err(map_introspect_error)?;
+        let id: i64 = row.try_get("id").map_err(map_sqlx_introspect_error)?;
+        let table: String = row.try_get("table").map_err(map_sqlx_introspect_error)?;
+        let from: String = row.try_get("from").map_err(map_sqlx_introspect_error)?;
+        let to: String = row.try_get("to").map_err(map_sqlx_introspect_error)?;
         let group = groups
             .entry(id)
             .or_insert_with(|| (table, Vec::new(), Vec::new()));

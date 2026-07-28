@@ -5,7 +5,6 @@
 
 mod describe;
 mod driver;
-mod error;
 mod introspect;
 mod quoting;
 mod tunnel;

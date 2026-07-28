@@ -14,8 +14,7 @@ use std::collections::HashMap;
 use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, Row as _};
 use zsql_core::{Catalog, ColumnMeta, CoreError, Relation, RelationKind, SchemaNs, SchemaTree};
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// The fixed catalog name every `MySQL`/`MariaDB` connection reports via
 /// `information_schema.TABLES.TABLE_CATALOG`.
@@ -71,7 +70,7 @@ async fn schema_names(pool: &MySqlPool) -> Result<Vec<String>, CoreError> {
     sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
-        .map_err(map_introspect_error)
+        .map_err(map_sqlx_introspect_error)
 }
 
 /// Every table and view across all non-system databases, grouped by database
@@ -85,13 +84,19 @@ async fn relations(pool: &MySqlPool) -> Result<HashMap<String, Vec<Relation>>, C
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let mut grouped: HashMap<String, Vec<Relation>> = HashMap::new();
     for row in &rows {
-        let schema: String = row.try_get("TABLE_SCHEMA").map_err(map_introspect_error)?;
-        let name: String = row.try_get("TABLE_NAME").map_err(map_introspect_error)?;
-        let table_type: String = row.try_get("TABLE_TYPE").map_err(map_introspect_error)?;
+        let schema: String = row
+            .try_get("TABLE_SCHEMA")
+            .map_err(map_sqlx_introspect_error)?;
+        let name: String = row
+            .try_get("TABLE_NAME")
+            .map_err(map_sqlx_introspect_error)?;
+        let table_type: String = row
+            .try_get("TABLE_TYPE")
+            .map_err(map_sqlx_introspect_error)?;
         let Some(kind) = relation_kind(&table_type) else {
             continue;
         };
@@ -134,15 +139,25 @@ async fn columns(
     let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
-        .map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
 
     let mut grouped: HashMap<(String, String), Vec<ColumnMeta>> = HashMap::new();
     for row in &rows {
-        let schema: String = row.try_get("TABLE_SCHEMA").map_err(map_introspect_error)?;
-        let relation: String = row.try_get("TABLE_NAME").map_err(map_introspect_error)?;
-        let name: String = row.try_get("COLUMN_NAME").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("COLUMN_TYPE").map_err(map_introspect_error)?;
-        let is_nullable: String = row.try_get("IS_NULLABLE").map_err(map_introspect_error)?;
+        let schema: String = row
+            .try_get("TABLE_SCHEMA")
+            .map_err(map_sqlx_introspect_error)?;
+        let relation: String = row
+            .try_get("TABLE_NAME")
+            .map_err(map_sqlx_introspect_error)?;
+        let name: String = row
+            .try_get("COLUMN_NAME")
+            .map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row
+            .try_get("COLUMN_TYPE")
+            .map_err(map_sqlx_introspect_error)?;
+        let is_nullable: String = row
+            .try_get("IS_NULLABLE")
+            .map_err(map_sqlx_introspect_error)?;
         grouped
             .entry((schema, relation))
             .or_default()

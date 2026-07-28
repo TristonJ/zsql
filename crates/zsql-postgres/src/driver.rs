@@ -11,9 +11,9 @@ use zsql_core::{
     BatchSink, ColumnMeta, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema,
     RowCount, SchemaTree, quote_ident,
 };
+use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
 use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
-use crate::error::{map_connect_error, map_query_error};
 use crate::values::decode_row;
 
 /// Bounded pool size for a single desktop client. Small on purpose: this app
@@ -69,7 +69,7 @@ impl PostgresDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect(url)
             .await
-            .map_err(map_connect_error)?;
+            .map_err(map_sqlx_connection_error)?;
         liveness_check(&pool).await?;
         Ok(pool)
     }
@@ -95,7 +95,7 @@ impl PostgresDriver {
             .max_connections(max_connections)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_lazy(url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 
     /// Build the small dedicated pool [`PgConnection::ping`] draws from.
@@ -118,7 +118,7 @@ impl PostgresDriver {
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .test_before_acquire(false)
             .connect_lazy(url)
-            .map_err(map_connect_error)
+            .map_err(map_sqlx_connection_error)
     }
 }
 
@@ -128,8 +128,8 @@ async fn liveness_check(pool: &PgPool) -> Result<i64, CoreError> {
     let row = sqlx::query("SELECT 1 AS one")
         .fetch_one(pool)
         .await
-        .map_err(map_connect_error)?;
-    let one: i32 = row.try_get("one").map_err(map_connect_error)?;
+        .map_err(map_sqlx_connection_error)?;
+    let one: i32 = row.try_get("one").map_err(map_sqlx_connection_error)?;
     Ok(i64::from(one))
 }
 
@@ -213,10 +213,6 @@ impl SqlxZsqlDriver<Postgres> for PostgresDriver {
             .fetch_one(&mut *conn)
             .await?;
         Ok(PgCancelHandle { pid })
-    }
-
-    fn map_query_error(err: sqlx::Error) -> CoreError {
-        map_query_error(err)
     }
 }
 
@@ -305,12 +301,12 @@ async fn fetch_reltuples(
     .bind(relation)
     .fetch_optional(pool)
     .await
-    .map_err(map_query_error)?;
+    .map_err(map_sqlx_query_error)?;
 
     let Some(row) = row else {
         return Ok(None);
     };
-    let reltuples: f32 = row.try_get("reltuples").map_err(map_query_error)?;
+    let reltuples: f32 = row.try_get("reltuples").map_err(map_sqlx_query_error)?;
     Ok(Some(reltuples))
 }
 
@@ -355,7 +351,7 @@ async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<
     let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
-        .map_err(map_query_error)?;
+        .map_err(map_sqlx_query_error)?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -379,8 +375,8 @@ mod tests {
         let cfg = ConnConfig::from_url(UNREACHABLE_URL).unwrap();
         let result = block_on(driver.connect(&cfg));
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(_) => panic!("connecting to an unreachable host must fail"),
@@ -396,7 +392,10 @@ mod tests {
             tunnel_local_addr: None,
         };
         let result = block_on(driver.connect(&cfg));
-        assert!(matches!(result, Err(zsql_core::CoreError::Connection(_))));
+        assert!(matches!(
+            result,
+            Err(zsql_core::CoreError::Connection { .. })
+        ));
     }
 
     #[test]
@@ -427,8 +426,8 @@ mod tests {
 
         let result = block_on(conn.introspect());
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(_) => panic!("introspecting an unreachable host must fail"),
@@ -450,8 +449,8 @@ mod tests {
 
         let result = block_on(conn.ping());
         match result {
-            Err(zsql_core::CoreError::Connection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Connection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Connection, got {other:?}"),
             Ok(()) => panic!("pinging an unreachable host must fail"),
@@ -515,7 +514,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("stream_query must push exactly one event, not hang");
         match evt {
-            Err(zsql_core::CoreError::Query(msg)) => assert!(!msg.is_empty()),
+            Err(zsql_core::CoreError::Query { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a single CoreError::Query, got {other:?}"),
         }
 
@@ -1508,8 +1507,8 @@ mod database_tests {
         );
 
         match result {
-            Err(zsql_core::CoreError::Query(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Query { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Query, got {other:?}"),
             Ok(row_count) => {
@@ -1630,8 +1629,8 @@ mod database_tests {
         );
 
         match result {
-            Err(zsql_core::CoreError::Introspection(msg)) => {
-                assert!(!msg.is_empty(), "error message should not be empty");
+            Err(zsql_core::CoreError::Introspection { message, .. }) => {
+                assert!(!message.is_empty(), "error message should not be empty");
             }
             Err(other) => panic!("expected CoreError::Introspection, got {other:?}"),
             Ok(detail) => {

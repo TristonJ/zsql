@@ -638,8 +638,9 @@ impl Session {
         cx: &Context<Self>,
     ) -> Task<Result<RelationSchema, CoreError>> {
         let Some(connection) = self.connection.clone() else {
-            return Task::ready(Err(CoreError::Connection(
+            return Task::ready(Err(CoreError::connection(
                 "cannot describe relation: not connected".to_owned(),
+                false,
             )));
         };
         let schema = schema.to_owned();
@@ -661,8 +662,9 @@ impl Session {
         cx: &Context<Self>,
     ) -> Task<Result<RowCount, CoreError>> {
         let Some(connection) = self.connection.clone() else {
-            return Task::ready(Err(CoreError::Connection(
+            return Task::ready(Err(CoreError::connection(
                 "cannot fetch row count: not connected".to_owned(),
+                false,
             )));
         };
         let schema = schema.to_owned();
@@ -807,7 +809,7 @@ pub(crate) async fn open_tunnel_and_connect(
     tracing::info!("opening ssh tunnel before connect");
     let tunnel = zsql_ssh::open_tunnel(ssh_cfg, remote_host, remote_port)
         .await
-        .map_err(|err| CoreError::Connection(err.to_string()))?;
+        .map_err(|err| CoreError::connection(err.to_string(), false))?;
 
     let (conn, tunnel) = connect_through_open_tunnel(url, Box::new(tunnel)).await?;
     Ok((conn, Some(tunnel)))
@@ -1280,7 +1282,7 @@ mod tests {
         let mut session = session_with_no_url();
         session.state = SessionState::Running;
 
-        session.apply_query_event(Err(CoreError::Query(
+        session.apply_query_event(Err(CoreError::query(
             "syntax error at or near \"selct\"".to_owned(),
         )));
 
@@ -1950,17 +1952,19 @@ mod gpui_tests {
             match &self.introspect_outcome {
                 FakeIntrospectOutcome::Ready(tree) => Ok(tree.clone()),
                 FakeIntrospectOutcome::Failed(message) => {
-                    Err(CoreError::Introspection(message.clone()))
+                    Err(CoreError::introspection(message.clone()))
                 }
             }
         }
 
         async fn ping(&self) -> Result<(), CoreError> {
             self.ping_calls.fetch_add(1, Ordering::SeqCst);
-            self.ping_rx
-                .recv_async()
-                .await
-                .unwrap_or_else(|_| Err(CoreError::Connection("fake connection closed".to_owned())))
+            self.ping_rx.recv_async().await.unwrap_or_else(|_| {
+                Err(CoreError::connection(
+                    "fake connection closed".to_owned(),
+                    false,
+                ))
+            })
         }
 
         async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
@@ -1977,7 +1981,7 @@ mod gpui_tests {
                 .lock()
                 .expect("count_outcome lock poisoned")
                 .clone()
-                .map_err(CoreError::Query)
+                .map_err(CoreError::query)
         }
 
         async fn describe_relation(
@@ -2110,7 +2114,10 @@ mod gpui_tests {
         });
 
         ping_sender
-            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .send(Err(CoreError::connection(
+                "connection reset".to_owned(),
+                false,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2148,7 +2155,10 @@ mod gpui_tests {
         });
 
         ping_sender
-            .send(Err(CoreError::Connection("connection reset".to_owned())))
+            .send(Err(CoreError::connection(
+                "connection reset".to_owned(),
+                true,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2329,7 +2339,10 @@ mod gpui_tests {
 
         // The fresh connection's own first tick, however, must be honored.
         fresh_ping
-            .send(Err(CoreError::Connection("fresh probe failed".to_owned())))
+            .send(Err(CoreError::connection(
+                "fresh probe failed".to_owned(),
+                false,
+            )))
             .expect("send failed");
         cx.executor().advance_clock(interval);
         cx.run_until_parked();
@@ -2527,7 +2540,7 @@ mod gpui_tests {
             let sinks = sinks.lock().expect("sinks lock poisoned");
             sinks[0].clone()
         };
-        sink.send(Err(CoreError::Query("syntax error".to_owned())))
+        sink.send(Err(CoreError::query("syntax error".to_owned())))
             .expect("sink send failed");
         cx.run_until_parked();
 

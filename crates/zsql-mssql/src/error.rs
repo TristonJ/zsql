@@ -7,31 +7,60 @@ use zsql_core::CoreError;
 /// Convert an I/O error encountered while opening the TCP connection into a
 /// [`CoreError::Connection`].
 pub(crate) fn map_io_connect_error(err: &std::io::Error) -> CoreError {
-    CoreError::Connection(format!("network error: {err}"))
+    CoreError::connection(format!("network error: {err}"), true)
 }
 
 /// Convert a `tiberius::Error` encountered while establishing (or logging
 /// into) a connection into a [`CoreError::Connection`].
 pub(crate) fn map_connect_error(err: tiberius::error::Error) -> CoreError {
-    CoreError::Connection(describe(err))
+    CoreError::Connection {
+        message: describe(&err),
+        transient: is_transient(&err),
+        source: Some(std::sync::Arc::new(err)),
+    }
 }
 
 /// Convert a `tiberius::Error` encountered while streaming a query's results
 /// into a [`CoreError::Query`].
 pub(crate) fn map_query_error(err: tiberius::error::Error) -> CoreError {
-    CoreError::Query(describe(err))
+    CoreError::Query {
+        message: describe(&err),
+        code: err.code().map(|c| c.to_string()),
+        position: None,
+        source: Some(std::sync::Arc::new(err)),
+    }
 }
 
 /// Convert a `tiberius::Error` encountered while introspecting the schema
 /// into a [`CoreError::Introspection`].
 pub(crate) fn map_introspect_error(err: tiberius::error::Error) -> CoreError {
-    CoreError::Introspection(describe(err))
+    CoreError::Introspection {
+        message: describe(&err),
+        source: Some(std::sync::Arc::new(err)),
+    }
+}
+
+/// Return whether or not this triberius error is plausibly transient
+pub(crate) fn is_transient(err: &tiberius::error::Error) -> bool {
+    use tiberius::error::Error;
+    match err {
+        Error::Io { kind, .. } => matches!(
+            kind,
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+        ),
+        Error::Tls(_) => true,
+        _ => false,
+    }
 }
 
 /// Render a short, useful description of a `tiberius::Error`. Never includes
 /// connection-string text: `tiberius::Error` carries none of it (that lives
 /// only in the URL this crate parses, never handed to `tiberius::Error`).
-fn describe(err: tiberius::error::Error) -> String {
+fn describe(err: &tiberius::error::Error) -> String {
     use tiberius::error::Error;
     match err {
         Error::Io { message, .. } => format!("network error: {message}"),
@@ -58,8 +87,8 @@ mod tests {
     fn io_error_maps_to_connection_error_with_network_prefix() {
         let mapped = map_connect_error(sample_io_error());
         match mapped {
-            CoreError::Connection(msg) => {
-                assert_eq!(msg, "network error: connection refused");
+            CoreError::Connection { message, .. } => {
+                assert_eq!(message, "network error: connection refused");
             }
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
@@ -68,13 +97,13 @@ mod tests {
     #[test]
     fn io_error_maps_to_query_error() {
         let mapped = map_query_error(sample_io_error());
-        assert!(matches!(mapped, CoreError::Query(_)));
+        assert!(matches!(mapped, CoreError::Query { .. }));
     }
 
     #[test]
     fn io_error_maps_to_introspection_error() {
         let mapped = map_introspect_error(sample_io_error());
-        assert!(matches!(mapped, CoreError::Introspection(_)));
+        assert!(matches!(mapped, CoreError::Introspection { .. }));
     }
 
     #[test]
@@ -82,7 +111,7 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
         let mapped = map_io_connect_error(&io_err);
         match mapped {
-            CoreError::Connection(msg) => assert!(msg.starts_with("network error:")),
+            CoreError::Connection { message, .. } => assert!(message.starts_with("network error:")),
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
     }
@@ -91,7 +120,7 @@ mod tests {
     fn tls_error_maps_with_a_tls_prefix() {
         let mapped = map_connect_error(tiberius::error::Error::Tls("bad cert".to_owned()));
         match mapped {
-            CoreError::Connection(msg) => assert!(msg.contains("TLS error")),
+            CoreError::Connection { message, .. } => assert!(message.contains("TLS error")),
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
     }

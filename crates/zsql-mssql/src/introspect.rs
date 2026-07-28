@@ -94,7 +94,7 @@ fn text(row: &tiberius::Row, column: &str) -> Result<String, CoreError> {
         .map_err(map_introspect_error)?
         .map(str::to_owned)
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -103,7 +103,7 @@ fn boolean(row: &tiberius::Row, column: &str) -> Result<bool, CoreError> {
     row.try_get::<bool, _>(column)
         .map_err(map_introspect_error)?
         .ok_or_else(|| {
-            CoreError::Introspection(format!("expected column '{column}' to be non-null"))
+            CoreError::introspection(format!("expected column '{column}' to be non-null"))
         })
 }
 
@@ -112,7 +112,7 @@ async fn current_database(client: &mut Client<TcpStream>) -> Result<String, Core
     let rows = run(client, "SELECT DB_NAME() AS name".to_owned()).await?;
     let row = rows
         .first()
-        .ok_or_else(|| CoreError::Introspection("DB_NAME() returned no row".to_owned()))?;
+        .ok_or_else(|| CoreError::introspection("DB_NAME() returned no row".to_owned()))?;
     text(row, "name")
 }
 

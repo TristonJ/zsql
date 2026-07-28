@@ -4,7 +4,11 @@ use std::marker::PhantomData;
 
 use futures::StreamExt as _;
 use sqlx::{AssertSqlSafe, Database, Executor, Row as _, SqlSafeStr as _, Statement as _};
-use zsql_core::{BatchSink, CoreError, QueryEvent, QueryHandle, RowBatch};
+use zsql_core::{BatchSink, QueryEvent, QueryHandle, RowBatch};
+
+use crate::error::map_sqlx_query_error;
+
+pub mod error;
 
 /// Rows are grouped into batches of at most this many rows before a
 /// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
@@ -38,8 +42,6 @@ pub trait SqlxZsqlDriver<DB: Database>: 'static {
     fn cancel_handle(
         conn: &mut DB::Connection,
     ) -> impl Future<Output = Result<Self::Cancel, sqlx::Error>> + Send;
-
-    fn map_query_error(err: sqlx::Error) -> CoreError;
 }
 
 /// Backend-specific data needed to cancel an in-flight query from a second
@@ -162,7 +164,7 @@ pub async fn run_query<DB, D>(
     let mut conn = match pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
-            let _ = sink.send_async(Err(D::map_query_error(err))).await;
+            let _ = sink.send_async(Err(map_sqlx_query_error(err))).await;
             return;
         }
     };
@@ -242,7 +244,7 @@ pub async fn run_query<DB, D>(
                 columns_sent = false;
             }
             futures::future::Either::Right((Some(Err(err)), _)) => {
-                let _ = sink.send_async(Err(D::map_query_error(err))).await;
+                let _ = sink.send_async(Err(map_sqlx_query_error(err))).await;
                 return;
             }
         }

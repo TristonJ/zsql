@@ -3,8 +3,7 @@
 use sqlx::Row as _;
 use sqlx::sqlite::SqlitePool;
 use zsql_core::{Catalog, ColumnMeta, CoreError, Relation, RelationKind, SchemaNs, SchemaTree};
-
-use crate::error::map_introspect_error;
+use zsql_sqlx::error::map_sqlx_introspect_error;
 
 /// `SQLite`'s fixed name for a connection's primary (always-present) database,
 /// as opposed to `temp` or any database added later via `ATTACH`. v0 does not
@@ -43,8 +42,8 @@ async fn main_database_file(pool: &SqlitePool) -> Result<String, CoreError> {
     let row = sqlx::query("SELECT file FROM pragma_database_list WHERE name = 'main'")
         .fetch_one(pool)
         .await
-        .map_err(map_introspect_error)?;
-    let file: String = row.try_get("file").map_err(map_introspect_error)?;
+        .map_err(map_sqlx_introspect_error)?;
+    let file: String = row.try_get("file").map_err(map_sqlx_introspect_error)?;
     Ok(if file.is_empty() {
         IN_MEMORY_CATALOG_NAME.to_owned()
     } else {
@@ -62,12 +61,12 @@ async fn relations(pool: &SqlitePool) -> Result<Vec<Relation>, CoreError> {
     )
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut relations = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
-        let sql_type: String = row.try_get("type").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
+        let sql_type: String = row.try_get("type").map_err(map_sqlx_introspect_error)?;
         let Some(kind) = relation_kind(&sql_type) else {
             continue;
         };
@@ -102,13 +101,13 @@ async fn columns(pool: &SqlitePool, table_name: &str) -> Result<Vec<ColumnMeta>,
     .bind(table_name)
     .fetch_all(pool)
     .await
-    .map_err(map_introspect_error)?;
+    .map_err(map_sqlx_introspect_error)?;
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("name").map_err(map_introspect_error)?;
-        let type_name: String = row.try_get("type").map_err(map_introspect_error)?;
-        let not_null: i64 = row.try_get("not_null").map_err(map_introspect_error)?;
+        let name: String = row.try_get("name").map_err(map_sqlx_introspect_error)?;
+        let type_name: String = row.try_get("type").map_err(map_sqlx_introspect_error)?;
+        let not_null: i64 = row.try_get("not_null").map_err(map_sqlx_introspect_error)?;
         columns.push(ColumnMeta {
             name,
             type_name,
