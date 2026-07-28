@@ -59,7 +59,7 @@ pub trait Driver: Send + Sync {
     /// network port
     fn default_port(&self) -> Option<u16>;
 
-    /// Specify if this driver is networked - defaults to default_port().is_some()
+    /// Specify if this driver is networked - defaults to `default_port().is_some()`
     fn is_networked(&self) -> bool {
         self.default_port().is_some()
     }

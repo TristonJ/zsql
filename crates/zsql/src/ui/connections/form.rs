@@ -367,7 +367,7 @@ impl ConnectionForm {
                 el.opacity(theme::CONNECTION_FORM_DIM_OPACITY)
             });
 
-        section = if self.is_network(driver_id) {
+        section = if Self::is_network(driver_id) {
             self.render_network_fields(section, driver_id, colors, window, cx)
         } else {
             section.child(Self::labeled_field(
@@ -464,7 +464,7 @@ impl ConnectionForm {
         driver_id: &str,
         colors: zsql_ui::theme::Colors,
     ) -> Option<Div> {
-        if !self.is_network(driver_id) {
+        if !Self::is_network(driver_id) {
             return None;
         }
         let parsed = self.parsed_url.as_ref()?;
@@ -689,7 +689,7 @@ impl ConnectionForm {
         parsed: &ConnectionUrl,
         cx: &mut Context<Self>,
     ) {
-        if self.is_network(driver_id) {
+        if Self::is_network(driver_id) {
             let host = parsed.host().unwrap_or_default();
             set_field_value_if_changed(&self.host_field, &host, cx);
             let port = parsed
@@ -719,7 +719,7 @@ impl ConnectionForm {
 
     /// Whether `driver_id` is a network driver. If not detected, we default
     /// to `true`.
-    pub fn is_network(&self, driver_id: &str) -> bool {
+    pub fn is_network(driver_id: &str) -> bool {
         is_network(driver_id).unwrap_or(true)
     }
 
@@ -738,7 +738,7 @@ impl ConnectionForm {
             self.url_field.read(cx).focus_handle(cx),
         ];
         if let Ok(driver_id) = self.driver_id.as_deref() {
-            if self.is_network(driver_id) {
+            if Self::is_network(driver_id) {
                 order.push(self.host_field.read(cx).focus_handle(cx));
                 order.push(self.port_field.read(cx).focus_handle(cx));
                 order.push(self.user_field.read(cx).focus_handle(cx));

@@ -226,18 +226,18 @@ impl Connection for PgConnection {
 
     #[tracing::instrument(name = "pg_introspect", skip_all, fields(pool_size = self.0.pool().size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        crate::introspect::introspect(&self.0.pool()).await
+        crate::introspect::introspect(self.0.pool()).await
     }
 
     #[tracing::instrument(name = "pg_ping", skip_all, fields(pool_size = self.0.probe_pool().size()))]
     async fn ping(&self) -> Result<(), CoreError> {
-        liveness_check(&self.0.probe_pool()).await?;
+        liveness_check(self.0.probe_pool()).await?;
         Ok(())
     }
 
     #[tracing::instrument(name = "pg_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(reltuples) = fetch_reltuples(&self.0.pool(), schema, relation).await? {
+        if let Some(reltuples) = fetch_reltuples(self.0.pool(), schema, relation).await? {
             if reltuples_is_reliable(reltuples) {
                 tracing::debug!(reltuples, "using planner row-count estimate");
                 return Ok(RowCount::Estimated(reltuples_to_row_count(reltuples)));
@@ -250,7 +250,7 @@ impl Connection for PgConnection {
         } else {
             tracing::debug!("no pg_class row found; falling back to an exact count");
         }
-        let exact = exact_row_count(&self.0.pool(), schema, relation).await?;
+        let exact = exact_row_count(self.0.pool(), schema, relation).await?;
         Ok(RowCount::Exact(exact))
     }
 
@@ -264,7 +264,7 @@ impl Connection for PgConnection {
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
-        crate::describe::describe_relation(&self.0.pool(), schema, relation).await
+        crate::describe::describe_relation(self.0.pool(), schema, relation).await
     }
 }
 

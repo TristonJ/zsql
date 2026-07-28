@@ -227,18 +227,18 @@ impl Connection for MySqlConnection {
 
     #[tracing::instrument(name = "mysql_introspect", skip_all, fields(pool_size = self.0.pool().size()))]
     async fn introspect(&self) -> Result<SchemaTree, CoreError> {
-        crate::introspect::introspect(&self.0.pool()).await
+        crate::introspect::introspect(self.0.pool()).await
     }
 
     #[tracing::instrument(name = "mysql_ping", skip_all, fields(pool_size = self.0.probe_pool().size()))]
     async fn ping(&self) -> Result<(), CoreError> {
-        liveness_check(&self.0.probe_pool()).await?;
+        liveness_check(self.0.probe_pool()).await?;
         Ok(())
     }
 
     #[tracing::instrument(name = "mysql_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
     async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(estimate) = fetch_table_rows_estimate(&self.0.pool(), schema, relation).await? {
+        if let Some(estimate) = fetch_table_rows_estimate(self.0.pool(), schema, relation).await? {
             tracing::debug!(
                 estimate,
                 "using information_schema.TABLES row-count estimate"
@@ -249,7 +249,7 @@ impl Connection for MySqlConnection {
             "no reliable TABLE_ROWS estimate (view, or relation not found); \
              falling back to an exact count"
         );
-        let exact = exact_row_count(&self.0.pool(), schema, relation).await?;
+        let exact = exact_row_count(self.0.pool(), schema, relation).await?;
         Ok(RowCount::Exact(exact))
     }
 
@@ -263,7 +263,7 @@ impl Connection for MySqlConnection {
         schema: &str,
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
-        crate::describe::describe_relation(&self.0.pool(), schema, relation).await
+        crate::describe::describe_relation(self.0.pool(), schema, relation).await
     }
 
     /// The click-to-preview query for `relation` in `schema`, capped at

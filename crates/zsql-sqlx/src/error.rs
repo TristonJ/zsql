@@ -3,6 +3,7 @@ use std::sync::Arc;
 use zsql_core::CoreError;
 
 /// Map a [`sqlx::Error`] into a [`CoreError::Connection`]
+#[must_use]
 pub fn map_sqlx_connection_error(err: sqlx::Error) -> CoreError {
     CoreError::Connection {
         message: describe_connection_error(&err),
@@ -41,12 +42,13 @@ fn is_connection_error_transient(err: &sqlx::Error) -> bool {
 }
 
 /// Convert a [`sqlx::Error`] into a [`CoreError::Query`]
+#[must_use]
 pub fn map_sqlx_query_error(err: sqlx::Error) -> CoreError {
     CoreError::Query {
         message: describe_query_error(&err),
         code: err
             .as_database_error()
-            .and_then(|e| e.code())
+            .and_then(sqlx::error::DatabaseError::code)
             .map(|c| c.to_string()),
         position: query_error_position(&err),
         source: Some(Arc::new(err)),
@@ -90,6 +92,7 @@ fn query_error_position(err: &sqlx::Error) -> Option<usize> {
 
 /// Convert a `sqlx::Error` encountered while introspecting the schema into a
 /// [`CoreError::Introspection`], with a short, useful description.
+#[must_use]
 pub fn map_sqlx_introspect_error(err: sqlx::Error) -> CoreError {
     CoreError::Introspection {
         message: describe_introspect_error(&err),
@@ -161,7 +164,7 @@ mod tests {
         let mapped = map_sqlx_connection_error(sqlx::Error::Configuration(cfg_err));
         match mapped {
             CoreError::Connection { message, .. } => {
-                assert!(message.contains("invalid connection configuration"))
+                assert!(message.contains("invalid connection configuration"));
             }
             other => panic!("expected CoreError::Connection, got {other:?}"),
         }
