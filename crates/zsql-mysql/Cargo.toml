@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 zsql-core = { path = "../zsql-core" }
+zsql-sqlx = { path = "../zsql-sqlx" }
 sqlx = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
