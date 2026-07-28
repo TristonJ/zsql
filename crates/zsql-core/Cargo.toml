@@ -9,6 +9,7 @@ publish = false
 async-trait = { workspace = true }
 flume = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 
