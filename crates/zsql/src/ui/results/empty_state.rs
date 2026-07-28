@@ -137,6 +137,7 @@ mod tests {
                 session.clone(),
                 empty_connection_store("click"),
                 Duration::from_millis(100),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 cx,
             )
         });

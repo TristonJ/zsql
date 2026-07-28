@@ -74,16 +74,23 @@ impl WorkspaceView {
     /// layout, `connection_store` backing the connection-manager modal,
     /// `probe_timeout` (typically [`crate::config::Config::liveness`]'s
     /// `probe_timeout()`) bounding the connection-manager form's Test
-    /// button, and `tab_sessions_path` (typically
+    /// button, `batch_size` (typically [`crate::config::Config::query`]'s
+    /// `batch_size`) sizing that Test button's connection's row-batching,
+    /// and `tab_sessions_path` (typically
     /// [`crate::config::Config::tab_sessions_path`]) as where per-connection
     /// tab sessions are read from and saved to.
     #[must_use]
+    // Every parameter is an independent, already-resolved piece of `Config`
+    // this workspace's own descendants need at construction; grouping them
+    // into a wrapper struct would only move the field list, not shrink it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: Entity<Session>,
         layout: LayoutConfig,
         value_panel: ValuePanelConfig,
         connection_store: ConnectionStore,
         probe_timeout: Duration,
+        batch_size: usize,
         tab_sessions_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -104,7 +111,13 @@ impl WorkspaceView {
         });
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), tabs.clone(), cx));
         let connections = cx.new(|cx| {
-            ConnectionManagerView::new(session.clone(), connection_store, probe_timeout, cx)
+            ConnectionManagerView::new(
+                session.clone(),
+                connection_store,
+                probe_timeout,
+                batch_size,
+                cx,
+            )
         });
         results.update(cx, |results, _cx| {
             results.set_connections_modal(connections.clone());

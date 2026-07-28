@@ -2,37 +2,21 @@
 //! on sqlx with the **smol** runtime so its futures await directly on gpui's
 //! executor
 
-use std::time::Duration;
-
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 use sqlx::{AssertSqlSafe, Column, Postgres, Row as _, TypeInfo};
 use zsql_core::{
     BatchSink, ColumnMeta, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema,
     RowCount, SchemaTree, quote_ident,
 };
-use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
+use zsql_sqlx::error::map_sqlx_query_error;
+use zsql_sqlx::pool::{
+    CANCEL_POOL_CONNECTIONS, MAX_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT, PROBE_POOL_CONNECTIONS,
+    build_pool, build_probe_pool, build_side_pool, liveness_check,
+};
 use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
 use crate::values::decode_row;
-
-/// Bounded pool size for a single desktop client. Small on purpose: this app
-/// drives at most a handful of concurrent operations (one running query plus
-/// occasional introspection), and a modest ceiling avoids hammering the
-/// server from a client that only ever has one user.
-const MAX_POOL_CONNECTIONS: u32 = 5;
-
-/// How long to wait for the initial connection (and later, a free pooled
-/// connection) before giving up.
-const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Bounded size of the dedicated pool [`issue_server_side_cancel`] draws
-/// from. Deliberately separate from `MAX_POOL_CONNECTIONS` and small: a
-/// `pg_cancel_backend` call is a single scalar query, never more than a
-/// couple of which are ever in flight at once for this single-user desktop
-/// client, and keeping it off the query pool entirely is the point (see the
-/// doc comment on [`PostgresDriver::build_side_pool`]).
-const CANCEL_POOL_CONNECTIONS: u32 = 2;
 
 /// Below this, `pg_class.reltuples` cannot be trusted as a row-count
 /// estimate. Modern Postgres (this driver has been verified against 18)
@@ -43,95 +27,9 @@ const CANCEL_POOL_CONNECTIONS: u32 = 2;
 /// defensive code guarding against a case Postgres cannot produce.
 const RELTUPLES_UNRELIABLE_THRESHOLD: f32 = 0.0;
 
-/// Bounded size of the dedicated pool [`PgConnection::ping`] draws from.
-/// Separate from both `MAX_POOL_CONNECTIONS` and `CANCEL_POOL_CONNECTIONS` so
-/// a liveness probe can never be blocked behind an in-flight query, nor
-/// blocked behind (or itself block) a `pg_cancel_backend` call. Sized at 2,
-/// not 1: the session only ever runs one probe at a time, but a second
-/// connection lets one probe's acquire succeed promptly even if the prior
-/// probe's connection has not yet been returned to the pool.
-const PROBE_POOL_CONNECTIONS: u32 = 2;
-
 /// The Postgres [`Driver`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PostgresDriver;
-
-impl PostgresDriver {
-    /// Build a bounded connection pool for `url` and verify it is reachable
-    /// with a trivial liveness query before returning it.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if the pool cannot be built or the
-    /// liveness query fails.
-    async fn build_pool(url: &str) -> Result<PgPool, CoreError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(MAX_POOL_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect(url)
-            .await
-            .map_err(map_sqlx_connection_error)?;
-        liveness_check(&pool).await?;
-        Ok(pool)
-    }
-
-    /// Build a small side pool of `max_connections`, used for an operation
-    /// that must never share a connection with the main query pool (see
-    /// [`build_pool`](Self::build_pool)). [`issue_server_side_cancel`]'s
-    /// cancel pool is built this way: a query connection that is
-    /// cooperatively cancelled while blocked server-side does not
-    /// necessarily free its permit back to the query pool right away
-    /// (returning a pooled connection first pings it to confirm it is idle,
-    /// which itself blocks until the backend actually responds), and
-    /// cancellation must not be starved behind that same query pool.
-    ///
-    /// Connects lazily: parsing/validating `url` cannot fail asynchronously
-    /// here, so this is synchronous, and no network round trip happens
-    /// against this pool until its first query is actually issued.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if `url` cannot be parsed.
-    fn build_side_pool(url: &str, max_connections: u32) -> Result<PgPool, CoreError> {
-        PgPoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect_lazy(url)
-            .map_err(map_sqlx_connection_error)
-    }
-
-    /// Build the small dedicated pool [`PgConnection::ping`] draws from.
-    ///
-    /// Deliberately disables sqlx's default `test_before_acquire`: sqlx's
-    /// pool otherwise pings an idle connection *before* handing it back and,
-    /// on failure, silently discards it and hands the caller a freshly
-    /// opened one instead - transparent self-healing that is exactly right
-    /// for the query pool, but wrong here, since it would mean a probe never
-    /// observes a dead connection at all (the pool quietly repairs itself
-    /// first). A liveness probe's entire purpose is to be the thing that
-    /// notices staleness, so this pool must hand back whatever connection it
-    /// has, dead or not, and let the probe's own query surface the failure.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if `url` cannot be parsed.
-    fn build_probe_pool(url: &str) -> Result<PgPool, CoreError> {
-        PgPoolOptions::new()
-            .max_connections(PROBE_POOL_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .test_before_acquire(false)
-            .connect_lazy(url)
-            .map_err(map_sqlx_connection_error)
-    }
-}
-
-/// Run a trivial `SELECT 1` against `pool` to confirm the connection is
-/// actually usable, not just accepted. Returns the decoded value.
-async fn liveness_check(pool: &PgPool) -> Result<i64, CoreError> {
-    let row = sqlx::query("SELECT 1 AS one")
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_connection_error)?;
-    let one: i32 = row.try_get("one").map_err(map_sqlx_connection_error)?;
-    Ok(i64::from(one))
-}
 
 #[async_trait]
 impl Driver for PostgresDriver {
@@ -170,14 +68,17 @@ impl Driver for PostgresDriver {
         };
         tracing::Span::current().record("tls_mode", tls_mode.label());
 
-        let pool = Self::build_pool(&url).await?;
-        let cancel_pool = Self::build_side_pool(&url, CANCEL_POOL_CONNECTIONS)?;
-        let probe_pool = Self::build_probe_pool(&url)?;
+        let pool: PgPool = build_pool(&url, MAX_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT).await?;
+        let cancel_pool: PgPool =
+            build_side_pool(&url, CANCEL_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
+        let probe_pool: PgPool =
+            build_probe_pool(&url, PROBE_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
         tracing::info!("postgres connection established");
         Ok(Box::new(PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
+            cfg.batch_size,
         ))))
     }
 }
@@ -390,6 +291,7 @@ mod tests {
         let cfg = ConnConfig {
             url: "not a valid url".to_owned(),
             tunnel_local_addr: None,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(
@@ -422,6 +324,7 @@ mod tests {
             pool,
             cancel_pool,
             probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ));
 
         let result = block_on(conn.introspect());
@@ -445,6 +348,7 @@ mod tests {
             pool,
             cancel_pool,
             probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ));
 
         let result = block_on(conn.ping());
@@ -471,6 +375,7 @@ mod tests {
             pool,
             cancel_pool,
             probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ))
     }
 
@@ -505,6 +410,7 @@ mod tests {
             pool,
             cancel_pool,
             probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ));
 
         let (tx, rx) = flume::unbounded();
@@ -1198,7 +1104,7 @@ mod database_tests {
     fn stream_query_batches_large_result_sets_when_configured() {
         let conn = live_connection();
 
-        let row_count = zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let row_count = zsql_core::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let (tx, rx) = flume::unbounded();
         let _handle = conn.stream_query(
             format!("SELECT g FROM generate_series(1, {row_count}) AS g"),
@@ -1216,7 +1122,7 @@ mod database_tests {
             match recv(&rx) {
                 Ok(zsql_core::QueryEvent::Batch(batch)) => {
                     assert!(
-                        batch.len() <= zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE,
+                        batch.len() <= zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                         "batch of {} rows exceeds the bound",
                         batch.len()
                     );
@@ -1236,8 +1142,47 @@ mod database_tests {
             batch_count >= 3,
             "expected at least 3 batches for {row_count} rows at a bound of \
              {}, got {batch_count}",
-            zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE
         );
+    }
+
+    #[test]
+    fn stream_query_honors_a_connection_configured_custom_batch_size_when_configured() {
+        let url = live_database_url();
+        let driver = PostgresDriver;
+        let mut cfg = ConnConfig::from_url(&url).unwrap();
+        let custom_batch_size = 3;
+        cfg.batch_size = custom_batch_size;
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let row_count = 10;
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(
+            format!("SELECT g FROM generate_series(1, {row_count}) AS g"),
+            tx,
+        );
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 1),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut total_rows = 0usize;
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    assert!(
+                        batch.len() <= custom_batch_size,
+                        "batch of {} rows exceeds the configured bound of {custom_batch_size}",
+                        batch.len()
+                    );
+                    total_rows += batch.len();
+                }
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(total_rows, row_count);
     }
 
     #[test]

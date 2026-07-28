@@ -345,6 +345,7 @@ mod tests {
                     session_for_connections,
                     empty_store_for_test("render"),
                     crate::config::Config::default().liveness.probe_timeout(),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                     cx,
                 )
             });
@@ -378,6 +379,7 @@ mod tests {
                     session_for_connections,
                     empty_store_for_test("render-connecting"),
                     crate::config::Config::default().liveness.probe_timeout(),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                     cx,
                 )
             });

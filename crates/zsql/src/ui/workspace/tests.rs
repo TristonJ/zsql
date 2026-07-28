@@ -271,6 +271,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -298,6 +299,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -339,6 +341,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -395,6 +398,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -451,6 +455,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -491,6 +496,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -580,6 +586,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -782,6 +789,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -894,6 +902,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -957,6 +966,7 @@ mod render_tests {
                 ValuePanelConfig::default(),
                 store,
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 Some(paths.tab_sessions.clone()),
                 cx,
             )
@@ -1082,6 +1092,7 @@ mod header_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -1120,6 +1131,7 @@ mod header_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -1157,6 +1169,7 @@ mod header_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )
@@ -1195,6 +1208,7 @@ mod header_tests {
                 ValuePanelConfig::default(),
                 empty_store_for_test(),
                 Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                 None,
                 cx,
             )

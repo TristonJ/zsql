@@ -67,12 +67,12 @@ pub struct ThemeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryConfig {
-    /// Rows accumulated per streamed batch before pushing to the UI.
+    /// Rows accumulated per streamed batch before pushing to the UI. Threaded
+    /// through to each sqlx-based driver's connection at connect time (see
+    /// `zsql_core::ConnConfig::batch_size`).
     pub batch_size: usize,
     /// Default `LIMIT` applied to table quick-previews.
     pub preview_limit: u64,
-    /// Server-side statement timeout in milliseconds (`0` disables it).
-    pub statement_timeout_ms: u64,
     /// Upper bound on rows accumulated for a single streamed query result.
     /// Once a result reaches this many rows the query is cancelled and the
     /// session reports a truncated result rather than continuing to grow
@@ -223,9 +223,8 @@ const DEFAULT_MAX_RESULT_ROWS: u64 = 5_000_000;
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            batch_size: 500,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
             preview_limit: 200,
-            statement_timeout_ms: 30_000,
             max_result_rows: DEFAULT_MAX_RESULT_ROWS,
         }
     }
@@ -353,6 +352,25 @@ mod tests {
     #[test]
     fn max_result_rows_defaults_to_five_million() {
         assert_eq!(Config::default().query.max_result_rows, 5_000_000);
+    }
+
+    #[test]
+    fn batch_size_defaults_to_the_shared_zsql_core_constant() {
+        assert_eq!(
+            Config::default().query.batch_size,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn query_config_batch_size_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.query.batch_size = 42;
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.query.batch_size, 42);
     }
 
     #[test]

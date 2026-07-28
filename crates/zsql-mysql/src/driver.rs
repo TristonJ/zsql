@@ -5,121 +5,26 @@
 //! so this one driver serves both (see [`crate::url::normalize_for_sqlx`]
 //! for the `mariadb://` -> `mysql://` scheme rewrite this relies on).
 
-use std::time::Duration;
-
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema, RowCount,
     SchemaTree,
 };
-use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
+use zsql_sqlx::error::map_sqlx_query_error;
+use zsql_sqlx::pool::{
+    CANCEL_POOL_CONNECTIONS, MAX_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT, PROBE_POOL_CONNECTIONS,
+    build_pool, build_probe_pool, build_side_pool, liveness_check,
+};
 use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
 use crate::quoting::backtick_quote_ident;
 use crate::values::{column_metas, decode_row};
 
-/// Bounded pool size for a single desktop client. Mirrors
-/// `zsql-postgres::MAX_POOL_CONNECTIONS`: this app drives at most a handful
-/// of concurrent operations, and a modest ceiling avoids hammering the
-/// server from a client that only ever has one user.
-const MAX_POOL_CONNECTIONS: u32 = 5;
-
-/// How long to wait for the initial connection (and later, a free pooled
-/// connection) before giving up.
-const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Bounded size of the dedicated pool [`issue_server_side_cancel`] draws
-/// from. Deliberately separate from `MAX_POOL_CONNECTIONS` and small: a
-/// `KILL QUERY` call is a single statement, never more than a couple of
-/// which are ever in flight at once for this single-user desktop client, and
-/// keeping it off the query pool entirely means cancellation is never queued
-/// behind the very query it is trying to stop.
-const CANCEL_POOL_CONNECTIONS: u32 = 2;
-
-/// Bounded size of the dedicated pool [`MySqlConnection::ping`] draws from.
-/// Separate from both `MAX_POOL_CONNECTIONS` and `CANCEL_POOL_CONNECTIONS` so
-/// a liveness probe can never be blocked behind an in-flight query, nor
-/// blocked behind (or itself block) a cancel request.
-const PROBE_POOL_CONNECTIONS: u32 = 2;
-
 /// The MySQL/MariaDB [`Driver`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MysqlDriver;
-
-impl MysqlDriver {
-    /// Build a bounded connection pool for `url` and verify it is reachable
-    /// with a trivial liveness query before returning it.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if `url` cannot be normalized, the
-    /// pool cannot be built, or the liveness query fails.
-    async fn build_pool(url: &str) -> Result<MySqlPool, CoreError> {
-        let url = crate::url::normalize_for_sqlx(url)?;
-        let pool = MySqlPoolOptions::new()
-            .max_connections(MAX_POOL_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect(&url)
-            .await
-            .map_err(map_sqlx_connection_error)?;
-        liveness_check(&pool).await?;
-        Ok(pool)
-    }
-
-    /// Build a small side pool of `max_connections`, used for an operation
-    /// that must never share a connection with the main query pool (see
-    /// [`build_pool`](Self::build_pool)). Connects lazily: parsing/
-    /// validating `url` cannot fail asynchronously here, so this is
-    /// synchronous, and no network round trip happens against this pool
-    /// until its first query is actually issued.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if `url` cannot be normalized or
-    /// parsed.
-    fn build_side_pool(url: &str, max_connections: u32) -> Result<MySqlPool, CoreError> {
-        let url = crate::url::normalize_for_sqlx(url)?;
-        MySqlPoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect_lazy(&url)
-            .map_err(map_sqlx_connection_error)
-    }
-
-    /// Build the small dedicated pool [`MySqlConnection::ping`] draws from.
-    ///
-    /// Deliberately disables sqlx's default `test_before_acquire`: sqlx's
-    /// pool otherwise pings an idle connection *before* handing it back and,
-    /// on failure, silently discards it and hands the caller a freshly
-    /// opened one instead -- exactly right for the query pool, but wrong
-    /// here, since a probe's entire purpose is to be the thing that notices
-    /// staleness, so this pool must hand back whatever connection it has,
-    /// dead or not, and let the probe's own query surface the failure.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if `url` cannot be normalized or
-    /// parsed.
-    fn build_probe_pool(url: &str) -> Result<MySqlPool, CoreError> {
-        let url = crate::url::normalize_for_sqlx(url)?;
-        MySqlPoolOptions::new()
-            .max_connections(PROBE_POOL_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .test_before_acquire(false)
-            .connect_lazy(&url)
-            .map_err(map_sqlx_connection_error)
-    }
-}
-
-/// Run a trivial `SELECT 1` against `pool` to confirm the connection is
-/// actually usable, not just accepted. Returns the decoded value.
-async fn liveness_check(pool: &MySqlPool) -> Result<i64, CoreError> {
-    let row = sqlx::query("SELECT 1 AS one")
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_connection_error)?;
-    let one: i32 = row.try_get("one").map_err(map_sqlx_connection_error)?;
-    Ok(i64::from(one))
-}
 
 #[async_trait]
 impl Driver for MysqlDriver {
@@ -157,15 +62,22 @@ impl Driver for MysqlDriver {
             None => (cfg.url.clone(), zsql_core::TlsVerify::Off),
         };
         tracing::Span::current().record("tls_mode", tls_mode.label());
+        // sqlx has no separate `MariaDB` backend, only `MySql`: a
+        // `mariadb://` URL must be normalized to `mysql://` before any pool
+        // (main, cancel, or probe) ever parses it.
+        let url = crate::url::normalize_for_sqlx(&url)?;
 
-        let pool = Self::build_pool(&url).await?;
-        let cancel_pool = Self::build_side_pool(&url, CANCEL_POOL_CONNECTIONS)?;
-        let probe_pool = Self::build_probe_pool(&url)?;
+        let pool: MySqlPool = build_pool(&url, MAX_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT).await?;
+        let cancel_pool: MySqlPool =
+            build_side_pool(&url, CANCEL_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
+        let probe_pool: MySqlPool =
+            build_probe_pool(&url, PROBE_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
         tracing::info!("mysql connection established");
         Ok(Box::new(MySqlConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
+            cfg.batch_size,
         ))))
     }
 }
@@ -374,6 +286,7 @@ mod tests {
         let cfg = ConnConfig {
             url: "not a valid url".to_owned(),
             tunnel_local_addr: None,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         };
         let result = block_on(driver.connect(&cfg));
         assert!(matches!(
@@ -435,6 +348,7 @@ mod tests {
             pool,
             cancel_pool,
             probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
         ))
     }
 
@@ -729,7 +643,7 @@ mod database_tests {
     fn stream_query_batches_large_result_sets_when_configured() {
         let conn = live_connection();
 
-        let row_count = zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let row_count = zsql_core::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let table = "zsql_test_batch_rows";
         seed_cross_join_source_table(&*conn, table);
         // A 4-way cross join of the 10-row helper table yields 10^4 =
@@ -749,7 +663,7 @@ mod database_tests {
             match recv(&rx) {
                 Ok(zsql_core::QueryEvent::Batch(batch)) => {
                     assert!(
-                        batch.len() <= zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE,
+                        batch.len() <= zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                         "batch of {} rows exceeds the bound",
                         batch.len()
                     );
@@ -769,8 +683,49 @@ mod database_tests {
             batch_count >= 3,
             "expected at least 3 batches for {row_count} rows at a bound of \
              {}, got {batch_count}",
-            zsql_sqlx::DEFAULT_QUERY_BATCH_SIZE
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE
         );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    #[test]
+    fn stream_query_honors_a_connection_configured_custom_batch_size_when_configured() {
+        let url = live_database_url();
+        let driver = MysqlDriver;
+        let mut cfg = ConnConfig::from_url(&url).unwrap();
+        let custom_batch_size = 3;
+        cfg.batch_size = custom_batch_size;
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let table = "zsql_test_custom_batch_size";
+        seed_cross_join_source_table(&*conn, table);
+        let row_count = 10;
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(cross_join_rows_sql(table, 2, row_count), tx);
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 1),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut total_rows = 0usize;
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    assert!(
+                        batch.len() <= custom_batch_size,
+                        "batch of {} rows exceeds the configured bound of {custom_batch_size}",
+                        batch.len()
+                    );
+                    total_rows += batch.len();
+                }
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(total_rows, row_count);
 
         run_ddl(&*conn, &format!("DROP TABLE {table}"));
     }

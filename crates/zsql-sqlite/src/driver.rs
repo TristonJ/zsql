@@ -9,32 +9,24 @@
 //! from reading further rows out of the `SQLite` connection worker, and no
 //! mechanism analogous to `pg_cancel_backend` is attempted or promised.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
     RowBatch, RowCount, SchemaTree, quote_ident,
 };
-use zsql_sqlx::error::{map_sqlx_connection_error, map_sqlx_query_error};
+use zsql_sqlx::error::map_sqlx_query_error;
+use zsql_sqlx::pool::{POOL_ACQUIRE_TIMEOUT, build_pool, liveness_check_or_skip_if_busy};
 
 use crate::values::{column_metas, decode_row};
 
-/// Rows are grouped into batches of at most this many rows before a
-/// [`QueryEvent::Batch`] is pushed into the sink. Bounded so a large result
-/// set streams to the UI incrementally instead of arriving as one huge
-/// allocation. Mirrors `zsql-postgres`'s batch bound; this is an internal
-/// placeholder default, not yet wired to `Config`.
-const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
-
 /// Pool size for a `SQLite` connection.
 ///
-/// Deliberately capped at one connection, for two reasons that go beyond
-/// the "single desktop user" reasoning `zsql-postgres` uses for its own
-/// (larger) pool bound:
+/// Deliberately capped at one connection, unlike the larger shared
+/// [`zsql_sqlx::pool::MAX_POOL_CONNECTIONS`] the network drivers use, for two
+/// reasons:
 /// - An in-memory (`:memory:`) database exists only for the lifetime of the
 ///   connection that opened it: a second pooled connection would see an
 ///   entirely separate, empty database, silently corrupting every query that
@@ -45,51 +37,9 @@ const DEFAULT_QUERY_BATCH_SIZE: usize = 500;
 ///   error between this process's own connections.
 const MAX_POOL_CONNECTIONS: u32 = 1;
 
-/// How long to wait for the initial connection (and later, a free pooled
-/// connection) before giving up.
-const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The `SQLite` [`Driver`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SqliteDriver;
-
-impl SqliteDriver {
-    /// Build a single-connection pool for `url` and verify it is reachable
-    /// with a trivial liveness query before returning it.
-    ///
-    /// # Errors
-    /// Returns [`CoreError::Connection`] if the pool cannot be built or the
-    /// liveness query fails.
-    async fn build_pool(url: &str) -> Result<SqlitePool, CoreError> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(MAX_POOL_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect(url)
-            .await
-            .map_err(map_sqlx_connection_error)?;
-        liveness_check(&pool).await?;
-        Ok(pool)
-    }
-}
-
-/// Run a trivial `SELECT 1` against `pool` to confirm the connection is
-/// actually usable, not just accepted. Returns the decoded value.
-async fn liveness_check(pool: &SqlitePool) -> Result<i64, CoreError> {
-    // Because the sqlite pool only has one connection, if that connection is busy
-    // we have no way to get a second connection to run the liveness check, so we
-    // just assume that the connection is still alive.
-    let Some(mut connection) = pool.try_acquire() else {
-        tracing::info!("sqlite pool is busy, skipping liveness check");
-        return Ok(1);
-    };
-
-    let row = sqlx::query("SELECT 1 AS one")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(map_sqlx_connection_error)?;
-    let one: i64 = row.try_get("one").map_err(map_sqlx_connection_error)?;
-    Ok(one)
-}
 
 #[async_trait]
 impl Driver for SqliteDriver {
@@ -118,9 +68,13 @@ impl Driver for SqliteDriver {
         // Unlike a Postgres URL, a SQLite URL is normally just a file path
         // (or `:memory:`) with no embedded credentials, but it is still kept
         // out of the span for consistency with the other driver.
-        let pool = Self::build_pool(&cfg.url).await?;
+        let pool: SqlitePool =
+            build_pool(&cfg.url, MAX_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT).await?;
         tracing::info!("sqlite connection established");
-        Ok(Box::new(SqliteConnectionImpl { pool }))
+        Ok(Box::new(SqliteConnectionImpl {
+            pool,
+            batch_size: cfg.batch_size,
+        }))
     }
 }
 
@@ -128,6 +82,9 @@ impl Driver for SqliteDriver {
 /// [`MAX_POOL_CONNECTIONS`]).
 pub struct SqliteConnectionImpl {
     pool: SqlitePool,
+    /// Rows grouped into one [`QueryEvent::Batch`] at a time, from the
+    /// connecting [`ConnConfig::batch_size`].
+    batch_size: usize,
 }
 
 impl SqliteConnectionImpl {
@@ -151,8 +108,9 @@ impl Connection for SqliteConnectionImpl {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
         let (cancel_tx, cancel_rx) = flume::unbounded();
         let pool = self.pool.clone();
+        let batch_size = self.batch_size;
         // Run on the smol-based executor sqlx's `runtime-smol` feature
-        async_global_executor::spawn(run_query(pool, sql, sink, cancel_rx)).detach();
+        async_global_executor::spawn(run_query(pool, sql, sink, cancel_rx, batch_size)).detach();
         QueryHandle::new(cancel_tx)
     }
 
@@ -162,7 +120,7 @@ impl Connection for SqliteConnectionImpl {
     }
 
     async fn ping(&self) -> Result<(), CoreError> {
-        liveness_check(&self.pool).await.map(|_| ())
+        liveness_check_or_skip_if_busy(&self.pool).await.map(|_| ())
     }
 
     /// `SQLite` has no analogue of Postgres's `pg_class.reltuples`: it keeps
@@ -231,8 +189,18 @@ fn count_sql(schema: &str, relation: &str) -> String {
 /// stops issuing further step requests to `SQLite`'s connection worker. There
 /// is no `SQLite`-side equivalent of `pg_cancel_backend` to also interrupt a
 /// step already in flight.
-#[tracing::instrument(name = "sqlite_stream_query", skip_all, fields(pool_size = pool.size()))]
-async fn run_query(pool: SqlitePool, sql: String, sink: BatchSink, cancel_rx: flume::Receiver<()>) {
+#[tracing::instrument(
+    name = "sqlite_stream_query",
+    skip_all,
+    fields(pool_size = pool.size(), batch_size)
+)]
+async fn run_query(
+    pool: SqlitePool,
+    sql: String,
+    sink: BatchSink,
+    cancel_rx: flume::Receiver<()>,
+    batch_size: usize,
+) {
     tracing::debug!(sql = %sql, "streaming query");
 
     let mut conn = match pool.acquire().await {
@@ -278,7 +246,7 @@ async fn run_query(pool: SqlitePool, sql: String, sink: BatchSink, cancel_rx: fl
                     any_columns_sent = true;
                 }
                 batch.push(decode_row(&row));
-                if batch.len() >= DEFAULT_QUERY_BATCH_SIZE {
+                if batch.len() >= batch_size {
                     let full = std::mem::take(&mut batch);
                     if sink.send_async(Ok(QueryEvent::Batch(full))).await.is_err() {
                         return;
@@ -451,7 +419,10 @@ mod tests {
         )
         .expect("in-memory connect should succeed");
         let pool_handle = pool.clone();
-        let conn = SqliteConnectionImpl { pool };
+        let conn = SqliteConnectionImpl {
+            pool,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+        };
 
         block_on(conn.close());
 
@@ -489,7 +460,10 @@ mod tests {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect_lazy(&unopenable_url())
             .expect("connect_lazy only parses the URL; it must not touch the filesystem");
-        let conn = SqliteConnectionImpl { pool };
+        let conn = SqliteConnectionImpl {
+            pool,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+        };
 
         let result = block_on(conn.introspect());
         match result {
@@ -957,7 +931,7 @@ mod tests {
         let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
-        let row_count = super::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
+        let row_count = zsql_core::DEFAULT_QUERY_BATCH_SIZE * 2 + 7;
         let sql = format!(
             "WITH RECURSIVE cnt(g) AS (\
                  SELECT 1 UNION ALL SELECT g + 1 FROM cnt WHERE g < {row_count}\
@@ -977,7 +951,7 @@ mod tests {
             match recv(&rx) {
                 Ok(zsql_core::QueryEvent::Batch(batch)) => {
                     assert!(
-                        batch.len() <= super::DEFAULT_QUERY_BATCH_SIZE,
+                        batch.len() <= zsql_core::DEFAULT_QUERY_BATCH_SIZE,
                         "batch of {} rows exceeds the bound",
                         batch.len()
                     );
@@ -997,8 +971,48 @@ mod tests {
             batch_count >= 3,
             "expected at least 3 batches for {row_count} rows at a bound of \
              {}, got {batch_count}",
-            super::DEFAULT_QUERY_BATCH_SIZE
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE
         );
+    }
+
+    #[test]
+    fn stream_query_honors_a_connection_configured_custom_batch_size() {
+        let driver = SqliteDriver;
+        let mut cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let custom_batch_size = 3;
+        cfg.batch_size = custom_batch_size;
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        let row_count = 10;
+        let sql = format!(
+            "WITH RECURSIVE cnt(g) AS (\
+                 SELECT 1 UNION ALL SELECT g + 1 FROM cnt WHERE g < {row_count}\
+             ) SELECT g FROM cnt"
+        );
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => assert_eq!(columns.len(), 1),
+            other => panic!("expected Columns first, got {other:?}"),
+        }
+
+        let mut total_rows = 0usize;
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => {
+                    assert!(
+                        batch.len() <= custom_batch_size,
+                        "batch of {} rows exceeds the configured bound of {custom_batch_size}",
+                        batch.len()
+                    );
+                    total_rows += batch.len();
+                }
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(total_rows, row_count);
     }
 
     #[test]

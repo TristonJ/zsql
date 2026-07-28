@@ -110,6 +110,9 @@ pub struct ConnectionManagerView {
     /// [`crate::config::Config::liveness`] so Test and the footer's live
     /// indicator agree on what "unreachable" means.
     probe_timeout: Duration,
+    /// Rows a Test attempt's connection batches at a time, from
+    /// [`crate::config::Config::query`]'s `batch_size`.
+    batch_size: usize,
     form: Entity<ConnectionForm>,
     /// We need to refocus the modal's own focus handle
     refocus_modal: bool,
@@ -120,12 +123,15 @@ impl ConnectionManagerView {
     /// holds. Starts closed, on the list panel, with no tracked active
     /// connection. `probe_timeout` is the Test button's connect+ping
     /// timeout (typically [`crate::config::Config::liveness`]'s
-    /// `probe_timeout()`).
+    /// `probe_timeout()`); `batch_size` is the Test button's connection's
+    /// row-batching (typically [`crate::config::Config::query`]'s
+    /// `batch_size`).
     #[must_use]
     pub fn new(
         session: Entity<Session>,
         store: ConnectionStore,
         probe_timeout: Duration,
+        batch_size: usize,
         cx: &mut Context<Self>,
     ) -> Self {
         let rows = build_rows(store.connections());
@@ -147,6 +153,7 @@ impl ConnectionManagerView {
             active: None,
             status: None,
             probe_timeout,
+            batch_size,
             form,
             refocus_modal: false,
         }
@@ -764,6 +771,7 @@ impl ConnectionManagerView {
             form.set_test_outcome(Some(TestOutcome::Pending), cx);
         });
         let timeout = self.probe_timeout;
+        let batch_size = self.batch_size;
         let form = self.form.clone();
         let (ssh, ssh_secret) = self.form.read(cx).ssh_state(cx);
         let ssh_cfg = ssh
@@ -773,7 +781,7 @@ impl ConnectionManagerView {
         cx.spawn(async move |_this, cx| {
             let started = Instant::now();
             let connect_result = cx
-                .background_spawn(open_tunnel_and_connect(url, ssh_cfg))
+                .background_spawn(open_tunnel_and_connect(url, ssh_cfg, batch_size))
                 .await;
             let outcome = match connect_result {
                 Ok((conn, _tunnel)) => {

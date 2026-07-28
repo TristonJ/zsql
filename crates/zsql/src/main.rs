@@ -84,6 +84,7 @@ fn main() -> anyhow::Result<()> {
                     let workspace_layout = cfg.layout.clone();
                     let workspace_value_panel = cfg.value_panel.clone();
                     let probe_timeout = cfg.liveness.probe_timeout();
+                    let batch_size = cfg.query.batch_size;
                     let tab_sessions_path = Config::tab_sessions_path();
                     let workspace = cx.new(|cx| {
                         WorkspaceView::new(
@@ -92,6 +93,7 @@ fn main() -> anyhow::Result<()> {
                             workspace_value_panel,
                             connection_store,
                             probe_timeout,
+                            batch_size,
                             tab_sessions_path,
                             cx,
                         )

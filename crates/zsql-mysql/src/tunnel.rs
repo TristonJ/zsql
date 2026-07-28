@@ -1,37 +1,26 @@
 //! Translates a connect URL plus an already-open tunnel's local address into
-//! the URL this driver actually connects with. Pure and network-free: every
-//! function here only builds a string.
-//!
-//! sqlx's `MySqlConnectOptions` has a single `host` field used both to dial
-//! and to verify a certificate's identity against, with no hook to install a
-//! custom TLS verifier -- so, unlike Postgres, there is no way to dial a
-//! tunnel's loopback address while still checking the certificate against
-//! the real remote hostname. A tunneled connection that requested full
-//! identity verification is capped to CA-chain verification instead of
-//! silently losing verification entirely: the SSH transport itself already
-//! authenticates the server being tunneled to.
+//! the URL this driver actually connects with. A thin wrapper over
+//! [`zsql_core::tunneled_connect_url_capping_verify_full`] naming this
+//! dialect's own `ssl-mode`/`sslmode` spelling, on top of the `mariadb://` ->
+//! `mysql://` scheme normalization sqlx's `MySql` backend requires.
 
 use std::net::SocketAddr;
 
-use zsql_core::{ConnectionUrl, CoreError, TlsVerify, rewrite_for_tunnel};
+use zsql_core::{CoreError, SslModeSpelling, TlsVerify};
 
-/// The `ssl-mode` value requesting full certificate-chain and hostname
-/// verification, matching sqlx's own spelling.
-const SSLMODE_VERIFY_IDENTITY: &str = "verify_identity";
-/// The `ssl-mode` value requesting certificate-chain verification without
-/// checking the hostname -- what a tunneled `verify_identity` request is
-/// capped to.
-const SSLMODE_VERIFY_CA: &str = "verify_ca";
+/// sqlx's own `ssl-mode` query parameter (with the legacy `sslmode` spelling
+/// also accepted) and its `verify_identity`/`verify_ca` value spellings.
+const SSLMODE: SslModeSpelling = SslModeSpelling {
+    param_names: &["ssl-mode", "sslmode"],
+    verify_full: "verify_identity",
+    verify_ca: "verify_ca",
+};
 
 /// Build the URL this driver should actually connect with when `original`
 /// requested a tunnel whose local address is `tunnel_addr`, and report which
-/// [`TlsVerify`] level that URL will end up requesting.
-///
-/// A requested `verify_identity` is capped to `verify_ca`: the certificate
-/// chain is still checked, but not the hostname (which cannot be, once the
-/// dial target is rewritten to the tunnel's loopback address). Every other
-/// mode (absent, `disabled`, `preferred`, `required`, or an already-`verify_ca`
-/// request) uses the plain fallback rewrite, unchanged beyond host and port.
+/// [`TlsVerify`] level that URL will end up requesting. See
+/// [`zsql_core::tunneled_connect_url_capping_verify_full`] for the capping
+/// rationale.
 ///
 /// # Errors
 /// Returns [`CoreError::Url`] if `original` cannot be parsed, or has no
@@ -41,37 +30,7 @@ pub fn tunneled_connect_url(
     tunnel_addr: SocketAddr,
 ) -> Result<(String, TlsVerify), CoreError> {
     let normalized = crate::url::normalize_for_sqlx(original)?;
-    let requested = detect_requested_verify(&ConnectionUrl::parse(&normalized)?);
-
-    match requested {
-        TlsVerify::VerifyFull => {
-            let mut url = ConnectionUrl::parse(&normalized)?;
-            url.set_host(&tunnel_addr.ip().to_string())?;
-            url.set_port(Some(tunnel_addr.port()))?;
-            url.set_query_param("ssl-mode", SSLMODE_VERIFY_CA);
-            Ok((url.to_url_string(), TlsVerify::VerifyCa))
-        }
-        TlsVerify::VerifyCa | TlsVerify::Off => {
-            Ok((rewrite_for_tunnel(&normalized, tunnel_addr)?, requested))
-        }
-    }
-}
-
-/// Read the `ssl-mode`/`sslmode` query parameter off `url` and translate it
-/// to a [`TlsVerify`] intent. Anything other than `verify_identity`/
-/// `verify_ca` (including no parameter at all) is [`TlsVerify::Off`]: those
-/// modes either use no TLS or accept whatever certificate the server
-/// presents, so tunneling has nothing extra to preserve for them.
-fn detect_requested_verify(url: &ConnectionUrl) -> TlsVerify {
-    let mode = url
-        .query_param("ssl-mode")
-        .or_else(|| url.query_param("sslmode"))
-        .map(|value| value.to_ascii_lowercase());
-    match mode.as_deref() {
-        Some(SSLMODE_VERIFY_IDENTITY) => TlsVerify::VerifyFull,
-        Some(SSLMODE_VERIFY_CA) => TlsVerify::VerifyCa,
-        _ => TlsVerify::Off,
-    }
+    zsql_core::tunneled_connect_url_capping_verify_full(&normalized, tunnel_addr, &SSLMODE)
 }
 
 #[cfg(test)]
