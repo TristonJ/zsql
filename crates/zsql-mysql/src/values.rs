@@ -50,64 +50,120 @@ fn decode_value(row: &MySqlRow, idx: usize) -> Value {
 
 /// Attempt to decode `row[idx]` using a type-specific mapping. Returns
 /// `None` when `type_name` is not one this module maps, or when decoding it
-/// unexpectedly errors.
+/// unexpectedly errors. Each arm reads the driver-native value out of `row`
+/// and immediately hands it to a plain-value conversion function, so the
+/// actual `Value` construction logic underneath is testable without a live
+/// row.
 fn known_value(row: &MySqlRow, idx: usize, type_name: &str) -> Option<Value> {
     match type_name {
         // `TINYINT(1)`, `BOOL`, and `BOOLEAN` all report as "BOOLEAN" here
         // (MySQL has no wire-level boolean type of its own); every other
         // `TINYINT` width stays an integer, matched below.
-        "BOOLEAN" => scalar::<bool, _>(row, idx, Value::Bool),
-        "TINYINT" => scalar::<i8, _>(row, idx, |v| Value::Int(i64::from(v))),
-        "SMALLINT" => scalar::<i16, _>(row, idx, |v| Value::Int(i64::from(v))),
-        "MEDIUMINT" | "INT" => scalar::<i32, _>(row, idx, |v| Value::Int(i64::from(v))),
-        "BIGINT" => scalar::<i64, _>(row, idx, Value::Int),
-        "TINYINT UNSIGNED" => scalar::<u8, _>(row, idx, |v| Value::Int(i64::from(v))),
-        "SMALLINT UNSIGNED" => scalar::<u16, _>(row, idx, |v| Value::Int(i64::from(v))),
+        "BOOLEAN" => decode::<bool>(row, idx).map(bool_value),
+        "TINYINT" => decode::<i8>(row, idx).map(|v| int_value(v.map(i64::from))),
+        "SMALLINT" => decode::<i16>(row, idx).map(|v| int_value(v.map(i64::from))),
+        "MEDIUMINT" | "INT" => decode::<i32>(row, idx).map(|v| int_value(v.map(i64::from))),
+        "BIGINT" => decode::<i64>(row, idx).map(int_value),
+        "TINYINT UNSIGNED" => decode::<u8>(row, idx).map(|v| int_value(v.map(i64::from))),
+        "SMALLINT UNSIGNED" => decode::<u16>(row, idx).map(|v| int_value(v.map(i64::from))),
         "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => {
-            scalar::<u32, _>(row, idx, |v| Value::Int(i64::from(v)))
+            decode::<u32>(row, idx).map(|v| int_value(v.map(i64::from)))
         }
         // `BIT` has no dedicated `Value` variant; it joins `BIGINT UNSIGNED`
         // on the same overflow-safe unsigned-integer path, treating the bit
         // field as the unsigned integer it numerically is.
-        "BIGINT UNSIGNED" | "BIT" => scalar::<u64, _>(row, idx, unsigned_to_value),
-        "FLOAT" => scalar::<f32, _>(row, idx, |v| Value::Float(f64::from(v))),
-        "DOUBLE" => scalar::<f64, _>(row, idx, Value::Float),
-        "DECIMAL" => scalar::<BigDecimal, _>(row, idx, |v| Value::Numeric(v.to_string())),
+        "BIGINT UNSIGNED" | "BIT" => decode::<u64>(row, idx).map(unsigned_value),
+        "FLOAT" => decode::<f32>(row, idx).map(|v| float_value(v.map(f64::from))),
+        "DOUBLE" => decode::<f64>(row, idx).map(float_value),
+        "DECIMAL" => decode::<BigDecimal>(row, idx).map(decimal_value),
         "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
-            scalar::<String, _>(row, idx, Value::Text)
+            decode::<String>(row, idx).map(text_value)
         }
         "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
-            scalar::<Vec<u8>, _>(row, idx, Value::Bytes)
+            decode::<Vec<u8>>(row, idx).map(bytes_value)
         }
-        "DATE" => scalar::<NaiveDate, _>(row, idx, |v| Value::Timestamp(v.to_string())),
-        "TIME" => scalar::<NaiveTime, _>(row, idx, |v| Value::Timestamp(v.to_string())),
+        "DATE" => decode::<NaiveDate>(row, idx).map(date_value),
+        "TIME" => decode::<NaiveTime>(row, idx).map(time_value),
         // `TIMESTAMP` is decoded exactly like `DATETIME`: the naive
         // wall-clock value the server sends back, with no time zone
         // conversion applied (MySQL's TIMESTAMP wire encoding is
         // indistinguishable from DATETIME's; only its storage semantics on
         // the server differ).
-        "DATETIME" | "TIMESTAMP" => {
-            scalar::<NaiveDateTime, _>(row, idx, |v| Value::Timestamp(format_naive_timestamp(v)))
-        }
-        "YEAR" => scalar::<u16, _>(row, idx, |v| Value::Int(i64::from(v))),
+        "DATETIME" | "TIMESTAMP" => decode::<NaiveDateTime>(row, idx).map(timestamp_value),
+        "YEAR" => decode::<u16>(row, idx).map(|v| int_value(v.map(i64::from))),
         // MariaDB has no native JSON wire type of its own -- JSON there is
         // a `LONGTEXT` alias, so a MariaDB JSON column (or a JSON-producing
         // expression) never reaches this arm and instead decodes as
         // `Value::Text` via the `LONGTEXT` arm above. This arm only ever
         // matches on MySQL, whose JSON type is a genuine distinct wire type.
-        "JSON" => {
-            scalar::<Json<Box<JsonRawValue>>, _>(row, idx, |v| Value::Json(v.0.get().to_owned()))
-        }
+        "JSON" => decode::<Json<Box<JsonRawValue>>>(row, idx).map(json_value),
         _ => None,
     }
 }
 
-/// ISO-8601-ish rendering of a timezone-less timestamp: chrono's own
-/// `Display` uses a space between date and time, so this formats explicitly
-/// with a `T` separator to match the ISO-8601 text the other temporal types
-/// already produce.
-fn format_naive_timestamp(dt: NaiveDateTime) -> String {
-    dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
+/// Decode column `idx` as `Option<T>` via sqlx's unchecked getter (this
+/// module's own `type_name` dispatch has already established which Rust
+/// type applies; sqlx's static `Type::compatible` check would otherwise
+/// reject some of these pairings, e.g. `NaiveDateTime` against a
+/// `TIMESTAMP`-typed column, which are byte-for-byte identical to `DATETIME`
+/// on the wire). Any decode error is treated as "not this type after all"
+/// (`None`), falling back to [`raw_fallback`].
+// The outer `Option` (decode succeeded at all) and inner `Option` (decoded
+// value vs. SQL NULL) are genuinely distinct axes here, not redundant
+// nesting: callers pattern-match `None` (fall back) separately from
+// `Some(None)` (a real, typed NULL).
+#[allow(clippy::option_option)]
+fn decode<'r, T>(row: &'r MySqlRow, idx: usize) -> Option<Option<T>>
+where
+    T: sqlx::Decode<'r, sqlx::MySql> + sqlx::Type<sqlx::MySql>,
+{
+    row.try_get_unchecked::<Option<T>, _>(idx).ok()
+}
+
+fn bool_value(v: Option<bool>) -> Value {
+    v.map_or(Value::Null, Value::Bool)
+}
+
+fn int_value(v: Option<i64>) -> Value {
+    v.map_or(Value::Null, Value::Int)
+}
+
+fn float_value(v: Option<f64>) -> Value {
+    v.map_or(Value::Null, Value::Float)
+}
+
+fn decimal_value(v: Option<BigDecimal>) -> Value {
+    v.map_or(Value::Null, |d| Value::Numeric(d.to_string()))
+}
+
+fn text_value(v: Option<String>) -> Value {
+    v.map_or(Value::Null, Value::Text)
+}
+
+fn bytes_value(v: Option<Vec<u8>>) -> Value {
+    v.map_or(Value::Null, Value::Bytes)
+}
+
+fn date_value(v: Option<NaiveDate>) -> Value {
+    v.map_or(Value::Null, |d| Value::Timestamp(d.to_string()))
+}
+
+fn time_value(v: Option<NaiveTime>) -> Value {
+    v.map_or(Value::Null, |t| Value::Timestamp(t.to_string()))
+}
+
+fn timestamp_value(v: Option<NaiveDateTime>) -> Value {
+    v.map_or(Value::Null, |dt| {
+        Value::Timestamp(format_naive_timestamp(dt))
+    })
+}
+
+fn json_value(v: Option<Json<Box<JsonRawValue>>>) -> Value {
+    v.map_or(Value::Null, |j| Value::Json(j.0.get().to_owned()))
+}
+
+fn unsigned_value(v: Option<u64>) -> Value {
+    v.map_or(Value::Null, unsigned_to_value)
 }
 
 /// Widen an unsigned 64-bit value to [`Value::Int`] when it fits `i64`'s
@@ -122,24 +178,12 @@ fn unsigned_to_value(v: u64) -> Value {
     }
 }
 
-/// Decode column `idx` as `Option<T>` via sqlx's unchecked getter (this
-/// module's own `type_name` dispatch has already established which Rust
-/// type applies; sqlx's static `Type::compatible` check would otherwise
-/// reject some of these pairings, e.g. `NaiveDateTime` against a
-/// `TIMESTAMP`-typed column, which are byte-for-byte identical to `DATETIME`
-/// on the wire). SQL NULL maps to [`Value::Null`]; any decode error is
-/// treated as "not this type after all" (`None`), falling back to
-/// [`raw_fallback`].
-fn scalar<'r, T, F>(row: &'r MySqlRow, idx: usize, to_value: F) -> Option<Value>
-where
-    T: sqlx::Decode<'r, sqlx::MySql>,
-    F: FnOnce(T) -> Value,
-{
-    match row.try_get_unchecked::<Option<T>, _>(idx) {
-        Ok(Some(v)) => Some(to_value(v)),
-        Ok(None) => Some(Value::Null),
-        Err(_) => None,
-    }
+/// ISO-8601-ish rendering of a timezone-less timestamp: chrono's own
+/// `Display` uses a space between date and time, so this formats explicitly
+/// with a `T` separator to match the ISO-8601 text the other temporal types
+/// already produce.
+fn format_naive_timestamp(dt: NaiveDateTime) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
 }
 
 /// Fallback decode for a column whose type this module does not map: `NULL`
@@ -149,8 +193,190 @@ where
 /// `MSSQL` drivers -- there is no raw text/bytes form of the value available
 /// to carry here).
 fn raw_fallback(row: &MySqlRow, idx: usize, type_name: &str) -> Value {
-    match row.try_get_raw(idx) {
-        Ok(raw) if raw.is_null() => Value::Null,
-        _ => Value::Unknown(type_name.to_owned()),
+    let is_null = row.try_get_raw(idx).is_ok_and(|raw| raw.is_null());
+    unknown_fallback(is_null, type_name)
+}
+
+fn unknown_fallback(is_null: bool, type_name: &str) -> Value {
+    if is_null {
+        Value::Null
+    } else {
+        Value::Unknown(type_name.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bool_value, bytes_value, date_value, decimal_value, float_value, format_naive_timestamp,
+        int_value, json_value, text_value, time_value, timestamp_value, unknown_fallback,
+        unsigned_to_value, unsigned_value,
+    };
+    use sqlx::types::chrono::{NaiveDate, NaiveTime};
+    use sqlx::types::{BigDecimal, Json, JsonRawValue};
+    use zsql_core::Value;
+
+    #[test]
+    fn bool_value_maps_a_boolean() {
+        assert_eq!(bool_value(Some(true)), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_value_maps_none_to_null() {
+        assert_eq!(bool_value(None), Value::Null);
+    }
+
+    #[test]
+    fn int_value_maps_a_tinyint_width_value() {
+        assert_eq!(int_value(Some(i64::from(8i8))), Value::Int(8));
+    }
+
+    #[test]
+    fn int_value_maps_a_bigint_width_value() {
+        assert_eq!(int_value(Some(64i64)), Value::Int(64));
+    }
+
+    #[test]
+    fn int_value_maps_none_to_null() {
+        assert_eq!(int_value(None), Value::Null);
+    }
+
+    #[test]
+    fn unsigned_to_value_stays_an_int_within_i64_range() {
+        assert_eq!(unsigned_to_value(42), Value::Int(42));
+        assert_eq!(
+            unsigned_to_value(i64::MAX as u64),
+            Value::Int(i64::MAX),
+            "the exact i64::MAX boundary must still decode as Int, not Numeric"
+        );
+    }
+
+    #[test]
+    fn unsigned_to_value_falls_back_to_numeric_above_i64_max() {
+        let above_max = i64::MAX as u64 + 1;
+        assert_eq!(
+            unsigned_to_value(above_max),
+            Value::Numeric(above_max.to_string())
+        );
+    }
+
+    #[test]
+    fn unsigned_value_maps_none_to_null() {
+        assert_eq!(unsigned_value(None), Value::Null);
+    }
+
+    #[test]
+    fn float_value_maps_a_double() {
+        assert_eq!(float_value(Some(2.5)), Value::Float(2.5));
+    }
+
+    #[test]
+    fn float_value_maps_none_to_null() {
+        assert_eq!(float_value(None), Value::Null);
+    }
+
+    #[test]
+    fn decimal_value_formats_a_decimal_string() {
+        let d: BigDecimal = "123.450".parse().unwrap();
+        assert_eq!(decimal_value(Some(d)), Value::Numeric("123.450".to_owned()));
+    }
+
+    #[test]
+    fn decimal_value_maps_none_to_null() {
+        assert_eq!(decimal_value(None), Value::Null);
+    }
+
+    #[test]
+    fn text_value_maps_a_string() {
+        assert_eq!(
+            text_value(Some("hi".to_owned())),
+            Value::Text("hi".to_owned())
+        );
+    }
+
+    #[test]
+    fn text_value_maps_none_to_null() {
+        assert_eq!(text_value(None), Value::Null);
+    }
+
+    #[test]
+    fn bytes_value_maps_binary_data() {
+        assert_eq!(
+            bytes_value(Some(vec![1, 2, 3])),
+            Value::Bytes(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn bytes_value_maps_none_to_null() {
+        assert_eq!(bytes_value(None), Value::Null);
+    }
+
+    #[test]
+    fn date_value_formats_a_calendar_date() {
+        let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        assert_eq!(
+            date_value(Some(d)),
+            Value::Timestamp("2024-01-15".to_owned())
+        );
+    }
+
+    #[test]
+    fn time_value_formats_a_clock_time() {
+        let t = NaiveTime::from_hms_opt(13, 45, 30).unwrap();
+        assert_eq!(time_value(Some(t)), Value::Timestamp("13:45:30".to_owned()));
+    }
+
+    #[test]
+    fn format_naive_timestamp_uses_a_t_separator() {
+        let dt = NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(13, 45, 30)
+            .unwrap();
+        assert_eq!(format_naive_timestamp(dt), "2024-01-15T13:45:30");
+    }
+
+    #[test]
+    fn timestamp_value_formats_a_datetime() {
+        let dt = NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(13, 45, 30)
+            .unwrap();
+        assert_eq!(
+            timestamp_value(Some(dt)),
+            Value::Timestamp("2024-01-15T13:45:30".to_owned())
+        );
+    }
+
+    #[test]
+    fn timestamp_value_maps_none_to_null() {
+        assert_eq!(timestamp_value(None), Value::Null);
+    }
+
+    #[test]
+    fn json_value_extracts_the_raw_json_text() {
+        let raw = JsonRawValue::from_string("{\"a\":1}".to_owned()).unwrap();
+        assert_eq!(
+            json_value(Some(Json(raw))),
+            Value::Json("{\"a\":1}".to_owned())
+        );
+    }
+
+    #[test]
+    fn json_value_maps_none_to_null() {
+        assert_eq!(json_value(None), Value::Null);
+    }
+
+    #[test]
+    fn unknown_fallback_reports_the_type_name_for_a_non_null_value() {
+        assert_eq!(
+            unknown_fallback(false, "SET"),
+            Value::Unknown("SET".to_owned())
+        );
+    }
+
+    #[test]
+    fn unknown_fallback_reports_null_regardless_of_type_name() {
+        assert_eq!(unknown_fallback(true, "SET"), Value::Null);
     }
 }

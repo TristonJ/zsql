@@ -34,19 +34,9 @@ pub(crate) async fn describe_relation(
     let indexes_raw = raw_indexes(pool, schema, relation).await?;
     let foreign_keys_raw = raw_foreign_keys(pool, schema, relation).await?;
 
-    // Owned, not borrowed from `indexes_raw`: `indexes_raw` itself is moved
-    // into `indexes` below, and these two sets are still needed afterward
-    // to build the primary-key `ConstraintInfo`.
-    let primary_key_columns: HashSet<String> = indexes_raw
-        .iter()
-        .find(|idx| idx.name == PRIMARY_KEY_NAME)
-        .map(|idx| idx.columns.iter().cloned().collect())
-        .unwrap_or_default();
-    let unique_columns: HashSet<String> = indexes_raw
-        .iter()
-        .filter(|idx| idx.unique && idx.name != PRIMARY_KEY_NAME && idx.columns.len() == 1)
-        .filter_map(|idx| idx.columns.first().cloned())
-        .collect();
+    // `indexes_raw` itself is moved into `indexes` below, so its
+    // primary-key/unique columns are derived first.
+    let (primary_key_columns, unique_columns) = primary_and_unique_columns(&indexes_raw);
     let foreign_keys_by_column = foreign_keys_by_local_column(&foreign_keys_raw);
 
     for column in &mut columns {
@@ -146,17 +136,29 @@ async fn columns(
         let default: Option<String> = row
             .try_get("COLUMN_DEFAULT")
             .map_err(map_sqlx_introspect_error)?;
-        columns.push(ColumnDetail {
-            name,
-            type_name,
-            nullable: is_nullable.eq_ignore_ascii_case("YES"),
-            default,
-            is_primary_key: false,
-            is_unique: false,
-            foreign_key: None,
-        });
+        columns.push(column_detail(name, type_name, &is_nullable, default));
     }
     Ok(columns)
+}
+
+/// Build a [`ColumnDetail`] from a row's already-decoded plain values, with
+/// its key/foreign-key flags left at their default (the caller fills those
+/// in separately once every column has been read).
+fn column_detail(
+    name: String,
+    type_name: String,
+    is_nullable: &str,
+    default: Option<String>,
+) -> ColumnDetail {
+    ColumnDetail {
+        name,
+        type_name,
+        nullable: is_nullable.eq_ignore_ascii_case("YES"),
+        default,
+        is_primary_key: false,
+        is_unique: false,
+        foreign_key: None,
+    }
 }
 
 /// One index's raw shape as read from `information_schema.STATISTICS`,
@@ -178,6 +180,23 @@ impl RawIndex {
             definition: format!("({})", self.columns.join(", ")),
         }
     }
+}
+
+/// Every column that is (part of) the relation's primary key, and every
+/// column that is the sole column of some other unique index (a composite
+/// unique index does not mark any single column unique on its own).
+fn primary_and_unique_columns(indexes: &[RawIndex]) -> (HashSet<String>, HashSet<String>) {
+    let primary_key_columns: HashSet<String> = indexes
+        .iter()
+        .find(|idx| idx.name == PRIMARY_KEY_NAME)
+        .map(|idx| idx.columns.iter().cloned().collect())
+        .unwrap_or_default();
+    let unique_columns: HashSet<String> = indexes
+        .iter()
+        .filter(|idx| idx.unique && idx.name != PRIMARY_KEY_NAME && idx.columns.len() == 1)
+        .filter_map(|idx| idx.columns.first().cloned())
+        .collect();
+    (primary_key_columns, unique_columns)
 }
 
 /// Every index on `schema.relation`, each with its columns in index-key
@@ -414,4 +433,214 @@ async fn check_constraints(
         });
     }
     Ok(constraints)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RawForeignKey, RawIndex, column_detail, foreign_keys_by_local_column,
+        primary_and_unique_columns,
+    };
+    use std::collections::HashSet;
+    use zsql_core::{ConstraintKind, ForeignKeyRef};
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn raw_index(name: &str, method: &str, unique: bool, columns: &[&str]) -> RawIndex {
+        RawIndex {
+            name: name.to_owned(),
+            method: method.to_owned(),
+            unique,
+            columns: owned(columns),
+        }
+    }
+
+    fn raw_foreign_key(
+        constraint_name: &str,
+        local_columns: &[&str],
+        ref_schema: &str,
+        ref_table: &str,
+        ref_columns: &[&str],
+    ) -> RawForeignKey {
+        RawForeignKey {
+            constraint_name: constraint_name.to_owned(),
+            local_columns: owned(local_columns),
+            target: ForeignKeyRef {
+                schema: ref_schema.to_owned(),
+                table: ref_table.to_owned(),
+                columns: owned(ref_columns),
+            },
+        }
+    }
+
+    #[test]
+    fn column_detail_maps_yes_is_nullable_to_true() {
+        let column = column_detail("id".to_owned(), "int".to_owned(), "YES", None);
+        assert!(column.nullable);
+    }
+
+    #[test]
+    fn column_detail_maps_no_is_nullable_to_false() {
+        let column = column_detail("id".to_owned(), "int".to_owned(), "NO", None);
+        assert!(!column.nullable);
+    }
+
+    #[test]
+    fn column_detail_is_case_insensitive_on_is_nullable() {
+        let column = column_detail("id".to_owned(), "int".to_owned(), "yes", None);
+        assert!(column.nullable);
+    }
+
+    #[test]
+    fn column_detail_reports_no_default_as_none() {
+        let column = column_detail("id".to_owned(), "int".to_owned(), "NO", None);
+        assert_eq!(column.default, None);
+    }
+
+    #[test]
+    fn column_detail_carries_a_non_trivial_default_expression() {
+        let column = column_detail(
+            "created_at".to_owned(),
+            "timestamp".to_owned(),
+            "NO",
+            Some("CURRENT_TIMESTAMP".to_owned()),
+        );
+        assert_eq!(column.default, Some("CURRENT_TIMESTAMP".to_owned()));
+    }
+
+    #[test]
+    fn column_detail_starts_with_no_key_flags_or_foreign_key() {
+        let column = column_detail("id".to_owned(), "int".to_owned(), "NO", None);
+        assert!(!column.is_primary_key);
+        assert!(!column.is_unique);
+        assert!(column.foreign_key.is_none());
+    }
+
+    #[test]
+    fn raw_index_into_index_info_lists_its_key_column() {
+        let info = raw_index("idx_email", "btree", true, &["email"]).into_index_info();
+        assert_eq!(info.name, "idx_email");
+        assert_eq!(info.method, "btree");
+        assert!(info.unique);
+        assert_eq!(info.definition, "(email)");
+    }
+
+    #[test]
+    fn raw_index_into_index_info_lists_every_column_of_a_composite_index() {
+        let info = raw_index("idx_a_b", "btree", false, &["a", "b"]).into_index_info();
+        assert!(!info.unique);
+        assert_eq!(info.definition, "(a, b)");
+    }
+
+    #[test]
+    fn raw_foreign_key_into_constraint_info_renders_a_single_column_reference() {
+        let info = raw_foreign_key("fk_user", &["user_id"], "app", "users", &["id"])
+            .into_constraint_info();
+        assert_eq!(info.kind, ConstraintKind::ForeignKey);
+        assert_eq!(
+            info.definition,
+            "FOREIGN KEY (user_id) REFERENCES app.users(id)"
+        );
+    }
+
+    #[test]
+    fn raw_foreign_key_into_constraint_info_renders_a_multi_column_reference() {
+        let info = raw_foreign_key(
+            "fk_order_item",
+            &["order_id", "item_id"],
+            "app",
+            "order_items",
+            &["order_id", "item_id"],
+        )
+        .into_constraint_info();
+        assert_eq!(
+            info.definition,
+            "FOREIGN KEY (order_id, item_id) REFERENCES app.order_items(order_id, item_id)"
+        );
+    }
+
+    #[test]
+    fn primary_and_unique_columns_is_empty_when_there_is_no_primary_key() {
+        let indexes = vec![raw_index("idx_email", "btree", true, &["email"])];
+        let (primary, unique) = primary_and_unique_columns(&indexes);
+        assert!(primary.is_empty());
+        assert_eq!(unique, HashSet::from(["email".to_owned()]));
+    }
+
+    #[test]
+    fn primary_and_unique_columns_collects_every_column_of_a_composite_primary_key() {
+        let indexes = vec![raw_index("PRIMARY", "btree", true, &["tenant_id", "id"])];
+        let (primary, unique) = primary_and_unique_columns(&indexes);
+        assert_eq!(
+            primary,
+            HashSet::from(["tenant_id".to_owned(), "id".to_owned()])
+        );
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn primary_and_unique_columns_marks_a_single_column_unique_index_unique() {
+        let indexes = vec![raw_index("idx_email", "btree", true, &["email"])];
+        let (_, unique) = primary_and_unique_columns(&indexes);
+        assert_eq!(unique, HashSet::from(["email".to_owned()]));
+    }
+
+    #[test]
+    fn primary_and_unique_columns_does_not_mark_a_composite_unique_indexs_columns_unique() {
+        let indexes = vec![raw_index("idx_a_b", "btree", true, &["a", "b"])];
+        let (_, unique) = primary_and_unique_columns(&indexes);
+        assert!(
+            unique.is_empty(),
+            "a composite unique index must not mark any single column unique on its own"
+        );
+    }
+
+    #[test]
+    fn primary_and_unique_columns_ignores_the_primary_key_index_in_the_unique_set() {
+        let indexes = vec![raw_index("PRIMARY", "btree", true, &["id"])];
+        let (primary, unique) = primary_and_unique_columns(&indexes);
+        assert_eq!(primary, HashSet::from(["id".to_owned()]));
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn foreign_keys_by_local_column_maps_a_single_column_key_to_its_target() {
+        let fks = [raw_foreign_key(
+            "fk_user",
+            &["user_id"],
+            "app",
+            "users",
+            &["id"],
+        )];
+        let by_column = foreign_keys_by_local_column(&fks);
+        assert_eq!(
+            by_column.get("user_id"),
+            Some(&ForeignKeyRef {
+                schema: "app".to_owned(),
+                table: "users".to_owned(),
+                columns: vec!["id".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn foreign_keys_by_local_column_attaches_one_target_to_every_column_of_a_multi_column_key() {
+        let fks = [raw_foreign_key(
+            "fk_order_item",
+            &["order_id", "item_id"],
+            "app",
+            "order_items",
+            &["order_id", "item_id"],
+        )];
+        let by_column = foreign_keys_by_local_column(&fks);
+        let expected = ForeignKeyRef {
+            schema: "app".to_owned(),
+            table: "order_items".to_owned(),
+            columns: vec!["order_id".to_owned(), "item_id".to_owned()],
+        };
+        assert_eq!(by_column.get("order_id"), Some(&expected));
+        assert_eq!(by_column.get("item_id"), Some(&expected));
+    }
 }

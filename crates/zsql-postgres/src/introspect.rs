@@ -35,14 +35,33 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
 
     let catalog_name = current_database(&mut tx).await?;
     let schema_names = schema_names(&mut tx).await?;
-    let mut relations_by_schema = relations(&mut tx).await?;
-    let mut columns_by_relation = columns(&mut tx).await?;
+    let relations_by_schema = relations(&mut tx).await?;
+    let columns_by_relation = columns(&mut tx).await?;
 
     // The transaction only ever read, so commit vs. rollback would leave the
     // database in the same state either way
     tx.rollback().await.map_err(map_sqlx_introspect_error)?;
 
-    let schemas = schema_names
+    let schemas = assemble_schemas(schema_names, relations_by_schema, columns_by_relation);
+
+    Ok(SchemaTree {
+        catalogs: vec![Catalog {
+            name: catalog_name,
+            schemas,
+        }],
+    })
+}
+
+/// Build every [`SchemaNs`] this database reports: one per name in
+/// `schema_names`, each carrying the relations grouped under it (empty if
+/// none were found) with that relation's own grouped columns attached (also
+/// empty if none were found).
+fn assemble_schemas(
+    schema_names: Vec<String>,
+    mut relations_by_schema: HashMap<String, Vec<Relation>>,
+    mut columns_by_relation: HashMap<(String, String), Vec<ColumnMeta>>,
+) -> Vec<SchemaNs> {
+    schema_names
         .into_iter()
         .map(|schema_name| {
             let mut schema_relations = relations_by_schema.remove(&schema_name).unwrap_or_default();
@@ -55,14 +74,7 @@ pub(crate) async fn introspect(pool: &PgPool) -> Result<SchemaTree, CoreError> {
                 tables: schema_relations,
             }
         })
-        .collect();
-
-    Ok(SchemaTree {
-        catalogs: vec![Catalog {
-            name: catalog_name,
-            schemas,
-        }],
-    })
+        .collect()
 }
 
 /// The name of the database the current connection is attached to
@@ -108,11 +120,22 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
         .await
         .map_err(map_sqlx_introspect_error)?;
 
-    let mut grouped: HashMap<String, Vec<Relation>> = HashMap::new();
+    let mut plain_rows = Vec::with_capacity(rows.len());
     for row in &rows {
         let schema: String = row.try_get("nspname").map_err(map_sqlx_introspect_error)?;
         let name: String = row.try_get("relname").map_err(map_sqlx_introspect_error)?;
         let relkind: String = row.try_get("relkind").map_err(map_sqlx_introspect_error)?;
+        plain_rows.push((schema, name, relkind));
+    }
+    Ok(group_relations(plain_rows))
+}
+
+/// Group plain `(schema, relation, relkind)` rows into a per-schema
+/// relation list, skipping any row whose `relkind` has no [`RelationKind`]
+/// mapping.
+fn group_relations(rows: Vec<(String, String, String)>) -> HashMap<String, Vec<Relation>> {
+    let mut grouped: HashMap<String, Vec<Relation>> = HashMap::new();
+    for (schema, name, relkind) in rows {
         let Some(kind) = relation_kind(&relkind) else {
             continue;
         };
@@ -122,7 +145,7 @@ async fn relations(conn: &mut PgConnection) -> Result<HashMap<String, Vec<Relati
             columns: Vec::new(),
         });
     }
-    Ok(grouped)
+    grouped
 }
 
 /// Map a `pg_class.relkind` code to the neutral [`RelationKind`].
@@ -160,7 +183,7 @@ async fn columns(
         .await
         .map_err(map_sqlx_introspect_error)?;
 
-    let mut grouped: HashMap<(String, String), Vec<ColumnMeta>> = HashMap::new();
+    let mut plain_rows = Vec::with_capacity(rows.len());
     for row in &rows {
         let schema: String = row.try_get("nspname").map_err(map_sqlx_introspect_error)?;
         let relation: String = row.try_get("relname").map_err(map_sqlx_introspect_error)?;
@@ -169,22 +192,36 @@ async fn columns(
             .try_get("type_name")
             .map_err(map_sqlx_introspect_error)?;
         let nullable: bool = row.try_get("nullable").map_err(map_sqlx_introspect_error)?;
-        grouped
-            .entry((schema, relation))
-            .or_default()
-            .push(ColumnMeta {
+        plain_rows.push((
+            schema,
+            relation,
+            ColumnMeta {
                 name,
                 type_name,
                 nullable,
-            });
+            },
+        ));
     }
-    Ok(grouped)
+    Ok(group_columns(plain_rows))
+}
+
+/// Group plain `(schema, relation, column)` rows into a per-relation column
+/// list, keyed by `(schema name, relation name)`.
+fn group_columns(
+    rows: Vec<(String, String, ColumnMeta)>,
+) -> HashMap<(String, String), Vec<ColumnMeta>> {
+    let mut grouped: HashMap<(String, String), Vec<ColumnMeta>> = HashMap::new();
+    for (schema, relation, column) in rows {
+        grouped.entry((schema, relation)).or_default().push(column);
+    }
+    grouped
 }
 
 #[cfg(test)]
 mod tests {
-    use super::relation_kind;
-    use zsql_core::RelationKind;
+    use super::{assemble_schemas, group_columns, group_relations, relation_kind};
+    use std::collections::HashMap;
+    use zsql_core::{ColumnMeta, RelationKind};
 
     #[test]
     fn maps_every_relkind_code() {
@@ -199,5 +236,90 @@ mod tests {
             "sequence relkind is not a relation"
         );
         assert_eq!(relation_kind(""), None, "empty code maps to nothing");
+    }
+
+    #[test]
+    fn group_relations_groups_multiple_relations_under_the_same_schema() {
+        let grouped = group_relations(vec![
+            ("public".to_owned(), "users".to_owned(), "r".to_owned()),
+            ("public".to_owned(), "widgets".to_owned(), "v".to_owned()),
+        ]);
+        let relations = &grouped["public"];
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].name, "users");
+        assert_eq!(relations[0].kind, RelationKind::Table);
+        assert_eq!(relations[1].name, "widgets");
+        assert_eq!(relations[1].kind, RelationKind::View);
+    }
+
+    #[test]
+    fn group_relations_skips_a_relation_with_an_unmapped_relkind() {
+        let grouped = group_relations(vec![(
+            "public".to_owned(),
+            "users_id_seq".to_owned(),
+            "S".to_owned(),
+        )]);
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn group_columns_groups_multiple_columns_under_the_same_relation_key() {
+        let column = |name: &str| ColumnMeta {
+            name: name.to_owned(),
+            type_name: "int4".to_owned(),
+            nullable: false,
+        };
+        let grouped = group_columns(vec![
+            ("public".to_owned(), "users".to_owned(), column("id")),
+            ("public".to_owned(), "users".to_owned(), column("name")),
+        ]);
+        let columns = &grouped[&("public".to_owned(), "users".to_owned())];
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[1].name, "name");
+    }
+
+    #[test]
+    fn assemble_schemas_produces_an_empty_relation_list_for_a_schema_with_no_tables() {
+        let schemas = assemble_schemas(
+            vec!["empty_schema".to_owned()],
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "empty_schema");
+        assert!(schemas[0].tables.is_empty());
+    }
+
+    #[test]
+    fn assemble_schemas_attaches_columns_when_the_grouped_map_has_a_matching_key() {
+        let relations = group_relations(vec![(
+            "public".to_owned(),
+            "users".to_owned(),
+            "r".to_owned(),
+        )]);
+        let columns = group_columns(vec![(
+            "public".to_owned(),
+            "users".to_owned(),
+            ColumnMeta {
+                name: "id".to_owned(),
+                type_name: "int4".to_owned(),
+                nullable: false,
+            },
+        )]);
+        let schemas = assemble_schemas(vec!["public".to_owned()], relations, columns);
+        assert_eq!(schemas[0].tables[0].columns.len(), 1);
+        assert_eq!(schemas[0].tables[0].columns[0].name, "id");
+    }
+
+    #[test]
+    fn assemble_schemas_leaves_columns_empty_when_the_grouped_map_has_no_matching_key() {
+        let relations = group_relations(vec![(
+            "public".to_owned(),
+            "users".to_owned(),
+            "r".to_owned(),
+        )]);
+        let schemas = assemble_schemas(vec!["public".to_owned()], relations, HashMap::new());
+        assert!(schemas[0].tables[0].columns.is_empty());
     }
 }
