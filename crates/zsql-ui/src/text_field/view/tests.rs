@@ -8,7 +8,6 @@ use super::{
 };
 use crate::text_field::theme;
 
-#[cfg(test)]
 impl TextFieldState {
     /// The pixel point that hit-tests back to `offset`, computed from the
     /// most recent paint's shaped line and bounds. Lets mouse-handling tests

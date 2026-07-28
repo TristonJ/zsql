@@ -19,7 +19,6 @@ use zsql_ui::table::{body_first_cell_debug_selector, column_resize_handle_debug_
 use zsql_ui::theme::Theme;
 
 /// Test-only accessors used by `ui::sidebar`'s and `ui::tabs`'s tests
-#[cfg(test)]
 impl ResultsView {
     pub(crate) fn source_label_for_test(&self) -> &str {
         &self.source_label
@@ -1756,7 +1755,6 @@ fn renders_the_grid_when_manually_selected_for_a_document_shaped_result(
     );
 }
 
-#[cfg(test)]
 mod value_panel_view_tests {
     use std::time::Duration;
 

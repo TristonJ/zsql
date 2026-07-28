@@ -4,7 +4,6 @@ use super::{ActiveConnection, WorkspaceView, clamp_editor_height, clamp_sidebar_
 use crate::ui::tabs::{Tab, TabId};
 
 /// Set the tracked active connection
-#[cfg(test)]
 impl WorkspaceView {
     pub fn set_active_connection(&mut self, active: ActiveConnection, cx: &mut Context<Self>) {
         self.connections
@@ -12,7 +11,6 @@ impl WorkspaceView {
     }
 }
 
-#[cfg(test)]
 mod resize_tests {
     use gpui::px;
 
@@ -164,7 +162,6 @@ mod resize_tests {
     }
 }
 
-#[cfg(test)]
 mod render_tests {
     use std::time::Duration;
 
@@ -1002,7 +999,6 @@ mod render_tests {
 /// active tab through the same `Session`/`QueryRunner` path
 /// `TabModel::run_for_tab` already uses, for both a `Script` and a
 /// `Generated` active tab, independent of keyboard focus.
-#[cfg(test)]
 mod header_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

@@ -12,7 +12,6 @@ use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::{ResultsSnapshot, ResultsView};
 
 /// Test-only accessor for asserting on a tab's captured run.
-#[cfg(test)]
 impl Tab {
     pub(crate) fn last_run_for_test(&self) -> Option<&ResultsSnapshot> {
         self.last_run.as_ref()

@@ -14,7 +14,6 @@ use super::{
 };
 
 /// Test-only constructors used by the UI views' render and action tests.
-#[cfg(test)]
 impl Session {
     /// Connect to an explicitly chosen URL without a tunnel: a test
     /// convenience for the common no-SSH case. Production connects go through
@@ -151,12 +150,10 @@ impl Session {
 /// letting a test prove a tunnel was torn down without opening a real SSH
 /// session. Shared between this module's plain (`block_on`) tests and its
 /// `gpui`-driven ones.
-#[cfg(test)]
 pub(crate) struct FakeTunnel {
     open_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(test)]
 impl FakeTunnel {
     /// Build a handle that increments `open_count` now and decrements it
     /// again on drop, so a caller can assert `open_count` reaching `0`
@@ -167,14 +164,12 @@ impl FakeTunnel {
     }
 }
 
-#[cfg(test)]
 impl TunnelHandle for FakeTunnel {
     fn local_addr(&self) -> SocketAddr {
         "127.0.0.1:1".parse().expect("valid loopback address")
     }
 }
 
-#[cfg(test)]
 impl Drop for FakeTunnel {
     fn drop(&mut self) {
         self.open_count
@@ -564,7 +559,6 @@ fn dropping_the_session_drops_its_active_tunnel() {
 }
 
 /// `TestAppContext`-driven `Session` tests that need no live database
-#[cfg(test)]
 mod gpui_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
