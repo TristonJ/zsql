@@ -1,10 +1,13 @@
 //! Parsing an `mssql://` (or `sqlserver://`) URL into the fields
-//! `tiberius::Config` needs. `tiberius` has no URL-URL parser of its own
-//! (only ADO.NET and JDBC connection-string formats), so this module owns a
-//! small, dependency-free parser instead of pulling in a general-purpose URL
-//! crate for one format.
+//! `tiberius::Config` needs. Generic URL structure (scheme, host, port,
+//! credentials, database, query parameters) is parsed once by
+//! [`zsql_core::ConnectionUrl`]; this module only maps that onto
+//! `tiberius`-shaped fields and applies mssql's own query-parameter
+//! spellings from [`crate::params`].
 
-use zsql_core::CoreError;
+use zsql_core::{ConnectionUrl, CoreError};
+
+use crate::params;
 
 /// The default TCP port for a SQL Server instance that was not given an
 /// explicit port.
@@ -37,14 +40,14 @@ pub(crate) struct MssqlUrl {
 ///
 /// # Errors
 /// Returns [`CoreError::Url`] if `url` is empty, has no `mssql://`/
-/// `sqlserver://` scheme, or is missing a host.
+/// `sqlserver://` scheme, is missing a host, or a boolean query parameter
+/// carries an unrecognized value.
 pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
-    let url = url.trim();
-    if url.is_empty() {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
         return Err(CoreError::Url("empty URL".to_owned()));
     }
-
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some((scheme, _)) = trimmed.split_once("://") else {
         return Err(CoreError::Url(
             "URL has no scheme (expected mssql:// or sqlserver://)".to_owned(),
         ));
@@ -55,71 +58,45 @@ pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
         )));
     }
 
-    let (authority_and_path, query) = match rest.split_once('?') {
-        Some((left, right)) => (left, Some(right)),
-        None => (rest, None),
-    };
-    let (authority, path) = match authority_and_path.split_once('/') {
-        Some((left, right)) => (left, Some(right)),
-        None => (authority_and_path, None),
-    };
+    let parsed = ConnectionUrl::parse(trimmed)?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| CoreError::Url("URL is missing a host".to_owned()))?;
+    let port = parsed.port().unwrap_or(DEFAULT_PORT);
 
-    let (userinfo, host_port) = match authority.rsplit_once('@') {
-        Some((left, right)) => (Some(left), right),
-        None => (None, authority),
+    let raw_user = parsed.raw_user();
+    let user = if raw_user.is_empty() {
+        None
+    } else {
+        Some(percent_decode(raw_user)?)
     };
-    // Userinfo is split into user/password on the first literal `:`, so a
-    // password containing a literal `:`, `/`, `?`, or `@` -- any of which
-    // would otherwise be misread as a URL delimiter -- must be
-    // percent-encoded by whoever writes the URL and is decoded back here.
-    let (user, password) = match userinfo {
-        Some(userinfo) => match userinfo.split_once(':') {
-            Some((user, password)) => {
-                (Some(percent_decode(user)?), Some(percent_decode(password)?))
-            }
-            None => (Some(percent_decode(userinfo)?), None),
-        },
-        None => (None, None),
-    };
+    let password = parsed.raw_password().map(percent_decode).transpose()?;
 
-    let (host, port) = match host_port.split_once(':') {
-        Some((host, port_text)) => {
-            let port: u16 = port_text
-                .parse()
-                .map_err(|_| CoreError::Url(format!("invalid port '{port_text}'")))?;
-            (host, port)
+    let database = {
+        let database = parsed.database();
+        let trimmed = database.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
         }
-        None => (host_port, DEFAULT_PORT),
     };
-    if host.is_empty() {
-        return Err(CoreError::Url("URL is missing a host".to_owned()));
-    }
 
-    let database = path
-        .map(str::trim)
-        .filter(|database| !database.is_empty())
-        .map(str::to_owned);
-
-    let mut encrypt = true;
-    let mut trust_server_certificate = false;
-    let mut ca_cert = None;
-    for pair in query.into_iter().flat_map(|query| query.split('&')) {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key.to_ascii_lowercase().as_str() {
-            "encrypt" => encrypt = parse_bool_param(key, value)?,
-            "trustservercertificate" | "trust_server_certificate" => {
-                trust_server_certificate = parse_bool_param(key, value)?;
-            }
-            "sslrootcert" | "ssl_root_cert" => ca_cert = Some(value.to_owned()),
-            _ => {}
-        }
-    }
+    let encrypt = match params::param_ci(&parsed, &[params::ENCRYPT_KEY]) {
+        Some(value) => params::parse_bool_param(params::ENCRYPT_KEY, &value)?,
+        None => true,
+    };
+    let trust_server_certificate = match params::param_ci(
+        &parsed,
+        &[params::TRUST_CERT_KEY, params::TRUST_CERT_ALIAS_KEY],
+    ) {
+        Some(value) => params::parse_bool_param(params::TRUST_CERT_KEY, &value)?,
+        None => false,
+    };
+    let ca_cert = params::param_ci(&parsed, &[params::CA_CERT_KEY, params::CA_CERT_ALIAS_KEY]);
 
     Ok(MssqlUrl {
-        host: host.to_owned(),
+        host,
         port,
         user,
         password,
@@ -133,7 +110,10 @@ pub(crate) fn parse(url: &str) -> Result<MssqlUrl, CoreError> {
 /// Percent-decode `text` (`%XX` -> the byte `0xXX`), the mechanism a URL
 /// author uses to embed a delimiter character (`:`, `/`, `?`, `@`) literally
 /// inside a username or password instead of having it misread as URL
-/// syntax.
+/// syntax. Unlike [`ConnectionUrl::user`]/[`ConnectionUrl::password`]'s
+/// lossy display-oriented decode, this rejects a malformed escape outright:
+/// a live connect must not silently guess what an ambiguous credential
+/// meant.
 ///
 /// # Errors
 /// Returns [`CoreError::Url`] if a `%` is not followed by two hex digits, or
@@ -161,18 +141,6 @@ fn percent_decode(text: &str) -> Result<String, CoreError> {
     }
     String::from_utf8(decoded)
         .map_err(|_| CoreError::Url("URL userinfo is not valid UTF-8 after decoding".to_owned()))
-}
-
-/// Parse a query-parameter value as a boolean, accepting the common
-/// spellings a hand-written URL is likely to use.
-fn parse_bool_param(key: &str, value: &str) -> Result<bool, CoreError> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        other => Err(CoreError::Url(format!(
-            "invalid value '{other}' for URL parameter '{key}'"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -304,5 +272,19 @@ mod tests {
         let url = parse("mssql://sa@localhost/db").unwrap();
         assert_eq!(url.user.as_deref(), Some("sa"));
         assert_eq!(url.password, None);
+    }
+
+    #[test]
+    fn a_ca_cert_path_with_a_literal_plus_is_not_read_back_as_a_space() {
+        let url = parse("mssql://localhost/db?sslrootcert=/etc/zsql/my+ca.crt").unwrap();
+        assert_eq!(url.ca_cert.as_deref(), Some("/etc/zsql/my+ca.crt"));
+    }
+
+    #[test]
+    fn a_percent_encoded_boolean_value_is_rejected_rather_than_decoded() {
+        // "%74rue" percent-decodes to "true", but a query-parameter value is
+        // matched against the boolean spellings as written, not decoded
+        // first -- so this is rejected rather than silently accepted.
+        assert!(parse("mssql://localhost/db?encrypt=%74rue").is_err());
     }
 }

@@ -204,6 +204,21 @@ impl ConnectionUrl {
         }
     }
 
+    /// The username exactly as written in the URL: still percent-encoded,
+    /// not decoded. Empty if the URL carries none, or if this is a
+    /// sqlite-path URL.
+    ///
+    /// For a caller that needs to validate percent-encoding strictly (e.g.
+    /// reject a truncated `%` escape) rather than accept it leniently the
+    /// way [`Self::user`]'s display-oriented decode does.
+    #[must_use]
+    pub fn raw_user(&self) -> &str {
+        match &self.inner {
+            Inner::Network(url) => url.username(),
+            Inner::SqlitePath(_) => "",
+        }
+    }
+
     /// Replace the username (plain text; percent-encoding is applied for
     /// you). A no-op on a sqlite-path URL.
     pub fn set_user(&mut self, user: &str) {
@@ -218,6 +233,17 @@ impl ConnectionUrl {
     pub fn password(&self) -> Option<String> {
         match &self.inner {
             Inner::Network(url) => url.password().map(percent_decode),
+            Inner::SqlitePath(_) => None,
+        }
+    }
+
+    /// The password exactly as written in the URL: still percent-encoded,
+    /// not decoded. `None` if absent, or if this is a sqlite-path URL. See
+    /// [`Self::raw_user`] for why this differs from [`Self::password`].
+    #[must_use]
+    pub fn raw_password(&self) -> Option<&str> {
+        match &self.inner {
+            Inner::Network(url) => url.password(),
             Inner::SqlitePath(_) => None,
         }
     }
@@ -326,6 +352,23 @@ impl ConnectionUrl {
             url.query_pairs_mut()
                 .clear()
                 .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
+    }
+
+    /// The query string exactly as written in the URL (after the `?`, before
+    /// any `#` fragment): not percent-decoded and its `&`/`=` structure not
+    /// interpreted. `None` if the URL has no query string, or if this is a
+    /// sqlite-path URL.
+    ///
+    /// For a caller that must parse a query value strictly (e.g. reject a
+    /// value that only resembles a recognized spelling once decoded) rather
+    /// than accept [`Self::query_param`]'s lenient percent- and
+    /// plus-decoding.
+    #[must_use]
+    pub fn raw_query(&self) -> Option<&str> {
+        match &self.inner {
+            Inner::Network(url) => url.query(),
+            Inner::SqlitePath(_) => None,
         }
     }
 
@@ -611,6 +654,49 @@ mod tests {
             "an unrelated edit must not touch userinfo"
         );
         assert_eq!(parsed.password().as_deref(), Some("p/w@rd"));
+    }
+
+    #[test]
+    fn raw_user_and_raw_password_stay_percent_encoded() {
+        let parsed =
+            ConnectionUrl::parse("postgres://us%3Aer:p%2Fw%40rd@host/db").expect("must parse");
+        assert_eq!(parsed.raw_user(), "us%3Aer");
+        assert_eq!(parsed.raw_password(), Some("p%2Fw%40rd"));
+    }
+
+    #[test]
+    fn raw_user_and_raw_password_pass_through_a_malformed_percent_escape_unchanged() {
+        // The `url` crate does not validate `%` escapes on parse, so a
+        // truncated or non-hex escape survives into the raw form exactly as
+        // written -- a caller wanting to reject it must do so itself.
+        let parsed = ConnectionUrl::parse("mssql://sa:p%zz@host/db").expect("must parse");
+        assert_eq!(parsed.raw_password(), Some("p%zz"));
+    }
+
+    #[test]
+    fn raw_user_and_raw_password_are_empty_and_none_with_no_userinfo() {
+        let parsed = ConnectionUrl::parse("postgres://host/db").expect("must parse");
+        assert_eq!(parsed.raw_user(), "");
+        assert_eq!(parsed.raw_password(), None);
+    }
+
+    #[test]
+    fn raw_query_is_not_percent_or_plus_decoded() {
+        let parsed =
+            ConnectionUrl::parse("postgres://host/db?path=/a+b&pct=%74rue").expect("must parse");
+        assert_eq!(parsed.raw_query(), Some("path=/a+b&pct=%74rue"));
+    }
+
+    #[test]
+    fn raw_query_is_none_with_no_query_string() {
+        let parsed = ConnectionUrl::parse("postgres://host/db").expect("must parse");
+        assert_eq!(parsed.raw_query(), None);
+    }
+
+    #[test]
+    fn raw_query_is_none_on_a_sqlite_path_url() {
+        let parsed = ConnectionUrl::parse("sqlite::memory:").expect("must parse");
+        assert_eq!(parsed.raw_query(), None);
     }
 
     // -- editing a single field touches only that field ---------------------

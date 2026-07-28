@@ -137,6 +137,19 @@ where
     }
 }
 
+impl<DB: Database, D> SqlxConnection<DB, D> {
+    /// Close all three pools this connection owns (main, cancel, probe),
+    /// releasing their background workers rather than leaving that to each
+    /// pool's own `Drop`.
+    #[tracing::instrument(name = "sqlx_connection_close", skip_all)]
+    pub async fn close(&self) {
+        self.pool.close().await;
+        self.cancel_pool.close().await;
+        self.probe_pool.close().await;
+        tracing::info!("sqlx connection pools closed");
+    }
+}
+
 /// Stream a query's results into `sink`. `sql` may hold several statements;
 /// each result-producing statement emits its own [`QueryEvent::Columns`]
 /// followed by that set's [`QueryEvent::Batch`]es, and the whole stream ends
@@ -310,4 +323,57 @@ fn spawn_server_side_cancel<DB: Database, C: CancelHandle<DB>>(
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::marker::PhantomData;
+    use std::time::Duration;
+
+    use sqlx::sqlite::{Sqlite, SqlitePoolOptions};
+
+    use super::SqlxConnection;
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        futures::executor::block_on(fut)
+    }
+
+    async fn sqlite_pool() -> sqlx::Pool<Sqlite> {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect should succeed")
+    }
+
+    #[test]
+    fn close_closes_all_three_owned_pools() {
+        let (pool, cancel_pool, probe_pool) = block_on(async {
+            (
+                sqlite_pool().await,
+                sqlite_pool().await,
+                sqlite_pool().await,
+            )
+        });
+        let pool_handle = pool.clone();
+        let cancel_handle = cancel_pool.clone();
+        let probe_handle = probe_pool.clone();
+
+        // `D` is only ever a `PhantomData` marker for `close`, which touches
+        // no `SqlxZsqlDriver` method, so a plain `()` stands in for it.
+        let connection: SqlxConnection<Sqlite, ()> = SqlxConnection {
+            pool,
+            cancel_pool,
+            probe_pool,
+            batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            driver: PhantomData,
+        };
+
+        block_on(connection.close());
+
+        assert!(pool_handle.is_closed(), "main pool must be closed");
+        assert!(cancel_handle.is_closed(), "cancel pool must be closed");
+        assert!(probe_handle.is_closed(), "probe pool must be closed");
+    }
 }
