@@ -73,7 +73,7 @@ impl ConnectionList {
 
 impl ConnectionList {
     fn render_status(cx: &App, status: Option<String>) -> Div {
-        let text = status.unwrap_or("click a row to connect\t•\tesc to close".to_string());
+        let text = status.unwrap_or("click a row to connect\t-\tesc to close".to_string());
         div()
             .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
             .text_color(rgb(cx.theme().colors.text_tertiary))

@@ -105,7 +105,9 @@ mod tests {
 
     impl Drop for TestThemesDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if let Err(err) = std::fs::remove_dir_all(&self.0) {
+                tracing::debug!(dir = %self.0.display(), %err, "failed to clean up test themes dir");
+            }
         }
     }
 

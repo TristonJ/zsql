@@ -1090,15 +1090,24 @@ mod render_tests {
         }
     }
 
-    fn build(cx: &mut gpui::TestAppContext, schema: SchemaState) {
+    fn build(
+        cx: &mut gpui::TestAppContext,
+        schema: SchemaState,
+    ) -> (gpui::Entity<SidebarView>, &mut gpui::VisualTestContext) {
         let session = cx.new(|_cx| Session::new_for_schema_test(schema));
         let tabs = build_tabs(session.clone(), cx);
-        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
+        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx))
     }
 
     #[gpui::test]
     fn renders_a_populated_schema_tree_without_panicking(cx: &mut gpui::TestAppContext) {
-        build(cx, SchemaState::Ready(sample_schema_tree()));
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                !view.rows.is_empty(),
+                "a populated schema tree must flatten into at least one visible row"
+            );
+        });
     }
 
     /// A schema with one catalog, one schema, and `table_count` tables.
@@ -1152,7 +1161,13 @@ mod render_tests {
             SchemaState::Error("permission denied for schema pg_catalog".to_owned()),
             SchemaState::Ready(SchemaTree::default()),
         ] {
-            build(cx, schema);
+            let (sidebar, vcx) = build(cx, schema);
+            sidebar.read_with(vcx, |view, _app| {
+                assert!(
+                    view.rows.is_empty(),
+                    "no catalog/table rows are known without a populated schema tree"
+                );
+            });
         }
     }
 

@@ -655,27 +655,42 @@ fn a_cancel_event_from_the_form(cx: &mut TestAppContext) {
     assert_eq!(*events.borrow(), vec![CapturedEvent::Cancel]);
 }
 
-#[gpui::test]
-fn an_add_event_from_the_form(cx: &mut TestAppContext) {
+/// Fills in the name/url inputs, clicks the footer button tagged
+/// `button_id`, and checks that exactly `expected` was emitted.
+fn assert_footer_button_emits(
+    cx: &mut TestAppContext,
+    name_input: &str,
+    button_id: &'static str,
+    button_label: &str,
+    expected: CapturedEvent,
+) {
     let (form, vcx, events) = build_form_in_window(cx);
     form.update(vcx, |form, cx| {
-        form.set_name_input("from-footer", cx);
+        form.set_name_input(name_input, cx);
         form.set_url_input("sqlite::memory:", cx);
     });
     vcx.run_until_parked();
 
     let bounds = vcx
-        .debug_bounds("connection-form-save")
-        .expect("the save button must be tagged and painted");
+        .debug_bounds(button_id)
+        .unwrap_or_else(|| panic!("the {button_label} button must be tagged and painted"));
     vcx.simulate_click(bounds.center(), Modifiers::default());
     vcx.run_until_parked();
 
-    assert_eq!(
-        *events.borrow(),
-        vec![CapturedEvent::Add {
+    assert_eq!(*events.borrow(), vec![expected]);
+}
+
+#[gpui::test]
+fn an_add_event_from_the_form(cx: &mut TestAppContext) {
+    assert_footer_button_emits(
+        cx,
+        "from-footer",
+        "connection-form-save",
+        "save",
+        CapturedEvent::Add {
             name: "from-footer".to_owned(),
             url: "sqlite::memory:".to_owned(),
-        }]
+        },
     );
 }
 
@@ -734,25 +749,15 @@ fn a_test_event_from_the_form(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_connect_event_from_the_form(cx: &mut TestAppContext) {
-    let (form, vcx, events) = build_form_in_window(cx);
-    form.update(vcx, |form, cx| {
-        form.set_name_input("via-footer", cx);
-        form.set_url_input("sqlite::memory:", cx);
-    });
-    vcx.run_until_parked();
-
-    let bounds = vcx
-        .debug_bounds("connection-form-connect")
-        .expect("the connect button must be tagged and painted");
-    vcx.simulate_click(bounds.center(), Modifiers::default());
-    vcx.run_until_parked();
-
-    assert_eq!(
-        *events.borrow(),
-        vec![CapturedEvent::Connect {
+    assert_footer_button_emits(
+        cx,
+        "via-footer",
+        "connection-form-connect",
+        "connect",
+        CapturedEvent::Connect {
             name: "via-footer".to_owned(),
             url: "sqlite::memory:".to_owned(),
-        }]
+        },
     );
 }
 

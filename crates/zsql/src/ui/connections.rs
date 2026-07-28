@@ -823,7 +823,7 @@ impl ConnectionManagerView {
     pub fn run_test(&mut self, cx: &mut Context<Self>, url: String) -> Task<()> {
         if let Err(reason) = detect_driver_id(&url) {
             self.form.update(cx, |form, cx| {
-                form.set_test_outcome(Some(TestOutcome::Failed(reason)), cx);
+                form.set_test_outcome(Some(TestOutcome::Failed(reason.to_string())), cx);
             });
             return Task::ready(());
         }

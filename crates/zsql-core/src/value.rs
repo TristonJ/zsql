@@ -31,7 +31,8 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// UUID rendered as text.
     Uuid(String),
-    /// Timestamp rendered as ISO-8601 text (v0 keeps time as text).
+    /// Timestamp rendered as ISO-8601 text; stays text until a typed time
+    /// value exists.
     Timestamp(String),
     /// JSON rendered as text.
     Json(String),

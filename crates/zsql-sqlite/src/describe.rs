@@ -27,8 +27,8 @@ const SQLITE_INDEX_METHOD: &str = "btree";
 
 /// Build a [`RelationSchema`] for `relation`. `schema` is accepted for
 /// parity with [`zsql_core::Connection::describe_relation`]'s signature but
-/// unused: v0 `SQLite` introspection only ever sees the single `main`
-/// schema (see `introspect.rs`'s `MAIN_SCHEMA_NAME`).
+/// unused: `SQLite` introspection only ever sees the single `main` schema
+/// (see `introspect.rs`'s `MAIN_SCHEMA_NAME`).
 ///
 /// # Errors
 /// Returns [`CoreError::Introspection`] if `relation` does not exist or any
@@ -240,7 +240,7 @@ async fn foreign_keys(
     let mut by_column = HashMap::new();
     for (table, local_columns, ref_columns) in groups.into_values() {
         let target = ForeignKeyRef {
-            // `SQLite` has one schema namespace in v0 (see the module doc
+            // `SQLite` has one schema namespace (see the module doc
             // comment); the referenced table is always reported unqualified.
             schema: crate::introspect::MAIN_SCHEMA_NAME.to_owned(),
             table,

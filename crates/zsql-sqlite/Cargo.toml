@@ -13,6 +13,8 @@ zsql-sqlx = { path = "../zsql-sqlx" }
 # for zsql-postgres): SQLite is file-based with no network/TLS surface, and
 # its storage classes decode with plain i64/f64/String/Vec<u8>, so none of
 # those extra type-mapping features are exercised here.
+# The version here must be kept in sync with the workspace-level `sqlx`
+# pin in the root Cargo.toml.
 sqlx = { version = "0.9", default-features = false, features = [
     "sqlite",
     "runtime-smol",

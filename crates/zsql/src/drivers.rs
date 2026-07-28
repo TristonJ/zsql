@@ -7,7 +7,7 @@
 //! through [`connect`] and never picks a driver directly.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use zsql_core::{Connection, CoreError, Driver};
 use zsql_mssql::MssqlDriver;
@@ -15,15 +15,20 @@ use zsql_mysql::MysqlDriver;
 use zsql_postgres::PostgresDriver;
 use zsql_sqlite::SqliteDriver;
 
-/// Build the list of drivers this binary registers.
-#[must_use]
-pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
+/// This binary's registered drivers, built once and shared by every caller.
+static REGISTERED_DRIVERS: LazyLock<Vec<Arc<dyn Driver>>> = LazyLock::new(|| {
     vec![
         Arc::new(PostgresDriver),
         Arc::new(SqliteDriver),
         Arc::new(MssqlDriver),
         Arc::new(MysqlDriver),
     ]
+});
+
+/// The list of drivers this binary registers.
+#[must_use]
+pub fn registered_drivers() -> Vec<Arc<dyn Driver>> {
+    REGISTERED_DRIVERS.clone()
 }
 
 /// Resolve `url`'s scheme to a registered driver and connect through it.
@@ -72,19 +77,23 @@ pub async fn connect_tunneled(
 }
 
 /// Detect the driver id `url` would resolve to
-pub fn detect_driver_id(url: &str) -> Result<&'static str, String> {
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` has no recognizable scheme, or its
+/// scheme has no registered driver.
+pub fn detect_driver_id(url: &str) -> Result<&'static str, CoreError> {
     let drivers = registered_drivers();
-    zsql_core::select_driver(&drivers, url)
-        .map(|driver| driver.id())
-        .map_err(|err| err.to_string())
+    zsql_core::select_driver(&drivers, url).map(|driver| driver.id())
 }
 
 /// Detect the driver name `url` would resolve to
-pub fn detect_driver_name(url: &str) -> Result<&'static str, String> {
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` has no recognizable scheme, or its
+/// scheme has no registered driver.
+pub fn detect_driver_name(url: &str) -> Result<&'static str, CoreError> {
     let drivers = registered_drivers();
-    zsql_core::select_driver(&drivers, url)
-        .map(|driver| driver.display_name())
-        .map_err(|err| err.to_string())
+    zsql_core::select_driver(&drivers, url).map(|driver| driver.display_name())
 }
 
 /// Detect the driver default port `url` would resolve to

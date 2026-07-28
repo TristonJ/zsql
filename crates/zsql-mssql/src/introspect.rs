@@ -41,7 +41,7 @@ fn system_schemas_sql_list() -> String {
 /// Build a full [`SchemaTree`] for the database `client` is connected to.
 ///
 /// MSSQL has no equivalent of Postgres's materialized views, and detecting
-/// table partitioning would need a further `sys.partitions` join this v0
+/// table partitioning would need a further `sys.partitions` join this
 /// introspection does not attempt, so every relation reports as
 /// [`RelationKind::Table`] or [`RelationKind::View`].
 ///

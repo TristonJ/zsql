@@ -229,12 +229,6 @@ impl ValuePanel {
         &self.focus_handle
     }
 
-    /// Whether the pannel has a pinned value
-    #[allow(dead_code)]
-    pub fn is_pinned(&self) -> bool {
-        self.state.is_pinned()
-    }
-
     /// Read-only access to the panel's [`ValuePanelState`], for tests that
     /// need to observe its open/pin/mode/tree state directly.
     #[cfg(test)]
@@ -1335,5 +1329,12 @@ mod tests {
             });
             vcx.run_until_parked();
         }
+
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                p.state_for_test().is_open(),
+                "the panel must stay open across every non-JSON cell it renders"
+            );
+        });
     }
 }

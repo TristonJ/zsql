@@ -98,7 +98,7 @@ impl Render for ConnectionFooterView {
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(colors.text_secondary))
-                    .child("Connecting…"),
+                    .child("Connecting..."),
             ),
             FooterDisplay::Disconnected => row
                 .child(grid::status_dot_outline(colors.text_tertiary))
@@ -139,7 +139,7 @@ mod tests {
     fn renders_without_panicking_when_connected_and_when_disconnected(cx: &mut TestAppContext) {
         let session = cx.new(|_cx| Session::new(&crate::config::Config::default()));
         let session_for_connections = session.clone();
-        let (_footer, vcx) = cx.add_window_view(|_window, cx| {
+        let (footer, vcx) = cx.add_window_view(|_window, cx| {
             let connections = cx.new(|cx| {
                 ConnectionManagerView::new(
                     session_for_connections,
@@ -151,6 +151,16 @@ mod tests {
             ConnectionFooterView::new(session, connections, cx)
         });
         vcx.run_until_parked();
+
+        footer.read_with(vcx, |footer, cx| {
+            assert!(
+                matches!(
+                    footer.session.read(cx).state(),
+                    crate::session::SessionState::Empty
+                ),
+                "a freshly built session must start Empty"
+            );
+        });
     }
 
     #[gpui::test]
@@ -162,7 +172,7 @@ mod tests {
             )
         });
         let session_for_connections = session.clone();
-        let (_footer, vcx) = cx.add_window_view(|_window, cx| {
+        let (footer, vcx) = cx.add_window_view(|_window, cx| {
             let connections = cx.new(|cx| {
                 ConnectionManagerView::new(
                     session_for_connections,
@@ -174,5 +184,15 @@ mod tests {
             ConnectionFooterView::new(session, connections, cx)
         });
         vcx.run_until_parked();
+
+        footer.read_with(vcx, |footer, cx| {
+            assert!(
+                matches!(
+                    footer.session.read(cx).state(),
+                    crate::session::SessionState::Connecting
+                ),
+                "the footer must keep reflecting the session's Connecting state"
+            );
+        });
     }
 }

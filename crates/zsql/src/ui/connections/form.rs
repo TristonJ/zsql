@@ -663,7 +663,7 @@ impl ConnectionForm {
     /// detected driver uses
     fn sync_fields_from_url(&mut self, cx: &mut Context<Self>) {
         let url_text = self.url_field.read(cx).value().to_string();
-        self.driver_id = detect_driver_id(&url_text);
+        self.driver_id = detect_driver_id(&url_text).map_err(|err| err.to_string());
 
         match ConnectionUrl::parse(&url_text) {
             Ok(parsed) => {
@@ -818,6 +818,8 @@ impl ConnectionForm {
         }
     }
 
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
     #[allow(clippy::needless_pass_by_value)]
     fn on_port_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
         let text = field.read(cx).value().to_string();
@@ -841,6 +843,8 @@ impl ConnectionForm {
         }
     }
 
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
     #[allow(clippy::needless_pass_by_value)]
     fn on_user_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
         let value = field.read(cx).value().to_string();
@@ -851,6 +855,8 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
     #[allow(clippy::needless_pass_by_value)]
     fn on_password_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
         let value = field.read(cx).value().to_string();
@@ -861,6 +867,8 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
     #[allow(clippy::needless_pass_by_value)]
     fn on_database_field_changed(&mut self, field: Entity<TextFieldState>, cx: &mut Context<Self>) {
         let value = field.read(cx).value().to_string();
@@ -871,6 +879,8 @@ impl ConnectionForm {
         self.reserialize_url(cx);
     }
 
+    // `Context::observe`'s callback signature hands the observed entity by
+    // value, not by reference.
     #[allow(clippy::needless_pass_by_value)]
     fn on_sqlite_path_field_changed(
         &mut self,
