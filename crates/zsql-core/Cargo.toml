@@ -12,5 +12,8 @@ thiserror = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 
+[dev-dependencies]
+futures = { workspace = true }
+
 [lints]
 workspace = true

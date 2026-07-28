@@ -167,6 +167,11 @@ impl Connection for PgConnection {
     ) -> Result<RelationSchema, CoreError> {
         crate::describe::describe_relation(self.0.pool(), schema, relation).await
     }
+
+    #[tracing::instrument(name = "pg_close", skip_all)]
+    async fn close(&self) {
+        self.0.close().await;
+    }
 }
 
 pub struct PgCancelHandle {

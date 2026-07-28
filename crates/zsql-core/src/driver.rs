@@ -138,6 +138,13 @@ pub trait Connection: Send + Sync {
     fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
         crate::sql::default_preview_query(schema, relation, limit)
     }
+
+    /// Release any resources this connection holds (pools, sockets,
+    /// background workers) ahead of it being dropped. Called once, before
+    /// the connection is discarded; never awaited on the UI thread, so an
+    /// implementation is free to take as long as it needs. The default is a
+    /// no-op for a backend with nothing to release deterministically.
+    async fn close(&self) {}
 }
 
 #[cfg(test)]
@@ -186,5 +193,13 @@ mod tests {
             connection.preview_query("public", "orders", 200),
             crate::sql::default_preview_query("public", "orders", 200)
         );
+    }
+
+    #[test]
+    fn a_connection_with_no_close_override_falls_back_to_a_no_op_default() {
+        let connection = DefaultOnlyConnection;
+        // The default body is a genuine no-op: this only proves it resolves
+        // and completes rather than panicking or hanging.
+        futures::executor::block_on(connection.close());
     }
 }

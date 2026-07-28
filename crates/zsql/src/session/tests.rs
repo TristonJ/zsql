@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use gpui::{Context, Task};
 use zsql_core::{
-    ColumnMeta, Connection, CoreError, QueryEvent, ResultSet, Row, RowBatch, RowCount, Value,
+    BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RelationSchema,
+    ResultSet, Row, RowBatch, RowCount, SchemaTree, Value,
 };
 
 use super::{
@@ -175,6 +176,52 @@ impl Drop for FakeTunnel {
     fn drop(&mut self) {
         self.open_count
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A [`Connection`] double whose `close()` is observable via an atomic
+/// counter, mirroring [`FakeTunnel`]'s pattern for proving teardown actually
+/// happened rather than merely inferring it. Every other method panics: this
+/// only ever stands in for a connection a switch is about to supersede, and
+/// no test exercises it beyond that.
+pub(crate) struct CloseCountingConnection {
+    close_calls: Arc<AtomicUsize>,
+}
+
+impl CloseCountingConnection {
+    pub(crate) fn new(close_calls: Arc<AtomicUsize>) -> Self {
+        Self { close_calls }
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for CloseCountingConnection {
+    fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn describe_relation(
+        &self,
+        _schema: &str,
+        _relation: &str,
+    ) -> Result<RelationSchema, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn close(&self) {
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -572,8 +619,10 @@ mod gpui_tests {
         RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
     };
 
-    use super::FakeTunnel;
-    use crate::session::{Config, LivenessState, SchemaState, Session, SessionState};
+    use super::{CloseCountingConnection, FakeTunnel};
+    use crate::session::{
+        Config, LivenessState, SchemaState, Session, SessionState, apply_connect_outcome,
+    };
 
     fn session_with_no_url() -> Session {
         Session::new(&Config::default())
@@ -836,6 +885,115 @@ mod gpui_tests {
                 "expected a not-connected error, got {message:?}"
             ),
             other => panic!("expected a not-connected error, got {other:?}"),
+        });
+    }
+
+    /// A connection switch that supersedes an already-active connection must
+    /// close the outgoing connection exactly once, dispatched as its own
+    /// background task rather than delaying the switch's own state update.
+    #[gpui::test]
+    async fn connect_to_closes_the_previously_active_connection_exactly_once(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let outgoing: Arc<dyn Connection> =
+            Arc::new(CloseCountingConnection::new(close_calls.clone()));
+        let session = cx.new(|_cx| Session::new_for_query_test(outgoing));
+
+        session
+            .update(cx, |session, cx| session.connect_to("sqlite::memory:", cx))
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "the superseded connection must be closed exactly once"
+        );
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected the new connection to succeed, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// A connection switch that fails must still close the connection it was
+    /// about to replace: the generation bump already invalidated that
+    /// connection's probe loop, so leaving it open would leak its pool
+    /// workers even though the switch itself never became queryable.
+    #[gpui::test]
+    async fn a_failed_connect_switch_still_closes_the_previously_active_connection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let outgoing: Arc<dyn Connection> =
+            Arc::new(CloseCountingConnection::new(close_calls.clone()));
+        let session = cx.new(|_cx| Session::new_for_query_test(outgoing));
+
+        session
+            .update(cx, |session, cx| {
+                session.connect_to("cassandra://host/db", cx)
+            })
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "the previously active connection must be closed even though the switch failed"
+        );
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected Error after a failed switch, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// A connect attempt whose outcome arrives after a newer attempt has
+    /// already superseded it (`connection_generation` moved on while it was
+    /// still running in the background) must still close the connection it
+    /// produced, exactly as a non-stale replace does -- it must not rely on
+    /// the discarded `Box<dyn Connection>`'s own `Drop` to release pools or
+    /// background workers.
+    #[gpui::test]
+    fn a_stale_connect_outcomes_own_connection_is_closed_exactly_once(cx: &mut TestAppContext) {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let discarded: Box<dyn Connection> =
+            Box::new(CloseCountingConnection::new(close_calls.clone()));
+
+        let session = cx.new(|_cx| session_with_no_url());
+        let connected = session.update(cx, |session, cx| {
+            // A newer attempt (generation 2) has already superseded the one
+            // whose outcome (generation 1) is being applied here.
+            session.connection_generation = 2;
+            apply_connect_outcome(session, 1, Ok((discarded, None)), cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !connected,
+            "a superseded attempt must never report itself connected"
+        );
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "a superseded attempt's own connection must be closed exactly once"
+        );
+        session.read_with(cx, |session, _app| {
+            assert!(
+                session.connection.is_none(),
+                "a superseded attempt must never install its connection onto the session"
+            );
         });
     }
 

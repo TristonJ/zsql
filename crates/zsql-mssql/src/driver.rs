@@ -255,6 +255,13 @@ impl Connection for MssqlConnection {
             crate::quoting::bracket_quote_ident(relation)
         )
     }
+
+    /// This driver opens a short-lived client per operation (see the module
+    /// doc comment) and holds nothing persistent, so there is nothing to
+    /// release; a future move to a persistent connection strategy would
+    /// implement teardown here.
+    #[tracing::instrument(name = "mssql_close", skip_all)]
+    async fn close(&self) {}
 }
 
 /// Look up `sys.dm_db_partition_stats` for `schema.relation`'s base table

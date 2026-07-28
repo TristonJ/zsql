@@ -5,6 +5,7 @@ mod describe;
 mod driver;
 mod error;
 mod introspect;
+pub mod params;
 mod quoting;
 mod url;
 mod values;

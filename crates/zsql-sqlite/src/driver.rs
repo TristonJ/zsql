@@ -87,22 +87,6 @@ pub struct SqliteConnectionImpl {
     batch_size: usize,
 }
 
-impl SqliteConnectionImpl {
-    /// Close the underlying pool.
-    ///
-    /// `zsql_core::Connection` has no `close` method today, so this is an
-    /// inherent method reachable only on the concrete type (not through
-    /// `Box<dyn Connection>`); it exists for callers that hold the concrete
-    /// connection and want to release the file handle deterministically
-    /// rather than relying on drop order. Dropping the connection (or the
-    /// pool inside it) is equally sufficient in every other case.
-    #[tracing::instrument(name = "sqlite_close", skip_all)]
-    pub async fn close(self) {
-        self.pool.close().await;
-        tracing::info!("sqlite connection closed");
-    }
-}
-
 #[async_trait]
 impl Connection for SqliteConnectionImpl {
     fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
@@ -152,6 +136,14 @@ impl Connection for SqliteConnectionImpl {
         relation: &str,
     ) -> Result<RelationSchema, CoreError> {
         crate::describe::describe_relation(&self.pool, schema, relation).await
+    }
+
+    /// Close the underlying pool, checkpointing rather than relying on
+    /// however/whenever its `Drop` runs.
+    #[tracing::instrument(name = "sqlite_close", skip_all)]
+    async fn close(&self) {
+        self.pool.close().await;
+        tracing::info!("sqlite connection closed");
     }
 }
 
@@ -408,10 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn close_shuts_down_the_underlying_pool() {
-        // `close` is reachable only on the concrete type (see its doc
-        // comment), so this builds one directly instead of going through
-        // `Driver::connect`, which returns `Box<dyn Connection>`.
+    fn close_shuts_down_the_underlying_pool_through_the_trait_object() {
         let pool = block_on(
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
@@ -419,10 +408,10 @@ mod tests {
         )
         .expect("in-memory connect should succeed");
         let pool_handle = pool.clone();
-        let conn = SqliteConnectionImpl {
+        let conn: Box<dyn Connection> = Box::new(SqliteConnectionImpl {
             pool,
             batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-        };
+        });
 
         block_on(conn.close());
 

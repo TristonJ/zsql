@@ -187,6 +187,11 @@ impl Connection for MySqlConnection {
             backtick_quote_ident(relation)
         )
     }
+
+    #[tracing::instrument(name = "mysql_close", skip_all)]
+    async fn close(&self) {
+        self.0.close().await;
+    }
 }
 
 /// Look up `information_schema.TABLES.TABLE_ROWS` for `schema.relation`,

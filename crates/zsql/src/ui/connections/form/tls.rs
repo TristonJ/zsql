@@ -9,6 +9,11 @@
 
 use gpui::{Context, Div, Window, div, prelude::*, px, rgb};
 use zsql_core::{ConnectionUrl, TlsVerify};
+use zsql_mssql::params::{
+    ENCRYPT_KEY as MSSQL_ENCRYPT_KEY, TRUST_CERT_ALIAS_KEY as MSSQL_TRUST_CERT_ALIAS_KEY,
+    TRUST_CERT_KEY as MSSQL_TRUST_CERT_KEY, is_truthy as mssql_is_truthy,
+    param_ci as mssql_param_ci,
+};
 use zsql_ui::{button::ButtonSwitch, theme::ActiveTheme};
 
 use crate::ui::theme;
@@ -28,13 +33,6 @@ const MYSQL_SSLMODE_FALLBACK_KEY: &str = "sslmode";
 const MYSQL_SSLMODE_OFF: &str = "disabled";
 const MYSQL_SSLMODE_VERIFY_CA: &str = "verify_ca";
 const MYSQL_SSLMODE_VERIFY_FULL: &str = "verify_identity";
-
-const MSSQL_ENCRYPT_KEY: &str = "encrypt";
-const MSSQL_TRUST_CERT_KEY: &str = "trustServerCertificate";
-/// The `snake_case` spelling `zsql_mssql`'s own URL parser also accepts for
-/// [`MSSQL_TRUST_CERT_KEY`], read alongside it so the control never disagrees
-/// with what the driver will actually do with a hand-edited URL.
-const MSSQL_TRUST_CERT_ALIAS_KEY: &str = "trust_server_certificate";
 
 fn is_mysql_family(driver_id: &str) -> bool {
     driver_id == "mysql" || driver_id == "mariadb"
@@ -187,25 +185,6 @@ fn write_mysql_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
     parsed.remove_query_param(MYSQL_SSLMODE_FALLBACK_KEY);
 }
 
-/// The truthy spellings `zsql_mssql`'s own boolean query-parameter parsing
-/// accepts (case-insensitively): `true`, `1`, `yes`.
-fn parse_bool_like(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
-}
-
-/// The value of whichever of `keys` last appears in `parsed`'s query string,
-/// matching a key case-insensitively -- mirroring `zsql_mssql`'s own parser,
-/// which lowercases keys and lets a later-appearing alias override an
-/// earlier one rather than the first match winning.
-fn mssql_param_ci(parsed: &ConnectionUrl, keys: &[&str]) -> Option<String> {
-    parsed
-        .extra_query_params(&[])
-        .into_iter()
-        .filter(|(k, _)| keys.iter().any(|key| key.eq_ignore_ascii_case(k)))
-        .map(|(_, v)| v)
-        .next_back()
-}
-
 /// mssql's mode, read off `parsed`'s `encrypt`/`trustServerCertificate`
 /// params: `encrypt=false` always wins as [`TlsVerify::Off`] regardless of
 /// `trustServerCertificate` (there is nothing left to trust once encryption
@@ -214,13 +193,13 @@ fn mssql_param_ci(parsed: &ConnectionUrl, keys: &[&str]) -> Option<String> {
 /// module doc comment), and its absence as [`TlsVerify::VerifyFull`].
 fn read_mssql_mode(parsed: &ConnectionUrl) -> TlsVerify {
     let encrypt =
-        mssql_param_ci(parsed, &[MSSQL_ENCRYPT_KEY]).is_none_or(|value| parse_bool_like(&value));
+        mssql_param_ci(parsed, &[MSSQL_ENCRYPT_KEY]).is_none_or(|value| mssql_is_truthy(&value));
     if !encrypt {
         return TlsVerify::Off;
     }
     let trust_server_certificate =
         mssql_param_ci(parsed, &[MSSQL_TRUST_CERT_KEY, MSSQL_TRUST_CERT_ALIAS_KEY])
-            .is_some_and(|value| parse_bool_like(&value));
+            .is_some_and(|value| mssql_is_truthy(&value));
     if trust_server_certificate {
         TlsVerify::VerifyCa
     } else {

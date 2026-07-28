@@ -344,43 +344,7 @@ impl Session {
                 .await;
 
             let connected = this.update(cx, |session, cx| {
-                // A newer connect attempt may have superseded this one while its
-                // tunnel and driver connect ran in the background. If so this
-                // outcome is stale: installing its connection and tunnel would
-                // leave a live tunnel held as current with no matching probe
-                // loop, and clearing state on its failure would wipe the newer
-                // attempt. Drop whatever this attempt produced (the tunnel and
-                // connection in `outcome` are torn down as it falls out of
-                // scope) and leave the current generation's state untouched.
-                if session.connection_generation != generation {
-                    tracing::debug!("discarding a superseded connect attempt's result");
-                    return false;
-                }
-                let connected = match outcome {
-                    Ok((conn, tunnel)) => {
-                        tracing::info!("session connected");
-                        session.connection = Some(Arc::from(conn));
-                        session.tunnel = tunnel;
-                        session.state = SessionState::Connected;
-                        true
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "session connect failed");
-                        // Drop any previously-active connection: the generation
-                        // bump already invalidated its probe loop, and leaving it
-                        // in `self.connection` would let `run_query` silently
-                        // execute against the database this failed switch was
-                        // meant to replace. Any tunnel this attempt itself opened
-                        // was already torn down inside `open_tunnel_and_connect`
-                        // before this error ever reached here.
-                        session.connection = None;
-                        session.tunnel = None;
-                        session.state = SessionState::Error(err.to_string());
-                        false
-                    }
-                };
-                cx.notify();
-                connected
+                apply_connect_outcome(session, generation, outcome, cx)
             });
 
             // Only a successful connect starts the probe loop: there is
@@ -781,6 +745,78 @@ fn row_count(accumulating: &ResultSet) -> u64 {
 /// else in flight, such as the liveness probe or an unrelated query.
 fn row_limit_reached(accumulated: u64, limit: u64) -> bool {
     accumulated >= limit
+}
+
+/// Applies a background connect attempt's outcome once back on the main
+/// thread, returning whether the session ended up connected.
+///
+/// If `generation` no longer matches `session.connection_generation`, a
+/// newer attempt has already superseded this one: installing its connection
+/// and tunnel would leave a live tunnel held as current with no matching
+/// probe loop, and clearing state on its failure would wipe the newer
+/// attempt's state instead. The stale attempt's own tunnel is dropped as it
+/// falls out of scope, but a stale `Ok` connection is explicitly closed
+/// rather than left to a non-deterministic `Drop` -- the same guarantee a
+/// non-stale replace gets from [`close_outgoing_connection`].
+///
+/// Otherwise this attempt is current: whatever connection it replaces (a
+/// prior successful connect, or `None`) is closed via
+/// [`close_outgoing_connection`] regardless of whether this attempt itself
+/// succeeded or failed.
+fn apply_connect_outcome(
+    session: &mut Session,
+    generation: u64,
+    outcome: Result<TunneledConnectOutcome, CoreError>,
+    cx: &mut Context<Session>,
+) -> bool {
+    if session.connection_generation != generation {
+        tracing::debug!("discarding a superseded connect attempt's result");
+        if let Ok((conn, _tunnel)) = outcome {
+            close_outgoing_connection(Some(Arc::from(conn)), cx);
+        }
+        return false;
+    }
+    // Whatever connection this attempt is about to replace (a prior
+    // successful connect, or `None`) is taken out here so its teardown can
+    // be dispatched below regardless of which branch this attempt lands in.
+    let outgoing = session.connection.take();
+    let connected = match outcome {
+        Ok((conn, tunnel)) => {
+            tracing::info!("session connected");
+            session.connection = Some(Arc::from(conn));
+            session.tunnel = tunnel;
+            session.state = SessionState::Connected;
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "session connect failed");
+            // Drop any previously-active connection: the generation bump
+            // already invalidated its probe loop, and leaving it in
+            // `self.connection` would let `run_query` silently execute
+            // against the database this failed switch was meant to
+            // replace. Any tunnel this attempt itself opened was already
+            // torn down inside `open_tunnel_and_connect` before this error
+            // ever reached here.
+            session.tunnel = None;
+            session.state = SessionState::Error(err.to_string());
+            false
+        }
+    };
+    close_outgoing_connection(outgoing, cx);
+    cx.notify();
+    connected
+}
+
+/// Closes `connection` (if any) on a detached background task, so its
+/// teardown never delays the state update replacing it.
+fn close_outgoing_connection(connection: Option<Arc<dyn Connection>>, cx: &mut Context<Session>) {
+    let Some(connection) = connection else {
+        return;
+    };
+    cx.background_spawn(async move {
+        connection.close().await;
+    })
+    .detach();
 }
 
 /// A successful connect's outcome: the live connection, and the tunnel it
