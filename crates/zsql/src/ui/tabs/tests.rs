@@ -6,10 +6,10 @@ use zsql_core::{
     BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RowCount, SchemaTree,
 };
 
-use super::{Tab, TabKind, TabModel};
+use super::{ResultsSnapshot, Tab, TabKind, TabModel};
 use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
-use crate::ui::results::{ResultsSnapshot, ResultsView};
+use crate::ui::results::ResultsView;
 
 /// Test-only accessor for asserting on a tab's captured run.
 impl Tab {

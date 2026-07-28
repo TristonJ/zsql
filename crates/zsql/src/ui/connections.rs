@@ -22,9 +22,7 @@ use crate::connections::{
     ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection, ssh_config_from_stored,
 };
 use crate::drivers::detect_driver_id;
-use crate::session::{
-    LivenessState, Session, SessionState, open_tunnel_and_connect, probe_connection,
-};
+use crate::session::{Session, SessionState, open_tunnel_and_connect, probe_connection};
 use crate::tab_session::ConnectionKey;
 use crate::ui::connections::form::{ConnectionForm, ConnectionFormEvent};
 use crate::ui::format::host_label;
@@ -55,72 +53,6 @@ pub struct ActiveConnection {
     pub name: String,
     /// The connection URL this name was resolved for.
     pub url: String,
-}
-
-/// What the connection footer (see [`super::footer`]) should render, derived
-/// from the session's lifecycle state and whichever connection (if any) is
-/// currently tracked as active.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FooterDisplay {
-    /// Show the active connection's name and host, with a filled status dot.
-    Connected {
-        /// The active connection's display name.
-        name: String,
-        /// A `host[:port]`-shaped label derived from the active connection's
-        /// URL.
-        host: String,
-    },
-    /// Show a "Connecting..." status while a connect attempt is in flight.
-    Connecting,
-    /// Show the "not connected, click to connect" prompt with a hollow dot.
-    Disconnected,
-}
-
-/// The connection footer's display, given the session's real lifecycle
-/// state and connection liveness, whether a live connection is currently
-/// held (see [`Session::is_connected`]), and whichever connection is
-/// tracked as active. Applies the same three-way Connecting/Connected/
-/// Disconnected distinction the results status bar uses (see
-/// `crate::ui::results`'s `status_indicator`), in this precedence order:
-///
-/// 1. [`LivenessState::Unreachable`] always overrides to [`FooterDisplay::Disconnected`],
-///    regardless of `state`.
-/// 2. [`SessionState::Connecting`] always renders [`FooterDisplay::Connecting`], even if
-///    `session_is_connected` is still `true` -- mid-switch, the prior
-///    connection's `Arc` is still held until the new connect resolves, and
-///    that stale "still connected" read must not win over the connect
-///    attempt actually in flight.
-/// 3. Otherwise, `session_is_connected` together with a tracked `active`
-///    connection renders [`FooterDisplay::Connected`].
-/// 4. Everything else (no URL configured, an errored connect with no live
-///    connection, or a connected session with no active connection
-///    tracked, which should not normally happen since every connect path
-///    threads one through) falls back to [`FooterDisplay::Disconnected`].
-///
-/// Note that a query error (as opposed to a connect failure) moves `state`
-/// to [`SessionState::Error`] without dropping the underlying connection,
-/// so rule 3 still applies and the footer keeps showing the still-connected
-/// database rather than falling back to "Not connected".
-#[must_use]
-pub fn footer_display(
-    state: &SessionState,
-    liveness: &LivenessState,
-    session_is_connected: bool,
-    active: Option<&ActiveConnection>,
-) -> FooterDisplay {
-    if matches!(liveness, LivenessState::Unreachable(_)) {
-        return FooterDisplay::Disconnected;
-    }
-    if matches!(state, SessionState::Connecting) {
-        return FooterDisplay::Connecting;
-    }
-    match (session_is_connected, active) {
-        (true, Some(active)) => FooterDisplay::Connected {
-            name: active.name.clone(),
-            host: host_label(&active.url),
-        },
-        _ => FooterDisplay::Disconnected,
-    }
 }
 
 /// One persisted connection as shown in the manager, with its auto-detected

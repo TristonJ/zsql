@@ -7,17 +7,18 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
     MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
-use zsql_core::{ColumnMeta, ResultSet, RowCount};
+use zsql_core::{ColumnMeta, ResultSet, RowCount, group_thousands};
 use zsql_ui::grid;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::connections::ConnectionManagerView;
 use super::format::{ValueKind, format_value};
+use super::tabs::ResultsSnapshot;
 use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{LivenessState, Session, SessionState};
-use crate::ui::format::{format_value_for_clipboard, group_thousands};
+use crate::ui::format::format_value_for_clipboard;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
@@ -60,19 +61,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", FocusValuePanel, Some(KEY_CONTEXT)),
     ]);
     value_panel::init(cx);
-}
-
-/// A tab's captured query outcome: the label, lifecycle state, and result
-/// set a [`ResultsView`] shows while that tab (rather than the live
-/// `Session`) is what it is displaying. Captured once a tab's own run
-/// reaches a terminal state, so switching back to that tab later restores
-/// exactly what it last produced instead of whatever a different tab most
-/// recently ran.
-#[derive(Debug, Clone)]
-pub struct ResultsSnapshot {
-    pub source_label: SharedString,
-    pub state: SessionState,
-    pub result: ResultSet,
 }
 
 /// Which layout the results pane renders a result with: the virtualized grid

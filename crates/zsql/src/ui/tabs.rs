@@ -15,7 +15,7 @@ use zsql_core::{RelationKind, ResultSet};
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
-use super::results::{ResultsSnapshot, ResultsView};
+use super::results::ResultsView;
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
@@ -23,6 +23,19 @@ use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 /// Identifies one open tab, stable for its lifetime and never reused within
 /// a single `TabModel`.
 pub type TabId = u64;
+
+/// A tab's captured query outcome: the label, lifecycle state, and result
+/// set a [`ResultsView`] shows while that tab (rather than the live
+/// `Session`) is what it is displaying. Captured once a tab's own run
+/// reaches a terminal state, so switching back to that tab later restores
+/// exactly what it last produced instead of whatever a different tab most
+/// recently ran.
+#[derive(Debug, Clone)]
+pub struct ResultsSnapshot {
+    pub source_label: SharedString,
+    pub state: SessionState,
+    pub result: ResultSet,
+}
 
 /// What kind of buffer a tab holds.
 #[derive(Debug, Clone, PartialEq, Eq)]

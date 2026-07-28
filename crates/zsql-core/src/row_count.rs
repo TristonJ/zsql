@@ -37,6 +37,36 @@ impl RowCount {
     pub fn is_estimated(self) -> bool {
         matches!(self, RowCount::Estimated(_))
     }
+
+    /// This count's value with [`THOUSANDS_SEPARATOR`]-grouped digits,
+    /// prefixed with [`ESTIMATE_MARKER`] when the count is an estimate.
+    #[must_use]
+    pub fn grouped_display(self) -> String {
+        let grouped = group_thousands(self.value());
+        if self.is_estimated() {
+            format!("{ESTIMATE_MARKER}{grouped}")
+        } else {
+            grouped
+        }
+    }
+}
+
+/// Groups digits every three places when rendering a row count for display.
+pub const THOUSANDS_SEPARATOR: char = ',';
+
+/// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
+/// the right, e.g. `1234567` -> `"1,234,567"`.
+#[must_use]
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(THOUSANDS_SEPARATOR);
+        }
+        grouped.push(ch);
+    }
+    grouped.chars().rev().collect()
 }
 
 impl fmt::Display for RowCount {
@@ -55,7 +85,24 @@ impl fmt::Display for RowCount {
 
 #[cfg(test)]
 mod tests {
-    use super::RowCount;
+    use super::{RowCount, group_thousands};
+
+    #[test]
+    fn group_thousands_inserts_a_separator_every_three_digits_from_the_right() {
+        assert_eq!(group_thousands(7), "7");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+        assert_eq!(group_thousands(0), "0");
+    }
+
+    #[test]
+    fn grouped_display_formats_counts_with_thousands_separators_and_estimate_marker() {
+        assert_eq!(RowCount::Exact(1_234_567).grouped_display(), "1,234,567");
+        assert_eq!(
+            RowCount::Estimated(1_234_567).grouped_display(),
+            "~1,234,567"
+        );
+    }
 
     #[test]
     fn exact_renders_without_an_estimate_marker() {
