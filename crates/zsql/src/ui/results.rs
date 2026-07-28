@@ -641,7 +641,7 @@ impl ResultsView {
             .into_any_element(),
             SessionState::Connecting => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
-                "Connecting…",
+                "Connecting...",
                 "Establishing a connection to the configured database.",
                 active_theme,
             )
@@ -655,7 +655,7 @@ impl ResultsView {
             .into_any_element(),
             SessionState::Running => Self::render_placeholder(
                 active_theme.colors.text_tertiary,
-                "Running query…",
+                "Running query...",
                 "Streaming results from the database.",
                 active_theme,
             )
@@ -1297,16 +1297,14 @@ impl ResultsView {
         // If no cell is currently selected, select (0, 0) and return without
         // applying the delta. This ensures the first arrow press in any
         // direction lands on the top-left cell consistently.
-        if self.table_state.read(cx).focused_cell().is_none() {
+        let Some((current_row, current_col)) = self.table_state.read(cx).focused_cell() else {
             tracing::trace!("moved the results grid selection to (0, 0)");
             self.table_state.update(cx, |state, cx| {
                 state.set_focused_cell(0, 0);
                 cx.notify();
             });
             return;
-        }
-
-        let (current_row, current_col) = self.table_state.read(cx).focused_cell().unwrap();
+        };
         let new_row = current_row
             .saturating_add_signed(delta_row)
             .min(row_count - 1);
@@ -1432,10 +1430,10 @@ fn status_indicator(
     }
     match state {
         SessionState::Empty => (colors.text_tertiary, "Not connected"),
-        SessionState::Connecting => (colors.status_warn, "Connecting…"),
+        SessionState::Connecting => (colors.status_warn, "Connecting..."),
         SessionState::Connected | SessionState::Results(_) => (colors.accent, "Connected"),
-        SessionState::Running => (colors.accent, "Running…"),
-        SessionState::Truncating { .. } => (colors.status_limited, "Running… (truncated)"),
+        SessionState::Running => (colors.accent, "Running..."),
+        SessionState::Truncating { .. } => (colors.status_limited, "Running... (truncated)"),
         SessionState::Truncated { .. } => (colors.status_limited, "Truncated"),
         SessionState::Error(_) => (colors.status_error, "Error"),
     }
@@ -1638,7 +1636,7 @@ mod tests {
                 &LivenessState::Unknown,
                 &active_theme
             ),
-            (colors.status_warn, "Connecting…")
+            (colors.status_warn, "Connecting...")
         );
         assert_eq!(
             status_indicator(
@@ -1654,7 +1652,7 @@ mod tests {
                 &LivenessState::Healthy,
                 &active_theme
             ),
-            (colors.accent, "Running…")
+            (colors.accent, "Running...")
         );
         assert_eq!(
             status_indicator(
@@ -1804,7 +1802,7 @@ mod tests {
         view.update(vcx, |view, cx| {
             let (_dot_color, label, error) = view.connection_status(cx);
             assert_eq!(
-                label, "Connecting…",
+                label, "Connecting...",
                 "switching sessions must show Connecting, not the frozen tab's stale Connected"
             );
             assert!(error.is_none());
@@ -3541,7 +3539,7 @@ mod value_panel_view_tests {
         vcx.run_until_parked();
         view.read_with(vcx, |v, app| {
             assert!(
-                v.value_panel.read(app).is_pinned(),
+                v.value_panel.read(app).state_for_test().is_pinned(),
                 "the panel must report itself pinned"
             );
             assert_eq!(

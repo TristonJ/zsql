@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::{drivers::detect_driver_name, ui::format::host_label};
 
 /// Owner-only file mode (`rw-------`) the connection store is written with.
-/// The entirety of V0's "secure": filesystem permissions only, no
-/// encryption or keyring integration.
+/// The store's only protection is these filesystem permissions: no
+/// encryption or keyring integration is applied to the file itself (the
+/// connection URLs it references are what live in the OS keyring).
 #[cfg(unix)]
 const STORE_FILE_MODE: u32 = 0o600;
 
@@ -447,8 +448,8 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), ConnectionStoreError> {
 
 #[cfg(not(unix))]
 fn set_owner_only_permissions(_path: &Path) -> Result<(), ConnectionStoreError> {
-    // No portable equivalent is applied here; see this module's doc comment
-    // for what "secure" means in V0.
+    // No portable equivalent is applied here; see `STORE_FILE_MODE`'s doc
+    // comment for what protection the store file actually has.
     Ok(())
 }
 

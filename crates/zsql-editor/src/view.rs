@@ -222,6 +222,9 @@ impl EditorView {
         self.highlighter.set_text(&self.buffer.text());
     }
 
+    // Line numbers here are always small (an SQL editor pane, not a huge
+    // document), so the `usize -> f32` conversion below cannot lose
+    // meaningful precision.
     #[allow(clippy::cast_precision_loss)]
     fn autoscroll_to_cursor(&mut self) {
         let cursor = self.buffer.cursor();
@@ -1313,6 +1316,8 @@ mod tests {
     // -- viewport / paint coverage -----------------------------------------
 
     #[gpui::test]
+    // Line counts in this test are always tiny, so the `usize -> f32`
+    // conversion below cannot lose meaningful precision.
     #[allow(clippy::cast_precision_loss)]
     fn moving_the_cursor_below_the_fold_scrolls_it_into_view(cx: &mut TestAppContext) {
         let (harness, vcx) = build_harness(cx);

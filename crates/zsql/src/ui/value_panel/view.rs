@@ -229,12 +229,6 @@ impl ValuePanel {
         &self.focus_handle
     }
 
-    /// Whether the pannel has a pinned value
-    #[allow(dead_code)]
-    pub fn is_pinned(&self) -> bool {
-        self.state.is_pinned()
-    }
-
     /// Read-only access to the panel's [`ValuePanelState`], for tests that
     /// need to observe its open/pin/mode/tree state directly.
     #[cfg(test)]

@@ -121,6 +121,8 @@ pub struct LayoutConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// All three fields end in `_width` because they describe the same
+// dimension (default/min/max), matching `LayoutConfig`'s own naming.
 #[allow(clippy::struct_field_names)]
 pub struct ValuePanelLayout {
     /// Value panel width when it first opens.

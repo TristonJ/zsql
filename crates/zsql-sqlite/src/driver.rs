@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(
             catalog.schemas.len(),
             1,
-            "v0 sqlite introspection surfaces exactly the main schema"
+            "sqlite introspection surfaces exactly the main schema"
         );
         let main = &catalog.schemas[0];
         assert_eq!(main.name, "main");

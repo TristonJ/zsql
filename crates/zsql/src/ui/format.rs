@@ -11,7 +11,7 @@ use zsql_ui::theme::Theme;
 /// color/style in the results grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
-    /// SQL NULL — the literal text `NULL`, styled distinctly from text.
+    /// SQL NULL - the literal text `NULL`, styled distinctly from text.
     Null,
     /// Boolean `true`/`false`.
     Bool,

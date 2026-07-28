@@ -20,6 +20,18 @@ use super::theme;
 use crate::session::Session;
 use crate::ui::format::group_thousands;
 
+/// Row height for the Columns, Indexes, and Constraints tables: taller than
+/// the grid's default row height for schema-browsing readability.
+const SCHEMA_TABLE_ROW_HEIGHT: gpui::Pixels = px(36.0);
+
+/// The style shared by the Columns, Indexes, and Constraints tables.
+fn schema_table_style(theme: &Theme) -> TableStyle {
+    TableStyle {
+        row_height: SCHEMA_TABLE_ROW_HEIGHT,
+        ..TableStyle::themed(theme)
+    }
+}
+
 /// What a schema tab currently has to render.
 enum FetchState {
     /// The describe fetch has not resolved yet.
@@ -279,8 +291,7 @@ impl SchemaTabView {
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
-                    row_height: px(36.0),
-                    ..TableStyle::themed(active_theme)
+                    ..schema_table_style(active_theme)
                 })
                 .columns(columns)
                 .row_count(detail.columns.len())
@@ -385,10 +396,7 @@ impl SchemaTabView {
             "Indexes",
             detail.indexes.len(),
             Table::new("schema-indexes-table", &self.indexes_table)
-                .style(TableStyle {
-                    row_height: px(36.0),
-                    ..TableStyle::themed(active_theme)
-                })
+                .style(schema_table_style(active_theme))
                 .columns(columns)
                 .row_count(detail.indexes.len())
                 .rows(Self::render_index_table_row_cells)
@@ -478,10 +486,7 @@ impl SchemaTabView {
             "Constraints",
             detail.constraints.len(),
             Table::new("schema-constraints-table", &self.constraints_table)
-                .style(TableStyle {
-                    row_height: px(36.0),
-                    ..TableStyle::themed(active_theme)
-                })
+                .style(schema_table_style(active_theme))
                 .columns(columns)
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)

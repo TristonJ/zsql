@@ -98,7 +98,7 @@ impl Render for ConnectionFooterView {
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(colors.text_secondary))
-                    .child("Connecting…"),
+                    .child("Connecting..."),
             ),
             FooterDisplay::Disconnected => row
                 .child(grid::status_dot_outline(colors.text_tertiary))

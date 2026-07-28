@@ -88,6 +88,7 @@ impl Entry {
         Ok(Self { entry_path: path })
     }
 
+    // Mock method: always returns `Ok` (see the block comment above).
     #[allow(clippy::unnecessary_wraps)]
     pub fn set_password(&self, password: &str) -> Result<(), Error> {
         let mut file = File::create(&self.entry_path).expect("failed to create mock keyring file");

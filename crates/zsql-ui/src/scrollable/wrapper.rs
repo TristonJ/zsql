@@ -129,7 +129,9 @@ fn nudge_when_unmeasured<V: Render>(state: &Entity<ScrollableState>, cx: &mut Co
         return;
     }
     cx.spawn(async move |this, cx| {
-        this.update(cx, |_, cx| cx.notify()).ok();
+        if let Err(err) = this.update(cx, |_, cx| cx.notify()) {
+            tracing::debug!(%err, "scrollable nudge: view gone before re-render");
+        }
     })
     .detach();
 }
