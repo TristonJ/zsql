@@ -70,5 +70,7 @@ workspace = true
 # Gates `session.rs`'s `ssh_live_tests` module: a dockerized sshd tunneling
 # to real Postgres/MySQL/MSSQL databases, following the same pattern as
 # `zsql-postgres`/`zsql-mssql`/`zsql-mysql`'s own `driver-integration-tests`
-# and `zsql-ssh`'s `ssh-integration-tests`. See `scripts/ssh-dev.sh`.
-ssh-integration-tests = []
+# and `zsql-ssh`'s `ssh-integration-tests`. See `scripts/ssh-dev.sh`. Enables
+# `zsql-ssh`'s matching feature too, so `ssh_live_tests` can draw fixture
+# defaults from `zsql_ssh::test_fixtures` instead of restating them.
+ssh-integration-tests = ["zsql-ssh/ssh-integration-tests"]

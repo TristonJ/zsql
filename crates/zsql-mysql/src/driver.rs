@@ -650,11 +650,19 @@ mod database_tests {
         let conn = live_connection();
 
         let (tx, rx) = flume::unbounded();
-        let handle = conn.stream_query("SELECT SLEEP(3)".to_owned(), tx);
-
-        // Let `SLEEP` actually start server-side before probing, so the ping
-        // genuinely races a query that is mid-flight.
-        std::thread::sleep(Duration::from_millis(300));
+        // A fast marker statement ahead of `SLEEP` gives an observable
+        // signal (its `Columns` event, which this driver only sends once
+        // that statement's first row has actually arrived) that the batch
+        // has been dispatched and is executing server-side, so the ping
+        // below genuinely races a query that is mid-flight. Waiting on
+        // `SLEEP`'s own `Columns` event would not do this: it carries no
+        // row until the sleep itself finishes, so it fires only once the
+        // "slow" query is already done.
+        let handle = conn.stream_query("SELECT 1 AS marker; SELECT SLEEP(3)".to_owned(), tx);
+        match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(_)) => {}
+            other => panic!("expected the marker SELECT's Columns first, got {other:?}"),
+        }
 
         let ping_started = std::time::Instant::now();
         block_on(conn.ping()).expect("ping must succeed independently of the slow query");

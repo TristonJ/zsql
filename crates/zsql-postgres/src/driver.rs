@@ -669,6 +669,52 @@ mod database_tests {
             .expect("expected an event within the timeout")
     }
 
+    /// How long [`wait_until_active_in_pg_stat_activity`] polls before
+    /// giving up.
+    const QUERY_START_POLL_DEADLINE: Duration = Duration::from_secs(5);
+    /// How often [`wait_until_active_in_pg_stat_activity`] re-checks
+    /// `pg_stat_activity` while waiting.
+    const QUERY_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// Polls `pg_stat_activity`, on a connection independent of the one
+    /// running `needle`, until some backend is actively running a query
+    /// containing it. Used to prove a query dispatched via `stream_query`
+    /// has genuinely started executing server-side before racing something
+    /// (a probe, a cancel) against it.
+    ///
+    /// `stream_query`'s own event stream cannot serve this purpose: this
+    /// driver only emits a statement's `Columns` event once that
+    /// statement's first row has actually arrived, and Postgres does not
+    /// flush a multi-statement simple query's earlier results ahead of the
+    /// whole batch completing -- so a query like `pg_sleep(n)`, which
+    /// produces its single row only once the sleep itself finishes, gives
+    /// no earlier observable signal that way.
+    fn wait_until_active_in_pg_stat_activity(url: &str, needle: &str) {
+        let check_pool = block_on(sqlx::postgres::PgPoolOptions::new().connect(url))
+            .expect("a separate verification connection must succeed");
+        let deadline = std::time::Instant::now() + QUERY_START_POLL_DEADLINE;
+        loop {
+            let count: i64 = block_on(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid()",
+                )
+                .bind(format!("%{needle}%"))
+                .fetch_one(&check_pool),
+            )
+            .expect("pg_stat_activity query should succeed");
+            if count > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no backend running a query containing {needle:?} appeared in \
+                 pg_stat_activity within {QUERY_START_POLL_DEADLINE:?}"
+            );
+            std::thread::sleep(QUERY_START_POLL_INTERVAL);
+        }
+    }
+
     #[test]
     fn connect_succeeds_against_a_live_database_when_configured() {
         live_connection();
@@ -689,11 +735,7 @@ mod database_tests {
 
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query("SELECT pg_sleep(3)".to_owned(), tx);
-
-        // Let `pg_sleep` actually start server-side before probing, so the
-        // ping genuinely races a query that is mid-flight, not one that
-        // hasn't been dispatched yet.
-        std::thread::sleep(Duration::from_millis(300));
+        wait_until_active_in_pg_stat_activity(&url, "pg_sleep");
 
         // The probe uses its own pool, so it must complete promptly instead
         // of waiting behind the slow query's connection.
@@ -1316,10 +1358,7 @@ mod database_tests {
 
         let (tx, rx) = flume::unbounded();
         let handle = conn.stream_query("SELECT pg_sleep(30)".to_owned(), tx);
-
-        // This delay exists so `pg_sleep` is genuinely in progress
-        // server-side by the time `cancel()` fires below
-        std::thread::sleep(Duration::from_millis(500));
+        wait_until_active_in_pg_stat_activity(&url, "pg_sleep");
         handle.cancel();
 
         loop {

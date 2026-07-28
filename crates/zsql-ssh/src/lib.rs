@@ -13,6 +13,8 @@ mod error;
 mod handler;
 mod host_key;
 mod runtime;
+#[cfg(feature = "ssh-integration-tests")]
+pub mod test_fixtures;
 mod tunnel;
 
 pub use config::{HostKeyPolicy, SshAuth, SshConfig};
