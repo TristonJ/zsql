@@ -1,6 +1,7 @@
 use gpui::Context;
 
-use super::{ActiveConnection, WorkspaceView, clamp_editor_height, clamp_sidebar_width};
+use super::{WorkspaceView, clamp_editor_height, clamp_sidebar_width};
+use crate::ui::connections::ActiveConnection;
 use crate::ui::tabs::{Tab, TabId};
 
 /// Set the tracked active connection

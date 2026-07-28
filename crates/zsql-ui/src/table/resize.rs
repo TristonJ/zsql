@@ -13,8 +13,9 @@ use gpui::{
     px, rgb, rgba,
 };
 
-use super::builder::{cell_content, cell_frame, cell_shell, tag_header_cell};
+use super::builder::{cell_content, cell_frame, cell_shell};
 use super::column::TableColumn;
+use super::debug::tag_header_cell;
 use super::state::TableState;
 use super::style::{COLUMN_RESIZE_HANDLE_WIDTH, TableStyle};
 

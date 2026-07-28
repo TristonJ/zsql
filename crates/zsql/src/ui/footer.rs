@@ -7,9 +7,76 @@ use gpui::{ClickEvent, Context, Entity, Render, Window, div, prelude::*, px, rgb
 use zsql_ui::grid;
 use zsql_ui::theme::ActiveTheme;
 
-use super::connections::{ConnectionManagerView, FooterDisplay, footer_display};
+use super::connections::{ActiveConnection, ConnectionManagerView};
 use super::theme;
-use crate::session::Session;
+use crate::session::{LivenessState, Session, SessionState};
+use crate::ui::format::host_label;
+
+/// What the connection footer should render, derived from the session's
+/// lifecycle state and whichever connection (if any) is currently tracked as
+/// active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FooterDisplay {
+    /// Show the active connection's name and host, with a filled status dot.
+    Connected {
+        /// The active connection's display name.
+        name: String,
+        /// A `host[:port]`-shaped label derived from the active connection's
+        /// URL.
+        host: String,
+    },
+    /// Show a "Connecting..." status while a connect attempt is in flight.
+    Connecting,
+    /// Show the "not connected, click to connect" prompt with a hollow dot.
+    Disconnected,
+}
+
+/// The connection footer's display, given the session's real lifecycle
+/// state and connection liveness, whether a live connection is currently
+/// held (see [`Session::is_connected`]), and whichever connection is
+/// tracked as active. Applies the same three-way Connecting/Connected/
+/// Disconnected distinction the results status bar uses (see
+/// `crate::ui::results`'s `status_indicator`), in this precedence order:
+///
+/// 1. [`LivenessState::Unreachable`] always overrides to [`FooterDisplay::Disconnected`],
+///    regardless of `state`.
+/// 2. [`SessionState::Connecting`] always renders [`FooterDisplay::Connecting`], even if
+///    `session_is_connected` is still `true` -- mid-switch, the prior
+///    connection's `Arc` is still held until the new connect resolves, and
+///    that stale "still connected" read must not win over the connect
+///    attempt actually in flight.
+/// 3. Otherwise, `session_is_connected` together with a tracked `active`
+///    connection renders [`FooterDisplay::Connected`].
+/// 4. Everything else (no URL configured, an errored connect with no live
+///    connection, or a connected session with no active connection
+///    tracked, which should not normally happen since every connect path
+///    threads one through) falls back to [`FooterDisplay::Disconnected`].
+///
+/// Note that a query error (as opposed to a connect failure) moves `state`
+/// to [`SessionState::Error`] without dropping the underlying connection,
+/// so rule 3 still applies and the footer keeps showing the still-connected
+/// database rather than falling back to "Not connected".
+#[must_use]
+pub fn footer_display(
+    state: &SessionState,
+    liveness: &LivenessState,
+    session_is_connected: bool,
+    active: Option<&ActiveConnection>,
+) -> FooterDisplay {
+    if matches!(liveness, LivenessState::Unreachable(_)) {
+        return FooterDisplay::Disconnected;
+    }
+    if matches!(state, SessionState::Connecting) {
+        return FooterDisplay::Connecting;
+    }
+    match (session_is_connected, active) {
+        (true, Some(active)) => FooterDisplay::Connected {
+            name: active.name.clone(),
+            host: host_label(&active.url),
+        },
+        _ => FooterDisplay::Disconnected,
+    }
+}
 
 /// The connection footer view.
 pub struct ConnectionFooterView {
@@ -122,10 +189,143 @@ impl Render for ConnectionFooterView {
 mod tests {
     use gpui::{AppContext as _, TestAppContext};
 
-    use super::ConnectionFooterView;
+    use super::{ActiveConnection, ConnectionFooterView, FooterDisplay, footer_display};
     use crate::connections::ConnectionStore;
-    use crate::session::Session;
+    use crate::session::{LivenessState, Session, SessionState};
     use crate::ui::connections::ConnectionManagerView;
+
+    fn sample_active_connection() -> ActiveConnection {
+        ActiveConnection {
+            id: None,
+            name: "zsql local".to_owned(),
+            url: "postgres://localhost:5432/zsql".to_owned(),
+        }
+    }
+
+    #[test]
+    fn footer_display_shows_the_active_connections_name_and_host_when_connected() {
+        let active = sample_active_connection();
+        match footer_display(
+            &SessionState::Connected,
+            &LivenessState::Unknown,
+            true,
+            Some(&active),
+        ) {
+            FooterDisplay::Connected { name, host } => {
+                assert_eq!(name, "zsql local");
+                assert_eq!(host, "localhost:5432");
+            }
+            other => panic!("expected FooterDisplay::Connected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footer_display_is_disconnected_when_the_session_holds_no_live_connection() {
+        let active = sample_active_connection();
+        assert_eq!(
+            footer_display(
+                &SessionState::Error("connection refused".to_owned()),
+                &LivenessState::Unknown,
+                false,
+                Some(&active)
+            ),
+            FooterDisplay::Disconnected,
+            "a failed connect must render the not-connected prompt, not an error affordance"
+        );
+    }
+
+    #[test]
+    fn footer_display_is_disconnected_when_connected_but_no_active_connection_is_tracked() {
+        assert_eq!(
+            footer_display(
+                &SessionState::Connected,
+                &LivenessState::Unknown,
+                true,
+                None
+            ),
+            FooterDisplay::Disconnected
+        );
+    }
+
+    #[test]
+    fn footer_display_shows_connecting_during_a_connect_attempt() {
+        assert_eq!(
+            footer_display(
+                &SessionState::Connecting,
+                &LivenessState::Unknown,
+                false,
+                None
+            ),
+            FooterDisplay::Connecting
+        );
+    }
+
+    #[test]
+    fn footer_display_shows_connected_immediately_after_a_successful_connect_needs_no_probe() {
+        // A fresh `Connected` session has not had time for the recurring
+        // liveness probe to complete even once yet.
+        let active = sample_active_connection();
+        assert_eq!(
+            footer_display(
+                &SessionState::Connected,
+                &LivenessState::Unknown,
+                true,
+                Some(&active)
+            ),
+            FooterDisplay::Connected {
+                name: "zsql local".to_owned(),
+                host: "localhost:5432".to_owned(),
+            },
+            "Connected must not wait on the first Healthy probe result"
+        );
+    }
+
+    #[test]
+    fn footer_display_shows_connecting_when_switching_even_though_the_prior_connection_is_still_held()
+     {
+        // Mid-switch: `connect_url` moves `state` to `Connecting` but keeps the
+        // prior connection's `Arc` alive (and `is_connected()` therefore still
+        // true) until the new attempt resolves.
+        let active = sample_active_connection();
+        assert_eq!(
+            footer_display(
+                &SessionState::Connecting,
+                &LivenessState::Healthy,
+                true,
+                Some(&active)
+            ),
+            FooterDisplay::Connecting,
+            "Connecting must win over a stale still-connected read from the connection being replaced"
+        );
+    }
+
+    #[test]
+    fn footer_display_is_disconnected_when_liveness_is_unreachable_even_though_connected() {
+        let active = sample_active_connection();
+        let unreachable = LivenessState::Unreachable("connection reset".to_owned());
+        assert_eq!(
+            footer_display(&SessionState::Connected, &unreachable, true, Some(&active)),
+            FooterDisplay::Disconnected
+        );
+    }
+
+    #[test]
+    fn footer_display_stays_connected_through_a_query_error_that_leaves_the_connection_live() {
+        let active = sample_active_connection();
+        assert_eq!(
+            footer_display(
+                &SessionState::Error("syntax error at or near \"selct\"".to_owned()),
+                &LivenessState::Healthy,
+                true,
+                Some(&active)
+            ),
+            FooterDisplay::Connected {
+                name: "zsql local".to_owned(),
+                host: "localhost:5432".to_owned(),
+            },
+            "a query error must not be mistaken for a connect failure while the connection is live"
+        );
+    }
 
     fn empty_store_for_test(label: &str) -> ConnectionStore {
         let path = std::env::temp_dir().join(format!(

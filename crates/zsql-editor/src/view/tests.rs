@@ -7,11 +7,12 @@ use gpui::{
 
 use gpui::{Hsla, UnderlineStyle, rgb};
 
+use super::element::build_runs;
 use super::{
     Backspace, Copy, Cut, DeleteForward, EditorView, MoveDocumentEnd, MoveDocumentStart, MoveDown,
     MoveLeft, MoveLineEnd, MoveLineStart, MoveRight, MoveUp, Newline, Paste, Position, QueryRunner,
     Redo, RunQuery, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectLeft,
-    SelectLineEnd, SelectLineStart, SelectRight, SelectUp, Undo, build_runs,
+    SelectLineEnd, SelectLineStart, SelectRight, SelectUp, Undo,
 };
 use crate::HighlightKind;
 use crate::theme::syntax_color;

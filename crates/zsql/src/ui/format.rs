@@ -106,10 +106,6 @@ pub fn format_value(value: &Value) -> FormattedValue {
     }
 }
 
-/// Groups digits every three places when rendering a total row count in the
-/// status bar.
-pub const THOUSANDS_SEPARATOR: char = ',';
-
 /// Format a single value for the clipboard
 #[must_use]
 pub fn format_value_for_clipboard(value: &Value) -> String {
@@ -175,20 +171,6 @@ pub fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
-}
-
-/// Render `n` with [`THOUSANDS_SEPARATOR`] inserted every three digits from
-/// the right, e.g. `1234567` -> `"1,234,567"`.
-pub fn group_thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, ch) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            grouped.push(THOUSANDS_SEPARATOR);
-        }
-        grouped.push(ch);
-    }
-    grouped.chars().rev().collect()
 }
 
 /// `row`'s cells as a single JSON object keyed by `columns`' names, each

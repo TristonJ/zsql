@@ -7,8 +7,8 @@ use std::ops::Range;
 
 use gpui::{Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb, rgba};
 use zsql_core::{
-    ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, KeyBadge, RelationKind,
-    RelationSchema, RowCount,
+    ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, KeyCellBadge, RelationKind,
+    RelationSchema, RowCount, classify_default, key_cell_badge,
 };
 use zsql_ui::grid;
 use zsql_ui::icon::{IconName, icon};
@@ -18,7 +18,6 @@ use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::theme;
 use crate::session::Session;
-use crate::ui::format::group_thousands;
 
 /// Row height for the Columns, Indexes, and Constraints tables: taller than
 /// the grid's default row height for schema-browsing readability.
@@ -779,105 +778,10 @@ fn relation_kind_pill_text(kind: RelationKind) -> &'static str {
 /// estimated, or [`theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER`] while the count
 /// has not arrived yet.
 fn format_row_count_stat(row_count: Option<RowCount>) -> String {
-    let Some(row_count) = row_count else {
-        return theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER.to_owned();
-    };
-    let grouped = group_thousands(row_count.value());
-    if row_count.is_estimated() {
-        format!("{}{grouped}", zsql_core::ESTIMATE_MARKER)
-    } else {
-        grouped
-    }
-}
-
-/// Classification of a column's `default` expression, for coloring the
-/// Default cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DefaultKind {
-    /// A function call, e.g. `now()` or `nextval('orders_id_seq')`.
-    Function,
-    /// A literal value, e.g. `0` or `'pending'`.
-    Literal,
-    /// No default.
-    None,
-}
-
-/// Classify `default` for [`DefaultKind`]-based coloring. A value is
-/// classified as a function call when it both contains `(` and ends with
-/// `)`; any other non-empty value is a literal.
-fn classify_default(default: Option<&str>) -> DefaultKind {
-    let Some(text) = default else {
-        return DefaultKind::None;
-    };
-    let trimmed = text.trim();
-    if trimmed.contains('(') && trimmed.ends_with(')') {
-        DefaultKind::Function
-    } else {
-        DefaultKind::Literal
-    }
-}
-
-/// Which badge (if any) a column's Keys cell renders, in a fixed priority:
-/// primary key, then foreign key, then unique, then check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum KeyCellBadge {
-    /// The column is (part of) the primary key.
-    Primary,
-    /// The column is a foreign key targeting the carried `table.column(s)`
-    /// string.
-    Foreign(String),
-    /// The column is constrained unique.
-    Unique,
-    /// The column is mentioned by a `CHECK` constraint.
-    Check,
-}
-
-/// Classify `column`'s Keys-cell badge from its own flags plus, for the
-/// `CHECK` case only, whether any of `constraints` mentions its name.
-fn key_cell_badge(column: &ColumnDetail, constraints: &[ConstraintInfo]) -> Option<KeyCellBadge> {
-    // The PK/FK/Unique roles come from zsql_core's shared classifier, in its
-    // priority order, so the schema view and any other consumer agree on a
-    // column's key role. The Check case is layered on top here because it is
-    // derived from the relation's constraints, not the column itself.
-    if let Some(badge) = column.key_badges().first() {
-        return Some(match badge {
-            KeyBadge::Primary => KeyCellBadge::Primary,
-            KeyBadge::Foreign => KeyCellBadge::Foreign(foreign_key_target(
-                column
-                    .foreign_key
-                    .as_ref()
-                    .expect("a Foreign key badge implies the column carries a foreign key"),
-            )),
-            KeyBadge::Unique => KeyCellBadge::Unique,
-        });
-    }
-    if column_has_check(&column.name, constraints) {
-        return Some(KeyCellBadge::Check);
-    }
-    None
-}
-
-/// The `-> target.column` link chip's target string: `table.col1,col2` for
-/// a composite key, `table.col` for a single-column one.
-fn foreign_key_target(fk: &ForeignKeyRef) -> String {
-    format!("{}.{}", fk.table, fk.columns.join(","))
-}
-
-/// Whether any `CHECK` constraint in `constraints` mentions `column_name` as
-/// a whole identifier (not merely as a substring of a longer name).
-fn column_has_check(column_name: &str, constraints: &[ConstraintInfo]) -> bool {
-    constraints
-        .iter()
-        .filter(|constraint| constraint.kind == ConstraintKind::Check)
-        .any(|constraint| definition_mentions_column(&constraint.definition, column_name))
-}
-
-/// Whether `definition` mentions `column_name` as a whole identifier token,
-/// splitting on any character that cannot appear inside a SQL identifier.
-fn definition_mentions_column(definition: &str, column_name: &str) -> bool {
-    definition
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .any(|token| token == column_name)
+    row_count.map_or_else(
+        || theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER.to_owned(),
+        RowCount::grouped_display,
+    )
 }
 
 /// The left key-rail tick color for `column`: teal for a primary key, the
@@ -894,12 +798,9 @@ fn rail_color(column: &ColumnDetail, active_theme: &Theme) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use zsql_core::{ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef};
+    use zsql_core::{ColumnDetail, ForeignKeyRef};
 
-    use super::{
-        DefaultKind, KeyCellBadge, classify_default, column_has_check, foreign_key_target,
-        key_cell_badge, rail_color, relation_kind_pill_text,
-    };
+    use super::{rail_color, relation_kind_pill_text};
     use zsql_ui::theme::Theme;
 
     fn plain_column() -> ColumnDetail {
@@ -912,135 +813,6 @@ mod tests {
             is_unique: false,
             foreign_key: None,
         }
-    }
-
-    #[test]
-    fn classify_default_none_for_no_default() {
-        assert_eq!(classify_default(None), DefaultKind::None);
-    }
-
-    #[test]
-    fn classify_default_recognizes_function_calls() {
-        assert_eq!(classify_default(Some("now()")), DefaultKind::Function);
-        assert_eq!(
-            classify_default(Some("nextval('orders_id_seq')")),
-            DefaultKind::Function
-        );
-    }
-
-    #[test]
-    fn classify_default_recognizes_literals() {
-        assert_eq!(classify_default(Some("0")), DefaultKind::Literal);
-        assert_eq!(classify_default(Some("'pending'")), DefaultKind::Literal);
-        assert_eq!(classify_default(Some("'{}'::jsonb")), DefaultKind::Literal);
-    }
-
-    #[test]
-    fn foreign_key_target_joins_a_single_column() {
-        let fk = ForeignKeyRef {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
-            columns: vec!["id".to_owned()],
-        };
-        assert_eq!(foreign_key_target(&fk), "users.id");
-    }
-
-    #[test]
-    fn foreign_key_target_joins_a_composite_key() {
-        let fk = ForeignKeyRef {
-            schema: "public".to_owned(),
-            table: "grants".to_owned(),
-            columns: vec!["tenant_id".to_owned(), "user_id".to_owned()],
-        };
-        assert_eq!(foreign_key_target(&fk), "grants.tenant_id,user_id");
-    }
-
-    #[test]
-    fn key_cell_badge_prioritizes_primary_key_over_everything_else() {
-        let column = ColumnDetail {
-            is_primary_key: true,
-            is_unique: true,
-            foreign_key: Some(ForeignKeyRef {
-                schema: "public".to_owned(),
-                table: "users".to_owned(),
-                columns: vec!["id".to_owned()],
-            }),
-            ..plain_column()
-        };
-        assert_eq!(key_cell_badge(&column, &[]), Some(KeyCellBadge::Primary));
-    }
-
-    #[test]
-    fn key_cell_badge_prefers_foreign_key_over_unique() {
-        let column = ColumnDetail {
-            is_unique: true,
-            foreign_key: Some(ForeignKeyRef {
-                schema: "public".to_owned(),
-                table: "users".to_owned(),
-                columns: vec!["id".to_owned()],
-            }),
-            ..plain_column()
-        };
-        assert_eq!(
-            key_cell_badge(&column, &[]),
-            Some(KeyCellBadge::Foreign("users.id".to_owned()))
-        );
-    }
-
-    #[test]
-    fn key_cell_badge_is_unique_for_a_unique_only_column() {
-        let column = ColumnDetail {
-            is_unique: true,
-            ..plain_column()
-        };
-        assert_eq!(key_cell_badge(&column, &[]), Some(KeyCellBadge::Unique));
-    }
-
-    #[test]
-    fn key_cell_badge_is_check_when_a_check_constraint_mentions_the_column() {
-        let column = ColumnDetail {
-            name: "total_cents".to_owned(),
-            ..plain_column()
-        };
-        let constraints = [ConstraintInfo {
-            name: "orders_total_cents_nonneg".to_owned(),
-            kind: ConstraintKind::Check,
-            definition: "total_cents >= 0".to_owned(),
-        }];
-        assert_eq!(
-            key_cell_badge(&column, &constraints),
-            Some(KeyCellBadge::Check)
-        );
-    }
-
-    #[test]
-    fn key_cell_badge_does_not_match_a_column_name_as_a_mere_substring() {
-        let column = ColumnDetail {
-            name: "total".to_owned(),
-            ..plain_column()
-        };
-        let constraints = [ConstraintInfo {
-            name: "orders_total_cents_nonneg".to_owned(),
-            kind: ConstraintKind::Check,
-            definition: "total_cents >= 0".to_owned(),
-        }];
-        assert_eq!(key_cell_badge(&column, &constraints), None);
-    }
-
-    #[test]
-    fn key_cell_badge_is_none_for_a_plain_column() {
-        assert_eq!(key_cell_badge(&plain_column(), &[]), None);
-    }
-
-    #[test]
-    fn column_has_check_ignores_non_check_constraints() {
-        let column_name = "id";
-        let constraints = [ConstraintInfo {
-            name: "orders_pkey".to_owned(),
-            kind: ConstraintKind::PrimaryKey,
-            definition: "id".to_owned(),
-        }];
-        assert!(!column_has_check(column_name, &constraints));
     }
 
     #[test]

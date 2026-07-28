@@ -18,11 +18,11 @@ pub use connection_url::{ConnectionUrl, rewrite_for_tunnel};
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
 pub use registry::select_driver;
-pub use row_count::{ESTIMATE_MARKER, RowCount};
+pub use row_count::{ESTIMATE_MARKER, RowCount, group_thousands};
 pub use schema::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 pub use schema_detail::{
-    ColumnDetail, ConstraintInfo, ConstraintKind, ForeignKeyRef, IndexInfo, KeyBadge,
-    RelationSchema,
+    ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, ForeignKeyRef, IndexInfo, KeyBadge,
+    KeyCellBadge, RelationSchema, classify_default, key_cell_badge,
 };
 pub use sql::{default_preview_query, quote_ident};
 pub use tls_verify::TlsVerify;

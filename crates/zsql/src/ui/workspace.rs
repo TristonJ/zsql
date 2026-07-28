@@ -1,7 +1,6 @@
 //! The root workspace view
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -14,16 +13,17 @@ use gpui::{
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::theme::ActiveTheme;
 
-use super::connections::{ActiveConnection, ConnectionManagerView};
+use super::connections::ConnectionManagerView;
 use super::footer::ConnectionFooterView;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
-use super::tabs::{Tab, TabId, TabKind, TabModel};
+use super::tab_bar;
+use super::tabs::{Tab, TabId, TabModel};
 use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::connections::ConnectionStore;
 use crate::session::Session;
-use crate::tab_session::{self, ConnectionKey, TabSessionSnapshot};
+use crate::tab_session::{self, TabSessionStore};
 
 /// Which pane boundary a divider drag is currently resizing, and the pane
 /// size/pointer position it started from. Tracking the drag's origin (not
@@ -60,37 +60,11 @@ pub struct WorkspaceView {
     /// know how much vertical space the editor and results panes have to
     /// share.
     column_height: Rc<Cell<Pixels>>,
-    /// Where tab-session snapshots are persisted
-    /// (`Config::tab_sessions_path`), if a config directory could be
-    /// resolved at all. `None` disables tab-session persistence entirely
-    /// rather than failing to start.
-    tab_sessions_path: Option<PathBuf>,
-    /// The tab-session key `tabs` currently holds state for, so a save
-    /// triggered by a tab change knows which key to write under, and a
-    /// connection switch knows which key's tabs it is replacing. `None`
-    /// while no connection has ever been tracked as active.
-    active_tab_session_key: Option<ConnectionKey>,
-    /// The active connection last seen by [`Self::handle_active_connection_changed`],
-    /// so that handler can tell an actual switch apart from an unrelated
-    /// change on `connections` (e.g. the modal opening).
-    last_active_connection: Option<ActiveConnection>,
-    /// Set just before [`Self::handle_active_connection_changed`] reloads
-    /// `tabs` from a snapshot, and consumed by the very next `tabs`
-    /// notification (that reload's own `cx.notify()`) instead of triggering
-    /// another save under the key that was just loaded. Without this, that
-    /// redundant save would race the outgoing connection's own save (both
-    /// dispatched onto the background executor around the same moment) for
-    /// no benefit -- the freshly loaded tabs already match what is (or is
-    /// not) on disk for that key.
-    suppress_next_tab_save: bool,
-    /// Every key's most recently dispatched-for-save snapshot, updated
-    /// synchronously in [`Self::dispatch_tab_session_save`] before that
-    /// save's write is handed to the background executor. Consulted first in
-    /// [`Self::handle_active_connection_changed`] so switching back to a key
-    /// whose write is still in flight sees this session's own latest tabs
-    /// rather than racing the background write for whatever is currently on
-    /// disk.
-    session_cache: HashMap<ConnectionKey, TabSessionSnapshot>,
+    /// The tab-session persistence state machine: where the store lives on
+    /// disk, which key `tabs` currently holds state for, the save/load race
+    /// protection described on [`TabSessionStore`], and the per-key cache of
+    /// the latest dispatched-for-save snapshot.
+    tab_session_store: TabSessionStore,
 }
 
 impl WorkspaceView {
@@ -147,7 +121,10 @@ impl WorkspaceView {
         // `Self::handle_active_connection_changed`).
         cx.observe(&connections, |this, connections, cx| {
             let new_active = connections.read(cx).active().cloned();
-            if new_active != this.last_active_connection {
+            if this
+                .tab_session_store
+                .active_connection_changed(new_active.as_ref())
+            {
                 this.handle_active_connection_changed(cx);
             }
             cx.notify();
@@ -159,7 +136,7 @@ impl WorkspaceView {
         // that changes, and persist the active connection's tab session so
         // the change survives a reconnect or restart.
         cx.observe(&tabs, |this, _tabs, cx| {
-            if std::mem::take(&mut this.suppress_next_tab_save) {
+            if this.tab_session_store.take_suppressed() {
                 cx.notify();
                 return;
             }
@@ -179,11 +156,7 @@ impl WorkspaceView {
             editor_height,
             drag: None,
             column_height: Rc::new(Cell::new(Pixels::ZERO)),
-            tab_sessions_path,
-            active_tab_session_key: None,
-            last_active_connection: None,
-            suppress_next_tab_save: false,
-            session_cache: HashMap::new(),
+            tab_session_store: TabSessionStore::new(tab_sessions_path),
         }
     }
 
@@ -226,46 +199,8 @@ impl WorkspaceView {
                 connections.active().cloned(),
             )
         };
-        self.active_tab_session_key.clone_from(&new_key);
-        self.last_active_connection = new_active;
+        let snapshot = self.tab_session_store.begin_switch(new_key, new_active);
 
-        // A key this session has already dispatched a save for always wins
-        // over disk: `dispatch_tab_session_save` records it here
-        // synchronously, before handing the actual write to the background
-        // executor, so this in-memory copy can never be older than whatever
-        // is (or, for a write still in flight, will shortly be) on disk for
-        // that key. Consulting disk instead in that case could observe the
-        // pre-write file if the background write has not run yet -- e.g. a
-        // quick switch back to a connection right after switching away from
-        // it -- and wrongly show its default tabs.
-        let snapshot = match &new_key {
-            Some(key) if self.session_cache.contains_key(key) => {
-                self.session_cache.get(key).cloned()
-            }
-            // Read synchronously rather than via a background executor: this
-            // runs before the tab strip for the newly active connection is
-            // ever shown, and the store is a small, local JSON file, so the
-            // blocking read finishes long before it would be worth the
-            // complexity of loading in the background and re-applying the
-            // result once it completed a frame or more later (which would
-            // show the wrong tabs briefly).
-            Some(key) => match &self.tab_sessions_path {
-                Some(path) => match tab_session::load_snapshot(path, key) {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to load tab session; falling back to the default tab"
-                        );
-                        None
-                    }
-                },
-                None => None,
-            },
-            None => None,
-        };
-
-        self.suppress_next_tab_save = true;
         self.tabs.update(cx, |tabs, cx| {
             tabs.load_for_connection(snapshot.as_ref(), cx);
         });
@@ -291,22 +226,17 @@ impl WorkspaceView {
             .unwrap_or_else(|| Task::ready(()))
     }
 
-    /// Build the active connection's current snapshot, record it as this
-    /// key's latest known state (see `session_cache`), and spawn its write
-    /// to disk on a background executor -- never on this (render/update)
-    /// thread -- returning the spawned [`Task`] so a caller that must
-    /// observe completion (app quit) can await it, while a caller that only
-    /// wants to fire-and-forget (a tab change) can detach it.
+    /// Build the active connection's current snapshot and spawn its write to
+    /// disk on a background executor -- never on this (render/update) thread
+    /// -- returning the spawned [`Task`] so a caller that must observe
+    /// completion (app quit) can await it, while a caller that only wants to
+    /// fire-and-forget (a tab change) can detach it.
     fn dispatch_tab_session_save(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
-        let key = self.active_tab_session_key.clone()?;
-        let path = self.tab_sessions_path.clone()?;
+        if !self.tab_session_store.can_persist() {
+            return None;
+        }
         let snapshot = self.tabs.read(cx).snapshot(cx);
-        tracing::info!(
-            key = ?key,
-            tab_count = snapshot.tabs.len(),
-            "dispatching tab session save"
-        );
-        self.session_cache.insert(key.clone(), snapshot.clone());
+        let (path, key, snapshot) = self.tab_session_store.dispatch_save(snapshot)?;
         Some(cx.background_spawn(async move {
             if let Err(err) = tab_session::save_snapshot(&path, &key, &snapshot) {
                 tracing::warn!(error = %err, "failed to save tab session");
@@ -388,17 +318,23 @@ impl WorkspaceView {
         }
     }
 
-    fn activate_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Visible to [`super::tab_bar`], which wires this up to a tab's click
+    /// handler.
+    pub(crate) fn activate_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.update(cx, |tabs, cx| tabs.set_active(id, cx));
         self.focus_active_editor(window, cx);
     }
 
-    fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Visible to [`super::tab_bar`], which wires this up to a tab's close
+    /// glyph.
+    pub(crate) fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.update(cx, |tabs, cx| tabs.close_tab(id, cx));
         self.focus_active_editor(window, cx);
     }
 
-    fn open_new_script_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Visible to [`super::tab_bar`], which wires this up to the new-tab
+    /// glyph's click handler.
+    pub(crate) fn open_new_script_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.update(cx, |tabs, cx| {
             tabs.new_script_tab(cx);
         });
@@ -419,93 +355,6 @@ impl WorkspaceView {
             return;
         };
         editor.update(cx, zsql_editor::EditorView::run_current_query);
-    }
-
-    /// The tab bar: one entry per open tab, in order, plus the trailing "+"
-    /// affordance that opens a new script tab.
-    fn render_tab_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let active_theme = cx.theme();
-        let active_id = self.tabs.read(cx).active_id();
-        let mut bar = zsql_ui::tabs::tab_bar_shell(active_theme);
-        for tab in self.tabs.read(cx).tabs() {
-            let active = active_id == Some(tab.id());
-            bar = bar.child(Self::render_tab(tab, active, cx));
-        }
-        bar.child(
-            zsql_ui::tabs::new_tab_glyph(active_theme)
-                .id("workspace-new-tab")
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
-                    view.open_new_script_tab(window, cx);
-                })),
-        )
-    }
-
-    /// One tab-bar entry, styled per its kind: a `Generated` tab gets the
-    /// live dot, table icon, italic name, "auto" pill, and (only while
-    /// active) a dashed underline; a `Script` tab gets a plain label with a
-    /// trailing `*` while dirty, and (only while active) a solid underline.
-    fn render_tab(tab: &Tab, active: bool, cx: &Context<Self>) -> impl IntoElement {
-        let active_theme = cx.theme();
-        let id = tab.id();
-        let mut shell = zsql_ui::tabs::tab_shell(active, active_theme).id(("workspace-tab", id));
-
-        shell = match tab.kind() {
-            TabKind::Generated { .. } => {
-                shell = shell
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(theme::TAB_ICON_TEXT_SIZE))
-                            .text_color(rgb(active_theme.colors.accent))
-                            .child("#"),
-                    )
-                    .child(div().italic().child(tab.title().to_owned()));
-                if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
-                }
-                shell
-            }
-            TabKind::Script => {
-                let mut label = tab.title().to_owned();
-                if tab.dirty() {
-                    label.push('*');
-                }
-                shell = shell.child(div().child(label));
-                if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
-                }
-                shell
-            }
-            TabKind::Schema { .. } => {
-                shell = shell
-                    .child(icon(
-                        IconName::Table,
-                        px(theme::TAB_ICON_TEXT_SIZE),
-                        active_theme.colors.accent,
-                    ))
-                    .child(div().child(tab.title().to_owned()));
-                if active {
-                    shell = shell.child(zsql_ui::tabs::active_underline_solid(active_theme));
-                }
-                shell
-            }
-        };
-
-        shell
-            .cursor_pointer()
-            .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-                view.activate_tab(id, window, cx);
-            }))
-            .child(
-                zsql_ui::tabs::close_glyph(format!("close-icon-{id}"), active_theme)
-                    .id(("workspace-tab-close", id))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        view.close_tab(id, window, cx);
-                    })),
-            )
     }
 
     /// The header above the active tab's content: a pane label on the left
@@ -788,7 +637,11 @@ impl Render for WorkspaceView {
                                 .absolute()
                                 .inset_0(),
                             )
-                            .child(self.render_tab_bar(cx))
+                            .child(tab_bar::render_tab_bar(
+                                self.tabs.read(cx).active_id(),
+                                self.tabs.read(cx).tabs(),
+                                cx,
+                            ))
                             .children(self.render_main_pane(cx)),
                     ),
             )
