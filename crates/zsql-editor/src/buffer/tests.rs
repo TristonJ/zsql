@@ -333,8 +333,8 @@ fn select_line_breaks_the_undo_group() {
 // -- select_word --------------------------------------------------------
 
 /// A `select_word` scenario: click at `click_column` on line 0 of `input`
-/// and check the resulting selected text plus whichever endpoints the
-/// original case cared about.
+/// and check the resulting selected text plus whichever endpoints that
+/// case checks.
 struct SelectWordCase {
     label: &'static str,
     input: &'static str,
