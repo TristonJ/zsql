@@ -332,46 +332,114 @@ fn select_line_breaks_the_undo_group() {
 
 // -- select_word --------------------------------------------------------
 
-#[test]
-fn select_word_in_the_middle_of_a_word_selects_the_whole_word() {
-    let mut buffer = TextBuffer::from_text("hello world");
-    buffer.select_word(Position::new(0, 2));
-    assert_eq!(buffer.selected_text(), "hello");
-    let (start, end) = buffer.selection().unwrap().ordered();
-    assert_eq!(start, Position::new(0, 0));
-    assert_eq!(end, Position::new(0, 5));
+/// A `select_word` scenario: click at `click_column` on line 0 of `input`
+/// and check the resulting selected text plus whichever endpoints the
+/// original case cared about.
+struct SelectWordCase {
+    label: &'static str,
+    input: &'static str,
+    click_column: usize,
+    expected_text: &'static str,
+    expected_range: SelectWordRange,
 }
 
-#[test]
-fn select_word_at_a_words_first_char_selects_the_whole_word() {
-    let mut buffer = TextBuffer::from_text("hello world");
-    buffer.select_word(Position::new(0, 0));
-    assert_eq!(buffer.selected_text(), "hello");
+enum SelectWordRange {
+    Unchecked,
+    Start((usize, usize)),
+    End((usize, usize)),
+    Full((usize, usize), (usize, usize)),
 }
 
-#[test]
-fn select_word_at_a_words_last_char_selects_the_whole_word() {
-    let mut buffer = TextBuffer::from_text("hello world");
-    buffer.select_word(Position::new(0, 4));
-    assert_eq!(buffer.selected_text(), "hello");
-}
+const SELECT_WORD_CASES: &[SelectWordCase] = &[
+    SelectWordCase {
+        label: "in_the_middle_of_a_word_selects_the_whole_word",
+        input: "hello world",
+        click_column: 2,
+        expected_text: "hello",
+        expected_range: SelectWordRange::Full((0, 0), (0, 5)),
+    },
+    SelectWordCase {
+        label: "at_a_words_first_char_selects_the_whole_word",
+        input: "hello world",
+        click_column: 0,
+        expected_text: "hello",
+        expected_range: SelectWordRange::Unchecked,
+    },
+    SelectWordCase {
+        label: "at_a_words_last_char_selects_the_whole_word",
+        input: "hello world",
+        click_column: 4,
+        expected_text: "hello",
+        expected_range: SelectWordRange::Unchecked,
+    },
+    SelectWordCase {
+        label: "on_a_word_starting_at_line_start_selects_from_column_zero",
+        input: "start middle end",
+        click_column: 1,
+        expected_text: "start",
+        expected_range: SelectWordRange::Start((0, 0)),
+    },
+    SelectWordCase {
+        label: "on_a_word_ending_at_line_end_selects_through_the_line_end",
+        input: "hello world",
+        click_column: 10,
+        expected_text: "world",
+        expected_range: SelectWordRange::End((0, 11)),
+    },
+    SelectWordCase {
+        label: "handles_accented_word_chars_by_char_column_not_byte_offset",
+        input: "caf\u{e9} tea",
+        click_column: 3,
+        expected_text: "caf\u{e9}",
+        expected_range: SelectWordRange::Full((0, 0), (0, 4)),
+    },
+    SelectWordCase {
+        label: "handles_cjk_word_chars_by_char_column",
+        input: "\u{4e2d}\u{6587} select",
+        click_column: 1,
+        expected_text: "\u{4e2d}\u{6587}",
+        expected_range: SelectWordRange::Full((0, 0), (0, 2)),
+    },
+];
 
 #[test]
-fn select_word_on_a_word_starting_at_line_start_selects_from_column_zero() {
-    let mut buffer = TextBuffer::from_text("start middle end");
-    buffer.select_word(Position::new(0, 1));
-    assert_eq!(buffer.selected_text(), "start");
-    let (start, _) = buffer.selection().unwrap().ordered();
-    assert_eq!(start, Position::new(0, 0));
-}
-
-#[test]
-fn select_word_on_a_word_ending_at_line_end_selects_through_the_line_end() {
-    let mut buffer = TextBuffer::from_text("hello world");
-    buffer.select_word(Position::new(0, 10));
-    assert_eq!(buffer.selected_text(), "world");
-    let (_, end) = buffer.selection().unwrap().ordered();
-    assert_eq!(end, Position::new(0, 11));
+fn select_word_selects_the_expected_span_for_each_case() {
+    for case in SELECT_WORD_CASES {
+        let mut buffer = TextBuffer::from_text(case.input);
+        buffer.select_word(Position::new(0, case.click_column));
+        assert_eq!(
+            buffer.selected_text(),
+            case.expected_text,
+            "case: {}",
+            case.label
+        );
+        match case.expected_range {
+            SelectWordRange::Unchecked => {}
+            SelectWordRange::Start((line, column)) => {
+                let (start, _) = buffer.selection().unwrap().ordered();
+                assert_eq!(start, Position::new(line, column), "case: {}", case.label);
+            }
+            SelectWordRange::End((line, column)) => {
+                let (_, end) = buffer.selection().unwrap().ordered();
+                assert_eq!(end, Position::new(line, column), "case: {}", case.label);
+            }
+            SelectWordRange::Full((start_line, start_column), (end_line, end_column)) => {
+                let (start, end) = buffer.selection().unwrap().ordered();
+                assert_eq!(
+                    start,
+                    Position::new(start_line, start_column),
+                    "case: {}",
+                    case.label
+                );
+                assert_eq!(
+                    end,
+                    Position::new(end_line, end_column),
+                    "case: {}",
+                    case.label
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -414,26 +482,6 @@ fn select_word_at_or_past_the_line_end_selects_nothing() {
     buffer.select_word(Position::new(0, 5));
     assert!(buffer.selection().is_none());
     assert_eq!(buffer.cursor(), Position::new(0, 5));
-}
-
-#[test]
-fn select_word_handles_accented_word_chars_by_char_column_not_byte_offset() {
-    let mut buffer = TextBuffer::from_text("caf\u{e9} tea");
-    buffer.select_word(Position::new(0, 3));
-    assert_eq!(buffer.selected_text(), "caf\u{e9}");
-    let (start, end) = buffer.selection().unwrap().ordered();
-    assert_eq!(start, Position::new(0, 0));
-    assert_eq!(end, Position::new(0, 4));
-}
-
-#[test]
-fn select_word_handles_cjk_word_chars_by_char_column() {
-    let mut buffer = TextBuffer::from_text("\u{4e2d}\u{6587} select");
-    buffer.select_word(Position::new(0, 1));
-    assert_eq!(buffer.selected_text(), "\u{4e2d}\u{6587}");
-    let (start, end) = buffer.selection().unwrap().ordered();
-    assert_eq!(start, Position::new(0, 0));
-    assert_eq!(end, Position::new(0, 2));
 }
 
 #[test]
@@ -638,15 +686,17 @@ fn backspace_with_an_active_selection_deletes_the_selection_instead_of_one_char(
     assert_eq!(buffer.cursor(), Position::new(0, 6));
 }
 
-#[test]
-fn backspace_over_a_selection_resyncs_the_desired_column_for_later_vertical_moves() {
+/// Builds the shared "selection then delete" setup for the resync tests
+/// below, runs `op`, and checks that the desired column tracked the
+/// collapsed selection's start rather than its far end.
+fn assert_deleting_a_selection_resyncs_the_desired_column(op: impl FnOnce(&mut TextBuffer)) {
     let mut buffer = TextBuffer::from_text("abcdefgh\nijklmnop");
     buffer.move_right();
     buffer.move_right(); // cursor (0, 2), desired_column 2
     buffer.extend_right();
     buffer.extend_right();
     buffer.extend_right(); // selection (0,2)-(0,5)
-    buffer.backspace();
+    op(&mut buffer);
     assert_eq!(buffer.cursor(), Position::new(0, 2));
     buffer.move_down();
     assert_eq!(
@@ -654,6 +704,11 @@ fn backspace_over_a_selection_resyncs_the_desired_column_for_later_vertical_move
         Position::new(1, 2),
         "desired column should follow the collapsed selection start, not the far end"
     );
+}
+
+#[test]
+fn backspace_over_a_selection_resyncs_the_desired_column_for_later_vertical_moves() {
+    assert_deleting_a_selection_resyncs_the_desired_column(TextBuffer::backspace);
 }
 
 // -- editing: delete-forward ------------------------------------------
@@ -698,20 +753,7 @@ fn delete_forward_with_an_active_selection_deletes_the_selection_instead_of_one_
 
 #[test]
 fn delete_forward_over_a_selection_resyncs_the_desired_column_for_later_vertical_moves() {
-    let mut buffer = TextBuffer::from_text("abcdefgh\nijklmnop");
-    buffer.move_right();
-    buffer.move_right(); // cursor (0, 2), desired_column 2
-    buffer.extend_right();
-    buffer.extend_right();
-    buffer.extend_right(); // selection (0,2)-(0,5)
-    buffer.delete_forward();
-    assert_eq!(buffer.cursor(), Position::new(0, 2));
-    buffer.move_down();
-    assert_eq!(
-        buffer.cursor(),
-        Position::new(1, 2),
-        "desired column should follow the collapsed selection start, not the far end"
-    );
+    assert_deleting_a_selection_resyncs_the_desired_column(TextBuffer::delete_forward);
 }
 
 // -- UTF-8 correctness -------------------------------------------------

@@ -118,62 +118,63 @@ fn adding_a_connection_appends_it_and_persists_to_disk(cx: &mut TestAppContext) 
     assert_eq!(reloaded.connections()[0].name, "new db");
 }
 
-#[gpui::test]
-fn adding_a_connection_with_an_empty_name_is_rejected_without_persisting(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("reject-empty-name");
+/// Drives `add_connection` with the given form inputs against a fresh store
+/// and checks that nothing was persisted. `expected_status_substring`, when
+/// present, is asserted against `view.status()`; omit it for cases that
+/// don't surface a specific status message.
+fn assert_rejected_without_persisting(
+    temp_label: &str,
+    name_input: &str,
+    url_input: &str,
+    expected_status_substring: Option<&str>,
+    cx: &mut TestAppContext,
+) {
+    let temp = TempStorePath::new(temp_label);
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
     let session = cx.new(|_cx| session_with_no_url());
     let manager = cx.new(|cx| new_manager(cx, session, store));
 
     manager.update(cx, |view, cx| {
-        view.set_name_input("", cx);
-        view.set_url_input("sqlite::memory:", cx);
+        view.set_name_input(name_input, cx);
+        view.set_url_input(url_input, cx);
         let (name, url) = view.form.read(cx).input_values(cx);
         view.add_connection(cx, &name, url)
             .expect("validation rejection is Ok(())");
 
         assert!(view.connections().is_empty());
-        assert!(view.status().is_some_and(|s| s.contains("name")));
+        if let Some(expected) = expected_status_substring {
+            assert!(view.status().is_some_and(|s| s.contains(expected)));
+        }
     });
 }
 
 #[gpui::test]
+fn adding_a_connection_with_an_empty_name_is_rejected_without_persisting(cx: &mut TestAppContext) {
+    assert_rejected_without_persisting(
+        "reject-empty-name",
+        "",
+        "sqlite::memory:",
+        Some("name"),
+        cx,
+    );
+}
+
+#[gpui::test]
 fn adding_a_connection_with_an_empty_url_is_rejected_without_persisting(cx: &mut TestAppContext) {
-    let temp = TempStorePath::new("reject-empty-url");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.set_name_input("new db", cx);
-        view.set_url_input("", cx);
-        let (name, url) = view.form.read(cx).input_values(cx);
-        view.add_connection(cx, &name, url)
-            .expect("validation rejection is Ok(())");
-
-        assert!(view.connections().is_empty());
-        assert!(view.status().is_some_and(|s| s.contains("URL")));
-    });
+    assert_rejected_without_persisting("reject-empty-url", "new db", "", Some("URL"), cx);
 }
 
 #[gpui::test]
 fn adding_a_connection_with_an_unrecognized_scheme_is_rejected_without_persisting(
     cx: &mut TestAppContext,
 ) {
-    let temp = TempStorePath::new("reject-bad-scheme");
-    let store = ConnectionStore::load(&temp.0).expect("load must succeed");
-    let session = cx.new(|_cx| session_with_no_url());
-    let manager = cx.new(|cx| new_manager(cx, session, store));
-
-    manager.update(cx, |view, cx| {
-        view.set_name_input("mystery", cx);
-        view.set_url_input("cassandra://host/db", cx);
-        let (name, url) = view.form.read(cx).input_values(cx);
-        view.add_connection(cx, &name, url)
-            .expect("validation rejection is Ok(())");
-
-        assert!(view.connections().is_empty());
-    });
+    assert_rejected_without_persisting(
+        "reject-bad-scheme",
+        "mystery",
+        "cassandra://host/db",
+        None,
+        cx,
+    );
 }
 
 // ---- host_label / active_connection_for_url -------------------------
