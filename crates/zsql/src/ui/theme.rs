@@ -405,9 +405,9 @@ pub const APPEARANCE_MODAL_GRID_MAX_HEIGHT: Pixels = px(520.0);
 /// Padding around the modal's scrollable card grid.
 pub const APPEARANCE_MODAL_GRID_PADDING: Pixels = px(24.0);
 /// Gap between cards in the modal's grid, on both axes.
-pub const APPEARANCE_MODAL_GRID_GAP: Pixels = px(18.0);
+pub const APPEARANCE_MODAL_GRID_GAP: Pixels = px(20.0);
 /// Fixed width of one theme card in the modal's grid.
-pub const APPEARANCE_CARD_WIDTH: Pixels = px(276.0);
+pub const APPEARANCE_CARD_WIDTH: Pixels = px(262.0);
 /// Corner radius of a theme card's mini-preview panel.
 pub const APPEARANCE_CARD_PREVIEW_RADIUS: f32 = 10.0;
 /// Vertical gap between a card's mini-preview panel and its name/tone row.

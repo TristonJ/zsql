@@ -109,7 +109,7 @@ pub struct ThemeEntry {
 #[must_use]
 pub(crate) fn display_name_for(name: &str) -> String {
     match name {
-        zsql_ui::theme::ZSQL_DARK_NAME => "zsql Dark".to_owned(),
+        zsql_ui::theme::ZSQL_DARK_NAME => "zsql dark".to_owned(),
         LATTE_NAME => "Catppuccin Latte".to_owned(),
         FRAPPE_NAME => "Catppuccin Frappe".to_owned(),
         MACCHIATO_NAME => "Catppuccin Macchiato".to_owned(),

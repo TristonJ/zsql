@@ -47,11 +47,8 @@ pub(super) fn render_theme_trigger(
         .px(theme::APPEARANCE_TRIGGER_PADDING_X)
         .py(theme::APPEARANCE_TRIGGER_PADDING_Y)
         .rounded(px(theme::APPEARANCE_TRIGGER_RADIUS))
-        .bg(rgb(active_colors.bg_raised))
-        .border_1()
-        .border_color(rgb(active_colors.border))
         .cursor_pointer()
-        .hover(|el| el.border_color(rgb(active_colors.accent)))
+        .hover(|el| el.text_color(rgb(active_colors.accent)))
         .child(render_swatch(chips))
         .child(
             div()

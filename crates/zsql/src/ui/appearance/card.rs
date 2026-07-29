@@ -46,11 +46,7 @@ pub(super) fn render_card(
         )
         .child(render_meta(entry, is_active, chrome))
         .on_click(on_click)
-        .focus(move |style| {
-            style
-                .border_color(rgba(Colors::wash(chrome.accent, 0x66)))
-                .bg(rgba(Colors::wash(chrome.accent, 0x0f)))
-        })
+        .focus(move |style| style.border_color(rgba(Colors::wash(chrome.accent, 0x66))))
 }
 
 /// The name/tone row below a card's preview: the theme's display name, plus
@@ -107,6 +103,8 @@ fn render_mini_preview(colors: Colors) -> impl IntoElement {
         .flex()
         .flex_col()
         .bg(rgb(colors.bg_app))
+        // If we don't set this, it clips through the rounded corners of the card's outer border
+        .rounded(px(theme::APPEARANCE_CARD_PREVIEW_RADIUS))
         .font_family("monospace")
         .child(render_mini_editor(colors))
         .child(render_mini_grid(colors))
@@ -123,6 +121,9 @@ fn render_mini_editor(colors: Colors) -> impl IntoElement {
         .h(theme::MINI_EDITOR_HEIGHT)
         .px(theme::MINI_PADDING_X)
         .bg(rgb(colors.bg_panel))
+        // If we don't set this, it clips through the rounded corners of the card's outer border
+        .rounded_t(px(theme::APPEARANCE_CARD_PREVIEW_RADIUS))
+        .overflow_hidden()
         .border_b_1()
         .border_color(rgb(colors.border))
         .text_size(px(theme::MINI_TEXT_SIZE))
@@ -265,6 +266,8 @@ fn render_mini_status(colors: Colors) -> impl IntoElement {
         .bg(rgb(colors.bg_panel))
         .border_t_1()
         .border_color(rgb(colors.border))
+        // If we don't set this, it clips through the rounded corners of the card's outer border
+        .rounded_b(px(theme::APPEARANCE_CARD_PREVIEW_RADIUS))
         .text_size(px(theme::MINI_STATUS_TEXT_SIZE))
         .text_color(rgb(colors.text_secondary))
         .child(zsql_ui::grid::status_dot(colors.accent))
