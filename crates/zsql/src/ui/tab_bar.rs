@@ -8,7 +8,8 @@
 use std::cell::Cell;
 
 use gpui::{
-    ClickEvent, Context, Entity, IntoElement, Pixels, ScrollHandle, div, point, prelude::*, px, rgb,
+    ClickEvent, Context, Entity, IntoElement, Pixels, ScrollHandle, ScrollWheelEvent, Window, div,
+    point, prelude::*, px, rgb,
 };
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
@@ -158,6 +159,48 @@ fn scroll_offset_to_reveal(
     Some(target.clamp(0.0, max_offset))
 }
 
+/// The horizontal component of a wheel gesture's pixel delta over the tab
+/// strip: the delta's own x component when populated (a horizontal
+/// trackpad swipe, or a shift-held wheel), falling back to its y component
+/// otherwise so a plain vertical wheel notch pans the strip too. The strip
+/// has no vertical axis of its own to disambiguate against, so every wheel
+/// gesture over it is read as horizontal, the way editors typically treat
+/// wheel input over an overflowing tab bar.
+fn wheel_delta_x(event: &ScrollWheelEvent, window: &Window) -> Pixels {
+    let delta = event.delta.pixel_delta(window.line_height());
+    if delta.x == px(0.0) { delta.y } else { delta.x }
+}
+
+/// Pans `handle` by a wheel gesture's horizontal delta, clamped to
+/// `[0, max_offset]`. A no-op once the strip has nothing left to scroll or
+/// the gesture carries no horizontal component. Returns whether the offset
+/// changed.
+fn scroll_tab_strip_by_wheel(
+    handle: &ScrollHandle,
+    event: &ScrollWheelEvent,
+    window: &Window,
+) -> bool {
+    let max_offset = f32::from(handle.max_offset().width);
+    if max_offset <= 0.0 {
+        return false;
+    }
+
+    let delta_x = f32::from(wheel_delta_x(event, window));
+    if delta_x == 0.0 {
+        return false;
+    }
+
+    let current_offset = -f32::from(handle.offset().x);
+    let new_offset = (current_offset - delta_x).clamp(0.0, max_offset);
+    if (new_offset - current_offset).abs() < f32::EPSILON {
+        return false;
+    }
+
+    let offset_y = handle.offset().y;
+    handle.set_offset(point(px(-new_offset), offset_y));
+    true
+}
+
 /// The width the row of tabs must be forced to (via an explicit `min_w` on
 /// the scrolled child) so real overflow occurs instead of flexbox shrinking
 /// every tab to fit the strip's available width.
@@ -208,6 +251,8 @@ pub fn render_tab_bar(
         .min_w(tab_row_min_width(tab_count, tab_width))
         .children(rendered_tabs);
 
+    let wheel_handle = tab_bar.handle.clone();
+    let wheel_scroll_state = tab_bar.scroll.clone();
     let viewport = div()
         .id("tab-bar-scroll-viewport")
         .debug_selector(|| "tab-bar-scroll-viewport".to_owned())
@@ -219,7 +264,15 @@ pub fn render_tab_bar(
         .h_full()
         .overflow_x_hidden()
         .track_scroll(&tab_bar.handle)
-        .on_scroll_wheel(ScrollableState::wheel_handler(&tab_bar.scroll))
+        .on_scroll_wheel(move |event: &ScrollWheelEvent, window, cx| {
+            if scroll_tab_strip_by_wheel(&wheel_handle, event, window) {
+                // `handle` is a plain `ScrollHandle`, not an entity of its
+                // own to notify through; piggyback on the scrollable state
+                // entity this same strip already owns so its offset change
+                // still triggers a repaint.
+                wheel_scroll_state.update(cx, |_state, cx| cx.notify());
+            }
+        })
         .child(row);
 
     let scrolled = viewport.with_scrollbars(&tab_bar.scroll, ScrollbarStyle::default(), cx);

@@ -1397,6 +1397,99 @@ mod render_tests {
              got {bounds_before:?} before and {bounds_after:?} after"
         );
     }
+
+    /// A horizontal trackpad swipe with no shift key held -- delta.x
+    /// populated, no modifier -- must still pan the strip: the tab strip
+    /// has no vertical axis of its own for shift to disambiguate against.
+    #[gpui::test]
+    fn a_plain_horizontal_trackpad_swipe_scrolls_the_tab_strip_without_shift(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped) before scrolling");
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x < bounds_before.origin.x,
+            "a plain (non-shift) horizontal trackpad swipe over the tab strip must scroll it \
+             toward later tabs, got {bounds_before:?} before and {bounds_after:?} after"
+        );
+    }
+
+    /// A plain vertical wheel notch -- no shift, no horizontal delta
+    /// component -- over the tab strip must also pan it horizontally,
+    /// matching how editors commonly treat a bare wheel scroll over an
+    /// overflowing tab bar.
+    #[gpui::test]
+    fn a_plain_vertical_wheel_notch_scrolls_the_tab_strip_horizontally(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped) before scrolling");
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x < bounds_before.origin.x,
+            "a plain vertical wheel notch over the tab strip must scroll it toward later tabs, \
+             got {bounds_before:?} before and {bounds_after:?} after"
+        );
+    }
 }
 
 /// Tests for the workspace header's Run button: it dispatches a run for the
