@@ -67,6 +67,10 @@ pub struct WorkspaceView {
     /// protection described on [`TabSessionStore`], and the per-key cache of
     /// the latest dispatched-for-save snapshot.
     tab_session_store: TabSessionStore,
+    /// The tab strip's horizontal scroll state; see [`tab_bar::TabBarState`].
+    tab_bar: tab_bar::TabBarState,
+    /// Width every tab-bar entry renders at; see [`LayoutConfig::tab_width`].
+    tab_width: Pixels,
 }
 
 /// The persisted, path-shaped settings [`WorkspaceView::new`] otherwise
@@ -158,6 +162,8 @@ impl WorkspaceView {
         let footer = cx.new(|cx| ConnectionFooterView::new(session, connections.clone(), cx));
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
+        let tab_width = layout.tab_width;
+        let tab_bar_state = tab_bar::TabBarState::new(cx);
 
         // Opening/closing the modal (or switching its list/add-form panel)
         // lives entirely inside `connections`' own state; this workspace
@@ -212,6 +218,8 @@ impl WorkspaceView {
             drag: None,
             column_height: Rc::new(Cell::new(Pixels::ZERO)),
             tab_session_store: TabSessionStore::new(tab_sessions_path),
+            tab_bar: tab_bar_state,
+            tab_width,
         }
     }
 
@@ -640,6 +648,7 @@ impl Render for WorkspaceView {
 
         div()
             .id("workspace-root")
+            .debug_selector(|| "workspace-root".to_owned())
             .relative()
             .flex()
             .flex_col()
@@ -703,8 +712,9 @@ impl Render for WorkspaceView {
                                 .inset_0(),
                             )
                             .child(tab_bar::render_tab_bar(
-                                self.tabs.read(cx).active_id(),
-                                self.tabs.read(cx).tabs(),
+                                &self.tabs,
+                                &self.tab_bar,
+                                self.tab_width,
                                 cx,
                             ))
                             .children(self.render_main_pane(cx)),

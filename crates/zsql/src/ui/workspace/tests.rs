@@ -1054,6 +1054,500 @@ mod render_tests {
         assert_eq!(saved.tabs.len(), 1);
         assert_eq!(saved.tabs[0].buffer_text, "select 42;");
     }
+
+    /// A workspace with no saved connections, so `WorkspaceView::new`'s
+    /// default single script tab is the only tab present at construction.
+    fn fresh_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<WorkspaceView>,
+        super::TabId,
+        &mut gpui::VisualTestContext,
+    ) {
+        let session = sample_schema_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+        let first_tab = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_id()
+                .expect("a fresh workspace has one active tab")
+        });
+        (workspace, first_tab, vcx)
+    }
+
+    /// Opens `count` additional script tabs beyond the workspace's initial
+    /// one, returning every open tab's id in order (index 0 is the initial
+    /// tab this test module always starts with).
+    fn open_extra_script_tabs(
+        workspace: &Entity<WorkspaceView>,
+        vcx: &mut gpui::VisualTestContext,
+        count: usize,
+    ) -> Vec<super::TabId> {
+        for _ in 0..count {
+            workspace.update(vcx, |workspace, cx| {
+                workspace.tabs.update(cx, |tabs, cx| {
+                    tabs.new_script_tab(cx);
+                });
+            });
+        }
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .tabs()
+                .iter()
+                .map(super::Tab::id)
+                .collect()
+        })
+    }
+
+    /// Enough extra tabs (on top of the workspace's initial one) to overflow
+    /// the tab strip's available width at the default layout/tab-width
+    /// config, comfortably past the point a single extra tab could round up
+    /// to.
+    const OVERFLOWING_EXTRA_TABS: usize = 19;
+
+    /// Opening enough tabs to overflow the strip's available width must
+    /// clip and scroll the strip itself, never grow the workspace's own
+    /// outer container past the window it was given.
+    #[gpui::test]
+    fn opening_enough_tabs_to_overflow_does_not_widen_the_workspace_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let _ = first_tab;
+
+        let width_before = vcx
+            .debug_bounds("workspace-root")
+            .expect("workspace-root must be painted")
+            .size
+            .width;
+        let viewport_before = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+
+        open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+
+        let width_after = vcx
+            .debug_bounds("workspace-root")
+            .expect("workspace-root must still be painted with many tabs open")
+            .size
+            .width;
+        let viewport_after = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must still be painted with many tabs open");
+
+        assert_eq!(
+            width_before, width_after,
+            "opening enough tabs to overflow the tab strip must not widen the workspace's own \
+             outer container"
+        );
+        // The strip's own viewport is where the clipping actually happens:
+        // if its min-width/overflow wiring regressed, the viewport itself
+        // would stretch to the tabs' summed width even while an ancestor's
+        // min_w_0 kept the workspace root at the window size.
+        assert_eq!(
+            viewport_before.size.width, viewport_after.size.width,
+            "the tab strip's scroll viewport must keep its width when its content overflows, \
+             not stretch to fit the tabs"
+        );
+    }
+
+    /// The new-tab button is a sibling after the scroll viewport, so it
+    /// must stay painted at the strip's trailing edge -- outside the
+    /// scrolled region -- no matter how far the strip is scrolled.
+    #[gpui::test]
+    fn the_new_tab_button_stays_reachable_while_the_strip_is_scrolled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let _ = first_tab;
+
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        // Scroll to the strip's far end by activating the last tab.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(last_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let root = vcx
+            .debug_bounds("workspace-root")
+            .expect("workspace-root must be painted");
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let button = vcx
+            .debug_bounds("workspace-new-tab")
+            .expect("the new-tab button must stay painted while the strip is scrolled");
+
+        assert!(
+            button.origin.x >= viewport.origin.x + viewport.size.width,
+            "the new-tab button must sit after the scroll viewport's trailing edge, not inside \
+             the scrolled region, got {button:?} against viewport {viewport:?}"
+        );
+        assert!(
+            button.origin.x + button.size.width <= root.origin.x + root.size.width,
+            "the new-tab button must stay within the workspace's own bounds, got {button:?} \
+             against root {root:?}"
+        );
+    }
+
+    /// Before the tab bar has anything to scroll to it, a tab far enough
+    /// along the overflowing strip paints outside the visible viewport;
+    /// activating it must scroll the strip so its whole width lands back
+    /// inside the viewport.
+    #[gpui::test]
+    fn the_last_tab_is_not_reachable_until_it_is_scrolled_into_view(cx: &mut gpui::TestAppContext) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        // Opening a tab activates it, which already scrolls it into view;
+        // reactivate the first tab to scroll back to the strip's start
+        // before checking the last tab's own reachability.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let last_bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped, not removed) off-screen");
+        assert!(
+            last_bounds_before.origin.x + last_bounds_before.size.width
+                > viewport.origin.x + viewport.size.width,
+            "the last tab must sit past the viewport's trailing edge before it is scrolled into \
+             view"
+        );
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(last_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let last_bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must be painted once scrolled into view");
+        assert!(
+            last_bounds_after.origin.x >= viewport.origin.x
+                && last_bounds_after.origin.x + last_bounds_after.size.width
+                    <= viewport.origin.x + viewport.size.width,
+            "activating the last tab must scroll the strip so its whole width lands fully \
+             within the viewport, got {last_bounds_after:?} against viewport {viewport:?}"
+        );
+    }
+
+    /// Opening enough tabs to overflow the strip in one burst -- each new
+    /// tab activating itself the moment it opens, the way a rapid run of
+    /// "+" clicks would -- must still land the final active tab back in
+    /// view without any further activation from the test: the strip's own
+    /// bookkeeping must not mistake a viewport measurement still describing
+    /// the pre-burst tab count for proof the newly active tab is already
+    /// visible.
+    #[gpui::test]
+    fn a_newly_active_tab_created_mid_overflow_burst_is_reachable_without_further_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let _ = first_tab;
+
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds = vcx
+            .debug_bounds(selector)
+            .expect("the newly active last tab must be painted");
+
+        assert!(
+            bounds.origin.x >= viewport.origin.x
+                && bounds.origin.x + bounds.size.width <= viewport.origin.x + viewport.size.width,
+            "the tab that just became active by opening it must land fully within the \
+             viewport without any further activation, got {bounds:?} against viewport \
+             {viewport:?}"
+        );
+    }
+
+    /// `TabModel::restore_tabs` (reached through `load_for_connection`) can
+    /// restore a session whose active tab sits far enough along an
+    /// overflowing strip that it was never on screen even once. That tab
+    /// must land in view too, without any further activation from the
+    /// test, the same as opening or clicking a tab already does.
+    #[gpui::test]
+    fn restoring_a_session_with_an_off_screen_active_tab_scrolls_it_into_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let _ = first_tab;
+
+        let tab_count = OVERFLOWING_EXTRA_TABS + 1;
+        let snapshot = tab_session::TabSessionSnapshot {
+            tabs: (0..tab_count)
+                .map(|i| tab_session::TabEntrySnapshot {
+                    kind: tab_session::TabEntryKind::Script,
+                    title: format!("query-{i}.sql"),
+                    buffer_text: String::new(),
+                })
+                .collect(),
+            active_index: Some(tab_count - 1),
+        };
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.tabs.update(cx, |tabs, cx| {
+                tabs.load_for_connection(Some(&snapshot), cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        let last_tab = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .tabs()
+                .last()
+                .expect("the snapshot restored at least one tab")
+                .id()
+        });
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds = vcx
+            .debug_bounds(selector)
+            .expect("the restored active tab must be painted");
+
+        assert!(
+            bounds.origin.x >= viewport.origin.x
+                && bounds.origin.x + bounds.size.width <= viewport.origin.x + viewport.size.width,
+            "restoring a session whose active tab is off screen must scroll it into view \
+             without any further activation, got {bounds:?} against viewport {viewport:?}"
+        );
+    }
+
+    /// Isolates the active-tab-scroll-into-view behavior itself: activating
+    /// an off-screen tab moves the strip; re-activating an already-visible
+    /// tab causes no further scroll.
+    #[gpui::test]
+    fn activating_an_already_visible_tab_causes_no_further_scroll(cx: &mut gpui::TestAppContext) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+        let _ = first_tab;
+
+        // Settle the strip on the last tab first: opening many tabs in a
+        // tight burst can itself land one render behind the true content
+        // extent, so this activation (not the burst itself) is what must
+        // have already brought the tab fully into view.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(last_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(selector)
+            .expect("the active last tab must already be painted in view");
+
+        // Re-activating the same (already visible) tab must not move the
+        // strip any further.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(last_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(selector)
+            .expect("the tab must still be painted after a no-op reactivation");
+        assert_eq!(
+            bounds_before, bounds_after,
+            "reactivating an already-visible tab must not move the strip's scroll offset"
+        );
+    }
+
+    /// A shift-held mouse-wheel/trackpad gesture over the tab strip must pan
+    /// it horizontally, mirroring `zsql_ui::scrollable::wrapper`'s own
+    /// `shift_held_wheel_scrolls_the_horizontal_axis` test. Also proves the
+    /// active-tab-scroll-into-view correction does not fight a manual
+    /// scroll: the active tab never changes here, only the offset.
+    #[gpui::test]
+    fn shift_held_wheel_over_the_tab_strip_scrolls_it_horizontally(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        // Scroll back to the strip's start, so a wheel gesture has visible
+        // room to move it.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped) before scrolling");
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x < bounds_before.origin.x,
+            "a shift-held wheel gesture over the tab strip must scroll it toward later tabs, \
+             got {bounds_before:?} before and {bounds_after:?} after"
+        );
+    }
+
+    /// A horizontal trackpad swipe with no shift key held -- delta.x
+    /// populated, no modifier -- must still pan the strip: the tab strip
+    /// has no vertical axis of its own for shift to disambiguate against.
+    #[gpui::test]
+    fn a_plain_horizontal_trackpad_swipe_scrolls_the_tab_strip_without_shift(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped) before scrolling");
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(-120.0), px(0.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x < bounds_before.origin.x,
+            "a plain (non-shift) horizontal trackpad swipe over the tab strip must scroll it \
+             toward later tabs, got {bounds_before:?} before and {bounds_after:?} after"
+        );
+    }
+
+    /// A plain vertical wheel notch -- no shift, no horizontal delta
+    /// component -- over the tab strip must also pan it horizontally,
+    /// matching how editors commonly treat a bare wheel scroll over an
+    /// overflowing tab bar.
+    #[gpui::test]
+    fn a_plain_vertical_wheel_notch_scrolls_the_tab_strip_horizontally(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(first_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let last_selector = crate::ui::tab_bar::tab_debug_selector_for_test(last_tab);
+        let bounds_before = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted (clipped) before scrolling");
+
+        vcx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+
+        let bounds_after = vcx
+            .debug_bounds(last_selector)
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x < bounds_before.origin.x,
+            "a plain vertical wheel notch over the tab strip must scroll it toward later tabs, \
+             got {bounds_before:?} before and {bounds_after:?} after"
+        );
+    }
 }
 
 /// Tests for the workspace header's Run button: it dispatches a run for the

@@ -122,6 +122,10 @@ pub struct LayoutConfig {
     pub divider_thickness: Pixels,
     /// Layout options for the value panel
     pub value_panel: ValuePanelLayout,
+    /// Width every entry in the scrollable tab strip renders at, and the
+    /// unit the strip's active-tab-scroll-into-view logic uses to locate a
+    /// tab's position along the strip.
+    pub tab_width: Pixels,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +191,7 @@ impl Default for LayoutConfig {
             results_min_height: px(120.0),
             divider_thickness: px(4.0),
             value_panel: ValuePanelLayout::default(),
+            tab_width: px(160.0),
         }
     }
 }
@@ -474,6 +479,7 @@ mod tests {
         cfg.layout.editor_min_height = gpui::px(150.0);
         cfg.layout.results_min_height = gpui::px(140.0);
         cfg.layout.divider_thickness = gpui::px(8.0);
+        cfg.layout.tab_width = gpui::px(180.0);
 
         let text = toml::to_string(&cfg).expect("config must serialize to toml");
         let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
@@ -485,6 +491,12 @@ mod tests {
         assert_eq!(parsed.layout.editor_min_height, gpui::px(150.0));
         assert_eq!(parsed.layout.results_min_height, gpui::px(140.0));
         assert_eq!(parsed.layout.divider_thickness, gpui::px(8.0));
+        assert_eq!(parsed.layout.tab_width, gpui::px(180.0));
+    }
+
+    #[test]
+    fn tab_width_defaults_to_a_positive_size() {
+        assert!(Config::default().layout.tab_width > gpui::px(0.0));
     }
 
     #[test]
