@@ -44,4 +44,6 @@ magick "$OUT/icon_16.png" "$OUT/icon_24.png" "$OUT/icon_32.png" \
     "$OUT/icon_48.png" "$OUT/icon_64.png" "$OUT/icon_128.png" \
     "$OUT/icon_256.png" "$OUT/icon.ico"
 
+cp "$SVG" "$OUT/icon.svg"
+
 echo "generated in $OUT: icon_{16,24,32,48,64,128,256,512,1024}.png icon.icns icon.ico"
