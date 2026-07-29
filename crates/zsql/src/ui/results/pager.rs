@@ -86,12 +86,6 @@ pub(crate) fn sortable_column_header(
             });
         });
 
-    if is_sorted {
-        header = header.bg(rgb(app_theme::sorted_header_bg(active_theme)));
-    } else if is_hovered {
-        header = header.bg(rgb(app_theme::hovered_header_bg(active_theme)));
-    }
-
     if let Some(controls) = controls {
         let dispatch = controls.dispatch.clone();
         let column_name = column.name.clone();
@@ -116,7 +110,6 @@ pub(crate) fn sortable_column_header(
         };
         header = header.child(
             div()
-                .ml_auto()
                 .text_size(px(app_theme::PAGER_TEXT_SIZE))
                 .text_color(rgb(colors.accent))
                 .child(arrow),
@@ -124,7 +117,6 @@ pub(crate) fn sortable_column_header(
     } else if controls.is_some() && is_hovered {
         header = header.child(
             div()
-                .ml_auto()
                 .text_size(px(app_theme::PAGER_TEXT_SIZE))
                 .text_color(rgb(colors.text_tertiary))
                 .child("\u{2195}"),

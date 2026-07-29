@@ -102,7 +102,7 @@ pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArg
     if let Some(offset) = args.offset
         && offset > 0
     {
-        let _ = write!(sql, " OFFSET {}", offset);
+        let _ = write!(sql, " OFFSET {offset}");
     }
     sql
 }

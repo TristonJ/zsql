@@ -154,21 +154,6 @@ pub const PAGER_GROUP_GAP: Pixels = px(6.0);
 /// generated preview).
 pub const PAGER_DISABLED_OPACITY: f32 = 0.45;
 
-/// Background of the results grid's active-sort column header: a soft
-/// accent wash, distinct from a hovered (non-sorted) header's own fainter
-/// wash.
-#[must_use]
-pub fn sorted_header_bg(theme: &Theme) -> u32 {
-    theme.colors.accent_wash_soft()
-}
-
-/// Background of a hovered, non-sorted results grid header: fainter than
-/// [`sorted_header_bg`], matching the mockup's neutral hover affordance.
-#[must_use]
-pub fn hovered_header_bg(theme: &Theme) -> u32 {
-    Colors::wash(theme.colors.text_primary, 0x08)
-}
-
 /// Background of the Grid|Text view switch's active segment, and of the
 /// wrap toggle when wrap is on: the accent wash used elsewhere for a
 /// selected/active control.
