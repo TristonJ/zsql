@@ -274,6 +274,26 @@ impl ResultsView {
             .and_then(|preview| preview.state.last_page_number())
     }
 
+    /// The active tab's own total row count, once known: the value the
+    /// status bar renders via [`format_total_row_count`]. Sourced from
+    /// [`ResultsView::preview`] -- the active tab's own frozen sort/page
+    /// state -- rather than from `session` directly, so a tab that is not
+    /// currently live never shows a different tab's most recently fetched
+    /// total. `None` while the active tab is not a live, unedited generated
+    /// preview, or that preview's own count fetch has not resolved yet.
+    fn active_total_row_count(&self) -> Option<RowCount> {
+        self.preview
+            .as_ref()
+            .and_then(|preview| preview.state.total_rows())
+    }
+
+    /// Test-only mirror of [`ResultsView::active_total_row_count`], for
+    /// asserting on the exact value the status bar would render.
+    #[cfg(test)]
+    pub(crate) fn active_total_row_count_for_test(&self) -> Option<RowCount> {
+        self.active_total_row_count()
+    }
+
     /// [`PrevPage`]'s handler: step the active preview's pager back one
     /// page. A no-op with no visible side effect while `preview` is `None`
     /// (the active tab is not a live generated preview) or already on page

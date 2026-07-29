@@ -82,9 +82,7 @@ impl ResultsView {
             left = left.child(count_text).child(elapsed_text);
         }
 
-        if let Some(total_row_count_text) =
-            format_total_row_count(self.session.read(cx).row_count())
-        {
+        if let Some(total_row_count_text) = format_total_row_count(self.active_total_row_count()) {
             left = left.child(total_row_count_text);
         }
 

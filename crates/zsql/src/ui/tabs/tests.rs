@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -1501,4 +1502,230 @@ fn the_rendered_pager_snapshot_reflects_the_total_once_the_async_count_resolves(
             "the pager snapshot must reflect the relation total once the count resolves"
         );
     });
+}
+
+/// A `Connection` double whose `count_rows` reports a distinct total per
+/// relation (falling back to `RowCount::Exact(0)` for an unlisted one) and
+/// records every relation it was called for, so a test can both assert on a
+/// specific relation's reported total and verify tab-switching never
+/// triggers a redundant fetch.
+struct PerRelationCountConnection {
+    sinks: Arc<Mutex<Vec<BatchSink>>>,
+    totals: HashMap<(String, String), RowCount>,
+    count_calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[async_trait]
+impl Connection for PerRelationCountConnection {
+    fn stream_query(&self, _sql: String, sink: BatchSink) -> QueryHandle {
+        self.sinks.lock().expect("sinks lock poisoned").push(sink);
+        let (cancel_tx, _cancel_rx) = flume::unbounded();
+        QueryHandle::new(cancel_tx)
+    }
+
+    async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+        Ok(SchemaTree::default())
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
+        let key = (schema.to_owned(), relation.to_owned());
+        self.count_calls
+            .lock()
+            .expect("count_calls lock poisoned")
+            .push(key.clone());
+        Ok(self.totals.get(&key).copied().unwrap_or(RowCount::Exact(0)))
+    }
+
+    async fn describe_relation(
+        &self,
+        _schema: &str,
+        _relation: &str,
+    ) -> Result<zsql_core::RelationSchema, CoreError> {
+        Ok(zsql_core::RelationSchema::default())
+    }
+}
+
+/// The ticket's exact repro (ZSQ-91): open a preview of relation A (its
+/// count resolves to one total), open a preview of relation B (a different
+/// total), then switch back to A's tab. The displayed total -- both the
+/// status bar's and the pager's -- must follow the active tab, not whichever
+/// relation was most recently fetched.
+#[gpui::test]
+fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_count(
+    cx: &mut TestAppContext,
+) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let count_calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let totals = HashMap::from([
+        (
+            ("public".to_owned(), "orders".to_owned()),
+            RowCount::Exact(300),
+        ),
+        (
+            ("public".to_owned(), "customers".to_owned()),
+            RowCount::Exact(999),
+        ),
+    ]);
+    let connection: Arc<dyn Connection> = Arc::new(PerRelationCountConnection {
+        sinks,
+        totals,
+        count_calls: count_calls.clone(),
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+
+    let orders_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            Some(RowCount::Exact(300)),
+            "orders' own count must be shown while its tab is active"
+        );
+    });
+
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "customers", cx)
+    });
+    cx.run_until_parked();
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            Some(RowCount::Exact(999)),
+            "customers' own count must be shown while its tab is active"
+        );
+    });
+
+    let calls_before_switch = count_calls.lock().expect("count_calls lock poisoned").len();
+
+    model.update(cx, |model, cx| model.set_active(orders_id, cx));
+    cx.run_until_parked();
+
+    // The root cause this ticket fixes: `Session::row_count` is still
+    // whatever was most recently fetched (customers' 999), since switching
+    // tabs never re-runs a query for orders. The status bar must not read
+    // this session-global value directly -- it must derive the displayed
+    // total from the active tab's own frozen preview state instead.
+    session.read_with(cx, |session, _cx| {
+        assert_eq!(
+            session.row_count(),
+            Some(RowCount::Exact(999)),
+            "the session-global row count still reflects the most recently fetched relation"
+        );
+    });
+
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            Some(RowCount::Exact(300)),
+            "switching back to orders' tab must show its own total, not customers'"
+        );
+        assert_eq!(
+            results.preview_last_page_number_for_test(),
+            Some(2), // 300 rows at 200/page.
+            "the pager must agree with the status bar on orders' own total"
+        );
+    });
+    assert_eq!(
+        count_calls.lock().expect("count_calls lock poisoned").len(),
+        calls_before_switch,
+        "switching tabs must not re-issue a count_rows call"
+    );
+}
+
+/// A generated tab whose count fetch has not resolved yet must keep
+/// rendering no total -- neither while it is active nor after switching
+/// away and back -- rather than fabricating one from another tab.
+#[gpui::test]
+fn a_tab_whose_count_fetch_is_still_pending_shows_no_total_across_a_tab_switch(
+    cx: &mut TestAppContext,
+) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let count_calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    // "orders" has no entry in `totals`, but that alone would resolve to
+    // `Exact(0)`; what actually matters here is that this connection is
+    // never parked past its `count_rows` call for "orders" before the
+    // assertions below run, so its fetch is still genuinely in flight.
+    let connection: Arc<dyn Connection> = Arc::new(PerRelationCountConnection {
+        sinks,
+        totals: HashMap::new(),
+        count_calls,
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+
+    let orders_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    // Deliberately not parked: the count fetch for "orders" has not
+    // resolved yet.
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            None,
+            "a not-yet-resolved count must render as absent, not zero or borrowed"
+        );
+    });
+
+    let script_id = model.update(cx, TabModel::new_script_tab);
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            None,
+            "a script tab that has never run a preview shows no total"
+        );
+    });
+
+    model.update(cx, |model, cx| model.set_active(orders_id, cx));
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            None,
+            "switching back to a tab whose count is still pending must not fabricate a total"
+        );
+    });
+
+    let _ = script_id;
+}
+
+/// A generated tab converted to a script by a manual edit keeps showing no
+/// total row count, unchanged by which tab was active before it.
+#[gpui::test]
+fn an_edited_generated_tab_shows_no_total_row_count(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection_and_total_rows(cx, 450);
+    let results = model.read_with(cx, |model, _app| model.results.clone());
+    let id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            Some(RowCount::Exact(450)),
+            "a live generated tab shows its own resolved total"
+        );
+    });
+
+    let editor = model.read_with(cx, |model, _app| model.tab(id).unwrap().editor().clone());
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("-- edited\n", cx);
+    });
+    cx.run_until_parked();
+
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.active_total_row_count_for_test(),
+            None,
+            "editing a generated tab must clear its displayed total row count"
+        );
+    });
+    let _ = sinks;
 }
