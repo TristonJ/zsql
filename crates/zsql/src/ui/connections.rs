@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use gpui::{App, Context, Entity, FocusHandle, KeyDownEvent, Task, Window, prelude::*};
 use uuid::Uuid;
 use zsql_core::Connection;
+use zsql_ui::scrollable::ScrollView;
 
 use crate::connections::{
     ConnectionArgs, ConnectionStore, ConnectionStoreError, StoredConnection, ssh_config_from_stored,
@@ -116,6 +117,11 @@ pub struct ConnectionManagerView {
     form: Entity<ConnectionForm>,
     /// We need to refocus the modal's own focus handle
     refocus_modal: bool,
+    /// Vertical scroll for the saved-connections list, capped at
+    /// `theme::MODAL_LIST_MAX_HEIGHT`: persists here (rather than being
+    /// rebuilt per-render) so drag and first-frame measurement state survive
+    /// across renders.
+    list_scroll: ScrollView,
 }
 
 impl ConnectionManagerView {
@@ -156,6 +162,7 @@ impl ConnectionManagerView {
             batch_size,
             form,
             refocus_modal: false,
+            list_scroll: ScrollView::new(cx),
         }
     }
 
