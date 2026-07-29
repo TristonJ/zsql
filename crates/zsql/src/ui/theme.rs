@@ -207,8 +207,16 @@ pub const GENERATED_HINT_TEXT_SIZE: f32 = 11.0;
 /// Text size of a tab's leading table-icon glyph.
 pub const TAB_ICON_TEXT_SIZE: f32 = 11.0;
 
-/// Tallest the modal's connection list is allowed to grow before it scrolls.
+/// Tallest the modal's connection-row viewport is allowed to grow before it
+/// scrolls.
 pub const MODAL_LIST_MAX_HEIGHT: Pixels = px(300.0);
+/// Width of the connection list's scrollbar track/thumb.
+pub const MODAL_LIST_SCROLLBAR_WIDTH: Pixels = px(8.0);
+/// Corner radius of the connection list's scrollbar thumb.
+pub const MODAL_LIST_SCROLLBAR_RADIUS: f32 = 4.0;
+/// Gap between the connection list's scrollbar track and the viewport edge
+/// it hugs.
+pub const MODAL_LIST_SCROLLBAR_GAP: Pixels = px(4.0);
 /// Corner radius of a connection-list row.
 pub const MODAL_ROW_RADIUS: f32 = 7.0;
 /// Background tint marking the currently-connected row in the modal list.

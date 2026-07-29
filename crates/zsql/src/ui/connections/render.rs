@@ -85,9 +85,11 @@ impl ConnectionManagerView {
     }
 
     /// The saved-connections list panel: every row plus the "Add
-    /// connection" affordance and the inline status line.
-    fn render_modal_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        ConnectionList::with_connections(
+    /// connection" affordance and the inline status line. The rows scroll
+    /// within a capped viewport (persisted across renders in
+    /// `self.list_scroll`); the footer stays outside it.
+    fn render_modal_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let list = ConnectionList::with_connections(
             self.connections()
                 .iter()
                 .enumerate()
@@ -104,7 +106,8 @@ impl ConnectionManagerView {
                     tracing::error!("failed to delete connection: {e}");
                 }
             }
-        }))
+        }));
+        list.render(&self.list_scroll, window, cx)
     }
 
     /// The add/edit form panel: [`super::form::ConnectionForm`] draws its own

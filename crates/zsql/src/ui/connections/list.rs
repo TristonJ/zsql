@@ -1,14 +1,16 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, Div, FocusHandle, RenderOnce, Stateful, Window, div, prelude::*, px, rgb, rgba,
+    App, ClickEvent, Context, Div, FocusHandle, Render, RenderOnce, Stateful, Window, div,
+    prelude::*, px, rgb, rgba,
 };
 use uuid::Uuid;
 use zsql_ui::{
     button::secondary_button,
     grid,
     icon::{IconName, icon},
-    theme::ActiveTheme,
+    scrollable::{ScrollView, ScrollbarStyle, vertical_scroll},
+    theme::{ActiveTheme, Theme},
 };
 
 use crate::ui::{connections::ConnectionRow, theme};
@@ -18,7 +20,6 @@ use crate::ui::{connections::ConnectionRow, theme};
 /// list's own.
 type EventListener = Rc<dyn Fn(&ConnectionListEvent, &mut Window, &mut App) + 'static>;
 
-#[derive(IntoElement)]
 pub struct ConnectionList {
     connection_rows: Vec<ConnectionListItem>,
     status_text: Option<String>,
@@ -79,61 +80,110 @@ impl ConnectionList {
             .text_color(rgb(cx.theme().colors.text_tertiary))
             .child(text)
     }
-}
 
-impl RenderOnce for ConnectionList {
-    fn render(mut self, window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
+    /// The connection list's scrollbar chrome: track/thumb thickness plus
+    /// the active theme's scrollbar colors. The track paints no background.
+    fn scrollbar_style(active_theme: &Theme) -> ScrollbarStyle {
+        ScrollbarStyle {
+            track_width: f32::from(theme::MODAL_LIST_SCROLLBAR_WIDTH),
+            track_color: None,
+            thumb_color: active_theme.colors.scrollbar_thumb,
+            thumb_hover_color: Some(active_theme.colors.scrollbar_thumb_hover),
+            radius: theme::MODAL_LIST_SCROLLBAR_RADIUS,
+            inset: f32::from(theme::MODAL_LIST_SCROLLBAR_GAP),
+            ..ScrollbarStyle::default()
+        }
+    }
+
+    /// Builds this list's element tree: the connection rows, scrollable
+    /// within a viewport capped at `theme::MODAL_LIST_MAX_HEIGHT`, followed
+    /// by the add-connection footer -- a sibling of the scrolled region, so
+    /// it stays fully visible and clickable regardless of row count.
+    ///
+    /// `scroll_view` must be owned by the caller's own view (`V`) and
+    /// persist across renders, the same as any other `ScrollView`: a fresh
+    /// one every render would lose drag/measurement state and never settle.
+    pub fn render<V: Render>(
+        mut self,
+        scroll_view: &ScrollView,
+        window: &mut Window,
+        cx: &mut Context<V>,
+    ) -> Div {
         let colors = cx.theme().colors;
-        let mut list = div()
+        // `flex_shrink_0` keeps this row column at its natural (possibly
+        // taller-than-viewport) height inside `vertical_scroll`'s flex
+        // column, which would otherwise squeeze it down to fit rather than
+        // letting it overflow and scroll.
+        let mut rows = div().flex().flex_col().gap_1().p_1().flex_shrink_0();
+        for child in self.connection_rows.drain(..) {
+            rows = rows.child(child);
+        }
+        let scrollbar_style = Self::scrollbar_style(cx.theme());
+        // Hugs the row column's own height up to the cap, so a short list
+        // sits flush above the footer instead of leaving empty space; only
+        // once the rows exceed the cap does this become the definite height
+        // `vertical_scroll`'s own `h_full()` viewport resolves against.
+        // `min_h_0` clears the flex min-content floor that would otherwise
+        // let the row column's intrinsic height push this past its cap.
+        let scrolled_rows = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_1()
+            .min_h_0()
             .max_h(theme::MODAL_LIST_MAX_HEIGHT)
-            .overflow_hidden();
-        for child in self.connection_rows.drain(..) {
-            list = list.child(child);
-        }
+            .child(vertical_scroll(
+                "connection-list-rows",
+                scroll_view,
+                scrollbar_style,
+                rows,
+                cx,
+            ));
+
         let event_listener = self.event_listener;
-        div().flex().flex_col().child(list).child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(rgb(colors.border_soft))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .w_full()
-                        .child(
-                            secondary_button("add-connection-button", window, cx)
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                // Lets render tests find this button's painted
-                                // bounds via `VisualTestContext::debug_bounds`
-                                // -- a no-op outside test/test-support builds.
-                                .debug_selector(|| "connection-list-add-button".to_owned())
-                                .child(icon(
-                                    IconName::Add,
-                                    theme::MODAL_ADD_ICON_SIZE,
-                                    colors.accent,
-                                ))
-                                .child("Add connection")
-                                .on_click(move |_c, w, cx| {
-                                    event_listener(&ConnectionListEvent::Add, w, cx);
-                                }),
-                        )
-                        .child(Self::render_status(cx, self.status_text)),
-                ),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(scrolled_rows)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(colors.border_soft))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .child(
+                                secondary_button("add-connection-button", window, cx)
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    // Lets render tests find this button's
+                                    // painted bounds via
+                                    // `VisualTestContext::debug_bounds` -- a
+                                    // no-op outside test/test-support builds.
+                                    .debug_selector(|| "connection-list-add-button".to_owned())
+                                    .child(icon(
+                                        IconName::Add,
+                                        theme::MODAL_ADD_ICON_SIZE,
+                                        colors.accent,
+                                    ))
+                                    .child("Add connection")
+                                    .on_click(move |_c, w, cx| {
+                                        event_listener(&ConnectionListEvent::Add, w, cx);
+                                    }),
+                            )
+                            .child(Self::render_status(cx, self.status_text)),
+                    ),
+            )
     }
 }
 
@@ -185,6 +235,7 @@ impl ConnectionListItem {
                         div()
                             .overflow_x_hidden()
                             .text_ellipsis()
+                            .w_full()
                             .text_size(px(theme::MODAL_ROW_NAME_TEXT_SIZE))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(colors.text_primary))
@@ -333,12 +384,13 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{
-        Context, Entity, FocusHandle, Modifiers, Render, TestAppContext, VisualTestContext, Window,
-        prelude::*,
+        Context, Entity, FocusHandle, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, Render, TestAppContext, VisualTestContext, Window, point, prelude::*, px,
     };
     use uuid::Uuid;
+    use zsql_ui::scrollable::{ScrollView, vertical_thumb_debug_selector};
 
-    use super::{ConnectionList, ConnectionListEvent};
+    use super::{ConnectionList, ConnectionListEvent, theme};
     use crate::connections::ConnectionArgs;
     use crate::ui::connections::ConnectionRow;
 
@@ -379,14 +431,19 @@ mod tests {
 
     /// A minimal host entity that renders a built [`ConnectionList`] and
     /// forwards every event it reports into a shared, test-owned capture
-    /// list -- exists only so the `RenderOnce` list component can be driven
-    /// through a real window, with no [`super::super::ConnectionManagerView`]
+    /// list -- exists only so the list component can be driven through a
+    /// real window, with no [`super::super::ConnectionManagerView`]
     /// involved.
     struct ListHost {
         rows: Vec<ConnectionRow>,
         row_focus_handles: Vec<FocusHandle>,
         active_id: Option<Uuid>,
         events: Rc<RefCell<Vec<CapturedEvent>>>,
+        list_scroll: ScrollView,
+        /// How many times `render` has run, so a test can tell whether the
+        /// list's first-frame scrollbar nudge settles after one extra
+        /// render or keeps rescheduling itself.
+        render_count: usize,
     }
 
     impl ListHost {
@@ -401,12 +458,15 @@ mod tests {
                 row_focus_handles,
                 active_id: None,
                 events,
+                list_scroll: ScrollView::new(cx),
+                render_count: 0,
             }
         }
     }
 
     impl Render for ListHost {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count += 1;
             let events = self.events.clone();
             ConnectionList::with_connections(
                 self.rows
@@ -417,6 +477,7 @@ mod tests {
             .on_event(move |event, _window, _cx| {
                 events.borrow_mut().push(CapturedEvent::from(event));
             })
+            .render(&self.list_scroll, window, cx)
         }
     }
 
@@ -553,5 +614,176 @@ mod tests {
         vcx.run_until_parked();
 
         assert_eq!(*events.borrow(), vec![CapturedEvent::Add]);
+    }
+
+    /// `count` distinct sqlite rows, named/ordered `conn-0`, `conn-1`, ...
+    fn many_rows(count: usize) -> Vec<ConnectionRow> {
+        (0..count)
+            .map(|i| sample_row(&format!("conn-{i}"), &format!("sqlite:///tmp/conn-{i}.db")))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_short_list_that_fits_the_capped_viewport_renders_with_no_scrollbar_thumb(
+        cx: &mut TestAppContext,
+    ) {
+        let (host, vcx, _events) = build_host(cx, many_rows(4));
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("connection-list-row-3").is_some(),
+            "all 4 rows must fit inside the capped viewport and paint"
+        );
+        let scroll = host.read_with(vcx, |h, _app| h.list_scroll.scroll_state().clone());
+        assert!(
+            vcx.debug_bounds(vertical_thumb_debug_selector(&scroll))
+                .is_none(),
+            "a list that fits the capped viewport must render no scrollbar thumb"
+        );
+    }
+
+    #[gpui::test]
+    fn a_short_list_hugs_its_rows_instead_of_reserving_the_full_capped_height(
+        cx: &mut TestAppContext,
+    ) {
+        let (_host, vcx, _events) = build_host(cx, many_rows(4));
+        vcx.run_until_parked();
+
+        let row3_bounds = vcx
+            .debug_bounds("connection-list-row-3")
+            .expect("row 3 must be painted");
+        let footer_bounds = vcx
+            .debug_bounds("connection-list-add-button")
+            .expect("the add-connection footer must be painted");
+        let half_cap = px(f32::from(theme::MODAL_LIST_MAX_HEIGHT) / 2.0);
+        assert!(
+            footer_bounds.origin.y < row3_bounds.origin.y + half_cap,
+            "a short list must hug its rows rather than reserving the full capped height, \
+             leaving a large empty gap above the footer"
+        );
+    }
+
+    #[gpui::test]
+    fn twelve_connections_stay_capped_with_the_footer_visible_and_a_scrollbar_thumb(
+        cx: &mut TestAppContext,
+    ) {
+        let (host, vcx, _events) = build_host(cx, many_rows(12));
+        vcx.run_until_parked();
+
+        let row0_bounds = vcx
+            .debug_bounds("connection-list-row-0")
+            .expect("row 0 must be painted");
+        let footer_bounds = vcx
+            .debug_bounds("connection-list-add-button")
+            .expect("the add-connection footer must stay painted with 12 connections");
+        let half_cap = px(f32::from(theme::MODAL_LIST_MAX_HEIGHT) / 2.0);
+        assert!(
+            footer_bounds.origin.y >= row0_bounds.origin.y + half_cap,
+            "the footer must sit below the capped scroll region, not just under row 0"
+        );
+
+        // Row 11 is still laid out (and so still has a recorded position)
+        // even while scrolled out of view -- overflow clips what paints,
+        // not what gets measured -- so "not reachable" means its position
+        // falls at or beyond the footer, outside the visible rows region.
+        let row11_bounds = vcx
+            .debug_bounds("connection-list-row-11")
+            .expect("row 11 is laid out even though it is clipped out of the capped viewport");
+        assert!(
+            row11_bounds.origin.y >= footer_bounds.origin.y,
+            "row 11 must not be visible inside the capped viewport before scrolling"
+        );
+
+        let scroll = host.read_with(vcx, |h, _app| h.list_scroll.scroll_state().clone());
+        assert!(
+            vcx.debug_bounds(vertical_thumb_debug_selector(&scroll))
+                .is_some(),
+            "12 connections overflowing the capped viewport must show a vertical scrollbar thumb"
+        );
+    }
+
+    #[gpui::test]
+    fn the_add_connection_footer_stays_clickable_with_many_connections(cx: &mut TestAppContext) {
+        let (_host, vcx, events) = build_host(cx, many_rows(12));
+        vcx.run_until_parked();
+
+        let bounds = vcx.debug_bounds("connection-list-add-button").expect(
+            "the add-connection button must stay tagged and painted outside the \
+                     scrolled rows region even with 12 connections",
+        );
+        vcx.simulate_click(bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        assert_eq!(*events.borrow(), vec![CapturedEvent::Add]);
+    }
+
+    #[gpui::test]
+    fn scrolling_the_capped_list_reveals_and_makes_clickable_a_row_hidden_beyond_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let rows = many_rows(12);
+        let target_id = rows[11].connection.id;
+        let (host, vcx, events) = build_host(cx, rows);
+        vcx.run_until_parked();
+
+        let scroll = host.read_with(vcx, |h, _app| h.list_scroll.scroll_state().clone());
+        let thumb_bounds = vcx
+            .debug_bounds(vertical_thumb_debug_selector(&scroll))
+            .expect("12 overflowing connections must show a scrollbar thumb to drag");
+
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: thumb_bounds.center(),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        let dragged_to = point(thumb_bounds.center().x, thumb_bounds.center().y + px(500.0));
+        vcx.simulate_event(MouseMoveEvent {
+            position: dragged_to,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: dragged_to,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        vcx.run_until_parked();
+
+        let row_bounds = vcx
+            .debug_bounds("connection-list-row-11")
+            .expect("row 11 must be reachable once the capped list is scrolled to its end");
+        vcx.simulate_click(row_bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        assert_eq!(*events.borrow(), vec![CapturedEvent::Connect(target_id)]);
+    }
+
+    #[gpui::test]
+    fn idle_reparking_after_the_first_frame_does_not_keep_rescheduling_renders(
+        cx: &mut TestAppContext,
+    ) {
+        let (host, vcx, _events) = build_host(cx, many_rows(12));
+        vcx.run_until_parked();
+
+        let scroll = host.read_with(vcx, |h, _app| h.list_scroll.scroll_state().clone());
+        assert!(
+            vcx.debug_bounds(vertical_thumb_debug_selector(&scroll))
+                .is_some(),
+            "the scrollbar must appear once the viewport is measured, with no further input"
+        );
+        let render_count_once_settled = host.read_with(vcx, |h, _app| h.render_count);
+
+        vcx.run_until_parked();
+        vcx.run_until_parked();
+        let render_count_after_idle_parking = host.read_with(vcx, |h, _app| h.render_count);
+
+        assert_eq!(
+            render_count_after_idle_parking, render_count_once_settled,
+            "once the viewport is measured, idle parking must not keep rescheduling renders"
+        );
     }
 }
