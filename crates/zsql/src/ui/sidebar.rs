@@ -27,7 +27,7 @@ use model::{SidebarRow, flatten_schema_tree, relation_icon_name, relation_tint};
 
 use super::tabs::TabModel;
 use super::theme;
-use crate::session::{SchemaState, Session};
+use crate::session::{SchemaState, Session, SessionState};
 
 mod model;
 
@@ -347,7 +347,11 @@ impl SidebarView {
             return None;
         }
         let active_theme = cx.theme();
-        let current = session.current_database().unwrap_or("").to_owned();
+        let current_text = if session.state() == &SessionState::Connecting {
+            "Connecting..."
+        } else {
+            session.current_database().unwrap_or("")
+        };
 
         Some(
             div()
@@ -376,15 +380,15 @@ impl SidebarView {
                                 .text_ellipsis()
                                 .text_size(px(theme::SIDEBAR_DB_SWITCHER_TEXT_SIZE))
                                 .text_color(rgb(active_theme.colors.text_secondary))
-                                .child(current),
+                                .child(current_text.to_owned()),
                         )
                         .child(icon(
                             IconName::ChevronDown,
                             theme::SIDEBAR_ROW_ICON_SIZE,
                             active_theme.colors.text_tertiary,
-                        )),
+                        ))
+                        .children(self.render_db_switcher_menu(cx)),
                 )
-                .children(self.render_db_switcher_menu(cx))
                 .into_any_element(),
         )
     }
@@ -401,17 +405,15 @@ impl SidebarView {
         let databases = session.available_databases().to_owned();
 
         let mut menu = ContextMenu::new("sidebar-db-switcher-menu")
-            .position(point(
-                px(theme::SIDEBAR_INDENT_L0),
-                theme::SIDEBAR_HEADER_HEIGHT,
-            ))
+            .anchor(gpui::Corner::TopLeft)
+            .offset(point(px(0.0), theme::SIDEBAR_HEADER_HEIGHT / 2.0))
             .on_close(cx.listener(|view, _event, _window, cx| {
                 view.close_db_switcher(cx);
             }));
         for database in databases {
             let selected = current.as_deref() == Some(database.as_str());
             let label = if selected {
-                format!("\u{2713} {database}")
+                format!("\u{2022}\t{database}")
             } else {
                 format!("  {database}")
             };

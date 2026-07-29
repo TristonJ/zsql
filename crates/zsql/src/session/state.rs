@@ -7,7 +7,7 @@ use std::time::Duration;
 use zsql_core::SchemaTree;
 
 /// What the session (and the results grid it drives) currently displays.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionState {
     /// No URL is configured (`DATABASE_URL` unset and no
     /// `connection.default_url` in the loaded [`Config`](crate::config::Config))
