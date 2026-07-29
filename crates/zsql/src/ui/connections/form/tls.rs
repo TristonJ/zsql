@@ -1,13 +1,12 @@
-//! The per-driver TLS-verification mode control: Off / Verify CA / Verify
-//! full for postgres and mysql/mariadb; for mssql the middle slot instead
-//! means "encrypt but trust the server certificate" (`tiberius` has no
-//! chain-only verification mode of its own, so the slot is repurposed
-//! rather than left unused). Reads from and writes back to each driver's
-//! own query-parameter encoding on the form's `parsed_url`: `sslmode` for
-//! postgres, `ssl-mode` for mysql/mariadb, and `encrypt`/
-//! `trustServerCertificate` for mssql.
+//! The per-driver TLS-verification mode control: postgres and mysql/mariadb
+//! each offer four modes (off / trust cert / verify ca / verify full);
+//! mssql offers three (off / trust cert / verify full), since `tiberius`
+//! has no chain-only verification mode of its own. Reads from and writes
+//! back to each driver's own query-parameter encoding on the form's
+//! `parsed_url`: `sslmode` for postgres, `ssl-mode` for mysql/mariadb, and
+//! `encrypt`/`trustServerCertificate` for mssql.
 
-use gpui::{Context, Div, Window, div, prelude::*, px, rgb};
+use gpui::{Context, Div, ElementId, SharedString, Window, div, prelude::*, px, rgb};
 use zsql_core::{ConnectionUrl, TlsVerify};
 use zsql_mssql::params::{
     ENCRYPT_KEY as MSSQL_ENCRYPT_KEY, TRUST_CERT_ALIAS_KEY as MSSQL_TRUST_CERT_ALIAS_KEY,
@@ -22,6 +21,7 @@ use super::ConnectionForm;
 
 const PG_SSLMODE_KEY: &str = "sslmode";
 const PG_SSLMODE_OFF: &str = "disable";
+const PG_SSLMODE_TRUST_CERT: &str = "require";
 const PG_SSLMODE_VERIFY_CA: &str = "verify-ca";
 const PG_SSLMODE_VERIFY_FULL: &str = "verify-full";
 
@@ -31,6 +31,7 @@ const MYSQL_SSLMODE_KEY: &str = "ssl-mode";
 /// would render as `Off` while the driver actually applies its mode.
 const MYSQL_SSLMODE_FALLBACK_KEY: &str = "sslmode";
 const MYSQL_SSLMODE_OFF: &str = "disabled";
+const MYSQL_SSLMODE_TRUST_CERT: &str = "required";
 const MYSQL_SSLMODE_VERIFY_CA: &str = "verify_ca";
 const MYSQL_SSLMODE_VERIFY_FULL: &str = "verify_identity";
 
@@ -54,11 +55,21 @@ pub(super) fn known_query_keys(driver_id: &str) -> Vec<&'static str> {
     }
 }
 
-/// The TLS modes every driver's control offers, in display order. What the
-/// middle slot ([`TlsVerify::VerifyCa`]) means differs by driver -- see
-/// [`mode_label`] -- but the control always has three positions.
-fn modes_for() -> &'static [TlsVerify] {
-    &[TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull]
+/// The TLS modes `driver_id`'s control offers, in display order. mssql has
+/// no chain-only verification mode of its own (`tiberius` either trusts the
+/// certificate outright or verifies it fully), so its control has three
+/// positions rather than postgres/mysql's four.
+fn modes_for(driver_id: &str) -> &'static [TlsVerify] {
+    if driver_id == "mssql" {
+        &[TlsVerify::Off, TlsVerify::TrustCert, TlsVerify::VerifyFull]
+    } else {
+        &[
+            TlsVerify::Off,
+            TlsVerify::TrustCert,
+            TlsVerify::VerifyCa,
+            TlsVerify::VerifyFull,
+        ]
+    }
 }
 
 /// The TLS modes currently selectable for `driver_id`, given whether the
@@ -67,7 +78,7 @@ fn modes_for() -> &'static [TlsVerify] {
 /// tunneled connection's hostname -- mssql verifies the real hostname
 /// through its own tunnel handling regardless, so it is never capped.
 pub(super) fn available_modes(driver_id: &str, ssh_enabled: bool) -> Vec<TlsVerify> {
-    let modes = modes_for();
+    let modes = modes_for(driver_id);
     if ssh_enabled && (is_mysql_family(driver_id) || driver_id == "postgres") {
         modes
             .iter()
@@ -99,30 +110,39 @@ fn effective_selected_mode(
 /// Whether the SSH toggle currently caps `driver_id`'s TLS control (drops
 /// verify-full), i.e. whether the "capped to verify-ca" note is shown.
 fn tls_is_capped(driver_id: &str, ssh_enabled: bool) -> bool {
-    ssh_enabled && available_modes(driver_id, ssh_enabled).len() < modes_for().len()
+    ssh_enabled && available_modes(driver_id, ssh_enabled).len() < modes_for(driver_id).len()
 }
 
-/// The label `driver_id`'s control shows for `mode`. mssql's middle slot
-/// reads "trust cert" rather than "verify ca": it skips certificate
-/// verification entirely (the opposite of what "verify" would imply), so
-/// reusing postgres/mysql's label here would claim a guarantee mssql does
-/// not make.
-fn mode_label(driver_id: &str, mode: TlsVerify) -> &'static str {
+/// The label every driver's control shows for `mode`. The text does not
+/// depend on the driver: each mode is its own [`TlsVerify`] variant.
+fn mode_label(mode: TlsVerify) -> &'static str {
     match mode {
         TlsVerify::Off => "off",
-        TlsVerify::VerifyCa if driver_id == "mssql" => "trust cert",
+        TlsVerify::TrustCert => "trust cert",
         TlsVerify::VerifyCa => "verify ca",
         TlsVerify::VerifyFull => "verify full",
     }
 }
 
-fn mode_element_id(driver_id: &str, mode: TlsVerify) -> &'static str {
-    match mode {
-        TlsVerify::Off => "connection-form-tls-off",
-        TlsVerify::VerifyCa if driver_id == "mssql" => "connection-form-tls-trust-cert",
-        TlsVerify::VerifyCa => "connection-form-tls-verify-ca",
-        TlsVerify::VerifyFull => "connection-form-tls-verify-full",
-    }
+/// A stable gpui element id for `driver_id`'s `mode` option, unique across
+/// every driver's control so no two controls ever share a painted id.
+fn mode_element_id(driver_id: &str, mode: TlsVerify) -> ElementId {
+    let family = if driver_id == "mssql" {
+        "mssql"
+    } else if is_mysql_family(driver_id) {
+        "mysql"
+    } else {
+        "postgres"
+    };
+    let slug = match mode {
+        TlsVerify::Off => "off",
+        TlsVerify::TrustCert => "trust-cert",
+        TlsVerify::VerifyCa => "verify-ca",
+        TlsVerify::VerifyFull => "verify-full",
+    };
+    ElementId::from(SharedString::from(format!(
+        "connection-form-tls-{family}-{slug}"
+    )))
 }
 
 pub(super) fn read_mode(driver_id: &str, parsed: &ConnectionUrl) -> TlsVerify {
@@ -149,6 +169,7 @@ fn read_postgres_mode(parsed: &ConnectionUrl) -> TlsVerify {
     match parsed.query_param(PG_SSLMODE_KEY).as_deref() {
         Some(PG_SSLMODE_VERIFY_FULL) => TlsVerify::VerifyFull,
         Some(PG_SSLMODE_VERIFY_CA) => TlsVerify::VerifyCa,
+        Some(PG_SSLMODE_TRUST_CERT) => TlsVerify::TrustCert,
         _ => TlsVerify::Off,
     }
 }
@@ -156,6 +177,7 @@ fn read_postgres_mode(parsed: &ConnectionUrl) -> TlsVerify {
 fn write_postgres_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
     let value = match mode {
         TlsVerify::Off => PG_SSLMODE_OFF,
+        TlsVerify::TrustCert => PG_SSLMODE_TRUST_CERT,
         TlsVerify::VerifyCa => PG_SSLMODE_VERIFY_CA,
         TlsVerify::VerifyFull => PG_SSLMODE_VERIFY_FULL,
     };
@@ -169,6 +191,7 @@ fn read_mysql_mode(parsed: &ConnectionUrl) -> TlsVerify {
     match value.as_deref() {
         Some(MYSQL_SSLMODE_VERIFY_FULL) => TlsVerify::VerifyFull,
         Some(MYSQL_SSLMODE_VERIFY_CA) => TlsVerify::VerifyCa,
+        Some(MYSQL_SSLMODE_TRUST_CERT) => TlsVerify::TrustCert,
         _ => TlsVerify::Off,
     }
 }
@@ -176,6 +199,7 @@ fn read_mysql_mode(parsed: &ConnectionUrl) -> TlsVerify {
 fn write_mysql_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
     let value = match mode {
         TlsVerify::Off => MYSQL_SSLMODE_OFF,
+        TlsVerify::TrustCert => MYSQL_SSLMODE_TRUST_CERT,
         TlsVerify::VerifyCa => MYSQL_SSLMODE_VERIFY_CA,
         TlsVerify::VerifyFull => MYSQL_SSLMODE_VERIFY_FULL,
     };
@@ -188,9 +212,8 @@ fn write_mysql_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
 /// mssql's mode, read off `parsed`'s `encrypt`/`trustServerCertificate`
 /// params: `encrypt=false` always wins as [`TlsVerify::Off`] regardless of
 /// `trustServerCertificate` (there is nothing left to trust once encryption
-/// itself is off); otherwise `trustServerCertificate=true` reads as the
-/// trust-cert mode (repurposing [`TlsVerify::VerifyCa`]'s slot -- see the
-/// module doc comment), and its absence as [`TlsVerify::VerifyFull`].
+/// itself is off); otherwise `trustServerCertificate=true` reads as
+/// [`TlsVerify::TrustCert`], and its absence as [`TlsVerify::VerifyFull`].
 fn read_mssql_mode(parsed: &ConnectionUrl) -> TlsVerify {
     let encrypt =
         mssql_param_ci(parsed, &[MSSQL_ENCRYPT_KEY]).is_none_or(|value| mssql_is_truthy(&value));
@@ -201,7 +224,7 @@ fn read_mssql_mode(parsed: &ConnectionUrl) -> TlsVerify {
         mssql_param_ci(parsed, &[MSSQL_TRUST_CERT_KEY, MSSQL_TRUST_CERT_ALIAS_KEY])
             .is_some_and(|value| mssql_is_truthy(&value));
     if trust_server_certificate {
-        TlsVerify::VerifyCa
+        TlsVerify::TrustCert
     } else {
         TlsVerify::VerifyFull
     }
@@ -214,12 +237,15 @@ fn write_mssql_mode(parsed: &mut ConnectionUrl, mode: TlsVerify) {
             parsed.remove_query_param(MSSQL_TRUST_CERT_KEY);
             parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
         }
-        TlsVerify::VerifyCa => {
+        TlsVerify::TrustCert => {
             parsed.remove_query_param(MSSQL_ENCRYPT_KEY);
             parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
             parsed.set_query_param(MSSQL_TRUST_CERT_KEY, "true");
         }
-        TlsVerify::VerifyFull => {
+        // mssql's control never offers verify-ca (see `modes_for`); a
+        // caller reaching this arm anyway gets full verification, the same
+        // as the absence of `trustServerCertificate`.
+        TlsVerify::VerifyCa | TlsVerify::VerifyFull => {
             parsed.remove_query_param(MSSQL_ENCRYPT_KEY);
             parsed.remove_query_param(MSSQL_TRUST_CERT_KEY);
             parsed.remove_query_param(MSSQL_TRUST_CERT_ALIAS_KEY);
@@ -249,7 +275,7 @@ impl ConnectionForm {
                 window,
                 cx,
                 mode_element_id(driver_id, mode),
-                mode_label(driver_id, mode),
+                mode_label(mode),
                 cx.listener(move |view, _event, _window, cx| {
                     view.set_tls_mode(&driver_id_owned, mode, cx);
                 }),
@@ -304,16 +330,25 @@ impl ConnectionForm {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use zsql_core::{ConnectionUrl, TlsVerify};
 
     use super::{
         MSSQL_TRUST_CERT_ALIAS_KEY, available_modes, effective_selected_mode, known_query_keys,
-        mode_label, read_mode, tls_is_capped, write_mode,
+        mode_element_id, mode_label, read_mode, tls_is_capped, write_mode,
     };
 
     fn parse(url: &str) -> ConnectionUrl {
         ConnectionUrl::parse(url).expect("test URL must parse")
     }
+
+    const ALL_MODES: [TlsVerify; 4] = [
+        TlsVerify::Off,
+        TlsVerify::TrustCert,
+        TlsVerify::VerifyCa,
+        TlsVerify::VerifyFull,
+    ];
 
     #[test]
     fn selected_mode_reflects_the_verify_ca_cap_once_ssh_is_on() {
@@ -376,7 +411,7 @@ mod tests {
 
     #[test]
     fn postgres_round_trips_every_mode_through_sslmode() {
-        for mode in [TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull] {
+        for mode in ALL_MODES {
             let mut url = parse("postgres://host/db");
             write_mode("postgres", &mut url, mode);
             assert_eq!(
@@ -396,18 +431,42 @@ mod tests {
         write_mode("postgres", &mut url, TlsVerify::VerifyCa);
         assert_eq!(url.query_param("sslmode").as_deref(), Some("verify-ca"));
 
+        write_mode("postgres", &mut url, TlsVerify::TrustCert);
+        assert_eq!(url.query_param("sslmode").as_deref(), Some("require"));
+
         write_mode("postgres", &mut url, TlsVerify::Off);
         assert_eq!(url.query_param("sslmode").as_deref(), Some("disable"));
+    }
+
+    #[test]
+    fn postgres_trust_cert_writes_exactly_sslmode_require_and_preserves_other_params() {
+        let mut url = parse("postgres://host/db?sslmode=disable&application_name=zsql");
+        write_mode("postgres", &mut url, TlsVerify::TrustCert);
+        assert_eq!(url.query_param("sslmode").as_deref(), Some("require"));
+        assert_eq!(
+            url.query_param("application_name").as_deref(),
+            Some("zsql"),
+            "an unrelated query parameter must survive the TLS edit"
+        );
     }
 
     // -- mysql / mariadb ---------------------------------------------------
 
     #[test]
     fn mysql_round_trips_every_mode_through_ssl_mode() {
-        for mode in [TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull] {
+        for mode in ALL_MODES {
             let mut url = parse("mysql://host/db");
             write_mode("mysql", &mut url, mode);
             assert_eq!(read_mode("mysql", &url), mode, "mode {mode:?} round-trip");
+        }
+    }
+
+    #[test]
+    fn mariadb_round_trips_every_mode_through_ssl_mode() {
+        for mode in ALL_MODES {
+            let mut url = parse("mariadb://host/db");
+            write_mode("mariadb", &mut url, mode);
+            assert_eq!(read_mode("mariadb", &url), mode, "mode {mode:?} round-trip");
         }
     }
 
@@ -429,6 +488,12 @@ mod tests {
     }
 
     #[test]
+    fn mysql_reads_the_sslmode_required_fallback_as_the_trust_cert_mode() {
+        let url = parse("mysql://host/db?sslmode=required");
+        assert_eq!(read_mode("mysql", &url), TlsVerify::TrustCert);
+    }
+
+    #[test]
     fn mysql_prefers_ssl_mode_over_the_sslmode_fallback_when_both_are_present() {
         let url = parse("mysql://host/db?ssl-mode=disabled&sslmode=verify_identity");
         assert_eq!(read_mode("mysql", &url), TlsVerify::Off);
@@ -446,6 +511,14 @@ mod tests {
     }
 
     #[test]
+    fn mysql_trust_cert_write_clears_the_sslmode_fallback_key() {
+        let mut url = parse("mysql://host/db?sslmode=verify_ca");
+        write_mode("mysql", &mut url, TlsVerify::TrustCert);
+        assert_eq!(url.query_param("sslmode"), None);
+        assert_eq!(url.query_param("ssl-mode").as_deref(), Some("required"));
+    }
+
+    #[test]
     fn mysql_writes_the_expected_ssl_mode_values() {
         let mut url = parse("mysql://host/db");
         write_mode("mysql", &mut url, TlsVerify::VerifyFull);
@@ -457,8 +530,23 @@ mod tests {
         write_mode("mysql", &mut url, TlsVerify::VerifyCa);
         assert_eq!(url.query_param("ssl-mode").as_deref(), Some("verify_ca"));
 
+        write_mode("mysql", &mut url, TlsVerify::TrustCert);
+        assert_eq!(url.query_param("ssl-mode").as_deref(), Some("required"));
+
         write_mode("mysql", &mut url, TlsVerify::Off);
         assert_eq!(url.query_param("ssl-mode").as_deref(), Some("disabled"));
+    }
+
+    #[test]
+    fn mysql_trust_cert_writes_exactly_ssl_mode_required_and_preserves_other_params() {
+        let mut url = parse("mysql://host/db?ssl-mode=disabled&application_name=zsql");
+        write_mode("mysql", &mut url, TlsVerify::TrustCert);
+        assert_eq!(url.query_param("ssl-mode").as_deref(), Some("required"));
+        assert_eq!(
+            url.query_param("application_name").as_deref(),
+            Some("zsql"),
+            "an unrelated query parameter must survive the TLS edit"
+        );
     }
 
     // -- mssql ---------------------------------------------------------
@@ -473,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn mssql_round_trips_all_three_modes() {
-        for mode in [TlsVerify::Off, TlsVerify::VerifyCa, TlsVerify::VerifyFull] {
+    fn mssql_round_trips_its_three_modes() {
+        for mode in [TlsVerify::Off, TlsVerify::TrustCert, TlsVerify::VerifyFull] {
             let mut url = parse("mssql://host/db");
             write_mode("mssql", &mut url, mode);
             assert_eq!(read_mode("mssql", &url), mode, "mode {mode:?} round-trip");
@@ -492,7 +580,7 @@ mod tests {
     #[test]
     fn mssql_trust_cert_writes_exactly_trust_server_certificate_true_and_leaves_encrypt_default() {
         let mut url = parse("mssql://host/db");
-        write_mode("mssql", &mut url, TlsVerify::VerifyCa);
+        write_mode("mssql", &mut url, TlsVerify::TrustCert);
         assert_eq!(
             url.query_param("trustServerCertificate").as_deref(),
             Some("true")
@@ -507,7 +595,7 @@ mod tests {
     #[test]
     fn mssql_trust_server_certificate_true_reads_as_the_trust_cert_mode_when_encrypt_is_on() {
         let url = parse("mssql://host/db?encrypt=true&trustServerCertificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::TrustCert);
     }
 
     #[test]
@@ -523,19 +611,19 @@ mod tests {
     #[test]
     fn mssql_reads_the_yes_spelling_of_trust_server_certificate_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?trustServerCertificate=yes");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::TrustCert);
     }
 
     #[test]
     fn mssql_reads_a_differently_cased_trust_server_certificate_key_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?TrustServerCertificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::TrustCert);
     }
 
     #[test]
     fn mssql_reads_the_snake_case_trust_server_certificate_alias_as_the_trust_cert_mode() {
         let url = parse("mssql://host/db?trust_server_certificate=true");
-        assert_eq!(read_mode("mssql", &url), TlsVerify::VerifyCa);
+        assert_eq!(read_mode("mssql", &url), TlsVerify::TrustCert);
     }
 
     #[test]
@@ -549,17 +637,27 @@ mod tests {
         assert!(known_query_keys("mssql").contains(&MSSQL_TRUST_CERT_ALIAS_KEY));
     }
 
+    // -- labels ------------------------------------------------------------
+
     #[test]
-    fn mssql_trust_cert_mode_label_is_distinct_from_verify_ca() {
-        assert_eq!(mode_label("mssql", TlsVerify::VerifyCa), "trust cert");
-        assert_ne!(mode_label("mssql", TlsVerify::VerifyCa), "verify ca");
+    fn trust_cert_mode_label_is_the_literal_string_trust_cert() {
+        // The label does not depend on which driver's control renders it,
+        // so this one assertion covers mssql, postgres, and mysql/mariadb
+        // alike.
+        assert_eq!(mode_label(TlsVerify::TrustCert), "trust cert");
+    }
+
+    #[test]
+    fn trust_cert_label_is_distinct_from_the_real_verify_ca_label() {
+        assert_ne!(
+            mode_label(TlsVerify::TrustCert),
+            mode_label(TlsVerify::VerifyCa)
+        );
     }
 
     #[test]
     fn postgres_and_mysql_keep_the_real_verify_ca_label() {
-        for driver_id in ["postgres", "mysql", "mariadb"] {
-            assert_eq!(mode_label(driver_id, TlsVerify::VerifyCa), "verify ca");
-        }
+        assert_eq!(mode_label(TlsVerify::VerifyCa), "verify ca");
     }
 
     // -- capping while an SSH tunnel is enabled -----------------------------
@@ -572,6 +670,7 @@ mod tests {
                 !modes.contains(&TlsVerify::VerifyFull),
                 "{driver_id} must not offer verify-full while SSH is enabled"
             );
+            assert!(modes.contains(&TlsVerify::TrustCert));
             assert!(modes.contains(&TlsVerify::VerifyCa));
             assert!(modes.contains(&TlsVerify::Off));
         }
@@ -596,11 +695,71 @@ mod tests {
     }
 
     #[test]
-    fn mssql_offers_a_third_mode_alongside_off_and_verify_full() {
-        // The slot rendered by `TlsVerify::VerifyCa` for mssql is the
-        // trust-cert mode (see `mode_label`), not real CA verification --
-        // but the control still offers three positions, regardless of SSH.
-        assert!(available_modes("mssql", false).contains(&TlsVerify::VerifyCa));
-        assert!(available_modes("mssql", true).contains(&TlsVerify::VerifyCa));
+    fn mssql_offers_exactly_three_modes_off_trust_cert_and_verify_full() {
+        for ssh_enabled in [false, true] {
+            let modes = available_modes("mssql", ssh_enabled);
+            assert_eq!(
+                modes,
+                vec![TlsVerify::Off, TlsVerify::TrustCert, TlsVerify::VerifyFull],
+                "mssql's control must always render exactly these three modes, in order"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_and_mysql_offer_exactly_four_modes_in_order_with_no_ssh() {
+        for driver_id in ["postgres", "mysql", "mariadb"] {
+            assert_eq!(
+                available_modes(driver_id, false),
+                vec![
+                    TlsVerify::Off,
+                    TlsVerify::TrustCert,
+                    TlsVerify::VerifyCa,
+                    TlsVerify::VerifyFull,
+                ],
+                "{driver_id}: modes must be offered off -> trust cert -> verify ca -> verify full"
+            );
+        }
+    }
+
+    // -- element ids ---------------------------------------------------------
+
+    #[test]
+    fn every_mode_element_id_is_unique_across_the_three_network_drivers() {
+        // mariadb intentionally shares mysql's ids (see `mode_element_id`):
+        // the two schemes drive the same control and are never rendered
+        // side by side, so only mssql/postgres/mysql need to be distinct
+        // from one another here.
+        let mut ids = HashSet::new();
+        for driver_id in ["mssql", "postgres", "mysql"] {
+            for mode in modes_for_test(driver_id) {
+                let id = mode_element_id(driver_id, mode);
+                assert!(
+                    ids.insert(format!("{id}")),
+                    "duplicate element id {id} for driver {driver_id} mode {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mariadb_and_mysql_share_the_same_mode_element_ids() {
+        for mode in ALL_MODES {
+            assert_eq!(
+                format!("{}", mode_element_id("mariadb", mode)),
+                format!("{}", mode_element_id("mysql", mode)),
+                "mariadb and mysql drive the same control, so their ids must match"
+            );
+        }
+    }
+
+    /// mssql's three modes vs. postgres/mysql's four, mirroring
+    /// [`super::modes_for`] without exposing it outside this test.
+    fn modes_for_test(driver_id: &str) -> Vec<TlsVerify> {
+        if driver_id == "mssql" {
+            vec![TlsVerify::Off, TlsVerify::TrustCert, TlsVerify::VerifyFull]
+        } else {
+            ALL_MODES.to_vec()
+        }
     }
 }

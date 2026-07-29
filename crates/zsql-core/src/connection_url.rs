@@ -504,7 +504,7 @@ pub fn tunneled_connect_url_capping_verify_full(
             url.set_query_param(sslmode.param_names[0], sslmode.verify_ca);
             Ok((url.to_url_string(), TlsVerify::VerifyCa))
         }
-        TlsVerify::VerifyCa | TlsVerify::Off => {
+        TlsVerify::TrustCert | TlsVerify::VerifyCa | TlsVerify::Off => {
             Ok((rewrite_for_tunnel(original, tunnel_addr)?, requested))
         }
     }

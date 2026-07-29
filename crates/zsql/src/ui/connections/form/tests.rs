@@ -247,6 +247,42 @@ fn selecting_tls_off_writes_the_disable_sslmode_value(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn selecting_tls_trust_cert_for_postgres_writes_the_require_sslmode_value(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("postgres://app:s3cr3t@host:5432/app?sslmode=disable", cx);
+    });
+    form.update(cx, |form, cx| {
+        form.set_tls_mode("postgres", zsql_core::TlsVerify::TrustCert, cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let url = form.url_field.read(cx).value().to_string();
+        assert!(
+            url.contains("sslmode=require"),
+            "selecting trust cert must write sslmode=require, got {url}"
+        );
+    });
+}
+
+#[gpui::test]
+fn selecting_tls_trust_cert_for_mysql_writes_the_required_ssl_mode_value(cx: &mut TestAppContext) {
+    let (form, _events) = build_form(cx);
+    form.update(cx, |form, cx| {
+        form.set_url_input("mysql://app:s3cr3t@host:3306/app?ssl-mode=disabled", cx);
+    });
+    form.update(cx, |form, cx| {
+        form.set_tls_mode("mysql", zsql_core::TlsVerify::TrustCert, cx);
+    });
+    form.read_with(cx, |form, cx| {
+        let url = form.url_field.read(cx).value().to_string();
+        assert!(
+            url.contains("ssl-mode=required"),
+            "selecting trust cert must write ssl-mode=required, got {url}"
+        );
+    });
+}
+
+#[gpui::test]
 fn editing_a_driver_field_rewrites_the_url_field_live(cx: &mut TestAppContext) {
     let (form, _events) = build_form(cx);
     form.update(cx, |form, cx| {
@@ -1235,6 +1271,10 @@ fn postgres_tls_control_drops_verify_full_while_ssh_is_enabled_and_restores_it_o
             form.tls_available_modes_for_test("postgres")
                 .contains(&zsql_core::TlsVerify::VerifyFull)
         );
+        assert!(
+            form.tls_available_modes_for_test("postgres")
+                .contains(&zsql_core::TlsVerify::TrustCert)
+        );
     });
 
     form.update(cx, |form, cx| form.set_ssh_enabled(true, cx));
@@ -1243,6 +1283,11 @@ fn postgres_tls_control_drops_verify_full_while_ssh_is_enabled_and_restores_it_o
             !form
                 .tls_available_modes_for_test("postgres")
                 .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+        assert!(
+            form.tls_available_modes_for_test("postgres")
+                .contains(&zsql_core::TlsVerify::TrustCert),
+            "trust cert must stay available while the SSH tunnel caps verify full"
         );
     });
 
@@ -1267,6 +1312,11 @@ fn mysql_tls_control_is_also_capped_while_ssh_is_enabled(cx: &mut TestAppContext
             !form
                 .tls_available_modes_for_test("mysql")
                 .contains(&zsql_core::TlsVerify::VerifyFull)
+        );
+        assert!(
+            form.tls_available_modes_for_test("mysql")
+                .contains(&zsql_core::TlsVerify::TrustCert),
+            "trust cert must stay available while the SSH tunnel caps verify full"
         );
     });
 }

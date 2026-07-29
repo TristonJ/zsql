@@ -9,6 +9,9 @@ pub enum TlsVerify {
     /// No certificate verification requested (or TLS not in use at all).
     #[default]
     Off,
+    /// TLS is in use, but the server's certificate is accepted without any
+    /// validation against a trust store.
+    TrustCert,
     /// Verify the certificate chain against a trusted CA, but not the
     /// server's hostname.
     VerifyCa,
@@ -24,6 +27,7 @@ impl TlsVerify {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::TrustCert => "trust-cert",
             Self::VerifyCa => "verify-ca",
             Self::VerifyFull => "verify-full",
         }
@@ -42,7 +46,13 @@ mod tests {
     #[test]
     fn label_names_each_variant() {
         assert_eq!(TlsVerify::Off.label(), "off");
+        assert_eq!(TlsVerify::TrustCert.label(), "trust-cert");
         assert_eq!(TlsVerify::VerifyCa.label(), "verify-ca");
         assert_eq!(TlsVerify::VerifyFull.label(), "verify-full");
+    }
+
+    #[test]
+    fn trust_cert_label_is_distinct_from_verify_ca() {
+        assert_ne!(TlsVerify::TrustCert.label(), TlsVerify::VerifyCa.label());
     }
 }

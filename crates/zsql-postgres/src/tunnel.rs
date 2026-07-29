@@ -56,6 +56,24 @@ mod tests {
     }
 
     #[test]
+    fn sslmode_require_falls_back_to_the_plain_rewrite() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let (url, verify) =
+            tunneled_connect_url("postgres://db.internal/app?sslmode=require", addr).unwrap();
+        assert_eq!(
+            verify,
+            TlsVerify::Off,
+            "a trust-cert request already does not verify identity, so it is not capped"
+        );
+        let parsed = ConnectionUrl::parse(&url).unwrap();
+        assert_eq!(
+            parsed.query_param("sslmode").as_deref(),
+            Some("require"),
+            "the trust-cert value must pass through the rewrite unmodified"
+        );
+    }
+
+    #[test]
     fn verify_full_is_capped_to_verify_ca_and_rewrites_host_and_port() {
         let addr = "127.0.0.1:54321".parse().unwrap();
         let (url, verify) = tunneled_connect_url(
