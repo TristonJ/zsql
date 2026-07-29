@@ -1,15 +1,114 @@
-//! OS text/IME input plumbing for [`EditorView`]: the `EntityInputHandler`
-//! implementation `gpui` drives keyboard and IME input through, plus the
-//! UTF-16 code-unit <-> flat char-offset conversions it needs since
-//! `EntityInputHandler` counts in UTF-16 while `TextBuffer` counts in chars.
+//! OS text/IME input plumbing for [`EditorView`]: an implementation of
+//! `zsql_ui::text_input::TextSource` over [`crate::TextBuffer`], and the
+//! `EntityInputHandler` impl that routes through `zsql_ui::text_input`'s
+//! shared plumbing.
+//!
+//! `TextSource` offsets are flat byte offsets into `buffer.text()`, the
+//! multi-line document joined by `\n`; `TextBuffer`'s own line/column
+//! `Position` is char-indexed within each line. This module is the
+//! translation boundary between the two: [`EditorView::position_for_offset`]
+//! and [`EditorView::offset_for_position`] convert one way,
+//! [`EditorView`]'s own `marked_range` field (kept char-indexed so
+//! [`super::element::build_runs`]'s per-line highlighter-span math never has
+//! to reason about bytes) converts the other via
+//! [`char_offset_to_byte`]/[`byte_offset_to_char`].
 
 use std::ops::Range;
 
-use gpui::{Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window, point, px};
+use gpui::{Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window, px};
+use zsql_ui::text_input::{self, TextSource};
 
 use super::EditorView;
-use super::element::line_top;
+use crate::Position;
 use crate::theme;
+
+impl TextSource for EditorView {
+    fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    fn cursor_offset(&self) -> usize {
+        self.offset_for_position(self.buffer.cursor())
+    }
+
+    fn selection_range(&self) -> Option<Range<usize>> {
+        let selection = self.buffer.selection()?;
+        let (start, end) = selection.ordered();
+        Some(self.offset_for_position(start)..self.offset_for_position(end))
+    }
+
+    fn selection_reversed(&self) -> bool {
+        self.buffer
+            .selection()
+            .is_some_and(|selection| selection.anchor > selection.cursor)
+    }
+
+    fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        let anchor_pos = self.position_for_offset(anchor);
+        let cursor_pos = self.position_for_offset(cursor);
+        self.buffer.set_selection(anchor_pos, cursor_pos);
+    }
+
+    fn marked_range(&self) -> Option<Range<usize>> {
+        let text = self.buffer.text();
+        self.marked_range.clone().map(|char_range| {
+            char_offset_to_byte(&text, char_range.start)..char_offset_to_byte(&text, char_range.end)
+        })
+    }
+
+    fn set_marked_range(&mut self, range: Option<Range<usize>>) {
+        let text = self.buffer.text();
+        self.marked_range = range.map(|byte_range| {
+            byte_offset_to_char(&text, byte_range.start)..byte_offset_to_char(&text, byte_range.end)
+        });
+    }
+
+    fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        let start_pos = self.position_for_offset(range.start);
+        let end_pos = self.position_for_offset(range.end);
+        self.buffer.set_selection(start_pos, end_pos);
+        self.buffer.insert_text(text);
+    }
+
+    fn line_position(&self, offset: usize) -> (usize, usize) {
+        let mut remaining = offset;
+        for (line_index, line) in self.buffer.lines().iter().enumerate() {
+            let len = line.len();
+            if remaining <= len {
+                return (line_index, remaining);
+            }
+            remaining -= len + 1; // +1 for the newline joining it to the next line
+        }
+        let last = self.buffer.lines().len() - 1;
+        (last, self.buffer.lines()[last].len())
+    }
+
+    fn offset_for_line_position(&self, line: usize, in_line_offset: usize) -> usize {
+        let line = line.min(self.buffer.lines().len() - 1);
+        let mut offset = 0;
+        for earlier in &self.buffer.lines()[..line] {
+            offset += earlier.len() + 1;
+        }
+        offset + in_line_offset.min(self.buffer.lines()[line].len())
+    }
+}
+
+impl EditorView {
+    /// The document position at flat byte `offset` (see
+    /// [`TextSource::line_position`]), clamped to the document.
+    fn position_for_offset(&self, offset: usize) -> Position {
+        let (line, in_line_byte) = self.line_position(offset);
+        let column = self.buffer.lines()[line][..in_line_byte].chars().count();
+        Position::new(line, column)
+    }
+
+    /// The flat byte offset of `position`. Inverse of
+    /// [`EditorView::position_for_offset`].
+    fn offset_for_position(&self, position: Position) -> usize {
+        let in_line_byte = self.buffer.line_byte_offset(position);
+        self.offset_for_line_position(position.line, in_line_byte)
+    }
+}
 
 impl EntityInputHandler for EditorView {
     fn text_for_range(
@@ -19,15 +118,9 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let text = self.buffer.text();
-        let char_range = char_range_from_utf16(&text, range_utf16);
-        actual_range.replace(char_range_to_utf16(&text, char_range.clone()));
-        Some(
-            text.chars()
-                .skip(char_range.start)
-                .take(char_range.len())
-                .collect(),
-        )
+        let (text, actual) = text_input::text_for_range(self, range_utf16);
+        actual_range.replace(actual);
+        Some(text)
     }
 
     fn selected_text_range(
@@ -36,21 +129,7 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let text = self.buffer.text();
-        let cursor_offset = self.buffer.char_offset_for_position(self.buffer.cursor());
-        let (start, end, reversed) = match self.buffer.selection() {
-            Some(selection) => {
-                let (start_pos, end_pos) = selection.ordered();
-                let start = self.buffer.char_offset_for_position(start_pos);
-                let end = self.buffer.char_offset_for_position(end_pos);
-                (start, end, selection.cursor == start_pos)
-            }
-            None => (cursor_offset, cursor_offset, false),
-        };
-        Some(UTF16Selection {
-            range: char_range_to_utf16(&text, start..end),
-            reversed,
-        })
+        Some(text_input::selected_text_range(self))
     }
 
     fn marked_text_range(
@@ -58,14 +137,11 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        let text = self.buffer.text();
-        self.marked_range
-            .clone()
-            .map(|range| char_range_to_utf16(&text, range))
+        text_input::marked_text_range(self)
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+        text_input::unmark_text(self);
     }
 
     fn replace_text_in_range(
@@ -75,12 +151,16 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let char_range = self.resolve_replace_range(range_utf16);
-        let start_pos = self.buffer.position_for_char_offset(char_range.start);
-        let end_pos = self.buffer.position_for_char_offset(char_range.end);
-        self.buffer.set_selection(start_pos, end_pos);
-        self.buffer.insert_text(new_text);
-        self.marked_range = None;
+        // Only a real IME composition finishing is notable enough to log --
+        // this same path also runs on every plain typed keystroke, which
+        // would otherwise flood a debug trace.
+        if self.marked_range.is_some() {
+            tracing::debug!(
+                chars = new_text.chars().count(),
+                "editor committing ime composition"
+            );
+        }
+        text_input::replace_text_in_range(self, range_utf16, new_text);
         self.notify_edit(cx);
     }
 
@@ -92,35 +172,12 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let char_range = self.resolve_replace_range(range_utf16);
-        let start_pos = self.buffer.position_for_char_offset(char_range.start);
-        let end_pos = self.buffer.position_for_char_offset(char_range.end);
-        self.buffer.set_selection(start_pos, end_pos);
-        self.buffer.insert_text(new_text);
-
-        let inserted_start = char_range.start;
-        let inserted_len = new_text.chars().count();
-        self.marked_range = if new_text.is_empty() {
-            None
-        } else {
-            Some(inserted_start..inserted_start + inserted_len)
-        };
-
-        if let Some(relative_utf16) = new_selected_range_utf16 {
-            // `new_selected_range_utf16` is UTF-16-relative to `new_text` itself
-            // (NSTextInputClient's `setMarkedText:selectedRange:` semantics), not
-            // to the document as a whole, so it must be resolved against
-            // `new_text` before adding `inserted_start`.
-            let relative = char_range_from_utf16(new_text, relative_utf16);
-            let selection_start = self
-                .buffer
-                .position_for_char_offset(inserted_start + relative.start);
-            let selection_end = self
-                .buffer
-                .position_for_char_offset(inserted_start + relative.end);
-            self.buffer.set_selection(selection_start, selection_end);
-        }
-
+        text_input::replace_and_mark_text_in_range(
+            self,
+            range_utf16,
+            new_text,
+            new_selected_range_utf16,
+        );
         self.notify_edit(cx);
     }
 
@@ -131,30 +188,13 @@ impl EntityInputHandler for EditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let text = self.buffer.text();
-        let char_range = char_range_from_utf16(&text, range_utf16);
-        let start = self.buffer.position_for_char_offset(char_range.start);
-        let end = self.buffer.position_for_char_offset(char_range.end);
-        if start.line != end.line {
-            // A marked/queried range spanning multiple lines is rare for SQL
-            // IME input; keep the OS-facing geometry simple and decline it
-            // rather than paint a misleading single-line box.
-            return None;
-        }
-
-        let line = self.last_lines.get(start.line)?;
-        let line_height = px(theme::EDITOR_LINE_HEIGHT);
-        let top = line_top(element_bounds.top(), line_height, start.line);
-        Some(Bounds::from_corners(
-            point(
-                element_bounds.left() + line.x_for_index(self.buffer.line_byte_offset(start)),
-                top,
-            ),
-            point(
-                element_bounds.left() + line.x_for_index(self.buffer.line_byte_offset(end)),
-                top + line_height,
-            ),
-        ))
+        text_input::bounds_for_range(
+            self,
+            range_utf16,
+            element_bounds,
+            &self.last_lines,
+            px(theme::EDITOR_LINE_HEIGHT),
+        )
     }
 
     fn character_index_for_point(
@@ -164,64 +204,21 @@ impl EntityInputHandler for EditorView {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let position = self.position_for_point(point)?;
-        let text = self.buffer.text();
-        let char_offset = self.buffer.char_offset_for_position(position);
-        Some(char_offset_to_utf16(&text, char_offset))
+        let offset = self.offset_for_position(position);
+        Some(text_input::character_index_for_point(self, offset))
     }
 }
 
-impl EditorView {
-    /// The flat char range a `replace_text_in_range`-style call should
-    /// operate on: the given UTF-16 range if present, else the active IME
-    /// composition range, else the current selection (collapsed to the
-    /// cursor if there is none).
-    fn resolve_replace_range(&self, range_utf16: Option<Range<usize>>) -> Range<usize> {
-        if let Some(range_utf16) = range_utf16 {
-            let text = self.buffer.text();
-            return char_range_from_utf16(&text, range_utf16);
-        }
-        if let Some(marked) = self.marked_range.clone() {
-            return marked;
-        }
-        let cursor = self.buffer.char_offset_for_position(self.buffer.cursor());
-        match self.buffer.selection() {
-            Some(selection) => {
-                let (start, end) = selection.ordered();
-                self.buffer.char_offset_for_position(start)
-                    ..self.buffer.char_offset_for_position(end)
-            }
-            None => cursor..cursor,
-        }
-    }
+/// The byte offset of the `char_offset`-th character of `text`, clamped to
+/// `text`'s length.
+fn char_offset_to_byte(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map_or(text.len(), |(byte_idx, _)| byte_idx)
 }
 
-// -- UTF-16 <-> flat char offset conversions --------------------------------
-//
-// `EntityInputHandler` deals in UTF-16 code unit offsets into "the text" the
-// OS was told about, which here is the whole document (`buffer.text()`).
-// `TextBuffer` itself only knows char offsets, so these free functions
-// bridge the two at the gpui boundary -- they stay out of the buffer module
-// so it has no reason to know what an OS text input API counts in.
-
-fn char_offset_from_utf16(text: &str, offset_utf16: usize) -> usize {
-    let mut utf16_count = 0;
-    for (char_index, ch) in text.chars().enumerate() {
-        if utf16_count >= offset_utf16 {
-            return char_index;
-        }
-        utf16_count += ch.len_utf16();
-    }
-    text.chars().count()
-}
-
-fn char_offset_to_utf16(text: &str, offset: usize) -> usize {
-    text.chars().take(offset).map(char::len_utf16).sum()
-}
-
-fn char_range_from_utf16(text: &str, range: Range<usize>) -> Range<usize> {
-    char_offset_from_utf16(text, range.start)..char_offset_from_utf16(text, range.end)
-}
-
-fn char_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
-    char_offset_to_utf16(text, range.start)..char_offset_to_utf16(text, range.end)
+/// The number of characters in `text` before byte offset `byte_offset`.
+/// Inverse of [`char_offset_to_byte`].
+fn byte_offset_to_char(text: &str, byte_offset: usize) -> usize {
+    text[..byte_offset].chars().count()
 }

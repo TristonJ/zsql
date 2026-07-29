@@ -8,8 +8,9 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Element, ElementId, ElementInputHandler, Entity, Font, GlobalElementId, Hsla,
     InspectorElementId, LayoutId, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
-    UnderlineStyle, Window, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    UnderlineStyle, Window, point, prelude::*, px, relative, rgb, rgba,
 };
+use zsql_ui::text_input::{self, SelectionLineSpan};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::EditorView;
@@ -111,12 +112,12 @@ impl Element for EditorContentElement {
             .then(|| {
                 let line = lines.get(cursor_position.line)?;
                 let x = line.x_for_index(editor.buffer.line_byte_offset(cursor_position));
-                let top = line_top(bounds.top(), line_height, cursor_position.line);
-                Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + x, top),
-                        size(theme::EDITOR_CURSOR_WIDTH, line_height),
-                    ),
+                Some(text_input::caret_quad(
+                    bounds,
+                    x,
+                    cursor_position.line,
+                    line_height,
+                    theme::EDITOR_CURSOR_WIDTH,
                     rgb(active_theme.colors.accent),
                 ))
             })
@@ -158,7 +159,7 @@ impl Element for EditorContentElement {
         for (line_index, line) in prepaint.lines.iter().enumerate() {
             let origin = point(
                 bounds.left(),
-                line_top(bounds.top(), line_height, line_index),
+                text_input::line_top(bounds.top(), line_height, line_index),
             );
             line.paint(origin, line_height, window, cx)
                 .expect("shaped editor line should paint");
@@ -177,19 +178,10 @@ impl Element for EditorContentElement {
     }
 }
 
-/// The pixel y-offset of `line_index`'s top edge, within an element whose
-/// content starts at `origin`.
-// Line indices here are always small (an SQL editor pane, not a huge
-// document), so the `usize -> f32` conversion below cannot lose meaningful
-// precision.
-#[allow(clippy::cast_precision_loss)]
-pub(super) fn line_top(origin: Pixels, line_height: Pixels, line_index: usize) -> Pixels {
-    origin + line_height * line_index as f32
-}
-
 /// The total pixel height of `line_count` lines at the editor's configured
-/// line height. See [`line_top`] for why the `usize -> f32` conversion here
-/// is safe.
+/// line height. Line counts here are always small (an SQL editor pane, not
+/// a huge document), so the `usize -> f32` conversion below cannot lose
+/// meaningful precision.
 #[allow(clippy::cast_precision_loss)]
 fn total_line_height(line_count: usize) -> Pixels {
     px(theme::EDITOR_LINE_HEIGHT * line_count as f32)
@@ -213,9 +205,8 @@ fn selection_highlight_quads(
     active_theme: &Theme,
 ) -> Vec<PaintQuad> {
     let (start, end) = selection.ordered();
-    let line_height = px(theme::EDITOR_LINE_HEIGHT);
 
-    (start.line..=end.line)
+    let spans: Vec<SelectionLineSpan> = (start.line..=end.line)
         .filter_map(|line_index| {
             let line = lines.get(line_index)?;
             let start_x = if line_index == start.line {
@@ -228,16 +219,20 @@ fn selection_highlight_quads(
             } else {
                 line.width + px(theme::EDITOR_SELECTION_EOL_PAD)
             };
-            let top = line_top(bounds.top(), line_height, line_index);
-            Some(fill(
-                Bounds::from_corners(
-                    point(bounds.left() + start_x, top),
-                    point(bounds.left() + end_x, top + line_height),
-                ),
-                rgba(theme::selection_bg(active_theme)),
-            ))
+            Some(SelectionLineSpan {
+                line_index,
+                start_x,
+                end_x,
+            })
         })
-        .collect()
+        .collect();
+
+    text_input::selection_quads(
+        &spans,
+        bounds,
+        px(theme::EDITOR_LINE_HEIGHT),
+        rgba(theme::selection_bg(active_theme)),
+    )
 }
 
 /// The active IME composition range, clipped to `line_index`'s own

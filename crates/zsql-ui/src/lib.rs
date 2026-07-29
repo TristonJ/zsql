@@ -12,5 +12,6 @@ pub mod scrollbar;
 pub mod table;
 pub mod tabs;
 pub mod text_field;
+pub mod text_input;
 pub mod theme;
 pub mod tree;

@@ -10,16 +10,16 @@ use gpui::{
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun,
-    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative,
-    rgb, rgba, size,
+    UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px, relative, rgb,
+    rgba,
 };
 
 use crate::text_field::model::{
-    BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_for_char_count,
-    byte_offset_to_utf16, byte_range_from_utf16, byte_range_to_utf16, char_count_before,
+    BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_for_char_count, char_count_before,
     should_show_placeholder,
 };
 use crate::text_field::theme;
+use crate::text_input::{self, TextSource};
 use crate::theme::ActiveTheme;
 
 /// Underline thickness for the IME marked-text (composition) span.
@@ -374,21 +374,47 @@ impl TextFieldState {
             display_index
         })
     }
+}
 
-    /// The flat byte range a `replace_text_in_range`-style call should
-    /// operate on: the given UTF-16 range if present, else the active IME
-    /// composition range, else the current selection (collapsed to the
-    /// cursor if there is none).
-    fn resolve_replace_range(&self, range_utf16: Option<Range<usize>>) -> Range<usize> {
-        if let Some(range_utf16) = range_utf16 {
-            return byte_range_from_utf16(self.model.text(), range_utf16);
-        }
-        if let Some(marked) = self.marked_range.clone() {
-            return marked;
-        }
-        self.model
-            .selection()
-            .unwrap_or(self.model.cursor()..self.model.cursor())
+impl TextSource for TextFieldState {
+    fn text(&self) -> String {
+        self.model.text().to_owned()
+    }
+
+    fn cursor_offset(&self) -> usize {
+        self.model.cursor()
+    }
+
+    fn selection_range(&self) -> Option<Range<usize>> {
+        self.model.selection()
+    }
+
+    fn selection_reversed(&self) -> bool {
+        self.model.selection_reversed()
+    }
+
+    fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        self.model.set_selection(anchor, cursor);
+    }
+
+    fn marked_range(&self) -> Option<Range<usize>> {
+        self.marked_range.clone()
+    }
+
+    fn set_marked_range(&mut self, range: Option<Range<usize>>) {
+        self.marked_range = range;
+    }
+
+    fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        self.model.replace_range(range, text);
+    }
+
+    fn line_position(&self, offset: usize) -> (usize, usize) {
+        (0, offset.min(self.model.text().len()))
+    }
+
+    fn offset_for_line_position(&self, _line: usize, in_line_offset: usize) -> usize {
+        in_line_offset.min(self.model.text().len())
     }
 }
 
@@ -470,10 +496,9 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let text = self.model.text();
-        let byte_range = byte_range_from_utf16(text, range_utf16);
-        actual_range.replace(byte_range_to_utf16(text, byte_range.clone()));
-        Some(text[byte_range].to_owned())
+        let (text, actual) = text_input::text_for_range(self, range_utf16);
+        actual_range.replace(actual);
+        Some(text)
     }
 
     fn selected_text_range(
@@ -482,15 +507,7 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let text = self.model.text();
-        let range = self
-            .model
-            .selection()
-            .unwrap_or(self.model.cursor()..self.model.cursor());
-        Some(UTF16Selection {
-            range: byte_range_to_utf16(text, range),
-            reversed: self.model.selection_reversed(),
-        })
+        Some(text_input::selected_text_range(self))
     }
 
     fn marked_text_range(
@@ -498,14 +515,11 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        let text = self.model.text();
-        self.marked_range
-            .clone()
-            .map(|range| byte_range_to_utf16(text, range))
+        text_input::marked_text_range(self)
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+        text_input::unmark_text(self);
     }
 
     fn replace_text_in_range(
@@ -515,9 +529,7 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.resolve_replace_range(range_utf16);
-        self.model.replace_range(range, new_text);
-        self.marked_range = None;
+        text_input::replace_text_in_range(self, range_utf16, new_text);
         self.note_keystroke(cx);
     }
 
@@ -529,28 +541,12 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.resolve_replace_range(range_utf16);
-        let inserted_start = range.start;
-        self.model.replace_range(range, new_text);
-        let inserted_len = self.model.cursor() - inserted_start;
-
-        self.marked_range = if inserted_len == 0 {
-            None
-        } else {
-            Some(inserted_start..inserted_start + inserted_len)
-        };
-
-        if let Some(relative_utf16) = new_selected_range_utf16 {
-            // `new_selected_range_utf16` is UTF-16-relative to `new_text`
-            // itself (NSTextInputClient's `setMarkedText:selectedRange:`
-            // semantics), not to the field's whole content, so it must be
-            // resolved against `new_text` before adding `inserted_start`.
-            let relative = byte_range_from_utf16(new_text, relative_utf16);
-            let selection_start = inserted_start + relative.start;
-            let selection_end = inserted_start + relative.end;
-            self.model.set_selection(selection_start, selection_end);
-        }
-
+        text_input::replace_and_mark_text_in_range(
+            self,
+            range_utf16,
+            new_text,
+            new_selected_range_utf16,
+        );
         self.note_keystroke(cx);
     }
 
@@ -561,19 +557,14 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let text = self.model.text();
-        let byte_range = byte_range_from_utf16(text, range_utf16);
-        let line = self.last_line.as_ref()?;
-        Some(Bounds::from_corners(
-            point(
-                element_bounds.left() + line.x_for_index(byte_range.start),
-                element_bounds.top(),
-            ),
-            point(
-                element_bounds.left() + line.x_for_index(byte_range.end),
-                element_bounds.top() + theme::FIELD_LINE_HEIGHT,
-            ),
-        ))
+        let lines = self.last_line.as_slice();
+        text_input::bounds_for_range(
+            self,
+            range_utf16,
+            element_bounds,
+            lines,
+            theme::FIELD_LINE_HEIGHT,
+        )
     }
 
     fn character_index_for_point(
@@ -583,7 +574,7 @@ impl EntityInputHandler for TextFieldState {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let offset = self.byte_offset_for_point(point)?;
-        Some(byte_offset_to_utf16(self.model.text(), offset))
+        Some(text_input::character_index_for_point(self, offset))
     }
 }
 
@@ -696,26 +687,26 @@ impl Element for TextFieldContentElement {
 
         let cursor = (field.focus_handle.is_focused(window) && field.blink.visible()).then(|| {
             let x = line.x_for_index(display_index(field.model.cursor()));
-            fill(
-                Bounds::new(
-                    point(bounds.left() + x, bounds.top()),
-                    size(theme::FIELD_CURSOR_WIDTH, theme::FIELD_LINE_HEIGHT),
-                ),
+            text_input::caret_quad(
+                bounds,
+                x,
+                0,
+                theme::FIELD_LINE_HEIGHT,
+                theme::FIELD_CURSOR_WIDTH,
                 rgb(theme_colors.accent),
             )
         });
 
         let selection = field.model.selection().map(|range| {
-            let start_x = line.x_for_index(display_index(range.start));
-            let end_x = line.x_for_index(display_index(range.end));
-            fill(
-                Bounds::from_corners(
-                    point(bounds.left() + start_x, bounds.top()),
-                    point(
-                        bounds.left() + end_x,
-                        bounds.top() + theme::FIELD_LINE_HEIGHT,
-                    ),
-                ),
+            let span = text_input::SelectionLineSpan {
+                line_index: 0,
+                start_x: line.x_for_index(display_index(range.start)),
+                end_x: line.x_for_index(display_index(range.end)),
+            };
+            text_input::selection_quad(
+                &span,
+                bounds,
+                theme::FIELD_LINE_HEIGHT,
                 rgba(theme_colors.accent_wash_hover()),
             )
         });
