@@ -1559,13 +1559,15 @@ mod header_tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use gpui::{AppContext as _, Entity, TestAppContext};
-    use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, RowCount, SchemaTree};
+    use gpui::{AppContext as _, Entity, Modifiers, TestAppContext};
+    use zsql_core::{
+        BatchSink, Connection, CoreError, QueryHandle, ResultSet, RowCount, SchemaTree,
+    };
 
     use super::{WorkspaceStartup, WorkspaceView};
     use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::ConnectionStore;
-    use crate::session::Session;
+    use crate::session::{Session, SessionState};
 
     /// A `Connection` double that records every SQL string `stream_query` is
     /// called with, in place of a real session/database, so a test can
@@ -1810,5 +1812,173 @@ mod header_tests {
             locked_queries.is_empty(),
             "running when no active tab exists must be a no-op"
         );
+    }
+
+    /// A session in `state` holding no connection at all, for the disabled
+    /// states the Run button and `RunQuery` must both reject: `Empty`,
+    /// `Connecting`, and an `Error` reached without ever completing a
+    /// connect.
+    fn disconnected_session(state: SessionState, cx: &mut TestAppContext) -> Entity<Session> {
+        cx.update(|cx| cx.new(|_cx| Session::new_for_render_test(state, ResultSet::default())))
+    }
+
+    #[gpui::test]
+    fn header_run_button_click_is_inert_while_not_connected(cx: &mut TestAppContext) {
+        for state in [
+            SessionState::Empty,
+            SessionState::Connecting,
+            SessionState::Error("connection refused".to_owned()),
+        ] {
+            let expected_state = state.clone();
+            let session = disconnected_session(state, cx);
+            let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+                WorkspaceView::new(
+                    session.clone(),
+                    LayoutConfig::default(),
+                    ValuePanelConfig::default(),
+                    empty_store_for_test(),
+                    Duration::from_secs(2),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                    WorkspaceStartup {
+                        tab_sessions_path: None,
+                        active_theme_name: "zsql-dark".to_owned(),
+                        themes_dir: None,
+                        config_path: None,
+                    },
+                    cx,
+                )
+            });
+            vcx.run_until_parked();
+
+            let editor = workspace.read_with(vcx, |workspace, cx| {
+                workspace
+                    .tabs
+                    .read(cx)
+                    .active_tab()
+                    .expect("a workspace always opens with an active script tab")
+                    .editor()
+                    .clone()
+            });
+            editor.update(vcx, |editor, cx| {
+                editor.set_text("select 1", cx);
+            });
+
+            let bounds = vcx
+                .debug_bounds("workspace-run-query-button")
+                .expect("the Run button must still paint while disabled");
+            vcx.simulate_click(bounds.center(), Modifiers::default());
+            vcx.run_until_parked();
+
+            session.read_with(vcx, |session, _app| {
+                assert_eq!(
+                    session.state(),
+                    &expected_state,
+                    "clicking Run while not connected must not mutate SessionState \
+                     (started from {expected_state:?})"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn header_run_button_click_dispatches_run_while_connected(cx: &mut TestAppContext) {
+        let (session, queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .expect("a workspace always opens with an active script tab")
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.set_text("select * from orders", cx);
+        });
+
+        let bounds = vcx
+            .debug_bounds("workspace-run-query-button")
+            .expect("the Run button must paint while connected");
+        vcx.simulate_click(bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        assert_eq!(
+            queries.lock().expect("queries lock poisoned").as_slice(),
+            ["select * from orders"],
+            "clicking the Run button while connected must dispatch the active tab's SQL"
+        );
+    }
+
+    #[gpui::test]
+    fn dispatching_run_query_while_not_connected_does_not_dispatch_or_mutate_state(
+        cx: &mut TestAppContext,
+    ) {
+        let starting_state = SessionState::Error("connection refused".to_owned());
+        let session = disconnected_session(starting_state.clone(), cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session.clone(),
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .expect("a workspace always opens with an active script tab")
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.set_text("select 1", cx);
+        });
+        let focus_handle = workspace
+            .read_with(vcx, WorkspaceView::editor_focus_handle)
+            .expect("the active script tab's editor must have a focus handle");
+        vcx.update(|window, _cx| window.focus(&focus_handle));
+
+        vcx.dispatch_action(zsql_editor::RunQuery);
+        vcx.run_until_parked();
+
+        session.read_with(vcx, |session, _app| {
+            assert_eq!(
+                session.state(),
+                &starting_state,
+                "RunQuery while not connected must not mutate SessionState"
+            );
+        });
     }
 }
