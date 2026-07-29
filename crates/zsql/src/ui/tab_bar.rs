@@ -275,7 +275,14 @@ pub fn render_tab_bar(
         })
         .child(row);
 
-    let scrolled = viewport.with_scrollbars(&tab_bar.scroll, ScrollbarStyle::default(), cx);
+    let scrolled = viewport.with_scrollbars(
+        &tab_bar.scroll,
+        ScrollbarStyle {
+            track_width: workspace_theme::TAB_SCROLLBAR_TRACK_WIDTH,
+            ..Default::default()
+        },
+        cx,
+    );
 
     zsql_ui::tabs::tab_bar_shell(&theme).child(scrolled).child(
         zsql_ui::tabs::new_tab_glyph(&theme)

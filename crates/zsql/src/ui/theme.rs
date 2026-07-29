@@ -41,6 +41,8 @@ pub const WORKSPACE_HEADER_HEIGHT: Pixels = px(38.0);
 pub const WORKSPACE_HEADER_PADDING_X: f32 = 10.0;
 /// Text size of the workspace header's left-hand pane label.
 pub const WORKSPACE_HEADER_LABEL_TEXT_SIZE: f32 = 10.5;
+pub const TAB_SCROLLBAR_TRACK_WIDTH: f32 = 4.0;
+
 /// Height of the Run button.
 pub const RUN_BUTTON_HEIGHT: Pixels = px(25.0);
 /// Horizontal padding inside the Run button.
