@@ -78,7 +78,10 @@ pub(crate) async fn introspect(client: &mut Client<TcpStream>) -> Result<SchemaT
 
 /// Run `sql` (a query built entirely from fixed string fragments, never
 /// runtime text) and collect its first result set.
-async fn run(client: &mut Client<TcpStream>, sql: String) -> Result<Vec<tiberius::Row>, CoreError> {
+pub(crate) async fn run(
+    client: &mut Client<TcpStream>,
+    sql: String,
+) -> Result<Vec<tiberius::Row>, CoreError> {
     client
         .simple_query(sql)
         .await
@@ -89,7 +92,7 @@ async fn run(client: &mut Client<TcpStream>, sql: String) -> Result<Vec<tiberius
 }
 
 /// A non-null text column, by name, from `row`.
-fn text(row: &tiberius::Row, column: &str) -> Result<String, CoreError> {
+pub(crate) fn text(row: &tiberius::Row, column: &str) -> Result<String, CoreError> {
     row.try_get::<&str, _>(column)
         .map_err(map_introspect_error)?
         .map(str::to_owned)

@@ -74,6 +74,11 @@ workspace = true
 # `zsql-ssh`'s matching feature too, so `ssh_live_tests` can draw fixture
 # defaults from `zsql_ssh::test_fixtures` instead of restating them.
 ssh-integration-tests = ["zsql-ssh/ssh-integration-tests"]
+# Gates `database_switch_live_tests`: `Session::switch_database` exercised
+# against a real Postgres server, following the same pattern as
+# `ssh-integration-tests` above and `zsql-postgres`'s own
+# `driver-integration-tests`. See `scripts/pg-dev.sh`.
+driver-integration-tests = []
 
 [package.metadata.packager]
 before-packaging-command = "cargo build --release"

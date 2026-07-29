@@ -172,6 +172,11 @@ impl Connection for PgConnection {
     async fn close(&self) {
         self.0.close().await;
     }
+
+    #[tracing::instrument(name = "pg_list_databases", skip_all, fields(pool_size = self.0.pool().size()))]
+    async fn list_databases(&self) -> Result<Option<Vec<String>>, CoreError> {
+        Ok(Some(crate::databases::list_databases(self.0.pool()).await?))
+    }
 }
 
 pub struct PgCancelHandle {
@@ -1796,5 +1801,44 @@ mod database_tests {
         );
 
         run_ddl(&*conn, &format!("DROP TABLE {SORTED_PREVIEW_TABLE}"));
+    }
+
+    /// A second database this test creates and drops, to prove
+    /// `list_databases` sees the whole server, not just the connected
+    /// database.
+    const SECOND_DATABASE: &str = "zsql_test_second_database";
+
+    #[test]
+    fn list_databases_includes_the_connected_and_a_second_database_and_excludes_templates_when_configured()
+     {
+        let conn = live_connection();
+        run_ddl(
+            &*conn,
+            &format!("DROP DATABASE IF EXISTS {SECOND_DATABASE}"),
+        );
+        run_ddl(&*conn, &format!("CREATE DATABASE {SECOND_DATABASE}"));
+
+        let databases = block_on(conn.list_databases())
+            .expect("list_databases should succeed")
+            .expect("postgres must report Some(databases), never None");
+
+        assert!(
+            databases.contains(&database_name_from_url(&live_database_url()).to_owned()),
+            "the connected database must be listed, got {databases:?}"
+        );
+        assert!(
+            databases.contains(&SECOND_DATABASE.to_owned()),
+            "the freshly created second database must be listed, got {databases:?}"
+        );
+        assert!(
+            !databases.iter().any(|name| name.starts_with("template")),
+            "template databases must be excluded, got {databases:?}"
+        );
+
+        let mut sorted = databases.clone();
+        sorted.sort_unstable();
+        assert_eq!(databases, sorted, "databases must be sorted by name");
+
+        run_ddl(&*conn, &format!("DROP DATABASE {SECOND_DATABASE}"));
     }
 }

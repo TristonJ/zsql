@@ -2,6 +2,8 @@
 
 mod config;
 mod connections;
+#[cfg(all(test, feature = "driver-integration-tests"))]
+mod database_switch_live_tests;
 mod drivers;
 mod keyring;
 mod observability;

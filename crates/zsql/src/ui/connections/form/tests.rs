@@ -16,7 +16,7 @@ use uuid::Uuid;
 use zsql_ui::modal::ModalSize;
 use zsql_ui::text_field::TextFieldEvent;
 
-use super::{ConnectionForm, ConnectionFormEvent, HostKeyMode};
+use super::{ConnectionForm, ConnectionFormEvent, DATABASE_FIELD_LABEL, HostKeyMode};
 use crate::connections::{HostKeyPolicy, SshAuthKind, StoredSsh};
 
 /// A plain-data mirror of [`ConnectionFormEvent`] a test can capture,
@@ -1441,4 +1441,15 @@ fn the_footer_still_emits_cancel_once_the_form_is_two_columns(cx: &mut TestAppCo
     vcx.run_until_parked();
 
     assert_eq!(*events.borrow(), vec![CapturedEvent::Cancel]);
+}
+
+/// The "Database" field is labeled to communicate it sets the initial/
+/// default database a fresh connect targets (a session can later
+/// switch away from it via the sidebar), not a permanent pin.
+#[test]
+fn the_database_fields_label_communicates_it_sets_the_default_on_connect() {
+    assert!(
+        DATABASE_FIELD_LABEL.to_lowercase().contains("default"),
+        "expected the database field's label to mention 'default', got {DATABASE_FIELD_LABEL:?}"
+    );
 }

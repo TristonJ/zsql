@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, Div, MouseButton, Pixels, Point, RenderOnce, SharedString, Window, anchored,
-    deferred, div, prelude::*, px, rgb, rgba,
+    App, ClickEvent, Corner, Div, MouseButton, Pixels, Point, RenderOnce, SharedString, Window,
+    anchored, deferred, div, prelude::*, px, rgb, rgba,
 };
 
 use crate::theme::{ActiveTheme, Colors, Theme};
@@ -54,6 +54,8 @@ pub struct ContextMenu {
     items: Vec<ContextMenuItem>,
     on_close: Option<ContextMenuOnCloseFn>,
     position: Option<Point<Pixels>>,
+    anchor: Option<Corner>,
+    offset: Option<Point<Pixels>>,
     separators: Vec<usize>,
 }
 
@@ -65,6 +67,8 @@ impl ContextMenu {
             items: Vec::new(),
             on_close: None,
             position: None,
+            anchor: None,
+            offset: None,
             separators: Vec::new(),
         }
     }
@@ -96,6 +100,18 @@ impl ContextMenu {
     #[must_use]
     pub fn on_close(mut self, f: impl Fn(&(), &mut Window, &mut App) + 'static) -> Self {
         self.on_close = Some(Rc::new(f));
+        self
+    }
+
+    #[must_use]
+    pub fn anchor(mut self, anchor: Corner) -> Self {
+        self.anchor = Some(anchor);
+        self
+    }
+
+    #[must_use]
+    pub fn offset(mut self, offset: Point<Pixels>) -> Self {
+        self.offset = Some(offset);
         self
     }
 
@@ -156,7 +172,7 @@ impl ContextMenuItem {
 }
 
 impl RenderOnce for ContextMenu {
-    fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let theme = cx.theme();
         let menu_selector = self.id.to_string();
         let mut menu = div()
@@ -183,12 +199,15 @@ impl RenderOnce for ContextMenu {
             menu = menu.child(item.style(self.style));
         }
 
+        let viewport_size = window.viewport_size();
         let on_mouse_left_close = self.on_close.clone();
         let on_mouse_right_close = self.on_close.clone();
         let backdrop = div()
             .absolute()
             .inset_0()
             .occlude()
+            .w(viewport_size.width)
+            .h(viewport_size.height)
             .when_some(on_mouse_left_close, |el, on_close| {
                 el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     on_close(&(), window, cx);
@@ -198,15 +217,21 @@ impl RenderOnce for ContextMenu {
                 el.on_mouse_down(MouseButton::Right, move |_, window, cx| {
                     on_close(&(), window, cx);
                 })
-            })
+            });
+
+        let container = div()
+            .absolute()
+            .child(anchored().position(Point::default()).child(backdrop))
             .child(
                 anchored()
                     .when_some(self.position, gpui::Anchored::position)
+                    .when_some(self.anchor, gpui::Anchored::anchor)
+                    .when_some(self.offset, gpui::Anchored::offset)
                     .snap_to_window()
                     .child(menu),
             );
 
-        deferred(backdrop).with_priority(1)
+        deferred(container).with_priority(1)
     }
 }
 

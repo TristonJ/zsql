@@ -99,6 +99,21 @@ pub const SIDEBAR_SCROLLBAR_GAP: Pixels = px(4.0);
 /// Text size of the "SCHEMA" header label.
 pub const SIDEBAR_HEADER_TEXT_SIZE: f32 = 10.5;
 
+/// Widest the sidebar header's database-switcher trigger is allowed to
+/// grow to before its label truncates.
+pub const SIDEBAR_DB_SWITCHER_MAX_WIDTH: Pixels = px(150.0);
+/// Text size of the database-switcher trigger's current-database label and
+/// its dropdown menu items.
+pub const SIDEBAR_DB_SWITCHER_TEXT_SIZE: f32 = 11.0;
+/// Horizontal padding inside the database-switcher trigger.
+pub const SIDEBAR_DB_SWITCHER_PADDING_X: Pixels = px(6.0);
+/// Vertical padding inside the database-switcher trigger.
+pub const SIDEBAR_DB_SWITCHER_PADDING_Y: Pixels = px(3.0);
+/// Corner radius of the database-switcher trigger.
+pub const SIDEBAR_DB_SWITCHER_RADIUS: f32 = 5.0;
+/// Gap between the database-switcher trigger's label and its chevron.
+pub const SIDEBAR_DB_SWITCHER_GAP: Pixels = px(4.0);
+
 /// Background tint for the selected relation row: the accent color at low
 /// opacity.
 #[must_use]

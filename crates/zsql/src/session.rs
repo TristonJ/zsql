@@ -16,7 +16,7 @@ mod probe;
 mod state;
 mod tunnel;
 
-use tunnel::{TunnelHandle, TunneledConnectOutcome};
+use tunnel::TunnelHandle;
 
 pub(crate) use probe::probe_connection;
 pub(crate) use state::{LivenessState, SchemaState, SessionState};
@@ -34,6 +34,29 @@ pub struct Session {
     url: Option<String>,
     /// The live connection, once `connect` succeeds
     connection: Option<Arc<dyn Connection>>,
+    /// The URL the active connection was actually opened with, kept
+    /// alongside `connection` so [`Session::switch_database`] can derive a
+    /// same-server URL for a different database without re-deriving it from
+    /// anything else. `None` before any successful connect, and cleared
+    /// again on a failed [`Session::connect_url`] attempt (but left
+    /// untouched by a failed [`Session::switch_database`] attempt -- see its
+    /// own doc comment).
+    current_url: Option<String>,
+    /// The active connection's current database, if the backend has one
+    /// (derived from `current_url`'s path). `None` before any successful
+    /// connect, for a sqlite connection (no database concept), or if the
+    /// URL carries no path segment.
+    current_database: Option<String>,
+    /// Every database selectable on the active connection's server, sorted,
+    /// populated from [`zsql_core::Connection::list_databases`] immediately
+    /// after each successful connect. Empty when the driver reports `None`
+    /// (a single-database backend, or one that already exposes databases as
+    /// schemas) or before any successful connect.
+    available_databases: Vec<String>,
+    /// The SSH tunnel config the active connection was opened through, if
+    /// any, kept so [`Session::switch_database`] can reopen an equivalent
+    /// tunnel for the same server rather than dropping to a direct connect.
+    active_ssh: Option<zsql_ssh::SshConfig>,
     /// The active connection's SSH tunnel, if it was opened through one.
     /// `None` for a direct connection, or before any connect attempt.
     /// Replaced (dropping whatever was there before) at the same point
@@ -102,6 +125,10 @@ impl Session {
         Self {
             url: None,
             connection: None,
+            current_url: None,
+            current_database: None,
+            available_databases: Vec::new(),
+            active_ssh: None,
             tunnel: None,
             state: SessionState::Empty,
             schema: SchemaState::NotLoaded,
@@ -156,6 +183,24 @@ impl Session {
     #[must_use]
     pub fn schema_generation(&self) -> u64 {
         self.schema_generation
+    }
+
+    /// The active connection's current database, if the backend has one.
+    /// `None` before any successful connect, for a backend with no
+    /// database concept (e.g. `SQLite`), or if the connected URL carries no
+    /// database path segment.
+    #[must_use]
+    pub fn current_database(&self) -> Option<&str> {
+        self.current_database.as_deref()
+    }
+
+    /// Every database selectable on the active connection's server, sorted.
+    /// Empty when the driver has no switchable-database concept (see
+    /// [`zsql_core::Connection::list_databases`]) or before any successful
+    /// connect.
+    #[must_use]
+    pub fn available_databases(&self) -> &[String] {
+        &self.available_databases
     }
 
     /// The click-to-preview SQL for `schema.relation`, in the active
@@ -321,11 +366,12 @@ impl Session {
         self.probe_in_flight = false;
         let generation = self.connection_generation;
         let batch_size = self.batch_size;
+        self.active_ssh.clone_from(&ssh);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let outcome = cx
-                .background_spawn(open_tunnel_and_connect(url, ssh, batch_size))
+                .background_spawn(connect_and_list_databases(url, ssh, batch_size))
                 .await;
 
             let connected = this.update(cx, |session, cx| {
@@ -338,6 +384,98 @@ impl Session {
                 let _ = this.update(cx, |session, cx| {
                     session.spawn_liveness_probe_loop(generation, cx);
                 });
+            }
+        })
+    }
+
+    /// Switch the active connection to `database`, on the same server:
+    /// derives a new URL from the current connection's own URL (via
+    /// [`zsql_core::ConnectionUrl::set_database`], so credentials, host,
+    /// port, query parameters, and any SSH tunnel configuration are carried
+    /// through unchanged) and performs the same cancel/reconnect/reset
+    /// sequence as [`Session::connect_url`]: the in-flight query (if any) is
+    /// cancelled, the schema tree is reset to
+    /// [`SchemaState::Loading`](crate::session::SchemaState::Loading)
+    /// immediately, `connection_generation` is bumped, and a fresh
+    /// connection is opened against the new database, followed by
+    /// re-introspection on success.
+    ///
+    /// Unlike `connect_url`, a failed switch leaves this session exactly as
+    /// it was before the attempt: the active connection, current database,
+    /// and schema tree are all restored rather than cleared, so a bad
+    /// target (e.g. no `CONNECT` right on it) never disconnects the
+    /// session from a server it was already talking to. The failure is
+    /// still surfaced via [`Session::state`], the same way a query error
+    /// is -- see [`Session::is_connected`].
+    ///
+    /// A no-op (an immediately completed task reporting an error) if there
+    /// is no active connection to switch from.
+    #[tracing::instrument(
+        name = "session_switch_database",
+        skip_all,
+        fields(database = tracing::field::Empty)
+    )]
+    pub fn switch_database(
+        &mut self,
+        database: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let database = database.into();
+        tracing::Span::current().record("database", database.as_str());
+        let Some(current_url) = self.current_url.clone() else {
+            self.state = SessionState::Error("cannot switch database: not connected".to_owned());
+            cx.notify();
+            return Task::ready(());
+        };
+        let new_url = match url_for_database(&current_url, &database) {
+            Ok(url) => url,
+            Err(err) => {
+                self.state = SessionState::Error(err.to_string());
+                cx.notify();
+                return Task::ready(());
+            }
+        };
+
+        // Replacing `active_query` drops its handle, cooperatively
+        // cancelling whatever query was streaming for the connection this
+        // switch is about to replace, exactly as a fresh `run_query` call
+        // would.
+        self.active_query = None;
+
+        let previous_schema = self.schema.clone();
+        self.set_schema(SchemaState::Loading);
+        self.state = SessionState::Connecting;
+        self.liveness = LivenessState::Unknown;
+
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.probe_in_flight = false;
+        let generation = self.connection_generation;
+        let batch_size = self.batch_size;
+        let ssh = self.active_ssh.clone();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(connect_and_list_databases(new_url, ssh, batch_size))
+                .await;
+
+            let (probe_generation, introspect_task) = this
+                .update(cx, |session, cx| {
+                    let probe_generation =
+                        apply_switch_outcome(session, generation, previous_schema, outcome, cx);
+                    let introspect_task =
+                        (probe_generation == Some(generation)).then(|| session.introspect(cx));
+                    (probe_generation, introspect_task)
+                })
+                .unwrap_or((None, None));
+
+            if let Some(probe_generation) = probe_generation {
+                let _ = this.update(cx, |session, cx| {
+                    session.spawn_liveness_probe_loop(probe_generation, cx);
+                });
+            }
+            if let Some(task) = introspect_task {
+                task.await;
             }
         })
     }
@@ -591,13 +729,13 @@ impl Session {
 fn apply_connect_outcome(
     session: &mut Session,
     generation: u64,
-    outcome: Result<TunneledConnectOutcome, CoreError>,
+    outcome: Result<ConnectAttempt, CoreError>,
     cx: &mut Context<Session>,
 ) -> bool {
     if session.connection_generation != generation {
         tracing::debug!("discarding a superseded connect attempt's result");
-        if let Ok((conn, _tunnel)) = outcome {
-            close_outgoing_connection(Some(Arc::from(conn)), cx);
+        if let Ok(attempt) = outcome {
+            close_outgoing_connection(Some(Arc::from(attempt.connection)), cx);
         }
         return false;
     }
@@ -606,10 +744,13 @@ fn apply_connect_outcome(
     // be dispatched below regardless of which branch this attempt lands in.
     let outgoing = session.connection.take();
     let connected = match outcome {
-        Ok((conn, tunnel)) => {
+        Ok(attempt) => {
             tracing::info!("session connected");
-            session.connection = Some(Arc::from(conn));
-            session.tunnel = tunnel;
+            session.connection = Some(Arc::from(attempt.connection));
+            session.tunnel = attempt.tunnel;
+            session.current_url = Some(attempt.url);
+            session.current_database = attempt.current_database;
+            session.available_databases = attempt.available_databases;
             session.state = SessionState::Connected;
             true
         }
@@ -623,6 +764,9 @@ fn apply_connect_outcome(
             // torn down inside `open_tunnel_and_connect` before this error
             // ever reached here.
             session.tunnel = None;
+            session.current_url = None;
+            session.current_database = None;
+            session.available_databases = Vec::new();
             session.state = SessionState::Error(err.to_string());
             false
         }
@@ -630,6 +774,133 @@ fn apply_connect_outcome(
     close_outgoing_connection(outgoing, cx);
     cx.notify();
     connected
+}
+
+/// Applies a background database-switch attempt's outcome once back on the
+/// main thread, returning the generation a liveness probe loop should be
+/// (re)started for, or `None` if this attempt's result was discarded because
+/// a newer attempt has already superseded it.
+///
+/// Unlike [`apply_connect_outcome`], a failed attempt here does not clear
+/// the session's connection: `session.connection`, `current_url`, and
+/// `current_database` are left exactly as they were before the switch was
+/// attempted (this function never touches them on the `Err` branch), and
+/// `schema` is restored to `previous_schema` rather than left at the
+/// `NotLoaded` [`Session::switch_database`] set synchronously before
+/// dispatching the attempt. `connection_generation` is bumped again so a
+/// liveness probe loop can resume for the still-active connection under a
+/// generation this (now-resolved) attempt no longer owns.
+fn apply_switch_outcome(
+    session: &mut Session,
+    generation: u64,
+    previous_schema: SchemaState,
+    outcome: Result<ConnectAttempt, CoreError>,
+    cx: &mut Context<Session>,
+) -> Option<u64> {
+    if session.connection_generation != generation {
+        tracing::debug!("discarding a superseded database switch's result");
+        if let Ok(attempt) = outcome {
+            close_outgoing_connection(Some(Arc::from(attempt.connection)), cx);
+        }
+        return None;
+    }
+    match outcome {
+        Ok(attempt) => {
+            tracing::info!("session switched database");
+            let outgoing = session.connection.take();
+            session.connection = Some(Arc::from(attempt.connection));
+            session.tunnel = attempt.tunnel;
+            session.current_url = Some(attempt.url);
+            session.current_database = attempt.current_database;
+            session.available_databases = attempt.available_databases;
+            session.state = SessionState::Connected;
+            close_outgoing_connection(outgoing, cx);
+            cx.notify();
+            Some(generation)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "session database switch failed; reverting");
+            session.set_schema(previous_schema);
+            session.state = SessionState::Error(err.to_string());
+            // The generation bump in `switch_database` already invalidated
+            // whatever probe loop was watching the connection this failed
+            // attempt would have replaced; bump again so a fresh loop can
+            // resume probing it under a generation this settled attempt no
+            // longer owns.
+            session.connection_generation = session.connection_generation.wrapping_add(1);
+            session.probe_in_flight = false;
+            cx.notify();
+            Some(session.connection_generation)
+        }
+    }
+}
+
+/// A background connect attempt's successful result: the live connection
+/// and its tunnel (if any), the URL it was actually opened with, that URL's
+/// database (if the backend has one), and the databases available on its
+/// server (see [`zsql_core::Connection::list_databases`]).
+struct ConnectAttempt {
+    connection: Box<dyn Connection>,
+    tunnel: Option<Box<dyn TunnelHandle>>,
+    url: String,
+    current_database: Option<String>,
+    available_databases: Vec<String>,
+}
+
+/// Opens `url` (through `ssh`'s tunnel first, if given, via
+/// [`open_tunnel_and_connect`]) and, once connected, lists the databases
+/// available on its server, bundling both into a [`ConnectAttempt`].
+async fn connect_and_list_databases(
+    url: String,
+    ssh: Option<zsql_ssh::SshConfig>,
+    batch_size: usize,
+) -> Result<ConnectAttempt, CoreError> {
+    let current_database = current_database_from_url(&url);
+    let (connection, tunnel) = open_tunnel_and_connect(url.clone(), ssh, batch_size).await?;
+    let available_databases = fetch_available_databases(connection.as_ref()).await;
+    Ok(ConnectAttempt {
+        connection,
+        tunnel,
+        url,
+        current_database,
+        available_databases,
+    })
+}
+
+/// `url`'s database, if it names one: `None` for a sqlite URL (no database
+/// concept) or a network URL with an empty path.
+fn current_database_from_url(url: &str) -> Option<String> {
+    let parsed = zsql_core::ConnectionUrl::parse(url).ok()?;
+    let database = parsed.database();
+    (!database.is_empty()).then_some(database)
+}
+
+/// `url` with its database path segment rewritten to `database` (via
+/// [`zsql_core::ConnectionUrl::set_database`], which percent-encodes it),
+/// leaving credentials, host, port, and query parameters -- and so, since
+/// none of those carry the tunnel's dial target, any SSH tunnel -- untouched.
+///
+/// # Errors
+/// Returns [`CoreError::Url`] if `url` cannot be parsed.
+fn url_for_database(url: &str, database: &str) -> Result<String, CoreError> {
+    let mut parsed = zsql_core::ConnectionUrl::parse(url)?;
+    parsed.set_database(database);
+    Ok(parsed.to_url_string())
+}
+
+/// The databases selectable on `connection`'s server, or an empty list if
+/// the driver reports [`None`] (no switchable-database concept) or the
+/// query itself fails -- a listing failure never fails the connect attempt
+/// it rides alongside, it only leaves the database switcher without options.
+async fn fetch_available_databases(connection: &dyn Connection) -> Vec<String> {
+    match connection.list_databases().await {
+        Ok(Some(databases)) => databases,
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            tracing::warn!(error = %err, "listing available databases failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Closes `connection` (if any) on a detached background task, so its

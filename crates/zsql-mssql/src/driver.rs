@@ -282,6 +282,12 @@ impl Connection for MssqlConnection {
     /// implement teardown here.
     #[tracing::instrument(name = "mssql_close", skip_all)]
     async fn close(&self) {}
+
+    #[tracing::instrument(name = "mssql_list_databases", skip_all)]
+    async fn list_databases(&self) -> Result<Option<Vec<String>>, CoreError> {
+        let mut client = open_client(&self.config, self.dial_addr).await?;
+        Ok(Some(crate::databases::list_databases(&mut client).await?))
+    }
 }
 
 /// Look up `sys.dm_db_partition_stats` for `schema.relation`'s base table
@@ -1641,6 +1647,50 @@ mod database_tests {
             matches!(result, Err(zsql_core::CoreError::Introspection { .. })),
             "expected a CoreError::Introspection, got {result:?}"
         );
+    }
+
+    /// A second database this test creates and drops, to prove
+    /// `list_databases` sees the whole instance, not just the connected
+    /// database.
+    const SECOND_DATABASE: &str = "zsql_test_second_database";
+
+    #[test]
+    fn list_databases_includes_the_seeded_database_and_excludes_the_four_system_databases_when_configured()
+     {
+        let conn = live_connection();
+        run_ddl(
+            &*conn,
+            &format!("IF DB_ID('{SECOND_DATABASE}') IS NOT NULL DROP DATABASE {SECOND_DATABASE}"),
+        );
+        run_ddl(&*conn, &format!("CREATE DATABASE {SECOND_DATABASE}"));
+
+        let databases = block_on(conn.list_databases())
+            .expect("list_databases should succeed")
+            .expect("mssql must report Some(databases), never None");
+
+        let connected_database = zsql_core::ConnectionUrl::parse(&live_database_url())
+            .expect("live URL must parse")
+            .database();
+        assert!(
+            databases.contains(&connected_database),
+            "the connected database must be listed, got {databases:?}"
+        );
+        assert!(
+            databases.contains(&SECOND_DATABASE.to_owned()),
+            "the freshly created second database must be listed, got {databases:?}"
+        );
+        for system_db in ["master", "model", "msdb", "tempdb"] {
+            assert!(
+                !databases.iter().any(|name| name == system_db),
+                "{system_db} must be excluded, got {databases:?}"
+            );
+        }
+
+        let mut sorted = databases.clone();
+        sorted.sort_unstable();
+        assert_eq!(databases, sorted, "databases must be sorted by name");
+
+        run_ddl(&*conn, &format!("DROP DATABASE {SECOND_DATABASE}"));
     }
 
     /// Run `sql` (typically DDL/DML setup) to completion against `conn`,

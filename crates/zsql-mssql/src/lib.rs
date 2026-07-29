@@ -1,6 +1,7 @@
 //! MSSQL backend for zsql, built on `tiberius` over `async-net` so it runs
 //! on the same smol/async-io reactor as the rest of this workspace.
 
+mod databases;
 mod describe;
 mod driver;
 mod error;

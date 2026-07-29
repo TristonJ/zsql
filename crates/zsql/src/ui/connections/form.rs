@@ -37,6 +37,11 @@ mod tls;
 pub(crate) use layout::FormColumns;
 pub(crate) use ssh::HostKeyMode;
 
+/// Label for [`ConnectionForm::database_field`]: names it as the database a
+/// fresh connect targets, not a permanent pin -- a session can switch away
+/// from it afterward via the sidebar's database switcher.
+pub(crate) const DATABASE_FIELD_LABEL: &str = "Default Database";
+
 /// The connection form's input fields, test-outcome banner, and footer.
 pub struct ConnectionForm {
     mode: ConnectionFormMode,
@@ -440,7 +445,7 @@ impl ConnectionForm {
                     .child(div().flex_1().child(self.render_password_field(colors, cx))),
             )
             .child(Self::labeled_field(
-                "Database",
+                DATABASE_FIELD_LABEL,
                 colors,
                 self.database_field.clone(),
             ))

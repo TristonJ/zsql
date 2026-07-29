@@ -27,7 +27,7 @@ use model::{SidebarRow, flatten_schema_tree, relation_icon_name, relation_tint};
 
 use super::tabs::TabModel;
 use super::theme;
-use crate::session::{SchemaState, Session};
+use crate::session::{SchemaState, Session, SessionState};
 
 mod model;
 
@@ -51,6 +51,9 @@ pub struct SidebarView {
     scroll: Entity<ScrollableState>,
     /// The currently open relation-row context menu, if any.
     context_menu: Option<ContextMenuState>,
+    /// Whether the database-switcher dropdown (see [`Self::render_header`])
+    /// is currently open.
+    db_switcher_open: bool,
 }
 
 /// A relation row's open right-click context menu: which relation it
@@ -89,6 +92,7 @@ impl SidebarView {
             tree_scroll_handle: UniformListScrollHandle::new(),
             scroll: cx.new(ScrollableState::new),
             context_menu: None,
+            db_switcher_open: false,
         };
         view.sync_rows(cx);
         view
@@ -264,8 +268,37 @@ impl SidebarView {
         }
     }
 
-    /// The "SCHEMA" header bar.
-    fn render_header(window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// Open (or close, if already open) the database-switcher dropdown.
+    fn toggle_db_switcher(&mut self, cx: &mut Context<Self>) {
+        self.db_switcher_open = !self.db_switcher_open;
+        cx.notify();
+    }
+
+    /// Close the database-switcher dropdown, if open.
+    fn close_db_switcher(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.db_switcher_open) {
+            cx.notify();
+        }
+    }
+
+    /// Switch the session to `database` via [`Session::switch_database`]
+    /// and close the dropdown. While the switch (and its re-introspect) is
+    /// in flight, the tree falls back to the existing
+    /// [`SchemaState::Loading`] placeholder; a failure surfaces through
+    /// [`Session::state`] the same way any other session error does, and
+    /// [`Session::current_database`] simply never changes, so the trigger's
+    /// displayed selection reverts on its own.
+    fn select_database(&mut self, database: String, cx: &mut Context<Self>) {
+        self.close_db_switcher(cx);
+        self.session
+            .update(cx, |session, cx| session.switch_database(database, cx))
+            .detach();
+    }
+
+    /// The "SCHEMA" header bar: the label, the database switcher (only when
+    /// the connection reports more than one selectable database), and the
+    /// refresh button.
+    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .flex_row()
@@ -284,9 +317,118 @@ impl SidebarView {
                     .child("SCHEMA"),
             )
             .child(
-                icon_button_secondary("sidebar-refresh-schema", window, cx, IconName::Refresh)
-                    .on_click(cx.listener(|view, _evt, _window, cx| view.refresh_schema(cx))),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .children(self.render_db_switcher(cx))
+                    .child(
+                        icon_button_secondary(
+                            "sidebar-refresh-schema",
+                            window,
+                            cx,
+                            IconName::Refresh,
+                        )
+                        .on_click(cx.listener(|view, _evt, _window, cx| view.refresh_schema(cx))),
+                    ),
             )
+    }
+
+    /// The database-switcher trigger: the current database's name plus a
+    /// chevron, opening [`Self::render_db_switcher_menu`] on click. `None`
+    /// when the active connection reports one or zero selectable databases
+    /// (a single-database backend, or a driver that reports no
+    /// switchable-database list at all -- see
+    /// [`zsql_core::Connection::list_databases`]).
+    fn render_db_switcher(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let session = self.session.read(cx);
+        if session.available_databases().len() <= 1 {
+            return None;
+        }
+        let active_theme = cx.theme();
+        let current_text = if session.state() == &SessionState::Connecting {
+            "Connecting..."
+        } else {
+            session.current_database().unwrap_or("")
+        };
+
+        Some(
+            div()
+                .relative()
+                .child(
+                    div()
+                        .id("sidebar-db-switcher-trigger")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(theme::SIDEBAR_DB_SWITCHER_GAP)
+                        .max_w(theme::SIDEBAR_DB_SWITCHER_MAX_WIDTH)
+                        .px(theme::SIDEBAR_DB_SWITCHER_PADDING_X)
+                        .py(theme::SIDEBAR_DB_SWITCHER_PADDING_Y)
+                        .rounded(px(theme::SIDEBAR_DB_SWITCHER_RADIUS))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
+                        .on_click(cx.listener(|view, _evt: &ClickEvent, _window, cx| {
+                            view.toggle_db_switcher(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .text_size(px(theme::SIDEBAR_DB_SWITCHER_TEXT_SIZE))
+                                .text_color(rgb(active_theme.colors.text_secondary))
+                                .child(current_text.to_owned()),
+                        )
+                        .child(icon(
+                            IconName::ChevronDown,
+                            theme::SIDEBAR_ROW_ICON_SIZE,
+                            active_theme.colors.text_tertiary,
+                        ))
+                        .children(self.render_db_switcher_menu(cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The database-switcher's open dropdown: one item per
+    /// [`Session::available_databases`] entry, the current database
+    /// highlighted. `None` when the dropdown is closed.
+    fn render_db_switcher_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.db_switcher_open {
+            return None;
+        }
+        let session = self.session.read(cx);
+        let current = session.current_database().map(str::to_owned);
+        let databases = session.available_databases().to_owned();
+
+        let mut menu = ContextMenu::new("sidebar-db-switcher-menu")
+            .anchor(gpui::Corner::TopLeft)
+            .offset(point(px(0.0), theme::SIDEBAR_HEADER_HEIGHT / 2.0))
+            .on_close(cx.listener(|view, _event, _window, cx| {
+                view.close_db_switcher(cx);
+            }));
+        for database in databases {
+            let selected = current.as_deref() == Some(database.as_str());
+            let label = if selected {
+                format!("\u{2022}\t{database}")
+            } else {
+                format!("  {database}")
+            };
+            let target = database.clone();
+            let item_id = format!("sidebar-db-switcher-item-{database}");
+            menu = menu.add_item(
+                ContextMenuItem::with_id(item_id, label).on_click(cx.listener(
+                    move |view, _event, _window, cx| {
+                        view.select_database(target.clone(), cx);
+                    },
+                )),
+            );
+        }
+
+        Some(menu.into_any_element())
     }
 
     /// The main content area: the tree when a schema is loaded, or a
@@ -617,7 +759,7 @@ impl Render for SidebarView {
             .flex_col()
             .size_full()
             .bg(rgb(active_theme.colors.bg_panel))
-            .child(Self::render_header(window, cx))
+            .child(self.render_header(window, cx))
             .child(self.render_body(window, cx))
             .children(self.render_context_menu(cx))
     }
@@ -691,7 +833,7 @@ mod render_tests {
     use zsql_core::{Relation, RelationKind};
 
     use super::{SidebarView, qualified_relation_name};
-    use crate::session::{SchemaState, Session};
+    use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
     use crate::ui::tabs::TabModel;
 
@@ -1238,5 +1380,139 @@ mod render_tests {
                 "refreshing without a connection must not change the schema state"
             );
         });
+    }
+
+    // -- database switcher ----------------------------------------
+
+    /// A session already connected (via a fake connection, no real network
+    /// I/O) with `databases` as its available-databases list and `current`
+    /// as its current database.
+    fn session_with_databases(
+        databases: &[&str],
+        current: Option<&str>,
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::Entity<Session> {
+        use std::sync::Arc;
+
+        cx.new(|_cx| {
+            let mut session =
+                Session::new_for_switch_test(Arc::new(RefreshingConnection), "sqlite::memory:");
+            session.set_schema_for_test(SchemaState::Ready(sample_schema_tree()));
+            session.set_available_databases_for_test(
+                databases.iter().map(|d| (*d).to_owned()).collect(),
+            );
+            session.set_current_database_for_test(current.map(str::to_owned));
+            session
+        })
+    }
+
+    #[gpui::test]
+    fn the_database_switcher_is_hidden_with_zero_or_one_available_databases(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for databases in [Vec::<&str>::new(), vec!["only_db"]] {
+            let session = session_with_databases(&databases, databases.first().copied(), cx);
+            let session_for_view = session.clone();
+            let tabs = build_tabs(session.clone(), cx);
+            let (sidebar, vcx) =
+                cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+            sidebar.update(vcx, |view, cx| {
+                assert!(
+                    view.render_db_switcher(cx).is_none(),
+                    "expected no database switcher with {} available database(s)",
+                    databases.len()
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn the_database_switcher_is_shown_with_more_than_one_available_database(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            assert!(
+                view.render_db_switcher(cx).is_some(),
+                "expected a database switcher with more than one available database"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn toggling_the_switcher_opens_and_closes_its_menu(cx: &mut gpui::TestAppContext) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.read_with(vcx, |view, _app| assert!(!view.db_switcher_open));
+
+        sidebar.update(vcx, SidebarView::toggle_db_switcher);
+        sidebar.read_with(vcx, |view, _app| assert!(view.db_switcher_open));
+
+        sidebar.update(vcx, SidebarView::close_db_switcher);
+        sidebar.read_with(vcx, |view, _app| assert!(!view.db_switcher_open));
+    }
+
+    /// Selecting a database from the switcher closes the menu synchronously
+    /// and dispatches the switch through `Session::switch_database`: the
+    /// session's state moves to `Connecting` in that same call, exactly as
+    /// calling `switch_database` directly does (see `session::tests`).
+    #[gpui::test]
+    fn selecting_a_database_closes_the_menu_and_dispatches_the_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, SidebarView::toggle_db_switcher);
+        sidebar.read_with(vcx, |view, _app| assert!(view.db_switcher_open));
+
+        sidebar.update(vcx, |view, cx| {
+            view.select_database("beta".to_owned(), cx);
+        });
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                !view.db_switcher_open,
+                "selecting an entry must close the menu synchronously"
+            );
+        });
+        session.read_with(vcx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connecting),
+                "expected switch_database to have been dispatched synchronously, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_rendered_database_switcher_menu_does_not_panic_while_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta", "gamma"], Some("beta"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+
+        sidebar.update(vcx, SidebarView::toggle_db_switcher);
+        // Forces a render pass with the switcher's deferred/anchored
+        // overlay on screen, catching a panic in the overlay itself.
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| assert!(view.db_switcher_open));
     }
 }
