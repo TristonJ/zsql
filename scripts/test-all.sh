@@ -124,7 +124,7 @@ export ZSQL_TEST_MYSQL_URL="mysql://root:${MYSQL_PASSWORD}@localhost:${MYSQL_POR
 
 echo "running workspace tests with database tests enabled (postgres, mssql, mysql)"
 cargo test --manifest-path "$HERE/../Cargo.toml" --workspace \
-  --features zsql-postgres/driver-integration-tests,zsql-mssql/driver-integration-tests,zsql-mysql/driver-integration-tests \
+  --features zsql-postgres/driver-integration-tests,zsql-mssql/driver-integration-tests,zsql-mysql/driver-integration-tests,zsql/driver-integration-tests \
   "$@"
 
 echo "re-running zsql-mysql's own suite against MariaDB"

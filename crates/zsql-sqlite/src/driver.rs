@@ -376,6 +376,17 @@ mod tests {
     }
 
     #[test]
+    fn list_databases_reports_none_since_sqlite_is_a_single_file_backend() {
+        // A single sqlite file has no server-wide database list to switch
+        // between, so this driver deliberately does not override the
+        // trait's default.
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        assert_eq!(block_on(conn.list_databases()).unwrap(), None);
+    }
+
+    #[test]
     fn preview_query_matches_the_shared_default_limit_form() {
         let driver = SqliteDriver;
         let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();

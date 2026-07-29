@@ -263,13 +263,13 @@ impl ConnectionUrl {
         let _ = url.set_password(value);
     }
 
-    /// The database name, taken from the URL's path with its leading `/`
-    /// stripped. Empty if the URL has no path, or if this is a sqlite-path
-    /// URL.
+    /// The percent-decoded database name, taken from the URL's path with
+    /// its leading `/` stripped. Empty if the URL has no path, or if this is
+    /// a sqlite-path URL.
     #[must_use]
     pub fn database(&self) -> String {
         match &self.inner {
-            Inner::Network(url) => url.path().trim_start_matches('/').to_owned(),
+            Inner::Network(url) => percent_decode(url.path().trim_start_matches('/')),
             Inner::SqlitePath(_) => String::new(),
         }
     }
@@ -1004,6 +1004,61 @@ mod tests {
             parsed.query_param("ssl-mode").as_deref(),
             Some("verify_ca"),
             "the capped value is written back under the primary parameter name"
+        );
+    }
+
+    // -- database switching ---------------------------------------
+
+    #[test]
+    fn set_database_percent_encodes_a_name_with_reserved_url_characters() {
+        let mut parsed = ConnectionUrl::parse("postgres://app@host:5432/original").unwrap();
+        parsed.set_database("weird db name?#&=");
+        let rewritten = parsed.to_url_string();
+        assert!(
+            !rewritten.contains(' '),
+            "a raw space must not appear in the rewritten URL: {rewritten}"
+        );
+
+        let reparsed = ConnectionUrl::parse(&rewritten).expect("rewritten URL must still parse");
+        assert_eq!(
+            reparsed.database(),
+            "weird db name?#&=",
+            "the database name must round-trip through the URL's percent-encoding unchanged"
+        );
+        assert_eq!(reparsed.host().as_deref(), Some("host"));
+        assert_eq!(reparsed.user(), "app");
+    }
+
+    #[test]
+    fn set_database_does_not_disturb_any_other_field() {
+        let mut parsed =
+            ConnectionUrl::parse("postgres://app:s3cr3t@host:5432/original?sslmode=require")
+                .unwrap();
+        parsed.set_database("db two");
+
+        assert_eq!(parsed.database(), "db two");
+        assert_eq!(parsed.host().as_deref(), Some("host"));
+        assert_eq!(parsed.port(), Some(5432));
+        assert_eq!(parsed.user(), "app");
+        assert_eq!(parsed.password().as_deref(), Some("s3cr3t"));
+        assert_eq!(parsed.query_param("sslmode").as_deref(), Some("require"));
+    }
+
+    #[test]
+    fn a_tunnel_local_addr_on_conn_config_is_untouched_by_a_database_switch_rewrite() {
+        let mut cfg = crate::config::ConnConfig::from_url("postgres://app@host:5432/db1").unwrap();
+        let tunnel_addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        cfg.tunnel_local_addr = Some(tunnel_addr);
+
+        let mut parsed = ConnectionUrl::parse(&cfg.url).unwrap();
+        parsed.set_database("db2");
+        cfg.url = parsed.to_url_string();
+
+        assert_eq!(cfg.url, "postgres://app@host:5432/db2");
+        assert_eq!(
+            cfg.tunnel_local_addr,
+            Some(tunnel_addr),
+            "rewriting the database path must not touch the tunnel's local address"
         );
     }
 

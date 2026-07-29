@@ -375,6 +375,16 @@ mod tests {
     }
 
     #[test]
+    fn list_databases_reports_none_since_databases_are_already_shown_as_schemas() {
+        // MySQL's own introspect already lists every non-system database as
+        // a schema, so this driver deliberately does not override the
+        // trait's default: a per-database dropdown would only narrow what
+        // is already fully visible in the tree.
+        let conn = connection_for_test();
+        assert_eq!(block_on(conn.list_databases()).unwrap(), None);
+    }
+
+    #[test]
     fn preview_query_quotes_both_identifiers_with_backticks_and_applies_the_limit() {
         let conn = connection_for_test();
         assert_eq!(

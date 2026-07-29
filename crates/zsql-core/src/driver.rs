@@ -146,6 +146,20 @@ pub trait Connection: Send + Sync {
     /// implementation is free to take as long as it needs. The default is a
     /// no-op for a backend with nothing to release deterministically.
     async fn close(&self) {}
+
+    /// Databases selectable on this server, sorted, with system/
+    /// non-connectable entries filtered out -- or `None` if this backend has
+    /// no switchable-database concept (a single-file backend like `SQLite`)
+    /// or already exposes that axis another way (`MySQL` surfaces every
+    /// database as a schema in [`Connection::introspect`] instead). The
+    /// default implementation covers every backend that does not opt in.
+    ///
+    /// # Errors
+    /// Returns an error if the backend supports this and the underlying
+    /// query fails.
+    async fn list_databases(&self) -> Result<Option<Vec<String>>, CoreError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +221,14 @@ mod tests {
         // The default body is a genuine no-op: this only proves it resolves
         // and completes rather than panicking or hanging.
         futures::executor::block_on(connection.close());
+    }
+
+    #[test]
+    fn a_connection_with_no_list_databases_override_reports_no_switchable_databases() {
+        let connection = DefaultOnlyConnection;
+        assert_eq!(
+            futures::executor::block_on(connection.list_databases()).unwrap(),
+            None
+        );
     }
 }

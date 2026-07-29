@@ -799,6 +799,73 @@ fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut Te
     });
 }
 
+// ---- database switching -------------------------------------
+
+/// Switching databases in-session (`Session::switch_database`) is a live,
+/// transient action: it must never rewrite the saved [`StoredConnection`]
+/// (or its keyring-held URL) a connection was chosen from, on disk or in
+/// the manager's own in-memory row list.
+#[gpui::test]
+async fn switching_database_in_session_does_not_mutate_the_stored_connection(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let _guard = crate::test_support::serialize_real_io();
+
+    let temp = TempStorePath::new("switch-no-mutate");
+    let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
+    store
+        .add(ConnectionArgs {
+            name: "local sqlite".to_owned(),
+            url: "sqlite::memory:".to_owned(),
+            ssh: None,
+            ssh_secret: None,
+        })
+        .expect("add must succeed");
+    let id = store.connections()[0].id;
+    let stored_before = store.connections()[0].clone();
+
+    let session = cx.new(|_cx| session_with_no_url());
+    let session_for_switch = session.clone();
+    let manager = cx.new(|cx| new_manager(cx, session, store));
+
+    manager.update(cx, |view, cx| view.connect(id, cx)).await;
+    session_for_switch.read_with(cx, |session, _app| {
+        assert!(matches!(session.state(), SessionState::Connected));
+    });
+
+    session_for_switch
+        .update(cx, |session, cx| session.switch_database("other", cx))
+        .await;
+
+    manager.read_with(cx, |view, _app| {
+        let stored_after = &view
+            .connections()
+            .iter()
+            .find(|row| row.connection.id == id)
+            .expect("connection must still be present")
+            .connection;
+        assert_eq!(
+            *stored_after, stored_before,
+            "the in-memory stored connection must be unchanged by an in-session switch"
+        );
+    });
+
+    let reloaded = ConnectionStore::load(&temp.0).expect("reload must succeed");
+    assert_eq!(
+        reloaded.connections()[0],
+        stored_before,
+        "the on-disk stored connection must be unchanged by an in-session switch"
+    );
+    let url_after = reloaded.connections()[0]
+        .get_url()
+        .expect("get_url must succeed");
+    assert_eq!(
+        url_after, "sqlite::memory:",
+        "the keyring-held URL must be unchanged by an in-session switch"
+    );
+}
+
 // ---- Test button ----------------------------------------------------
 
 #[gpui::test]

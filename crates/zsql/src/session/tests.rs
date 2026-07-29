@@ -30,6 +30,10 @@ impl Session {
         Self {
             url: None,
             connection: None,
+            current_url: None,
+            current_database: None,
+            available_databases: Vec::new(),
+            active_ssh: None,
             tunnel: None,
             state,
             schema: SchemaState::NotLoaded,
@@ -79,6 +83,40 @@ impl Session {
         self.set_schema(schema);
     }
 
+    /// Set the session's current database directly, letting a test stand up
+    /// a session that already reports one without going through a real
+    /// connect.
+    pub(crate) fn set_current_database_for_test(&mut self, database: Option<String>) {
+        self.current_database = database;
+    }
+
+    /// Set the session's available-databases list directly, letting a test
+    /// stand up a session that already reports one without going through a
+    /// real connect's `list_databases` call.
+    pub(crate) fn set_available_databases_for_test(&mut self, databases: Vec<String>) {
+        self.available_databases = databases;
+    }
+
+    /// Whether the session's currently held connection is the exact same
+    /// `Arc` allocation as `other` -- lets a [`Session::switch_database`]
+    /// test prove the *same* connection instance survived a failed switch,
+    /// rather than merely a same-typed replacement.
+    pub(crate) fn holds_connection_for_test(&self, other: &Arc<dyn Connection>) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, other))
+    }
+
+    /// A clone of the session's currently held connection, if any -- lets a
+    /// test capture it before an action to later prove (via
+    /// [`Session::holds_connection_for_test`]) whether that exact instance
+    /// survived. Only exercised by the gated `database_switch_live_tests`
+    /// module today.
+    #[cfg_attr(not(feature = "driver-integration-tests"), allow(dead_code))]
+    pub(crate) fn connection_for_test(&self) -> Option<Arc<dyn Connection>> {
+        self.connection.clone()
+    }
+
     /// Build a session already holding `schema` as its introspected schema
     /// state, connected but idle, with no result set
     pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {
@@ -93,6 +131,18 @@ impl Session {
     pub(crate) fn new_for_query_test(connection: Arc<dyn Connection>) -> Self {
         let mut session = Self::new_for_render_test(SessionState::Connected, ResultSet::default());
         session.connection = Some(connection);
+        session
+    }
+
+    /// Build a session already connected to `connection` at `url`, idle,
+    /// with no result set -- for [`Session::switch_database`] tests, which
+    /// derive their new connect URL from `Session`'s own `current_url`.
+    pub(crate) fn new_for_switch_test(
+        connection: Arc<dyn Connection>,
+        url: impl Into<String>,
+    ) -> Self {
+        let mut session = Self::new_for_query_test(connection);
+        session.current_url = Some(url.into());
         session
     }
 
@@ -226,6 +276,69 @@ impl Connection for CloseCountingConnection {
     async fn close(&self) {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// A [`Connection`] double whose `list_databases` answers with a scripted
+/// outcome, for unit-testing [`super::fetch_available_databases`]'s mapping
+/// of a driver's `Option<Vec<String>>`/error result to the plain `Vec`
+/// `Session::available_databases` caches -- without a live driver. Every
+/// other method is unexercised.
+struct ListDatabasesConnection {
+    outcome: Result<Option<Vec<String>>, String>,
+}
+
+#[async_trait::async_trait]
+impl Connection for ListDatabasesConnection {
+    fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn describe_relation(
+        &self,
+        _schema: &str,
+        _relation: &str,
+    ) -> Result<RelationSchema, CoreError> {
+        unimplemented!("not exercised by this test")
+    }
+
+    async fn list_databases(&self) -> Result<Option<Vec<String>>, CoreError> {
+        self.outcome.clone().map_err(CoreError::introspection)
+    }
+}
+
+#[test]
+fn fetch_available_databases_returns_the_drivers_list_when_some() {
+    let conn = ListDatabasesConnection {
+        outcome: Ok(Some(vec!["alpha".to_owned(), "beta".to_owned()])),
+    };
+    let databases = block_on(super::fetch_available_databases(&conn));
+    assert_eq!(databases, vec!["alpha".to_owned(), "beta".to_owned()]);
+}
+
+#[test]
+fn fetch_available_databases_is_empty_when_the_driver_reports_none() {
+    let conn = ListDatabasesConnection { outcome: Ok(None) };
+    assert!(block_on(super::fetch_available_databases(&conn)).is_empty());
+}
+
+#[test]
+fn fetch_available_databases_is_empty_rather_than_panicking_on_a_query_error() {
+    let conn = ListDatabasesConnection {
+        outcome: Err("permission denied for pg_database".to_owned()),
+    };
+    assert!(block_on(super::fetch_available_databases(&conn)).is_empty());
 }
 
 fn session_with_no_url() -> Session {
@@ -530,6 +643,60 @@ fn a_batch_landing_exactly_on_the_limit_truncates_without_overshoot() {
 
     assert_eq!(session.result().rows.len(), 4);
     assert!(matches!(session.state(), SessionState::Truncating { .. }));
+}
+
+// -- database switching -----------------------------------------
+
+#[test]
+fn url_for_database_rewrites_only_the_database_segment() {
+    let rewritten = super::url_for_database(
+        "postgres://app:pw@host:5432/original?sslmode=require",
+        "other",
+    )
+    .expect("rewrite should succeed");
+    assert_eq!(
+        rewritten,
+        "postgres://app:pw@host:5432/other?sslmode=require"
+    );
+}
+
+/// A database name containing reserved/special URL characters must survive
+/// the rewrite through percent-encoding, never dropped or truncated -- and,
+/// since it only ever reaches [`zsql_core::ConnectionUrl::set_database`]'s
+/// path-segment encoding, never interpolated into a SQL string either.
+#[test]
+fn url_for_database_percent_encodes_a_name_with_reserved_characters() {
+    let rewritten =
+        super::url_for_database("postgres://app@host:5432/original", "weird db?#&name's")
+            .expect("rewrite should succeed");
+
+    let parsed = zsql_core::ConnectionUrl::parse(&rewritten).expect("rewritten URL must parse");
+    assert_eq!(parsed.database(), "weird db?#&name's");
+    assert_eq!(parsed.host().as_deref(), Some("host"));
+    assert_eq!(parsed.user(), "app");
+}
+
+#[test]
+fn url_for_database_rejects_an_unparseable_url() {
+    assert!(super::url_for_database("not-a-url", "other").is_err());
+}
+
+#[test]
+fn current_database_from_url_reads_the_urls_database_segment() {
+    assert_eq!(
+        super::current_database_from_url("postgres://host/app"),
+        Some("app".to_owned())
+    );
+}
+
+#[test]
+fn current_database_from_url_is_none_for_a_sqlite_url() {
+    assert_eq!(super::current_database_from_url("sqlite::memory:"), None);
+}
+
+#[test]
+fn current_database_from_url_is_none_for_a_url_with_no_database_segment() {
+    assert_eq!(super::current_database_from_url("postgres://host"), None);
 }
 
 // -- tunnel lifecycle ---------------------------------------------------
@@ -980,7 +1147,14 @@ mod gpui_tests {
             // A newer attempt (generation 2) has already superseded the one
             // whose outcome (generation 1) is being applied here.
             session.connection_generation = 2;
-            apply_connect_outcome(session, 1, Ok((discarded, None)), cx)
+            let attempt = crate::session::ConnectAttempt {
+                connection: discarded,
+                tunnel: None,
+                url: "sqlite::memory:".to_owned(),
+                current_database: None,
+                available_databases: Vec::new(),
+            };
+            apply_connect_outcome(session, 1, Ok(attempt), cx)
         });
         cx.run_until_parked();
 
@@ -997,6 +1171,49 @@ mod gpui_tests {
             assert!(
                 session.connection.is_none(),
                 "a superseded attempt must never install its connection onto the session"
+            );
+        });
+    }
+
+    /// A successful connect attempt's `available_databases` (as populated by
+    /// [`super::fetch_available_databases`] alongside the connection itself)
+    /// must land in `Session::available_databases`, not just the transient
+    /// [`crate::session::ConnectAttempt`] it arrives in -- proving the
+    /// assignment inside `apply_connect_outcome` actually wires the fetched
+    /// list into session state, the same way `current_database` does.
+    #[gpui::test]
+    fn a_successful_connect_outcome_populates_available_databases(cx: &mut TestAppContext) {
+        let connection: Box<dyn Connection> =
+            Box::new(CloseCountingConnection::new(Arc::new(AtomicUsize::new(0))));
+
+        let session = cx.new(|_cx| session_with_no_url());
+        let connected = session.update(cx, |session, cx| {
+            let generation = session.connection_generation;
+            let attempt = crate::session::ConnectAttempt {
+                connection,
+                tunnel: None,
+                url: "sqlite::memory:".to_owned(),
+                current_database: Some("primary".to_owned()),
+                available_databases: vec!["alpha".to_owned(), "beta".to_owned()],
+            };
+            apply_connect_outcome(session, generation, Ok(attempt), cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            connected,
+            "a successful connect attempt must report connected"
+        );
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                session.available_databases(),
+                &["alpha".to_owned(), "beta".to_owned()],
+                "the attempt's available_databases must be copied onto the session"
+            );
+            assert_eq!(
+                session.current_database(),
+                Some("primary"),
+                "the attempt's current_database must be copied onto the session"
             );
         });
     }
@@ -2705,5 +2922,176 @@ mod gpui_tests {
 
         // Just to be clear, explicitly drop the run_task
         drop(run_task);
+    }
+
+    // -- switch_database ------------------------------------------
+
+    #[gpui::test]
+    async fn switch_database_with_no_active_connection_reports_an_error(cx: &mut TestAppContext) {
+        let session = cx.new(|_cx| session_with_no_url());
+
+        session
+            .update(cx, |session, cx| session.switch_database("other", cx))
+            .await;
+
+        session.read_with(cx, |session, _app| match session.state() {
+            SessionState::Error(message) => assert!(
+                message.contains("not connected"),
+                "expected a not-connected error, got: {message}"
+            ),
+            other => panic!("expected SessionState::Error, got {other:?}"),
+        });
+    }
+
+    /// The full swap-and-reset sequence `switch_database` runs: the
+    /// in-flight query is cancelled and the schema tree resets to
+    /// `NotLoaded` synchronously (before the new connect even resolves,
+    /// mirroring `connect_to`'s own synchronous reset), `connection_generation`
+    /// bumps synchronously, and once the new connect resolves the previous
+    /// connection is closed exactly once and the session ends up `Connected`.
+    #[gpui::test]
+    async fn switch_database_performs_the_swap_and_reset_sequence(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let outgoing: Arc<dyn Connection> =
+            Arc::new(CloseCountingConnection::new(close_calls.clone()));
+        let session = cx.new(|_cx| Session::new_for_switch_test(outgoing, "sqlite::memory:"));
+
+        let (cancel_tx, cancel_rx) = flume::unbounded::<()>();
+        session.update(cx, |session, _cx| {
+            session.active_query = Some(zsql_core::QueryHandle::new(cancel_tx));
+        });
+
+        let generation_before =
+            session.read_with(cx, |session, _app| session.connection_generation);
+
+        let task = session.update(cx, |session, cx| {
+            let task = session.switch_database("other", cx);
+            assert!(
+                session.active_query.is_none(),
+                "expected the in-flight query's handle to be dropped synchronously"
+            );
+            assert!(
+                matches!(session.schema(), SchemaState::Loading),
+                "expected the schema to reset synchronously to Loading, got {:?}",
+                session.schema()
+            );
+            assert!(
+                matches!(session.state(), SessionState::Connecting),
+                "expected Connecting synchronously, got {:?}",
+                session.state()
+            );
+            assert!(
+                session.connection_generation > generation_before,
+                "expected connection_generation to bump synchronously"
+            );
+            task
+        });
+        task.await;
+
+        assert!(
+            cancel_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "dropping the in-flight query's handle must have closed its cancel channel"
+        );
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "the outgoing connection must be closed exactly once"
+        );
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Connected),
+                "expected Connected after a successful switch, got {:?}",
+                session.state()
+            );
+        });
+    }
+
+    /// A failed switch must leave the session exactly as it was before the
+    /// attempt: the previous connection stays installed (the same `Arc`,
+    /// never closed), the current database is untouched, and the schema
+    /// tree is restored to whatever it held before the attempt rather than
+    /// left at `NotLoaded`. The failure itself is still surfaced via
+    /// `state`, the same way a query error is.
+    #[gpui::test]
+    async fn a_failed_switch_leaves_connection_database_and_schema_exactly_as_before(
+        cx: &mut TestAppContext,
+    ) {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let original: Arc<dyn Connection> =
+            Arc::new(CloseCountingConnection::new(close_calls.clone()));
+        let original_clone = original.clone();
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_switch_test(original, "cassandra://host/originaldb");
+            session.set_current_database_for_test(Some("originaldb".to_owned()));
+            session.set_schema_for_test(SchemaState::Ready(sample_schema_tree()));
+            session
+        });
+
+        session
+            .update(cx, |session, cx| session.switch_database("otherdb", cx))
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert!(
+                matches!(session.state(), SessionState::Error(_)),
+                "expected Error after a failed switch, got {:?}",
+                session.state()
+            );
+            assert_eq!(
+                session.current_database.as_deref(),
+                Some("originaldb"),
+                "current_database must be untouched by a failed switch"
+            );
+            assert!(
+                session.holds_connection_for_test(&original_clone),
+                "the original connection instance must still be installed"
+            );
+            match session.schema() {
+                SchemaState::Ready(tree) => assert_eq!(
+                    tree.catalogs.len(),
+                    sample_schema_tree().catalogs.len(),
+                    "the prior Ready schema must be restored, not left at NotLoaded"
+                ),
+                other => panic!("expected the prior Ready schema restored, got {other:?}"),
+            }
+        });
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            0,
+            "a failed switch must never close the connection it failed to replace"
+        );
+    }
+
+    /// Verify that `switch_database` does not disturb unrelated session
+    /// configuration such as the preview limit or other state fields that
+    /// should persist across database switches.
+    #[gpui::test]
+    async fn switch_database_does_not_disturb_unrelated_session_config(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::test_support::serialize_real_io();
+
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_switch_test(
+                Arc::new(CloseCountingConnection::new(Arc::new(AtomicUsize::new(0)))),
+                "sqlite::memory:",
+            );
+            session.preview_limit = 250;
+            session
+        });
+        let preview_limit_before = session.read_with(cx, |session, _app| session.preview_limit);
+
+        session
+            .update(cx, |session, cx| session.switch_database("other", cx))
+            .await;
+
+        session.read_with(cx, |session, _app| {
+            assert_eq!(
+                session.preview_limit, preview_limit_before,
+                "switch_database must not disturb unrelated session config"
+            );
+        });
     }
 }
