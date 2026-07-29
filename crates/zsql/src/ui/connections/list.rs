@@ -20,7 +20,6 @@ use crate::ui::{connections::ConnectionRow, theme};
 /// list's own.
 type EventListener = Rc<dyn Fn(&ConnectionListEvent, &mut Window, &mut App) + 'static>;
 
-#[derive(Clone)]
 pub struct ConnectionList {
     connection_rows: Vec<ConnectionListItem>,
     status_text: Option<String>,
@@ -236,6 +235,7 @@ impl ConnectionListItem {
                         div()
                             .overflow_x_hidden()
                             .text_ellipsis()
+                            .w_full()
                             .text_size(px(theme::MODAL_ROW_NAME_TEXT_SIZE))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(colors.text_primary))
