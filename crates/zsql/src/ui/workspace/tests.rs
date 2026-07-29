@@ -1141,6 +1141,9 @@ mod render_tests {
             .expect("workspace-root must be painted")
             .size
             .width;
+        let viewport_before = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
 
         open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
 
@@ -1149,11 +1152,66 @@ mod render_tests {
             .expect("workspace-root must still be painted with many tabs open")
             .size
             .width;
+        let viewport_after = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must still be painted with many tabs open");
 
         assert_eq!(
             width_before, width_after,
             "opening enough tabs to overflow the tab strip must not widen the workspace's own \
              outer container"
+        );
+        // The strip's own viewport is where the clipping actually happens:
+        // if its min-width/overflow wiring regressed, the viewport itself
+        // would stretch to the tabs' summed width even while an ancestor's
+        // min_w_0 kept the workspace root at the window size.
+        assert_eq!(
+            viewport_before.size.width, viewport_after.size.width,
+            "the tab strip's scroll viewport must keep its width when its content overflows, \
+             not stretch to fit the tabs"
+        );
+    }
+
+    /// The new-tab button is a sibling after the scroll viewport, so it
+    /// must stay painted at the strip's trailing edge -- outside the
+    /// scrolled region -- no matter how far the strip is scrolled.
+    #[gpui::test]
+    fn the_new_tab_button_stays_reachable_while_the_strip_is_scrolled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, first_tab, vcx) = fresh_workspace(cx);
+        let _ = first_tab;
+
+        let tab_ids = open_extra_script_tabs(&workspace, vcx, OVERFLOWING_EXTRA_TABS);
+        let last_tab = *tab_ids.last().expect("at least one tab was opened");
+
+        // Scroll to the strip's far end by activating the last tab.
+        workspace.update(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .update(cx, |tabs, cx| tabs.set_active(last_tab, cx));
+        });
+        vcx.run_until_parked();
+
+        let root = vcx
+            .debug_bounds("workspace-root")
+            .expect("workspace-root must be painted");
+        let viewport = vcx
+            .debug_bounds("tab-bar-scroll-viewport")
+            .expect("the scroll viewport must be painted");
+        let button = vcx
+            .debug_bounds("workspace-new-tab")
+            .expect("the new-tab button must stay painted while the strip is scrolled");
+
+        assert!(
+            button.origin.x >= viewport.origin.x + viewport.size.width,
+            "the new-tab button must sit after the scroll viewport's trailing edge, not inside \
+             the scrolled region, got {button:?} against viewport {viewport:?}"
+        );
+        assert!(
+            button.origin.x + button.size.width <= root.origin.x + root.size.width,
+            "the new-tab button must stay within the workspace's own bounds, got {button:?} \
+             against root {root:?}"
         );
     }
 

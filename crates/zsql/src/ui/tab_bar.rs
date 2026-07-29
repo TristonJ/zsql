@@ -280,6 +280,7 @@ pub fn render_tab_bar(
     zsql_ui::tabs::tab_bar_shell(&theme).child(scrolled).child(
         zsql_ui::tabs::new_tab_glyph(&theme)
             .id("workspace-new-tab")
+            .debug_selector(|| "workspace-new-tab".to_owned())
             .cursor_pointer()
             .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
                 view.open_new_script_tab(window, cx);
