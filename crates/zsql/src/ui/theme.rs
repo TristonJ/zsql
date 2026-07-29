@@ -374,6 +374,91 @@ pub const SCHEMA_INDEXES_WIDTHS: [Pixels; 4] = [px(220.0), px(100.0), px(80.0), 
 /// (Name, Type, Definition).
 pub const SCHEMA_CONSTRAINTS_WIDTHS: [Pixels; 3] = [px(260.0), px(140.0), px(360.0)];
 
+// ---- status-bar appearance trigger -------------------------------------
+
+/// Side length of one swatch chip in the status-bar theme trigger.
+pub const APPEARANCE_TRIGGER_SWATCH_SIZE: Pixels = px(7.0);
+/// Gap between the status-bar theme trigger's swatch chips.
+pub const APPEARANCE_TRIGGER_SWATCH_GAP: Pixels = px(2.0);
+/// Corner radius of one swatch chip in the status-bar theme trigger.
+pub const APPEARANCE_TRIGGER_SWATCH_RADIUS: f32 = 2.0;
+/// Horizontal padding inside the status-bar theme trigger.
+pub const APPEARANCE_TRIGGER_PADDING_X: Pixels = px(9.0);
+/// Vertical padding inside the status-bar theme trigger.
+pub const APPEARANCE_TRIGGER_PADDING_Y: Pixels = px(3.0);
+/// Corner radius of the status-bar theme trigger.
+pub const APPEARANCE_TRIGGER_RADIUS: f32 = 7.0;
+/// Horizontal gap between the status-bar theme trigger's swatch, name, and
+/// caret.
+pub const APPEARANCE_TRIGGER_GAP: Pixels = px(7.0);
+/// Text size of the status-bar theme trigger's name and caret.
+pub const APPEARANCE_TRIGGER_TEXT_SIZE: f32 = 12.0;
+
+// ---- Appearance modal ---------------------------------------------------
+
+/// Text size of the Appearance modal's title.
+pub const APPEARANCE_MODAL_TITLE_TEXT_SIZE: f32 = 15.0;
+/// Text size of the Appearance modal's subtitle.
+pub const APPEARANCE_MODAL_SUBTITLE_TEXT_SIZE: f32 = 13.0;
+/// Tallest the modal's card grid is allowed to grow before it scrolls.
+pub const APPEARANCE_MODAL_GRID_MAX_HEIGHT: Pixels = px(520.0);
+/// Padding around the modal's scrollable card grid.
+pub const APPEARANCE_MODAL_GRID_PADDING: Pixels = px(24.0);
+/// Gap between cards in the modal's grid, on both axes.
+pub const APPEARANCE_MODAL_GRID_GAP: Pixels = px(20.0);
+/// Fixed width of one theme card in the modal's grid.
+pub const APPEARANCE_CARD_WIDTH: Pixels = px(262.0);
+/// Corner radius of a theme card's mini-preview panel.
+pub const APPEARANCE_CARD_PREVIEW_RADIUS: f32 = 10.0;
+/// Vertical gap between a card's mini-preview panel and its name/tone row.
+pub const APPEARANCE_CARD_META_GAP: Pixels = px(11.0);
+/// Text size of a card's theme name.
+pub const APPEARANCE_CARD_NAME_TEXT_SIZE: f32 = 13.5;
+/// Text size of a card's tone/ACTIVE label.
+pub const APPEARANCE_CARD_TONE_TEXT_SIZE: f32 = 9.0;
+/// Padding around the modal's footer hint and Done button.
+pub const APPEARANCE_FOOTER_PADDING_X: Pixels = px(26.0);
+/// Vertical padding around the modal's footer hint and Done button.
+pub const APPEARANCE_FOOTER_PADDING_Y: Pixels = px(16.0);
+/// Text size of the modal footer's hint text.
+pub const APPEARANCE_FOOTER_HINT_TEXT_SIZE: f32 = 12.0;
+/// Horizontal padding inside the modal footer's Done button.
+pub const APPEARANCE_DONE_BUTTON_PADDING_X: Pixels = px(18.0);
+/// Vertical padding inside the modal footer's Done button.
+pub const APPEARANCE_DONE_BUTTON_PADDING_Y: Pixels = px(8.0);
+/// Corner radius of the modal footer's Done button.
+pub const APPEARANCE_DONE_BUTTON_RADIUS: f32 = 7.0;
+/// Text size of the modal footer's Done button.
+pub const APPEARANCE_DONE_BUTTON_TEXT_SIZE: f32 = 13.0;
+
+// ---- mini zsql preview (painted inside an Appearance-modal card) --------
+
+/// Height of the mini preview's editor line.
+pub const MINI_EDITOR_HEIGHT: Pixels = px(30.0);
+/// Horizontal padding inside the mini preview's editor line and status
+/// strip.
+pub const MINI_PADDING_X: Pixels = px(10.0);
+/// Text size of the mini preview's editor line and grid.
+pub const MINI_TEXT_SIZE: f32 = 10.5;
+/// Text size of the mini preview's Run chip.
+pub const MINI_RUN_CHIP_TEXT_SIZE: f32 = 9.5;
+/// Horizontal padding inside the mini preview's Run chip.
+pub const MINI_RUN_CHIP_PADDING_X: Pixels = px(8.0);
+/// Corner radius of the mini preview's Run chip.
+pub const MINI_RUN_CHIP_RADIUS: f32 = 5.0;
+/// Height of one row (header or data) in the mini preview's results grid.
+pub const MINI_GRID_ROW_HEIGHT: Pixels = px(24.0);
+/// Text size of the mini preview's column type tags.
+pub const MINI_TAG_TEXT_SIZE: f32 = 7.5;
+/// Horizontal padding inside the mini preview's column type tags.
+pub const MINI_TAG_PADDING_X: Pixels = px(4.0);
+/// Corner radius of the mini preview's column type tags.
+pub const MINI_TAG_RADIUS: f32 = 4.0;
+/// Height of the mini preview's status strip.
+pub const MINI_STATUS_HEIGHT: Pixels = px(24.0);
+/// Text size of the mini preview's status strip.
+pub const MINI_STATUS_TEXT_SIZE: f32 = 9.5;
+
 #[cfg(test)]
 mod tests {
     use super::{

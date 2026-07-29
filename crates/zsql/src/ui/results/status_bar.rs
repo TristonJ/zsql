@@ -1,6 +1,6 @@
 //! The results pane's bottom connection/status bar.
 
-use gpui::{Context, Div, div, prelude::*, px, rgb};
+use gpui::{Context, Div, SharedString, div, prelude::*, px, rgb};
 use zsql_ui::grid;
 use zsql_ui::theme::ActiveTheme;
 
@@ -47,23 +47,21 @@ impl ResultsView {
         let colors = active_theme.colors;
         let (dot_color, label, error_message) = self.connection_status(cx);
 
-        let mut bar = div()
+        // The left cluster (connection status, query metrics, any error
+        // message) grows to fill the bar; the theme trigger is a fixed-width
+        // sibling after it, so it always lands flush against the bar's right
+        // edge regardless of which optional pieces the left cluster shows.
+        let mut left = div()
             .flex()
             .flex_row()
             .items_center()
-            .flex_shrink_0()
+            .flex_1()
+            .min_w_0()
             .gap_4()
-            .h(theme::STATUS_BAR_HEIGHT)
-            .px_3()
-            .bg(rgb(colors.bg_panel))
-            .border_t_1()
-            .border_color(rgb(colors.border))
-            .font_family(&cx.theme().fonts.data)
-            .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
-            .text_color(rgb(colors.text_secondary))
             .child(grid::status_dot(dot_color))
             .child(
                 div()
+                    .flex_shrink_0()
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(rgb(colors.text_primary))
                     .child(label),
@@ -81,17 +79,17 @@ impl ResultsView {
         if let Some((count_text, elapsed_text)) =
             status_metrics(effective_state, metrics_count, metrics_unit)
         {
-            bar = bar.child(count_text).child(elapsed_text);
+            left = left.child(count_text).child(elapsed_text);
         }
 
         if let Some(total_row_count_text) =
             format_total_row_count(self.session.read(cx).row_count())
         {
-            bar = bar.child(total_row_count_text);
+            left = left.child(total_row_count_text);
         }
 
         if let Some(message) = error_message {
-            bar = bar.child(
+            left = left.child(
                 div()
                     .flex_1()
                     .min_w_0()
@@ -101,6 +99,35 @@ impl ResultsView {
             );
         }
 
-        bar
+        let active_display_name: SharedString = self
+            .appearance_modal
+            .as_ref()
+            .map_or_else(
+                || crate::theme_resolve::display_name_for(zsql_ui::theme::ZSQL_DARK_NAME),
+                |modal| modal.read(cx).active_theme_display_name(),
+            )
+            .into();
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .gap_4()
+            .h(theme::STATUS_BAR_HEIGHT)
+            .px_3()
+            .bg(rgb(colors.bg_panel))
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .font_family(&cx.theme().fonts.data)
+            .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
+            .text_color(rgb(colors.text_secondary))
+            .child(left)
+            .child(super::appearance_trigger::render_theme_trigger(
+                self.appearance_modal.clone(),
+                colors,
+                active_display_name,
+                cx,
+            ))
     }
 }

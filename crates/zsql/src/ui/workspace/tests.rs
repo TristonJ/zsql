@@ -1,6 +1,6 @@
 use gpui::Context;
 
-use super::{WorkspaceView, clamp_editor_height, clamp_sidebar_width};
+use super::{WorkspaceStartup, WorkspaceView, clamp_editor_height, clamp_sidebar_width};
 use crate::ui::connections::ActiveConnection;
 use crate::ui::tabs::{Tab, TabId};
 
@@ -169,7 +169,7 @@ mod render_tests {
     use gpui::{AppContext as _, Entity};
     use zsql_core::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
 
-    use super::WorkspaceView;
+    use super::{WorkspaceStartup, WorkspaceView};
     use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::{ConnectionArgs, ConnectionStore};
     use crate::session::{SchemaState, Session, SessionState};
@@ -272,7 +272,12 @@ mod render_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -300,7 +305,12 @@ mod render_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -342,7 +352,12 @@ mod render_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -399,7 +414,12 @@ mod render_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -456,7 +476,12 @@ mod render_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -497,7 +522,12 @@ mod render_tests {
                 store,
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                Some(paths.tab_sessions.clone()),
+                WorkspaceStartup {
+                    tab_sessions_path: Some(paths.tab_sessions.clone()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -587,7 +617,12 @@ mod render_tests {
                 store,
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -790,7 +825,12 @@ mod render_tests {
                 store,
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                Some(paths.tab_sessions.clone()),
+                WorkspaceStartup {
+                    tab_sessions_path: Some(paths.tab_sessions.clone()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -903,7 +943,12 @@ mod render_tests {
                 store,
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                Some(paths.tab_sessions.clone()),
+                WorkspaceStartup {
+                    tab_sessions_path: Some(paths.tab_sessions.clone()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -967,7 +1012,12 @@ mod render_tests {
                 store,
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                Some(paths.tab_sessions.clone()),
+                WorkspaceStartup {
+                    tab_sessions_path: Some(paths.tab_sessions.clone()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -1018,7 +1068,7 @@ mod header_tests {
     use gpui::{AppContext as _, Entity, TestAppContext};
     use zsql_core::{BatchSink, Connection, CoreError, QueryHandle, RowCount, SchemaTree};
 
-    use super::WorkspaceView;
+    use super::{WorkspaceStartup, WorkspaceView};
     use crate::config::{LayoutConfig, ValuePanelConfig};
     use crate::connections::ConnectionStore;
     use crate::session::Session;
@@ -1093,7 +1143,12 @@ mod header_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -1132,7 +1187,12 @@ mod header_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -1170,7 +1230,12 @@ mod header_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
@@ -1209,7 +1274,12 @@ mod header_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                None,
+                WorkspaceStartup {
+                    tab_sessions_path: None,
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                },
                 cx,
             )
         });
