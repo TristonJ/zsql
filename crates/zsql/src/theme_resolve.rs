@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn display_name_for_known_builtins_matches_the_documented_labels() {
-        assert_eq!(super::display_name_for(ZSQL_DARK_NAME), "zsql Dark");
+        assert_eq!(super::display_name_for(ZSQL_DARK_NAME), "zsql dark");
         assert_eq!(super::display_name_for(LATTE_NAME), "Catppuccin Latte");
         assert_eq!(super::display_name_for(FRAPPE_NAME), "Catppuccin Frappe");
         assert_eq!(
