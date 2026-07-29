@@ -34,6 +34,14 @@ pub fn run_button_hint(theme: &Theme) -> u32 {
     Colors::wash(theme.colors.bg_app, 0xb3)
 }
 
+/// Run button background while no live connection is held: a dimmer accent
+/// than the resting fill, so the disabled state still reads as the same
+/// control rather than a different color role entirely.
+#[must_use]
+pub fn run_button_disabled_bg(theme: &Theme) -> u32 {
+    theme.colors.accent_dim()
+}
+
 /// Height of the workspace header above the active tab's content, holding
 /// the pane label and the Run button.
 pub const WORKSPACE_HEADER_HEIGHT: Pixels = px(38.0);
@@ -505,8 +513,9 @@ pub const MINI_STATUS_TEXT_SIZE: f32 = 9.5;
 #[cfg(test)]
 mod tests {
     use super::{
-        generated_strip_accent, generated_strip_bg, modal_row_active_bg, run_button_hint,
-        run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, status_disconnected,
+        generated_strip_accent, generated_strip_bg, modal_row_active_bg, run_button_disabled_bg,
+        run_button_hint, run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg,
+        status_disconnected,
     };
     use zsql_ui::theme::Theme;
 
@@ -534,5 +543,14 @@ mod tests {
         assert_eq!(run_button_hint(&theme), 0x10_12_17_b3);
         // was theme::MODAL_ROW_ACTIVE_BG.
         assert_eq!(modal_row_active_bg(&theme), 0x33_c2_ac_17);
+    }
+
+    /// The disabled Run button fill must be a dimmer shade of the accent,
+    /// not the resting accent itself.
+    #[test]
+    fn run_button_disabled_bg_is_dimmer_than_the_resting_accent() {
+        let theme = Theme::default();
+        assert_eq!(run_button_disabled_bg(&theme), theme.colors.accent_dim());
+        assert_ne!(run_button_disabled_bg(&theme), theme.colors.accent);
     }
 }

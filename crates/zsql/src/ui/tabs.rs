@@ -399,10 +399,16 @@ impl TabModel {
 
     /// Run `sql` for tab `id` through `session`, the `RunQuery`/Run-button
     /// seam every tab's editor is wired to (see [`TabModel::build_editor`]).
+    /// A no-op while `session` holds no live connection, so a keystroke or
+    /// click reaching here without a connection never dispatches.
     fn run_for_tab(&mut self, id: TabId, sql: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tab(id) else {
             return;
         };
+        if !self.session.read(cx).is_connected() {
+            tracing::debug!(tab_id = id, "run rejected: not connected");
+            return;
+        }
         let label = display_label(tab);
         let kind = tab.kind.clone();
         // A live generated tab is a preview of its relation, so re-running it

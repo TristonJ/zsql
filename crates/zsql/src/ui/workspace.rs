@@ -46,6 +46,10 @@ enum DividerDrag {
 }
 
 pub struct WorkspaceView {
+    /// Kept alongside the sub-entities that also hold their own clone, so
+    /// the header can read [`Session::is_connected`] for the Run button's
+    /// enabled state without reaching into `tabs`.
+    session: Entity<Session>,
     connections: Entity<ConnectionManagerView>,
     appearance: Entity<AppearanceModalView>,
     footer: Entity<ConnectionFooterView>,
@@ -126,6 +130,7 @@ impl WorkspaceView {
             themes_dir,
             config_path,
         } = startup;
+        let header_session = session.clone();
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         results.update(cx, |results, cx| {
             results.configure_value_panel(cx, &layout, value_panel);
@@ -206,6 +211,7 @@ impl WorkspaceView {
         .detach();
 
         Self {
+            session: header_session,
             connections,
             appearance,
             footer,
@@ -433,8 +439,10 @@ impl WorkspaceView {
     /// and the Run button, with its keyboard-shortcut hint, on the right.
     /// Rendered once per frame regardless of the active tab's kind, so both
     /// a full `Script` editor and a compact `Generated` strip get a Run
-    /// affordance.
-    fn render_header(cx: &Context<Self>) -> impl IntoElement {
+    /// affordance. The Run button is disabled -- muted fill, non-interactive
+    /// -- whenever `session` holds no live connection; see
+    /// [`Session::is_connected`].
+    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let run_shortcut = if cfg!(target_os = "macos") {
             "Cmd+Enter"
         } else {
@@ -442,6 +450,12 @@ impl WorkspaceView {
         };
         let active_theme = cx.theme();
         let colors = active_theme.colors;
+        let can_run = self.session.read(cx).is_connected();
+        let run_button_bg = if can_run {
+            colors.accent
+        } else {
+            theme::run_button_disabled_bg(active_theme)
+        };
 
         div()
             .flex()
@@ -463,6 +477,7 @@ impl WorkspaceView {
             .child(
                 div()
                     .id("workspace-run-query-button")
+                    .debug_selector(|| "workspace-run-query-button".to_owned())
                     .flex()
                     .flex_row()
                     .items_center()
@@ -470,13 +485,16 @@ impl WorkspaceView {
                     .h(theme::RUN_BUTTON_HEIGHT)
                     .px(px(theme::RUN_BUTTON_PADDING_X))
                     .rounded(px(theme::RUN_BUTTON_RADIUS))
-                    .bg(rgb(colors.accent))
+                    .bg(rgb(run_button_bg))
                     .text_color(rgb(colors.bg_app))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::run_button_hover_bg(active_theme))))
-                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                        view.run_active_tab(cx);
-                    }))
+                    .when(can_run, |el| {
+                        el.cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme::run_button_hover_bg(active_theme))))
+                            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                                view.run_active_tab(cx);
+                            }))
+                    })
+                    .when(!can_run, gpui::Styled::cursor_not_allowed)
                     .child(icon(
                         IconName::Run,
                         theme::RUN_BUTTON_ICON_SIZE,
@@ -543,7 +561,7 @@ impl WorkspaceView {
         }
 
         vec![
-            Self::render_header(cx).into_any_element(),
+            self.render_header(cx).into_any_element(),
             self.render_active_body(cx),
             div()
                 .id("editor-results-divider")
