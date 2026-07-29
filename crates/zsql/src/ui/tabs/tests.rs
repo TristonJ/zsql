@@ -3,18 +3,24 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use gpui::{AppContext as _, Entity, SharedString, TestAppContext};
 use zsql_core::{
-    BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RowCount, SchemaTree,
+    BatchSink, ColumnMeta, Connection, CoreError, PreviewQueryArgs, QueryEvent, QueryHandle,
+    RowCount, SchemaTree,
 };
 
-use super::{ResultsSnapshot, Tab, TabKind, TabModel};
+use super::{PreviewAction, ResultsSnapshot, Tab, TabKind, TabModel};
 use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::ResultsView;
 
-/// Test-only accessor for asserting on a tab's captured run.
+/// Test-only accessors: a tab's captured run, and its sort/page window (see
+/// [`Tab::preview_state`]'s field doc for when the latter is meaningful).
 impl Tab {
     pub(crate) fn last_run_for_test(&self) -> Option<&ResultsSnapshot> {
         self.last_run.as_ref()
+    }
+
+    pub(crate) fn preview_state(&self) -> &zsql_core::preview_state::PreviewQueryState {
+        &self.preview_state
     }
 }
 
@@ -57,6 +63,9 @@ impl Connection for FakeConnection {
 /// whose sinks a test can never reach, so its runs never resolve.
 struct RecordingConnection {
     sinks: Arc<Mutex<Vec<BatchSink>>>,
+    /// The relation total [`Connection::count_rows`] reports, so a
+    /// pager test can page through more than a single (empty) page.
+    total_rows: u64,
 }
 
 #[async_trait]
@@ -76,7 +85,7 @@ impl Connection for RecordingConnection {
     }
 
     async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
-        Ok(RowCount::Exact(0))
+        Ok(RowCount::Exact(self.total_rows))
     }
 
     async fn describe_relation(
@@ -95,21 +104,16 @@ impl Connection for RecordingConnection {
 fn build_model_with_recording_connection(
     cx: &mut TestAppContext,
 ) -> (Entity<TabModel>, Arc<Mutex<Vec<BatchSink>>>) {
-    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
-    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
-        sinks: sinks.clone(),
-    });
-    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let session_for_results = session.clone();
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session_for_results, "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
-    (model, sinks)
+    build_model_with_recording_connection_and_total_rows(cx, 0)
 }
 
 #[gpui::test]
 fn re_running_a_generated_preview_tab_refreshes_the_relation_row_count(cx: &mut TestAppContext) {
     let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
-    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection { sinks });
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks,
+        total_rows: 0,
+    });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
     let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
     let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results, cx)));
@@ -209,8 +213,8 @@ impl Connection for DialectRecordingConnection {
         Ok(zsql_core::RelationSchema::default())
     }
 
-    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-        format!("SELECT TOP ({limit}) * FROM [{schema}].[{relation}]")
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        format!("SELECT TOP ({}) * FROM [{schema}].[{relation}]", args.limit)
     }
 }
 
@@ -1196,5 +1200,305 @@ fn switching_between_two_connections_snapshots_swaps_the_whole_tab_set(cx: &mut 
         assert_eq!(model.tabs()[0].title(), "b-query.sql");
         assert_eq!(model.tabs()[0].editor().read(app).text(), "select 'b';");
         assert_eq!(model.active_id(), Some(model.tabs()[0].id()));
+    });
+}
+
+/// Like [`build_model_with_results`], but backed by a
+/// [`RecordingConnection`] so a test can independently complete (or
+/// leave in flight) each tab's own dispatched run, by sending directly
+/// on the sink `stream_query` was called with. `total_rows` seeds every
+/// relation's reported row count, so a pager test has more than one
+/// page to step through.
+fn build_model_with_recording_connection_and_total_rows(
+    cx: &mut TestAppContext,
+    total_rows: u64,
+) -> (Entity<TabModel>, Arc<Mutex<Vec<BatchSink>>>) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks: sinks.clone(),
+        total_rows,
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let session_for_results = session.clone();
+    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session_for_results, "", cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
+    (model, sinks)
+}
+
+/// Sort/pager clicks apply to the tab active when `action` fires,
+/// exactly what the pager and header UI reach through
+/// [`TabModel::preview_dispatch`].
+fn dispatch(model: &Entity<TabModel>, cx: &mut TestAppContext, action: PreviewAction) {
+    model.update(cx, |model, cx| model.dispatch_preview_action(action, cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn clicking_a_new_column_sorts_ascending_rewrites_the_buffer_and_reruns(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(&model, cx, PreviewAction::Sort("total_cents".to_owned()));
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().sort_column(), Some("total_cents"));
+        assert_eq!(
+            tab.preview_state().sort_direction(),
+            zsql_core::SortDirection::Asc,
+            "a fresh sort on a new column starts ascending"
+        );
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200",
+            "the editor buffer must equal exactly the SQL that was rerun"
+        );
+    });
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before + 1,
+        "sorting a live generated tab must re-run its query"
+    );
+}
+
+#[gpui::test]
+fn clicking_the_already_active_sort_column_flips_direction(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::Sort("id".to_owned()));
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs()[0].preview_state().sort_column(), Some("id"));
+    });
+
+    dispatch(&model, cx, PreviewAction::Sort("id".to_owned()));
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().sort_column(), Some("id"));
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" ORDER BY \"id\" DESC LIMIT 200",
+            "a second click on the active column must flip ASC to DESC"
+        );
+    });
+}
+
+#[gpui::test]
+fn each_generated_tab_keeps_its_own_independent_sort_and_page(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 10_000);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    dispatch(&model, cx, PreviewAction::Sort("total_cents".to_owned()));
+    dispatch(&model, cx, PreviewAction::NextPage);
+
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "customers", cx)
+    });
+    cx.run_until_parked();
+
+    model.read_with(cx, |model, app| {
+        let orders = model
+            .tabs()
+            .iter()
+            .find(|tab| tab.title() == "orders")
+            .expect("orders tab still open");
+        assert_eq!(orders.preview_state().sort_column(), Some("total_cents"));
+        assert_eq!(orders.preview_state().page(), 2);
+
+        let customers = model
+            .tabs()
+            .iter()
+            .find(|tab| tab.title() == "customers")
+            .expect("customers tab active");
+        assert_eq!(
+            customers.preview_state().sort_column(),
+            None,
+            "opening a second generated tab must not inherit the first tab's sort"
+        );
+        assert_eq!(customers.preview_state().page(), 1);
+        assert_eq!(
+            customers.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"customers\" LIMIT 200",
+            "the second tab's own buffer must not carry the first tab's ORDER BY/OFFSET"
+        );
+    });
+}
+
+#[gpui::test]
+fn editing_a_generated_tabs_buffer_makes_further_sort_and_page_actions_inert(
+    cx: &mut TestAppContext,
+) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    let id = model.read_with(cx, |model, _app| model.tabs()[0].id());
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("-- edited\n", cx);
+    });
+    cx.run_until_parked();
+
+    model.read_with(cx, |model, _app| {
+        assert!(model.tab(id).unwrap().dirty());
+        assert!(matches!(model.tab(id).unwrap().kind(), TabKind::Script));
+    });
+
+    let text_before = editor.read_with(cx, |editor, _app| editor.text());
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(&model, cx, PreviewAction::Sort("id".to_owned()));
+    dispatch(&model, cx, PreviewAction::NextPage);
+
+    let text_after = editor.read_with(cx, |editor, _app| editor.text());
+    assert_eq!(
+        text_before, text_after,
+        "sort/page actions on an edited (now Script) tab must not touch its buffer"
+    );
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before,
+        "sort/page actions on an edited tab must not dispatch a run"
+    );
+}
+
+#[gpui::test]
+fn last_page_jumps_using_the_sessions_already_fetched_total_row_count(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection(cx);
+    let session = model.read_with(cx, |model, _app| model.session.clone());
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    // Simulate the initial preview_relation count fetch resolving with
+    // 450 total rows -- last_page_active_tab must use exactly this
+    // already-known total, not issue any count query of its own.
+    session.update(cx, |session, cx| {
+        session.set_row_count_for_test(Some(zsql_core::RowCount::Exact(450)));
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::LastPage);
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        // 450 rows at 200/page: pages of 200, 200, 50 -> last page 3.
+        assert_eq!(tab.preview_state().page(), 3);
+        assert_eq!(tab.preview_state().offset(), 400);
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 400"
+        );
+    });
+}
+
+#[gpui::test]
+fn next_page_rewrites_limit_offset_and_the_buffer_stays_in_sync(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 10_000);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::NextPage);
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().page(), 2);
+        assert_eq!(tab.preview_state().offset(), 200);
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 200"
+        );
+    });
+}
+
+#[gpui::test]
+fn prev_page_is_a_no_op_and_does_not_rerun_when_already_on_page_one(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(&model, cx, PreviewAction::PrevPage);
+
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs()[0].preview_state().page(), 1);
+    });
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before,
+        "prev page at the first page must not dispatch another run"
+    );
+}
+
+#[gpui::test]
+fn sorting_re_anchors_the_page_to_one_dropping_any_offset(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 10_000);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::NextPage);
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs()[0].preview_state().page(), 2);
+    });
+
+    dispatch(&model, cx, PreviewAction::Sort("id".to_owned()));
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().page(), 1);
+        assert_eq!(tab.preview_state().offset(), 0);
+        assert!(
+            !tab.editor().read(app).text().contains("OFFSET"),
+            "page 1 must not carry an OFFSET clause: {}",
+            tab.editor().read(app).text()
+        );
+    });
+}
+
+#[gpui::test]
+fn the_rendered_pager_snapshot_reflects_the_total_once_the_async_count_resolves(
+    cx: &mut TestAppContext,
+) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks,
+        total_rows: 450, // 3 pages at the default 200/page.
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    // The count fetch resolves on its own schedule after the first page
+    // renders; when it lands it must reach the rendered pager snapshot,
+    // not just the owning tab's own preview state.
+    results.read_with(cx, |results, _cx| {
+        assert_eq!(
+            results.preview_last_page_number_for_test(),
+            Some(3),
+            "the pager snapshot must reflect the relation total once the count resolves"
+        );
     });
 }

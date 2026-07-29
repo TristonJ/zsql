@@ -9,13 +9,16 @@
 //! (framework-agnostic) or `zsql-core` (driver-agnostic).
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
+use zsql_core::preview_state::PreviewQueryState;
 use zsql_core::{RelationKind, ResultSet};
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
 use super::results::ResultsView;
+use super::results::pager::{PreviewAction, PreviewControls, PreviewDispatch};
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
@@ -101,6 +104,13 @@ pub struct Tab {
     /// The read-only schema view for a `Schema` tab; `None` for every other
     /// kind.
     schema_view: Option<Entity<SchemaTabView>>,
+    /// This tab's own sort/page window, keyed per tab rather than shared,
+    /// so switching between two open generated tabs never leaks one's sort
+    /// or page into the other's grid or editor buffer. Only meaningful
+    /// while `kind` is `Generated` and the tab is not yet `dirty`; carried
+    /// (but ignored) on every other tab so `Tab`'s fields never need to be
+    /// optional just for this one kind.
+    preview_state: PreviewQueryState,
 }
 
 impl Tab {
@@ -189,6 +199,11 @@ pub struct TabModel {
     live_owner: Option<TabId>,
     session: Entity<Session>,
     results: Entity<ResultsView>,
+    /// The single callback every sort/pager control routes its clicks
+    /// through, built once and shared by every rendered control (see
+    /// [`TabModel::preview_controls_for_active_tab`]) rather than a fresh
+    /// closure per render.
+    preview_dispatch: PreviewDispatch,
 }
 
 impl TabModel {
@@ -200,8 +215,42 @@ impl TabModel {
     pub fn new(
         session: Entity<Session>,
         results: Entity<ResultsView>,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let model = cx.entity();
+        // Reused, not re-fetched: a sort or page change previews the same
+        // relation the tab's initial `preview_relation` call already
+        // counted, so its total is still valid (see
+        // `Session::preview_relation_windowed`'s own doc comment). Syncing
+        // it here on every `session` notification -- rather than only once
+        // right after a run finishes -- also picks up the initial preview's
+        // own count fetch, which resolves on its own schedule alongside
+        // (not before) the query that renders the first page.
+        cx.observe(&session, |model: &mut Self, session, cx| {
+            let Some(id) = model.live_owner else {
+                return;
+            };
+            let total = session.read(cx).row_count();
+            let mut changed = false;
+            if let Some(tab) = model.tabs.iter_mut().find(|tab| tab.id == id)
+                && tab.is_generated()
+                && tab.preview_state.total_rows() != total
+            {
+                tab.preview_state.set_total_rows(total);
+                changed = true;
+            }
+            // The pager and page readout render from a snapshot pushed by
+            // `sync_preview_controls`, not from the tab directly. A session
+            // notification fires for every streaming batch, but the count
+            // lands just once, so refresh that snapshot only when the active
+            // tab's total actually changes -- reflecting it right away without
+            // re-syncing on every unrelated notification.
+            if changed && model.active == Some(id) {
+                model.sync_preview_controls(cx);
+            }
+        })
+        .detach();
+
         Self {
             tabs: Vec::new(),
             active: None,
@@ -212,6 +261,9 @@ impl TabModel {
             live_owner: None,
             session,
             results,
+            preview_dispatch: Rc::new(move |action, _window, cx| {
+                model.update(cx, |model, cx| model.dispatch_preview_action(action, cx));
+            }),
         }
     }
 
@@ -271,6 +323,7 @@ impl TabModel {
         if self.tab(id).is_some() {
             self.active = Some(id);
             self.sync_results_to_active(cx);
+            self.sync_preview_controls(cx);
             cx.notify();
         }
     }
@@ -431,6 +484,7 @@ impl TabModel {
             editor.set_compact(true);
         });
 
+        let page_size = self.session.read(cx).preview_limit();
         self.tabs.push(Tab {
             id,
             kind: TabKind::Generated {
@@ -442,6 +496,7 @@ impl TabModel {
             dirty: false,
             last_run: None,
             schema_view: None,
+            preview_state: PreviewQueryState::new(page_size),
         });
         self.generated_by_relation.insert(key, id);
         self.active = Some(id);
@@ -450,6 +505,7 @@ impl TabModel {
             session.preview_relation(schema, relation, cx)
         });
         self.dispatch_run(id, format!("{schema}.{relation}"), task, cx);
+        self.sync_preview_controls(cx);
 
         tracing::info!(tab_id = id, schema, relation, "opened generated tab");
         cx.notify();
@@ -465,6 +521,7 @@ impl TabModel {
         self.next_script_number += 1;
 
         tracing::info!(tab_id = id, title = %title, "opened new script tab");
+        let page_size = self.session.read(cx).preview_limit();
         self.tabs.push(Tab {
             id,
             kind: TabKind::Script,
@@ -473,9 +530,11 @@ impl TabModel {
             dirty: false,
             last_run: None,
             schema_view: None,
+            preview_state: PreviewQueryState::new(page_size),
         });
         self.active = Some(id);
         self.sync_results_to_active(cx);
+        self.sync_preview_controls(cx);
         cx.notify();
         id
     }
@@ -511,6 +570,7 @@ impl TabModel {
             SchemaTabView::new(&session, schema.to_owned(), relation.to_owned(), kind, cx)
         });
 
+        let page_size = self.session.read(cx).preview_limit();
         self.tabs.push(Tab {
             id,
             kind: TabKind::Schema {
@@ -522,10 +582,12 @@ impl TabModel {
             dirty: false,
             last_run: None,
             schema_view: Some(schema_view),
+            preview_state: PreviewQueryState::new(page_size),
         });
         self.schema_by_relation.insert(key, id);
         self.active = Some(id);
         self.sync_results_to_active(cx);
+        self.sync_preview_controls(cx);
 
         tracing::info!(tab_id = id, schema, relation, "opened schema tab");
         cx.notify();
@@ -567,6 +629,7 @@ impl TabModel {
                 Some(self.tabs[index.min(self.tabs.len() - 1)].id)
             };
             self.sync_results_to_active(cx);
+            self.sync_preview_controls(cx);
         }
 
         tracing::info!(tab_id = id, "closed tab");
@@ -609,7 +672,170 @@ impl TabModel {
             });
         }
 
+        self.sync_preview_controls(cx);
         cx.notify();
+    }
+
+    /// Route `action` to whichever tab is currently active, per
+    /// [`PreviewAction`]'s own variants. The single body every control
+    /// [`TabModel::preview_dispatch`] reaches ultimately calls into.
+    fn dispatch_preview_action(&mut self, action: PreviewAction, cx: &mut Context<Self>) {
+        match action {
+            PreviewAction::Sort(column) => self.sort_active_tab_by(&column, cx),
+            PreviewAction::FirstPage => self.first_page_active_tab(cx),
+            PreviewAction::PrevPage => self.prev_page_active_tab(cx),
+            PreviewAction::NextPage => self.next_page_active_tab(cx),
+            PreviewAction::LastPage => self.last_page_active_tab(cx),
+            PreviewAction::CyclePageSize => self.cycle_page_size_active_tab(cx),
+        }
+    }
+
+    /// Toggle the active tab's sort by `column` (see
+    /// [`PreviewQueryState::toggle_sort`]) and re-run it. A no-op while the
+    /// active tab is not a live, unedited generated preview.
+    fn sort_active_tab_by(&mut self, column: &str, cx: &mut Context<Self>) {
+        let column = column.to_owned();
+        self.rerun_active_generated_tab(cx, move |state| {
+            state.toggle_sort(&column);
+            true
+        });
+    }
+
+    /// Step the active tab's pager back one page. A no-op at page 1, or
+    /// while the active tab is not a live, unedited generated preview.
+    fn prev_page_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.rerun_active_generated_tab(cx, PreviewQueryState::prev_page);
+    }
+
+    /// Step the active tab's pager forward one page. A no-op at the last
+    /// known page, or while the active tab is not a live, unedited
+    /// generated preview.
+    fn next_page_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.rerun_active_generated_tab(cx, PreviewQueryState::next_page);
+    }
+
+    /// Jump the active tab's pager to page 1. A no-op already on page 1, or
+    /// while the active tab is not a live, unedited generated preview.
+    fn first_page_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.rerun_active_generated_tab(cx, PreviewQueryState::first_page);
+    }
+
+    /// Jump the active tab's pager to the last known page. A no-op while
+    /// the total row count is unknown, already on the last page, or the
+    /// active tab is not a live, unedited generated preview.
+    fn last_page_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.rerun_active_generated_tab(cx, PreviewQueryState::last_page);
+    }
+
+    /// Advance the active tab's page size to the next configured choice
+    /// (from [`Session::preview_page_sizes`]), wrapping around, and
+    /// re-anchor per [`PreviewQueryState::set_page_size`]. A no-op while the
+    /// active tab is not a live, unedited generated preview.
+    fn cycle_page_size_active_tab(&mut self, cx: &mut Context<Self>) {
+        let page_sizes = self.session.read(cx).preview_page_sizes().to_vec();
+        if page_sizes.is_empty() {
+            return;
+        }
+        self.rerun_active_generated_tab(cx, move |state| {
+            let current = page_sizes
+                .iter()
+                .position(|&size| size == state.page_size());
+            let next = current.map_or(0, |index| (index + 1) % page_sizes.len());
+            state.set_page_size(page_sizes[next]);
+            true
+        });
+    }
+
+    /// Apply `mutate` to the active tab's [`PreviewQueryState`] (only while
+    /// it is a live, unedited generated preview), and, only when `mutate`
+    /// reports it actually changed the window (e.g. `prev_page` at page 1
+    /// returns `false`), re-run the tab's query via the exact same windowed
+    /// builder call used to rewrite its buffer -- so buffer text and
+    /// executed SQL can never diverge, and a pager control already at its
+    /// boundary is a true no-op rather than an redundant identical rerun.
+    fn rerun_active_generated_tab(
+        &mut self,
+        cx: &mut Context<Self>,
+        mutate: impl FnOnce(&mut PreviewQueryState) -> bool,
+    ) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let changed = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .is_some_and(|tab| {
+                if tab.dirty || !matches!(tab.kind, TabKind::Generated { .. }) {
+                    return false;
+                }
+                mutate(&mut tab.preview_state)
+            });
+        if !changed {
+            return;
+        }
+
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        let TabKind::Generated { schema, relation } = tab.kind.clone() else {
+            return;
+        };
+        let sort = tab
+            .preview_state
+            .sort_pair()
+            .map(|(column, direction)| (column.to_owned(), direction));
+        let limit = tab.preview_state.page_size();
+        let offset = tab.preview_state.offset();
+        let editor = tab.editor.clone();
+
+        let _span = tracing::info_span!(
+            "tab_preview_requery",
+            tab_id = id,
+            schema = %schema,
+            relation = %relation,
+            limit,
+            offset
+        )
+        .entered();
+
+        let sort_ref = sort
+            .as_ref()
+            .map(|(column, direction)| (column.as_str(), *direction));
+        let sql = self
+            .session
+            .read(cx)
+            .preview_sql_windowed(&schema, &relation, sort_ref, limit, offset);
+        editor.update(cx, |editor, cx| editor.set_text(&sql, cx));
+
+        tracing::info!("rewriting generated preview query for a sort/page change");
+        let task = self.session.update(cx, |session, cx| {
+            session.preview_relation_windowed(&schema, &relation, sort_ref, limit, offset, cx)
+        });
+        self.dispatch_run(id, format!("{schema}.{relation}"), task, cx);
+        self.sync_preview_controls(cx);
+    }
+
+    /// Rebuild `results`'s [`PreviewControls`] from the active tab: `Some`
+    /// while it is a live, unedited generated preview, else `None`, which
+    /// is what renders the grid's sort headers and the results bar's pager
+    /// inert without hiding the grid itself.
+    fn sync_preview_controls(&self, cx: &mut Context<Self>) {
+        let controls = self.active.and_then(|id| self.tab(id)).and_then(|tab| {
+            let TabKind::Generated { .. } = tab.kind else {
+                return None;
+            };
+            if tab.dirty {
+                return None;
+            }
+            Some(PreviewControls {
+                state: tab.preview_state.clone(),
+                dispatch: self.preview_dispatch.clone(),
+            })
+        });
+        self.results.update(cx, |results, cx| {
+            results.set_preview_controls(controls, cx);
+        });
     }
 
     /// This model's entire tab state as a persistable, window-independent
@@ -694,6 +920,7 @@ impl TabModel {
             "tab session loaded for connection"
         );
         self.sync_results_to_active(cx);
+        self.sync_preview_controls(cx);
         cx.notify();
     }
 
@@ -713,6 +940,7 @@ impl TabModel {
             .filter_map(|entry| parse_script_number(&entry.title))
             .max()
             .map_or(1, |highest| highest + 1);
+        let page_size = self.session.read(cx).preview_limit();
 
         for entry in &snapshot.tabs {
             let id = self.allocate_id();
@@ -748,6 +976,7 @@ impl TabModel {
                 dirty,
                 last_run: None,
                 schema_view: None,
+                preview_state: PreviewQueryState::new(page_size),
             });
         }
 

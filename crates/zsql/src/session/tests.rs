@@ -35,6 +35,7 @@ impl Session {
             schema: SchemaState::NotLoaded,
             schema_generation: 0,
             preview_limit: Config::default().query.preview_limit,
+            preview_page_sizes: Config::default().query.preview_page_sizes,
             batch_size: Config::default().query.batch_size,
             max_result_rows: Config::default().query.max_result_rows,
             active_query: None,
@@ -617,8 +618,9 @@ mod gpui_tests {
 
     use gpui::{AppContext as _, Entity, TestAppContext};
     use zsql_core::{
-        BatchSink, Catalog, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, Relation,
-        RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs, SchemaTree, Value,
+        BatchSink, Catalog, ColumnMeta, Connection, CoreError, PreviewQueryArgs, QueryEvent,
+        QueryHandle, Relation, RelationKind, ResultSet, Row, RowBatch, RowCount, SchemaNs,
+        SchemaTree, Value,
     };
 
     use super::{CloseCountingConnection, FakeTunnel};
@@ -1285,8 +1287,8 @@ mod gpui_tests {
             Ok(zsql_core::RelationSchema::default())
         }
 
-        fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-            format!("SELECT TOP ({limit}) * FROM [{schema}].[{relation}]")
+        fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+            format!("SELECT TOP ({}) * FROM [{schema}].[{relation}]", args.limit)
         }
     }
 

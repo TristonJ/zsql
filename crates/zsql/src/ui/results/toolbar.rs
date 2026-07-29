@@ -80,6 +80,7 @@ impl ResultsView {
     fn render_bar_right(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let active_theme = cx.theme();
         let switch_enabled = self.effective_result(cx).has_single_text_column();
+        let displayed_row_count = self.effective_result(cx).rows.len();
 
         let mut row = div()
             .flex()
@@ -87,6 +88,12 @@ impl ResultsView {
             .items_center()
             .flex_shrink_0()
             .gap(theme::RESULTS_BAR_RIGHT_GAP);
+
+        row = row.child(super::pager::render_pager_bar(
+            self.preview.as_ref(),
+            displayed_row_count,
+            active_theme,
+        ));
 
         if self.view_mode == ViewMode::Text {
             row = row.child(Self::render_icon_button(

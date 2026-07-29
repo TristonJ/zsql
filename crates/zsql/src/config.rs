@@ -71,8 +71,12 @@ pub struct QueryConfig {
     /// through to each sqlx-based driver's connection at connect time (see
     /// `zsql_core::ConnConfig::batch_size`).
     pub batch_size: usize,
-    /// Default `LIMIT` applied to table quick-previews.
+    /// Default `LIMIT` applied to table quick-previews, and the page size a
+    /// fresh preview's pager starts at.
     pub preview_limit: u64,
+    /// The page sizes a preview's pager cycles through, in order. The
+    /// results bar's page-size control never hardcodes these numbers.
+    pub preview_page_sizes: Vec<u64>,
     /// Upper bound on rows accumulated for a single streamed query result.
     /// Once a result reaches this many rows the query is cancelled and the
     /// session reports a truncated result rather than continuing to grow
@@ -225,6 +229,7 @@ impl Default for QueryConfig {
         Self {
             batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
             preview_limit: 200,
+            preview_page_sizes: vec![100, 200, 500, 1000],
             max_result_rows: DEFAULT_MAX_RESULT_ROWS,
         }
     }
@@ -423,6 +428,25 @@ mod tests {
             parsed.query.max_result_rows,
             Config::default().query.max_result_rows
         );
+    }
+
+    #[test]
+    fn preview_page_sizes_default_to_the_four_documented_choices_in_order() {
+        assert_eq!(
+            Config::default().query.preview_page_sizes,
+            vec![100, 200, 500, 1000]
+        );
+    }
+
+    #[test]
+    fn preview_page_sizes_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.query.preview_page_sizes = vec![50, 250];
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.query.preview_page_sizes, vec![50, 250]);
     }
 
     #[test]

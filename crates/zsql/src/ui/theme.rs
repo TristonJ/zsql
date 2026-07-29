@@ -136,6 +136,24 @@ pub const RESULTS_ICON_BUTTON_RADIUS: f32 = 5.0;
 /// Text size of the results bar's copy/wrap icon buttons.
 pub const RESULTS_ICON_BUTTON_TEXT_SIZE: f32 = 11.0;
 
+// ---- results pane: preview sort/pager controls -------------------------
+
+/// Height of a pager control (first/prev/next/last, page-size cycle).
+pub const PAGER_BUTTON_HEIGHT: Pixels = px(20.0);
+/// Horizontal padding inside a pager control.
+pub const PAGER_BUTTON_PADDING_X: Pixels = px(7.0);
+/// Corner radius of a pager control.
+pub const PAGER_BUTTON_RADIUS: f32 = 5.0;
+/// Text size of every pager control and the "rows X-Y" / "page N / total"
+/// readouts.
+pub const PAGER_TEXT_SIZE: f32 = 11.0;
+/// Horizontal gap between the pager's own controls.
+pub const PAGER_GROUP_GAP: Pixels = px(6.0);
+/// Text/border opacity applied to a pager control while it is disabled
+/// (the boundary end it steps toward, or the active tab is not a live
+/// generated preview).
+pub const PAGER_DISABLED_OPACITY: f32 = 0.45;
+
 /// Background of the Grid|Text view switch's active segment, and of the
 /// wrap toggle when wrap is on: the accent wash used elsewhere for a
 /// selected/active control.

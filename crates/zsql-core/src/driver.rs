@@ -7,6 +7,7 @@ use crate::error::CoreError;
 use crate::row_count::RowCount;
 use crate::schema::SchemaTree;
 use crate::schema_detail::RelationSchema;
+use crate::sql::PreviewQueryArgs;
 use crate::value::{ColumnMeta, RowBatch};
 
 /// An incremental event emitted while a query streams to the UI.
@@ -135,8 +136,8 @@ pub trait Connection: Send + Sync {
     /// building the text touches neither the connection nor the network, so
     /// callers may call it freely (e.g. to show what a query will run before
     /// running it).
-    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-        crate::sql::default_preview_query(schema, relation, limit)
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        crate::sql::default_preview_query(schema, relation, args)
     }
 
     /// Release any resources this connection holds (pools, sockets,
@@ -154,6 +155,7 @@ mod tests {
     use crate::row_count::RowCount;
     use crate::schema::SchemaTree;
     use crate::schema_detail::RelationSchema;
+    use crate::sql::PreviewQueryArgs;
 
     /// A connection double that overrides nothing, so it takes the trait's
     /// default [`Connection::preview_query`] body verbatim.
@@ -190,8 +192,12 @@ mod tests {
     fn a_connection_with_no_override_falls_back_to_the_shared_default() {
         let connection = DefaultOnlyConnection;
         assert_eq!(
-            connection.preview_query("public", "orders", 200),
-            crate::sql::default_preview_query("public", "orders", 200)
+            connection.preview_query("public", "orders", PreviewQueryArgs::from_limit(200)),
+            crate::sql::default_preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200)
+            )
         );
     }
 
