@@ -1549,11 +1549,10 @@ impl Connection for PerRelationCountConnection {
     }
 }
 
-/// The ticket's exact repro (ZSQ-91): open a preview of relation A (its
-/// count resolves to one total), open a preview of relation B (a different
-/// total), then switch back to A's tab. The displayed total -- both the
-/// status bar's and the pager's -- must follow the active tab, not whichever
-/// relation was most recently fetched.
+/// Open a preview of relation A (its count resolves to one total), open a
+/// preview of relation B (a different total), then switch back to A's tab.
+/// The displayed total -- both the status bar's and the pager's -- must
+/// follow the active tab, not whichever relation was most recently fetched.
 #[gpui::test]
 fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_count(
     cx: &mut TestAppContext,
@@ -1601,6 +1600,11 @@ fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_co
             Some(RowCount::Exact(999)),
             "customers' own count must be shown while its tab is active"
         );
+        assert_eq!(
+            results.status_bar_total_row_count_text_for_test(),
+            Some("999 total".to_owned()),
+            "the status bar's rendered text must reflect customers' own total"
+        );
     });
 
     let calls_before_switch = count_calls.lock().expect("count_calls lock poisoned").len();
@@ -1608,11 +1612,10 @@ fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_co
     model.update(cx, |model, cx| model.set_active(orders_id, cx));
     cx.run_until_parked();
 
-    // The root cause this ticket fixes: `Session::row_count` is still
-    // whatever was most recently fetched (customers' 999), since switching
-    // tabs never re-runs a query for orders. The status bar must not read
-    // this session-global value directly -- it must derive the displayed
-    // total from the active tab's own frozen preview state instead.
+    // Session::row_count still reflects the most recently fetched relation
+    // (customers' 999); switching tabs never re-runs a query for orders. The
+    // status bar must derive the displayed total from the active tab's own
+    // frozen preview state rather than this session-global value.
     session.read_with(cx, |session, _cx| {
         assert_eq!(
             session.row_count(),
@@ -1626,6 +1629,11 @@ fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_co
             results.active_total_row_count_for_test(),
             Some(RowCount::Exact(300)),
             "switching back to orders' tab must show its own total, not customers'"
+        );
+        assert_eq!(
+            results.status_bar_total_row_count_text_for_test(),
+            Some("300 total".to_owned()),
+            "the status bar's rendered text must follow orders' own total, not customers'"
         );
         assert_eq!(
             results.preview_last_page_number_for_test(),
@@ -1691,6 +1699,11 @@ fn a_tab_whose_count_fetch_is_still_pending_shows_no_total_across_a_tab_switch(
             None,
             "switching back to a tab whose count is still pending must not fabricate a total"
         );
+        assert_eq!(
+            results.status_bar_total_row_count_text_for_test(),
+            None,
+            "the status bar must render no total text while the count is still pending"
+        );
     });
 
     let _ = script_id;
@@ -1725,6 +1738,11 @@ fn an_edited_generated_tab_shows_no_total_row_count(cx: &mut TestAppContext) {
             results.active_total_row_count_for_test(),
             None,
             "editing a generated tab must clear its displayed total row count"
+        );
+        assert_eq!(
+            results.status_bar_total_row_count_text_for_test(),
+            None,
+            "the status bar must render no total text for an edited generated tab"
         );
     });
     let _ = sinks;
