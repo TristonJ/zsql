@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use gpui::{AppContext as _, Entity, SharedString, TestAppContext};
 use zsql_core::{
-    BatchSink, ColumnMeta, Connection, CoreError, QueryEvent, QueryHandle, RowCount, SchemaTree,
+    BatchSink, ColumnMeta, Connection, CoreError, PreviewQueryArgs, QueryEvent, QueryHandle,
+    RowCount, SchemaTree,
 };
 
 use super::{PreviewAction, ResultsSnapshot, Tab, TabKind, TabModel};
@@ -212,8 +213,8 @@ impl Connection for DialectRecordingConnection {
         Ok(zsql_core::RelationSchema::default())
     }
 
-    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-        format!("SELECT TOP ({limit}) * FROM [{schema}].[{relation}]")
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        format!("SELECT TOP ({}) * FROM [{schema}].[{relation}]", args.limit)
     }
 }
 

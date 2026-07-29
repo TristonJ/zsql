@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema, RowCount,
-    SchemaTree, SortDirection,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, PreviewQueryArgs, QueryHandle,
+    RelationSchema, RowCount, SchemaTree,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{
@@ -182,48 +182,32 @@ impl Connection for MySqlConnection {
 
     /// The click-to-preview query for `relation` in `schema`, capped at
     /// `limit` rows, in this dialect's syntax: backtick-quoted identifiers.
-    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-        format!(
-            "SELECT * FROM {}.{} LIMIT {limit}",
-            backtick_quote_ident(schema),
-            backtick_quote_ident(relation)
-        )
-    }
-
-    #[tracing::instrument(name = "mysql_close", skip_all)]
-    async fn close(&self) {
-        self.0.close().await;
-    }
-
-    /// The sort-and-page-windowed form of [`Connection::preview_query`]:
-    /// backtick-quoted identifiers, an optional `ORDER BY`, and `LIMIT` /
-    /// `OFFSET` (`MySQL`/`MariaDB` accept `OFFSET` directly after `LIMIT`).
-    fn preview_query_windowed(
-        &self,
-        schema: &str,
-        relation: &str,
-        sort: Option<(&str, SortDirection)>,
-        limit: u64,
-        offset: u64,
-    ) -> String {
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
         let mut sql = format!(
             "SELECT * FROM {}.{}",
             backtick_quote_ident(schema),
             backtick_quote_ident(relation)
         );
-        if let Some((column, direction)) = sort {
+        if let Some((column, direction)) = args.sort {
             let _ = write!(
                 sql,
                 " ORDER BY {} {}",
-                backtick_quote_ident(column),
+                backtick_quote_ident(&column),
                 direction.as_sql()
             );
         }
-        let _ = write!(sql, " LIMIT {limit}");
-        if offset > 0 {
+        let _ = write!(sql, " LIMIT {}", args.limit);
+        if let Some(offset) = args.offset
+            && offset > 0
+        {
             let _ = write!(sql, " OFFSET {offset}");
         }
         sql
+    }
+
+    #[tracing::instrument(name = "mysql_close", skip_all)]
+    async fn close(&self) {
+        self.0.close().await;
     }
 }
 
@@ -282,7 +266,7 @@ async fn exact_row_count(pool: &MySqlPool, schema: &str, relation: &str) -> Resu
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
+    use zsql_core::{ConnConfig, Connection, Driver, PreviewQueryArgs, SortDirection};
 
     use super::{MySqlConnection, MysqlDriver};
 
@@ -394,7 +378,7 @@ mod tests {
     fn preview_query_quotes_both_identifiers_with_backticks_and_applies_the_limit() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query("zsql", "orders", 200),
+            conn.preview_query("zsql", "orders", PreviewQueryArgs::from_limit(200)),
             "SELECT * FROM `zsql`.`orders` LIMIT 200"
         );
     }
@@ -402,7 +386,11 @@ mod tests {
     #[test]
     fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("zsql", "orders`; DROP TABLE users; --", 200);
+        let sql = conn.preview_query(
+            "zsql",
+            "orders`; DROP TABLE users; --",
+            PreviewQueryArgs::from_limit(200),
+        );
         assert_eq!(
             sql,
             "SELECT * FROM `zsql`.`orders``; DROP TABLE users; --` LIMIT 200"
@@ -411,74 +399,73 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_with_no_sort_and_no_offset_matches_the_plain_preview() {
+    fn preview_query_applies_ascending_and_descending_sorts() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query_windowed("zsql", "orders", None, 200, 0),
-            conn.preview_query("zsql", "orders", 200)
-        );
-    }
-
-    #[test]
-    fn preview_query_windowed_applies_ascending_and_descending_sorts() {
-        let conn = connection_for_test();
-        assert_eq!(
-            conn.preview_query_windowed(
+            conn.preview_query(
                 "zsql",
                 "orders",
-                Some(("total_cents", SortDirection::Asc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200)
+                    .offset(0)
+                    .sort("total_cents", SortDirection::Asc)
             ),
             "SELECT * FROM `zsql`.`orders` ORDER BY `total_cents` ASC LIMIT 200"
         );
         assert_eq!(
-            conn.preview_query_windowed(
+            conn.preview_query(
                 "zsql",
                 "orders",
-                Some(("total_cents", SortDirection::Desc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200)
+                    .offset(0)
+                    .sort("total_cents", SortDirection::Desc)
             ),
             "SELECT * FROM `zsql`.`orders` ORDER BY `total_cents` DESC LIMIT 200"
         );
     }
 
     #[test]
-    fn preview_query_windowed_omits_offset_on_page_one_and_applies_it_from_page_two() {
+    fn preview_query_omits_offset_on_page_one_and_applies_it_from_page_two() {
         let conn = connection_for_test();
-        let page_one = conn.preview_query_windowed("zsql", "orders", None, 200, 0);
+        let page_one = conn.preview_query("zsql", "orders", PreviewQueryArgs::from_limit(200));
         assert!(!page_one.contains("OFFSET"), "page one: {page_one}");
         assert_eq!(
-            conn.preview_query_windowed("zsql", "orders", None, 200, 200),
+            conn.preview_query(
+                "zsql",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(200)
+            ),
             "SELECT * FROM `zsql`.`orders` LIMIT 200 OFFSET 200"
         );
         assert_eq!(
-            conn.preview_query_windowed("zsql", "orders", None, 200, 800),
+            conn.preview_query(
+                "zsql",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(800)
+            ),
             "SELECT * FROM `zsql`.`orders` LIMIT 200 OFFSET 800"
         );
     }
 
     #[test]
-    fn preview_query_windowed_supports_every_configured_page_size() {
+    fn preview_query_supports_every_configured_page_size() {
         let conn = connection_for_test();
         for page_size in [100_u64, 200, 500, 1000] {
             assert_eq!(
-                conn.preview_query_windowed("zsql", "orders", None, page_size, 0),
+                conn.preview_query("zsql", "orders", PreviewQueryArgs::from_limit(page_size)),
                 format!("SELECT * FROM `zsql`.`orders` LIMIT {page_size}")
             );
         }
     }
 
     #[test]
-    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+    fn preview_query_is_safe_against_an_injection_shaped_sort_column() {
         let conn = connection_for_test();
-        let sql = conn.preview_query_windowed(
+        let sql = conn.preview_query(
             "zsql",
             "orders",
-            Some(("total`; DROP TABLE users; --", SortDirection::Asc)),
-            200,
-            0,
+            PreviewQueryArgs::from_limit(200)
+                .offset(0)
+                .sort("total`; DROP TABLE users; --", SortDirection::Asc),
         );
         assert_eq!(
             sql,
@@ -543,7 +530,7 @@ mod tests {
 mod database_tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Driver};
+    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs};
 
     use super::MysqlDriver;
 
@@ -894,7 +881,7 @@ mod database_tests {
     fn preview_query_executes_against_a_live_seeded_table_when_configured() {
         let conn = live_connection();
 
-        let sql = conn.preview_query("zsql", "users", 5);
+        let sql = conn.preview_query("zsql", "users", PreviewQueryArgs::from_limit(5));
         assert!(
             sql.contains("LIMIT 5"),
             "expected a LIMIT-bounded preview: {sql}"

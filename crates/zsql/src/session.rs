@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, Task, prelude::*};
-use zsql_core::{Connection, CoreError, RelationSchema, ResultSet, RowCount, SchemaTree};
+use zsql_core::{
+    Connection, CoreError, PreviewQueryArgs, RelationSchema, ResultSet, RowCount, SchemaTree,
+};
 
 use crate::config::Config;
 
@@ -171,8 +173,20 @@ impl Session {
     #[must_use]
     pub fn preview_sql(&self, schema: &str, relation: &str) -> String {
         self.connection.as_ref().map_or_else(
-            || zsql_core::default_preview_query(schema, relation, self.preview_limit),
-            |connection| connection.preview_query(schema, relation, self.preview_limit),
+            || {
+                zsql_core::default_preview_query(
+                    schema,
+                    relation,
+                    PreviewQueryArgs::from_limit(self.preview_limit),
+                )
+            },
+            |connection| {
+                connection.preview_query(
+                    schema,
+                    relation,
+                    PreviewQueryArgs::from_limit(self.preview_limit),
+                )
+            },
         )
     }
 
@@ -209,9 +223,14 @@ impl Session {
         limit: u64,
         offset: u64,
     ) -> String {
+        let mut args = PreviewQueryArgs::from_limit(limit).offset(offset);
+        if let Some((column, direction)) = sort {
+            args = args.sort(column, direction);
+        }
+        let conn_args = args.clone();
         self.connection.as_ref().map_or_else(
-            || zsql_core::default_preview_query_windowed(schema, relation, sort, limit, offset),
-            |connection| connection.preview_query_windowed(schema, relation, sort, limit, offset),
+            move || zsql_core::default_preview_query(schema, relation, args),
+            move |connection| connection.preview_query(schema, relation, conn_args),
         )
     }
 

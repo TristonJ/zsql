@@ -265,7 +265,7 @@ async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
+    use zsql_core::{ConnConfig, Connection, Driver, PreviewQueryArgs, SortDirection};
 
     use super::{PgConnection, PostgresDriver};
 
@@ -388,7 +388,7 @@ mod tests {
     fn preview_query_quotes_both_identifiers_and_applies_the_limit() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query("public", "orders", 200),
+            conn.preview_query("public", "orders", PreviewQueryArgs::from_limit(200)),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200"
         );
     }
@@ -396,7 +396,11 @@ mod tests {
     #[test]
     fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        let sql = conn.preview_query(
+            "public",
+            "orders\"; DROP TABLE users; --",
+            PreviewQueryArgs::from_limit(200),
+        );
         assert_eq!(
             sql,
             "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
@@ -405,74 +409,72 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_with_no_sort_and_no_offset_matches_the_plain_preview() {
+    fn preview_query_applies_ascending_and_descending_sorts() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query_windowed("public", "orders", None, 200, 0),
-            conn.preview_query("public", "orders", 200)
-        );
-    }
-
-    #[test]
-    fn preview_query_windowed_applies_ascending_and_descending_sorts() {
-        let conn = connection_for_test();
-        assert_eq!(
-            conn.preview_query_windowed(
+            conn.preview_query(
                 "public",
                 "orders",
-                Some(("total_cents", SortDirection::Asc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200).sort("total_cents", SortDirection::Asc)
             ),
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200"
         );
         assert_eq!(
-            conn.preview_query_windowed(
+            conn.preview_query(
                 "public",
                 "orders",
-                Some(("total_cents", SortDirection::Desc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200).sort("total_cents", SortDirection::Desc)
             ),
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" DESC LIMIT 200"
         );
     }
 
     #[test]
-    fn preview_query_windowed_omits_offset_on_page_one_and_applies_it_from_page_two() {
+    fn preview_query_omits_offset_on_page_one_and_applies_it_from_page_two() {
         let conn = connection_for_test();
-        let page_one = conn.preview_query_windowed("public", "orders", None, 200, 0);
+        let page_one = conn.preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).offset(0),
+        );
         assert!(!page_one.contains("OFFSET"), "page one: {page_one}");
         assert_eq!(
-            conn.preview_query_windowed("public", "orders", None, 200, 200),
+            conn.preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(200)
+            ),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 200"
         );
         assert_eq!(
-            conn.preview_query_windowed("public", "orders", None, 200, 800),
+            conn.preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(800)
+            ),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 800"
         );
     }
 
     #[test]
-    fn preview_query_windowed_supports_every_configured_page_size() {
+    fn preview_query_supports_every_configured_page_size() {
         let conn = connection_for_test();
         for page_size in [100_u64, 200, 500, 1000] {
             assert_eq!(
-                conn.preview_query_windowed("public", "orders", None, page_size, 0),
+                conn.preview_query("public", "orders", PreviewQueryArgs::from_limit(page_size)),
                 format!("SELECT * FROM \"public\".\"orders\" LIMIT {page_size}")
             );
         }
     }
 
     #[test]
-    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+    fn preview_query_is_safe_against_an_injection_shaped_sort_column() {
         let conn = connection_for_test();
-        let sql = conn.preview_query_windowed(
+        let sql = conn.preview_query(
             "public",
             "orders",
-            Some(("total\"; DROP TABLE users; --", SortDirection::Asc)),
-            200,
-            0,
+            PreviewQueryArgs::from_limit(200)
+                .sort("total\"; DROP TABLE users; --", SortDirection::Asc),
         );
         assert_eq!(
             sql,
@@ -574,7 +576,7 @@ mod tests {
 mod database_tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Driver};
+    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs};
 
     use super::PostgresDriver;
 
@@ -1764,16 +1766,16 @@ mod database_tests {
     /// by `n` at a page size of 10, and asserts page 2 is exactly
     /// `n` = 15..=6 in descending order.
     #[test]
-    fn preview_query_windowed_returns_the_correct_sorted_windowed_rows_when_configured() {
+    fn preview_query_returns_the_correct_sorted_rows_when_configured() {
         let conn = live_connection();
         seed_sorted_preview_table(&*conn);
 
-        let sql = conn.preview_query_windowed(
+        let sql = conn.preview_query(
             "public",
             SORTED_PREVIEW_TABLE,
-            Some(("n", zsql_core::SortDirection::Desc)),
-            10,
-            10,
+            PreviewQueryArgs::from_limit(10)
+                .offset(10)
+                .sort("n", zsql_core::SortDirection::Desc),
         );
         assert!(sql.contains("ORDER BY \"n\" DESC"), "{sql}");
         assert!(sql.contains("OFFSET 10"), "{sql}");

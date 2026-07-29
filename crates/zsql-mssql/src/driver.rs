@@ -29,8 +29,8 @@ use futures::future::Either;
 use futures::{StreamExt as _, pin_mut};
 use tiberius::{Client, QueryItem};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
-    RowBatch, RowCount, SchemaTree, SortDirection,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, PreviewQueryArgs, QueryEvent,
+    QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree,
 };
 
 use crate::error::{map_connect_error, map_io_connect_error, map_query_error};
@@ -248,12 +248,32 @@ impl Connection for MssqlConnection {
 
     /// The click-to-preview query for `relation` in `schema`, capped at
     /// `limit` rows, in this dialect's syntax.
-    fn preview_query(&self, schema: &str, relation: &str, limit: u64) -> String {
-        format!(
-            "SELECT TOP ({limit}) * FROM {}.{}",
-            crate::quoting::bracket_quote_ident(schema),
-            crate::quoting::bracket_quote_ident(relation)
-        )
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        if let Some(offset) = args.offset {
+            let order_by = args.sort.map_or_else(
+                || "(SELECT NULL)".to_owned(),
+                |(column, direction)| {
+                    format!(
+                        "{} {}",
+                        crate::quoting::bracket_quote_ident(&column),
+                        direction.as_sql()
+                    )
+                },
+            );
+            format!(
+                "SELECT * FROM {}.{} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY",
+                crate::quoting::bracket_quote_ident(schema),
+                crate::quoting::bracket_quote_ident(relation),
+                args.limit
+            )
+        } else {
+            format!(
+                "SELECT TOP ({}) * FROM {}.{}",
+                args.limit,
+                crate::quoting::bracket_quote_ident(schema),
+                crate::quoting::bracket_quote_ident(relation)
+            )
+        }
     }
 
     /// This driver opens a short-lived client per operation (see the module
@@ -262,43 +282,6 @@ impl Connection for MssqlConnection {
     /// implement teardown here.
     #[tracing::instrument(name = "mssql_close", skip_all)]
     async fn close(&self) {}
-
-    /// The sort-and-page-windowed form of [`Connection::preview_query`]:
-    /// `OFFSET`/`FETCH NEXT`, the paging idiom `TOP` has no equivalent for.
-    ///
-    /// SQL Server rejects a bare `OFFSET` with no `ORDER BY` on the same
-    /// query, so when no explicit sort is active this still emits one:
-    /// `ORDER BY (SELECT NULL)`. This synchronous, no-I/O builder is never
-    /// given the relation's columns (unlike `describe_relation`, which would
-    /// require a round trip), so it cannot name a real column to sort by;
-    /// `(SELECT NULL)` is the standard idiom for "a syntactically valid
-    /// order the caller does not care about" and satisfies the OFFSET/FETCH
-    /// grammar without claiming a stable ordering guarantee this driver
-    /// cannot actually make.
-    fn preview_query_windowed(
-        &self,
-        schema: &str,
-        relation: &str,
-        sort: Option<(&str, SortDirection)>,
-        limit: u64,
-        offset: u64,
-    ) -> String {
-        let order_by = sort.map_or_else(
-            || "(SELECT NULL)".to_owned(),
-            |(column, direction)| {
-                format!(
-                    "{} {}",
-                    crate::quoting::bracket_quote_ident(column),
-                    direction.as_sql()
-                )
-            },
-        );
-        format!(
-            "SELECT * FROM {}.{} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY",
-            crate::quoting::bracket_quote_ident(schema),
-            crate::quoting::bracket_quote_ident(relation)
-        )
-    }
 }
 
 /// Look up `sys.dm_db_partition_stats` for `schema.relation`'s base table
@@ -502,7 +485,7 @@ async fn run_query(
 mod tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Connection, Driver, SortDirection};
+    use zsql_core::{ConnConfig, Connection, Driver, PreviewQueryArgs, SortDirection};
 
     use super::{MssqlDriver, row_count_from_partition_stats};
 
@@ -701,7 +684,7 @@ mod tests {
     fn preview_query_uses_top_instead_of_limit() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query("schema", "relation", 200),
+            conn.preview_query("schema", "relation", PreviewQueryArgs::from_limit(200)),
             "SELECT TOP (200) * FROM [schema].[relation]"
         );
     }
@@ -709,14 +692,18 @@ mod tests {
     #[test]
     fn preview_query_never_emits_a_limit_clause() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("dbo", "orders", 50);
+        let sql = conn.preview_query("dbo", "orders", PreviewQueryArgs::from_limit(50));
         assert!(!sql.contains("LIMIT"));
     }
 
     #[test]
     fn preview_query_is_safe_against_an_injection_shaped_relation_name() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("dbo", "orders]; DROP TABLE users; --", 200);
+        let sql = conn.preview_query(
+            "dbo",
+            "orders]; DROP TABLE users; --",
+            PreviewQueryArgs::from_limit(200),
+        );
         assert_eq!(
             sql,
             "SELECT TOP (200) * FROM [dbo].[orders]]; DROP TABLE users; --]"
@@ -728,7 +715,11 @@ mod tests {
     #[test]
     fn preview_query_is_safe_against_an_injection_shaped_schema_name() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("dbo]; DROP TABLE users; --", "orders", 200);
+        let sql = conn.preview_query(
+            "dbo]; DROP TABLE users; --",
+            "orders",
+            PreviewQueryArgs::from_limit(200),
+        );
         assert_eq!(
             sql,
             "SELECT TOP (200) * FROM [dbo]]; DROP TABLE users; --].[orders]"
@@ -740,20 +731,20 @@ mod tests {
     #[test]
     fn preview_query_is_safe_against_a_close_bracket_in_the_relation_name() {
         let conn = connection_for_test();
-        let sql = conn.preview_query("dbo", "weird]name", 10);
+        let sql = conn.preview_query("dbo", "weird]name", PreviewQueryArgs::from_limit(10));
         assert_eq!(sql, "SELECT TOP (10) * FROM [dbo].[weird]]name]");
     }
 
     #[test]
-    fn preview_query_windowed_with_a_sort_emits_offset_fetch_and_the_real_order_by() {
+    fn preview_query_with_a_sort_emits_offset_fetch_and_the_real_order_by() {
         let conn = connection_for_test();
         assert_eq!(
-            conn.preview_query_windowed(
+            conn.preview_query(
                 "dbo",
                 "orders",
-                Some(("total_cents", SortDirection::Desc)),
-                200,
-                200
+                PreviewQueryArgs::from_limit(200)
+                    .offset(200)
+                    .sort("total_cents", SortDirection::Desc),
             ),
             "SELECT * FROM [dbo].[orders] ORDER BY [total_cents] DESC \
              OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
@@ -761,11 +752,15 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_with_no_sort_still_produces_valid_offset_fetch_sql_for_page_two() {
+    fn preview_query_with_no_sort_still_produces_valid_offset_fetch_sql_for_page_two() {
         // SQL Server requires an ORDER BY alongside OFFSET/FETCH; with no
         // explicit sort selected this must still be present, not omitted.
         let conn = connection_for_test();
-        let sql = conn.preview_query_windowed("dbo", "orders", None, 200, 200);
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200).offset(200),
+        );
         assert_eq!(
             sql,
             "SELECT * FROM [dbo].[orders] ORDER BY (SELECT NULL) \
@@ -777,9 +772,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_omits_no_offset_special_casing_page_one_still_has_offset_zero() {
+    fn preview_query_omits_no_offset_special_casing_page_one_still_has_offset_zero() {
         let conn = connection_for_test();
-        let sql = conn.preview_query_windowed("dbo", "orders", None, 200, 0);
+        let sql = conn.preview_query("dbo", "orders", PreviewQueryArgs::from_limit(200).offset(0));
         assert!(
             sql.contains("OFFSET 0 ROWS"),
             "OFFSET/FETCH syntax always states the offset explicitly: {sql}"
@@ -787,10 +782,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_supports_every_configured_page_size() {
+    fn preview_query_supports_every_configured_page_size() {
         let conn = connection_for_test();
         for page_size in [100_u64, 200, 500, 1000] {
-            let sql = conn.preview_query_windowed("dbo", "orders", None, page_size, 0);
+            let sql = conn.preview_query(
+                "dbo",
+                "orders",
+                PreviewQueryArgs::from_limit(page_size).offset(0),
+            );
             assert!(
                 sql.contains(&format!("FETCH NEXT {page_size} ROWS ONLY")),
                 "page size {page_size}: {sql}"
@@ -799,14 +798,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_query_windowed_is_safe_against_an_injection_shaped_sort_column() {
+    fn preview_query_is_safe_against_an_injection_shaped_sort_column() {
         let conn = connection_for_test();
-        let sql = conn.preview_query_windowed(
+        let sql = conn.preview_query(
             "dbo",
             "orders",
-            Some(("total]; DROP TABLE users; --", SortDirection::Asc)),
-            200,
-            0,
+            PreviewQueryArgs::from_limit(200)
+                .offset(0)
+                .sort("total]; DROP TABLE users; --", SortDirection::Asc),
         );
         assert_eq!(
             sql,
@@ -847,7 +846,7 @@ mod tests {
 mod database_tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Driver, RelationSchema};
+    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs, RelationSchema};
 
     use super::MssqlDriver;
 
@@ -1171,7 +1170,7 @@ mod database_tests {
 
         // The `TOP` preview must be valid T-SQL end to end, not merely the
         // right string: a `LIMIT`-shaped query would come back as an Err here.
-        let sql = conn.preview_query("dbo", "users", 5);
+        let sql = conn.preview_query("dbo", "users", PreviewQueryArgs::from_limit(5));
         assert!(
             sql.contains("TOP (5)"),
             "expected a TOP-limited preview: {sql}"

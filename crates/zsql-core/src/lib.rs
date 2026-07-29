@@ -30,6 +30,6 @@ pub use schema_detail::{
     ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, ForeignKeyRef, IndexInfo, KeyBadge,
     KeyCellBadge, RelationSchema, classify_default, key_cell_badge,
 };
-pub use sql::{SortDirection, default_preview_query, default_preview_query_windowed, quote_ident};
+pub use sql::{PreviewQueryArgs, SortDirection, default_preview_query, quote_ident};
 pub use tls_verify::TlsVerify;
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

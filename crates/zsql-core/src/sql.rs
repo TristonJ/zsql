@@ -2,6 +2,40 @@
 
 use std::fmt::Write as _;
 
+/// Arguments for generating preview queries
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewQueryArgs {
+    pub limit: u64,
+    pub offset: Option<u64>,
+    pub sort: Option<(String, SortDirection)>,
+}
+
+impl PreviewQueryArgs {
+    /// Construct a new `PreviewQueryArgs` with the given limit and no offset or sort.
+    #[must_use]
+    pub fn from_limit(limit: u64) -> Self {
+        Self {
+            limit,
+            offset: None,
+            sort: None,
+        }
+    }
+
+    /// Set the offset for the preview query.
+    #[must_use]
+    pub fn offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// Set the sort for the preview query.
+    #[must_use]
+    pub fn sort(mut self, column: impl AsRef<str>, direction: SortDirection) -> Self {
+        self.sort = Some((column.as_ref().to_string(), direction));
+        self
+    }
+}
+
 /// Which way a preview's `ORDER BY` sorts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
@@ -48,56 +82,34 @@ pub fn quote_ident(ident: &str) -> String {
     out
 }
 
-/// The click-to-preview query for `relation` in `schema`, windowed by an
-/// optional `(column, direction)` sort and a `LIMIT`/`OFFSET` page, in the
-/// dialect [`crate::driver::Connection::preview_query_windowed`]'s default
-/// implementation uses. `sort`'s column comes from the same
-/// [`quote_ident`] escaping `schema`/`relation` already go through, so a
-/// column name can never break out of the `ORDER BY` clause. `offset` is
-/// omitted from the generated text entirely when it is `0`, so a first-page
-/// request reads exactly like a plain `LIMIT` preview.
+/// The click-to-preview query for `relation` in `schema`
 #[must_use]
-pub fn default_preview_query_windowed(
-    schema: &str,
-    relation: &str,
-    sort: Option<(&str, SortDirection)>,
-    limit: u64,
-    offset: u64,
-) -> String {
+pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
     let mut sql = format!(
         "SELECT * FROM {}.{}",
         quote_ident(schema),
         quote_ident(relation)
     );
-    if let Some((column, direction)) = sort {
+    if let Some((column, direction)) = args.sort {
         let _ = write!(
             sql,
             " ORDER BY {} {}",
-            quote_ident(column),
+            quote_ident(&column),
             direction.as_sql()
         );
     }
-    let _ = write!(sql, " LIMIT {limit}");
-    if offset > 0 {
-        let _ = write!(sql, " OFFSET {offset}");
+    let _ = write!(sql, " LIMIT {}", args.limit);
+    if let Some(offset) = args.offset
+        && offset > 0
+    {
+        let _ = write!(sql, " OFFSET {}", offset);
     }
     sql
 }
 
-/// The click-to-preview query for `relation` in `schema`, capped at `limit`
-/// rows, in the dialect [`crate::driver::Connection::preview_query`]'s
-/// default implementation uses. Exactly [`default_preview_query_windowed`]
-/// with no sort and no offset.
-#[must_use]
-pub fn default_preview_query(schema: &str, relation: &str, limit: u64) -> String {
-    default_preview_query_windowed(schema, relation, None, limit, 0)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        SortDirection, default_preview_query, default_preview_query_windowed, quote_ident,
-    };
+    use super::{PreviewQueryArgs, SortDirection, default_preview_query, quote_ident};
 
     #[test]
     fn quote_ident_wraps_a_plain_name_in_double_quotes() {
@@ -122,14 +134,18 @@ mod tests {
     #[test]
     fn default_preview_query_quotes_both_identifiers_and_applies_the_limit() {
         assert_eq!(
-            default_preview_query("public", "orders", 200),
+            default_preview_query("public", "orders", PreviewQueryArgs::from_limit(200)),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200"
         );
     }
 
     #[test]
     fn default_preview_query_is_safe_against_an_injection_attempting_relation_name() {
-        let sql = default_preview_query("public", "orders\"; DROP TABLE users; --", 200);
+        let sql = default_preview_query(
+            "public",
+            "orders\"; DROP TABLE users; --",
+            PreviewQueryArgs::from_limit(200),
+        );
         assert_eq!(
             sql,
             "SELECT * FROM \"public\".\"orders\"\"; DROP TABLE users; --\" LIMIT 200"
@@ -146,20 +162,24 @@ mod tests {
     #[test]
     fn windowed_query_with_no_sort_and_page_one_matches_the_plain_default_form() {
         assert_eq!(
-            default_preview_query_windowed("public", "orders", None, 200, 0),
-            default_preview_query("public", "orders", 200)
+            default_preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(0)
+            ),
+            default_preview_query("public", "orders", PreviewQueryArgs::from_limit(200))
         );
     }
 
     #[test]
     fn windowed_query_applies_an_ascending_sort() {
         assert_eq!(
-            default_preview_query_windowed(
+            default_preview_query(
                 "public",
                 "orders",
-                Some(("total_cents", SortDirection::Asc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200)
+                    .offset(0)
+                    .sort("total_cents", SortDirection::Asc)
             ),
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200"
         );
@@ -168,12 +188,12 @@ mod tests {
     #[test]
     fn windowed_query_applies_a_descending_sort() {
         assert_eq!(
-            default_preview_query_windowed(
+            default_preview_query(
                 "public",
                 "orders",
-                Some(("total_cents", SortDirection::Desc)),
-                200,
-                0
+                PreviewQueryArgs::from_limit(200)
+                    .offset(0)
+                    .sort("total_cents", SortDirection::Desc)
             ),
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" DESC LIMIT 200"
         );
@@ -181,7 +201,11 @@ mod tests {
 
     #[test]
     fn windowed_query_omits_offset_on_page_one() {
-        let sql = default_preview_query_windowed("public", "orders", None, 200, 0);
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).offset(0),
+        );
         assert!(
             !sql.contains("OFFSET"),
             "a zero offset must not appear in the generated text: {sql}"
@@ -191,7 +215,11 @@ mod tests {
     #[test]
     fn windowed_query_applies_offset_math_for_page_two() {
         assert_eq!(
-            default_preview_query_windowed("public", "orders", None, 200, 200),
+            default_preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(200)
+            ),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 200"
         );
     }
@@ -200,7 +228,11 @@ mod tests {
     fn windowed_query_applies_offset_math_for_a_later_page() {
         // Page 5 at 200 rows/page: offset = (5 - 1) * 200.
         assert_eq!(
-            default_preview_query_windowed("public", "orders", None, 200, 800),
+            default_preview_query(
+                "public",
+                "orders",
+                PreviewQueryArgs::from_limit(200).offset(800)
+            ),
             "SELECT * FROM \"public\".\"orders\" LIMIT 200 OFFSET 800"
         );
     }
@@ -208,7 +240,8 @@ mod tests {
     #[test]
     fn windowed_query_supports_every_configured_page_size() {
         for page_size in [100_u64, 200, 500, 1000] {
-            let sql = default_preview_query_windowed("public", "orders", None, page_size, 0);
+            let sql =
+                default_preview_query("public", "orders", PreviewQueryArgs::from_limit(page_size));
             assert_eq!(
                 sql,
                 format!("SELECT * FROM \"public\".\"orders\" LIMIT {page_size}")
@@ -219,12 +252,12 @@ mod tests {
     #[test]
     fn windowed_query_combines_sort_and_offset_for_page_two() {
         assert_eq!(
-            default_preview_query_windowed(
+            default_preview_query(
                 "public",
                 "orders",
-                Some(("total_cents", SortDirection::Desc)),
-                200,
-                200
+                PreviewQueryArgs::from_limit(200)
+                    .offset(200)
+                    .sort("total_cents", SortDirection::Desc)
             ),
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" DESC LIMIT 200 OFFSET 200"
         );
@@ -232,12 +265,12 @@ mod tests {
 
     #[test]
     fn windowed_query_is_safe_against_an_injection_shaped_sort_column() {
-        let sql = default_preview_query_windowed(
+        let sql = default_preview_query(
             "public",
             "orders",
-            Some(("total\"; DROP TABLE users; --", SortDirection::Asc)),
-            200,
-            0,
+            PreviewQueryArgs::from_limit(200)
+                .offset(0)
+                .sort("total\"; DROP TABLE users; --", SortDirection::Asc),
         );
         assert_eq!(
             sql,
@@ -248,12 +281,12 @@ mod tests {
 
     #[test]
     fn windowed_query_is_safe_against_a_keyword_shaped_sort_column() {
-        let sql = default_preview_query_windowed(
+        let sql = default_preview_query(
             "public",
             "orders",
-            Some(("order", SortDirection::Asc)),
-            200,
-            0,
+            PreviewQueryArgs::from_limit(200)
+                .offset(0)
+                .sort("order", SortDirection::Asc),
         );
         assert!(
             sql.contains("ORDER BY \"order\" ASC"),
