@@ -31,6 +31,56 @@ use crate::session::{SchemaState, Session, SessionState};
 
 mod model;
 
+/// What [`SidebarView::render_body`] shows in place of the tree: `None`
+/// means the tree itself should render instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarPlaceholder {
+    /// No connection has been attempted, or the last one failed before any
+    /// schema tree existed.
+    NotLoaded,
+    /// A connect or an introspection is in flight.
+    Loading,
+    /// Introspection failed. The message is safe to show directly in the
+    /// UI.
+    Error(String),
+    /// Introspection succeeded but the connected database reported no
+    /// catalogs.
+    EmptySchema,
+}
+
+/// The sidebar's placeholder for `state`/`schema`, in this precedence
+/// order:
+///
+/// 1. [`SessionState::Connecting`] always renders
+///    [`SidebarPlaceholder::Loading`], even while `schema` is still
+///    [`SchemaState::NotLoaded`] -- a first connect resets the schema to
+///    `NotLoaded` before the connect attempt starts, and without this
+///    override the sidebar would show the "connect to a database" prompt
+///    while a connection is actively being established. This mirrors
+///    `footer::footer_display`'s and `results::status_indicator`'s own
+///    Connecting override.
+/// 2. Otherwise, `schema` alone decides: [`SchemaState::NotLoaded`] and
+///    [`SchemaState::Loading`] map to [`SidebarPlaceholder::NotLoaded`] and
+///    [`SidebarPlaceholder::Loading`] respectively, [`SchemaState::Error`]
+///    maps to [`SidebarPlaceholder::Error`], an empty
+///    [`SchemaState::Ready`] tree maps to [`SidebarPlaceholder::EmptySchema`],
+///    and a populated [`SchemaState::Ready`] tree renders the tree itself
+///    (`None`).
+fn sidebar_placeholder(state: &SessionState, schema: &SchemaState) -> Option<SidebarPlaceholder> {
+    if matches!(state, SessionState::Connecting) {
+        return Some(SidebarPlaceholder::Loading);
+    }
+    match schema {
+        SchemaState::NotLoaded => Some(SidebarPlaceholder::NotLoaded),
+        SchemaState::Loading => Some(SidebarPlaceholder::Loading),
+        SchemaState::Error(message) => Some(SidebarPlaceholder::Error(message.clone())),
+        SchemaState::Ready(tree) if tree.catalogs.is_empty() => {
+            Some(SidebarPlaceholder::EmptySchema)
+        }
+        SchemaState::Ready(_) => None,
+    }
+}
+
 /// The schema sidebar view.
 pub struct SidebarView {
     session: Entity<Session>,
@@ -432,39 +482,46 @@ impl SidebarView {
     }
 
     /// The main content area: the tree when a schema is loaded, or a
-    /// centered prompt/status message for every other `SchemaState`.
+    /// centered prompt/status message for every other `SchemaState` (see
+    /// [`sidebar_placeholder`], including its `SessionState::Connecting`
+    /// override).
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let active_theme = cx.theme();
         let colors = active_theme.colors;
         let placeholder = {
             let session = self.session.read(cx);
-            match session.schema() {
-                SchemaState::NotLoaded => Some((
-                    colors.text_tertiary,
-                    "No schema",
-                    "Connect to a database to browse its schema.".to_owned(),
-                )),
-                SchemaState::Loading => Some((
-                    colors.text_tertiary,
-                    "Loading schema...",
-                    "Fetching catalogs, schemas, and relations.".to_owned(),
-                )),
-                SchemaState::Error(message) => {
-                    Some((colors.status_error, "Schema unavailable", message.clone()))
-                }
-                SchemaState::Ready(tree) if tree.catalogs.is_empty() => Some((
-                    colors.text_tertiary,
-                    "No catalogs",
-                    "The connected database reported no catalogs.".to_owned(),
-                )),
-                SchemaState::Ready(_) => None,
-            }
+            sidebar_placeholder(session.state(), session.schema())
         };
 
         match placeholder {
-            Some((color, title, detail)) => {
-                Self::render_placeholder(color, title, &detail, active_theme).into_any_element()
-            }
+            Some(SidebarPlaceholder::NotLoaded) => Self::render_placeholder(
+                colors.text_tertiary,
+                "No schema",
+                "Connect to a database to browse its schema.",
+                active_theme,
+            )
+            .into_any_element(),
+            Some(SidebarPlaceholder::Loading) => Self::render_placeholder(
+                colors.text_tertiary,
+                "Loading schema...",
+                "Fetching catalogs, schemas, and relations.",
+                active_theme,
+            )
+            .into_any_element(),
+            Some(SidebarPlaceholder::Error(message)) => Self::render_placeholder(
+                colors.status_error,
+                "Schema unavailable",
+                &message,
+                active_theme,
+            )
+            .into_any_element(),
+            Some(SidebarPlaceholder::EmptySchema) => Self::render_placeholder(
+                colors.text_tertiary,
+                "No catalogs",
+                "The connected database reported no catalogs.",
+                active_theme,
+            )
+            .into_any_element(),
             None => self.render_tree(window, cx).into_any_element(),
         }
     }
@@ -783,10 +840,14 @@ fn sidebar_tree_content_height(row_count: usize) -> Pixels {
 
 #[cfg(test)]
 mod tests {
+    use zsql_core::{Catalog, SchemaNs, SchemaTree};
     use zsql_ui::theme::Theme;
     use zsql_ui::tree::ROW_HEIGHT;
 
-    use super::{SidebarView, sidebar_tree_content_height};
+    use super::{
+        SidebarPlaceholder, SidebarView, sidebar_placeholder, sidebar_tree_content_height,
+    };
+    use crate::session::{SchemaState, SessionState};
     use crate::ui::theme;
 
     #[test]
@@ -818,6 +879,91 @@ mod tests {
         assert!((style.radius - theme::SIDEBAR_SCROLLBAR_RADIUS).abs() < f32::EPSILON);
         assert!((style.inset - f32::from(theme::SIDEBAR_SCROLLBAR_GAP)).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn a_first_connect_in_flight_shows_the_loading_placeholder_not_the_connect_prompt() {
+        assert_eq!(
+            sidebar_placeholder(&SessionState::Connecting, &SchemaState::NotLoaded),
+            Some(SidebarPlaceholder::Loading),
+            "Connecting must override the stale NotLoaded schema left by a first connect"
+        );
+    }
+
+    #[test]
+    fn a_database_switch_in_flight_still_shows_the_loading_placeholder() {
+        // `switch_database` resets the schema to `Loading` (not `NotLoaded`)
+        // before moving `state` to `Connecting`; the Connecting override
+        // must not change what is already the correct placeholder here.
+        assert_eq!(
+            sidebar_placeholder(&SessionState::Connecting, &SchemaState::Loading),
+            Some(SidebarPlaceholder::Loading)
+        );
+    }
+
+    #[test]
+    fn a_failed_first_connect_reverts_to_the_not_loaded_placeholder() {
+        assert_eq!(
+            sidebar_placeholder(
+                &SessionState::Error("connection refused".to_owned()),
+                &SchemaState::NotLoaded
+            ),
+            Some(SidebarPlaceholder::NotLoaded),
+            "a failed connect must not leave the sidebar stuck on the loading placeholder"
+        );
+    }
+
+    #[test]
+    fn a_query_error_on_an_already_loaded_schema_does_not_touch_the_tree_placeholder() {
+        // A query error (as opposed to a connect failure) never touches
+        // `SchemaState`, so the tree must keep rendering rather than
+        // falling back to any placeholder.
+        let tree = SchemaTree {
+            catalogs: vec![Catalog {
+                name: "zsql".to_owned(),
+                schemas: vec![SchemaNs {
+                    name: "public".to_owned(),
+                    tables: vec![],
+                }],
+            }],
+        };
+        assert_eq!(
+            sidebar_placeholder(
+                &SessionState::Error("syntax error".to_owned()),
+                &SchemaState::Ready(tree)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_successful_connect_proceeds_from_not_loaded_through_loading_to_the_tree() {
+        assert_eq!(
+            sidebar_placeholder(&SessionState::Connected, &SchemaState::NotLoaded),
+            Some(SidebarPlaceholder::NotLoaded)
+        );
+        assert_eq!(
+            sidebar_placeholder(&SessionState::Connected, &SchemaState::Loading),
+            Some(SidebarPlaceholder::Loading)
+        );
+        assert_eq!(
+            sidebar_placeholder(
+                &SessionState::Connected,
+                &SchemaState::Ready(SchemaTree::default())
+            ),
+            Some(SidebarPlaceholder::EmptySchema)
+        );
+    }
+
+    #[test]
+    fn a_schema_introspection_error_maps_to_error_placeholder() {
+        assert_eq!(
+            sidebar_placeholder(
+                &SessionState::Connected,
+                &SchemaState::Error("boom".to_owned())
+            ),
+            Some(SidebarPlaceholder::Error("boom".to_owned()))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -832,7 +978,7 @@ mod render_tests {
     };
     use zsql_core::{Relation, RelationKind};
 
-    use super::{SidebarView, qualified_relation_name};
+    use super::{SidebarPlaceholder, SidebarView, qualified_relation_name, sidebar_placeholder};
     use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
     use crate::ui::tabs::TabModel;
@@ -947,6 +1093,23 @@ mod render_tests {
         cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx))
     }
 
+    /// Like [`build`], but over a session in `state` rather than always
+    /// `SessionState::Connected` -- for tests that need control over the
+    /// session's connect lifecycle state, not just its schema.
+    fn build_with_state(
+        cx: &mut gpui::TestAppContext,
+        state: SessionState,
+        schema: SchemaState,
+    ) -> (gpui::Entity<SidebarView>, &mut gpui::VisualTestContext) {
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_render_test(state, zsql_core::ResultSet::default());
+            session.set_schema_for_test(schema);
+            session
+        });
+        let tabs = build_tabs(session.clone(), cx);
+        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx))
+    }
+
     #[gpui::test]
     fn renders_a_populated_schema_tree_without_panicking(cx: &mut gpui::TestAppContext) {
         let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
@@ -1017,6 +1180,52 @@ mod render_tests {
                 );
             });
         }
+    }
+
+    /// Regression test for a first-time connect: while `SessionState` is
+    /// `Connecting` and the schema has not yet started loading, the sidebar
+    /// must show the loading placeholder, not the stale "connect to a
+    /// database" prompt.
+    #[gpui::test]
+    fn a_connect_in_flight_renders_the_loading_placeholder_not_the_connect_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_state(cx, SessionState::Connecting, SchemaState::NotLoaded);
+        sidebar.read_with(vcx, |view, app| {
+            assert!(
+                view.rows.is_empty(),
+                "no catalog/table rows are known while a first connect is in flight"
+            );
+            let session = view.session.read(app);
+            assert_eq!(
+                sidebar_placeholder(session.state(), session.schema()),
+                Some(SidebarPlaceholder::Loading),
+                "a connect in flight must show the loading placeholder, not the connect prompt"
+            );
+        });
+    }
+
+    /// Regression test: once a first connect fails, the sidebar must revert
+    /// to the "connect to a database" placeholder rather than staying stuck
+    /// on the loading placeholder shown while it was in flight.
+    #[gpui::test]
+    fn a_failed_first_connect_renders_the_connect_prompt_placeholder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_state(
+            cx,
+            SessionState::Error("connection refused".to_owned()),
+            SchemaState::NotLoaded,
+        );
+        sidebar.read_with(vcx, |view, app| {
+            assert!(view.rows.is_empty());
+            let session = view.session.read(app);
+            assert_eq!(
+                sidebar_placeholder(session.state(), session.schema()),
+                Some(SidebarPlaceholder::NotLoaded),
+                "a failed first connect must not stay stuck on the loading placeholder"
+            );
+        });
     }
 
     #[gpui::test]
