@@ -665,6 +665,9 @@ impl Render for EditorView {
 /// crates' tests that drive an [`EditorView`] end to end (see the
 /// `test-support` feature).
 #[cfg(any(test, feature = "test-support"))]
+use zsql_ui::text_input;
+
+#[cfg(any(test, feature = "test-support"))]
 impl EditorView {
     #[must_use]
     pub fn buffer_for_test(&self) -> &TextBuffer {
@@ -706,7 +709,7 @@ impl EditorView {
         let byte_index = self.buffer.line_byte_offset(position);
         point(
             bounds.left() + line.x_for_index(byte_index),
-            element::line_top(bounds.top(), px(theme::EDITOR_LINE_HEIGHT), position.line),
+            text_input::line_top(bounds.top(), px(theme::EDITOR_LINE_HEIGHT), position.line),
         )
     }
 }
