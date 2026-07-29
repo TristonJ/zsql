@@ -18,7 +18,7 @@ use crate::ui::{connections::ConnectionRow, theme};
 /// list's own.
 type EventListener = Rc<dyn Fn(&ConnectionListEvent, &mut Window, &mut App) + 'static>;
 
-#[derive(IntoElement, Clone)]
+#[derive(IntoElement)]
 pub struct ConnectionList {
     connection_rows: Vec<ConnectionListItem>,
     status_text: Option<String>,

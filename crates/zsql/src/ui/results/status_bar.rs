@@ -40,6 +40,21 @@ impl ResultsView {
         (dot_color, label, error_message)
     }
 
+    /// The exact text the status bar shows for the active tab's total row
+    /// count, or `None` when it shows no such segment at all. The one place
+    /// [`format_total_row_count`] is applied for the status bar, so the
+    /// rendered text and [`ResultsView::active_total_row_count`] can never
+    /// drift apart.
+    fn status_bar_total_row_count_text(&self) -> Option<String> {
+        format_total_row_count(self.active_total_row_count())
+    }
+
+    /// Test-only mirror of [`ResultsView::status_bar_total_row_count_text`].
+    #[cfg(test)]
+    pub(crate) fn status_bar_total_row_count_text_for_test(&self) -> Option<String> {
+        self.status_bar_total_row_count_text()
+    }
+
     /// The bottom connection/status bar: connection state + label, row
     /// count, and elapsed query time.
     pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> Div {
@@ -82,9 +97,7 @@ impl ResultsView {
             left = left.child(count_text).child(elapsed_text);
         }
 
-        if let Some(total_row_count_text) =
-            format_total_row_count(self.session.read(cx).row_count())
-        {
+        if let Some(total_row_count_text) = self.status_bar_total_row_count_text() {
             left = left.child(total_row_count_text);
         }
 
