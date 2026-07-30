@@ -39,6 +39,7 @@ pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut Window, &mut App
 /// ([`crate::ui::results::ResultsView::set_preview_controls`]): `None`
 /// whenever the active tab is not a live, unedited generated preview, which
 /// is what renders every control inert without hiding the grid itself.
+#[derive(Clone)]
 pub(crate) struct PreviewControls {
     pub state: PreviewQueryState,
     pub dispatch: PreviewDispatch,

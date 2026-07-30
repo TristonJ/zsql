@@ -1036,9 +1036,7 @@ mod render_tests {
         session: gpui::Entity<Session>,
         cx: &mut gpui::TestAppContext,
     ) -> gpui::Entity<TabModel> {
-        let session_for_results = session.clone();
-        let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-        cx.new(|cx| TabModel::new(session, results, cx))
+        cx.new(|cx| TabModel::new(session, cx))
     }
 
     fn sample_schema_tree() -> SchemaTree {
@@ -1271,8 +1269,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let session_for_results = session.clone();
         let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
-        let results_for_tabs = results.clone();
-        let tabs = cx.new(|cx| TabModel::new(session.clone(), results_for_tabs, cx));
+        let tabs = cx.new(|cx| TabModel::new(session.clone(), cx));
         let tabs_for_view = tabs.clone();
         let (sidebar, vcx) =
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));
