@@ -30,7 +30,7 @@ impl OnHoverState for Stateful<Div> {
             return self;
         };
 
-        let hover_id = SharedString::from(format!("{}-global-hover", id));
+        let hover_id = SharedString::from(format!("{id}-global-hover"));
         let hovered = window.use_keyed_state(hover_id, cx, |_w, _c| false);
         self.on_hover({
             let hovered = hovered.clone();

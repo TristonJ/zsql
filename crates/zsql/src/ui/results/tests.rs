@@ -2308,27 +2308,26 @@ fn render_filter_bar_does_not_panic_across_every_editing_state(cx: &mut gpui::Te
     let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
 
     // Committed chips (including an fx-tagged expression value) and a live
-    // dispatcher, with no editor open.
-    view.update_in(vcx, |view, window, cx| {
-        let _ = view.render_filter_bar(window, cx);
-    });
+    // dispatcher, with no editor open: covered by the window's initial draw.
+    vcx.run_until_parked();
 
-    // The column picker open, before a target column is chosen.
+    // The column picker open, before a target column is chosen. Each state
+    // renders through the window's own draw rather than a direct
+    // render_filter_bar call: hover-state hooks inside the bar may only run
+    // during a draw pass.
     view.update_in(vcx, |view, window, cx| {
         view.begin_add_filter(window, cx);
-        let _ = view.render_filter_bar(window, cx);
     });
+    vcx.run_until_parked();
 
     // Mid-edit, with the operator menu open.
     view.update_in(vcx, |view, window, cx| {
         view.pick_filter_column(&column("status", "text"), window, cx);
         view.toggle_filter_editor_menu(cx);
-        let _ = view.render_filter_bar(window, cx);
     });
+    vcx.run_until_parked();
 
     // Detached (no active preview controls): every control renders inert.
     view.update(vcx, |view, cx| view.set_preview_controls(None, cx));
-    view.update_in(vcx, |view, window, cx| {
-        let _ = view.render_filter_bar(window, cx);
-    });
+    vcx.run_until_parked();
 }

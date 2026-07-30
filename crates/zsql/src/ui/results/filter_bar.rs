@@ -8,7 +8,7 @@
 
 use gpui::{
     Context, Div, Entity, Focusable, SharedString, Stateful, Window, deferred, div, prelude::*, px,
-    rems, rgb,
+    rgb,
 };
 use zsql_core::{
     ColumnMeta, FilterCondition, FilterConditionId, FilterConnector, FilterOperator,
