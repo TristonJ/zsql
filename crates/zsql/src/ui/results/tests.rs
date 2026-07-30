@@ -4,6 +4,7 @@ use gpui::{
     AppContext as _, Context, Focusable as _, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, point, px,
 };
+use zsql_core::value::UnknownValue;
 use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
 use super::{
@@ -127,7 +128,7 @@ fn renders_one_frame_without_panicking(cx: &mut gpui::TestAppContext) {
         ]),
     ]));
     result.rows.push(Row(vec![
-        Value::Unknown("custom_type".to_owned()),
+        Value::Unknown(UnknownValue::None),
         Value::Bool(false),
     ]));
 

@@ -16,6 +16,7 @@ use zsql_sqlx::pool::{
 };
 use zsql_sqlx::{CancelHandle, SqlxZsqlDriver};
 
+use crate::type_resolve::{self, PgColumnResolver};
 use crate::values::decode_row;
 
 /// Below this, `pg_class.reltuples` cannot be trusted as a row-count
@@ -73,12 +74,14 @@ impl Driver for PostgresDriver {
             build_side_pool(&url, CANCEL_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
         let probe_pool: PgPool =
             build_probe_pool(&url, PROBE_POOL_CONNECTIONS, POOL_ACQUIRE_TIMEOUT)?;
+        let column_resolver = PgColumnResolver::new(probe_pool.clone());
         tracing::info!("postgres connection established");
         Ok(Box::new(PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
             cfg.batch_size,
+            column_resolver,
         ))))
     }
 }
@@ -87,6 +90,7 @@ impl SqlxZsqlDriver<Postgres> for PostgresDriver {
     const NAME: &'static str = "postgres";
 
     type Cancel = PgCancelHandle;
+    type ColumnContext = PgColumnResolver;
 
     fn column_metas(columns: &[<Postgres as sqlx::Database>::Column]) -> Vec<ColumnMeta> {
         columns
@@ -115,9 +119,17 @@ impl SqlxZsqlDriver<Postgres> for PostgresDriver {
             .await?;
         Ok(PgCancelHandle { pid })
     }
+
+    async fn resolve_columns(
+        ctx: &Self::ColumnContext,
+        raw_columns: &[<Postgres as sqlx::Database>::Column],
+        columns: &mut [ColumnMeta],
+    ) {
+        type_resolve::resolve_columns(ctx, raw_columns, columns).await;
+    }
 }
 
-pub struct PgConnection(zsql_sqlx::SqlxConnection<Postgres, PostgresDriver>);
+pub struct PgConnection(zsql_sqlx::SqlxConnection<Postgres, PostgresDriver, PgColumnResolver>);
 
 #[async_trait]
 impl Connection for PgConnection {
@@ -273,6 +285,7 @@ mod tests {
     use zsql_core::{ConnConfig, Connection, Driver, PreviewQueryArgs, SortDirection};
 
     use super::{PgConnection, PostgresDriver};
+    use crate::type_resolve::PgColumnResolver;
 
     const UNREACHABLE_URL: &str = "postgres://user:pass@zsql-test-nonexistent-host.invalid/db";
 
@@ -330,11 +343,13 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
+        let column_resolver = PgColumnResolver::new(probe_pool.clone());
         let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
             zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_resolver,
         ));
 
         let result = block_on(conn.introspect());
@@ -354,11 +369,13 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
+        let column_resolver = PgColumnResolver::new(probe_pool.clone());
         let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
             zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_resolver,
         ));
 
         let result = block_on(conn.ping());
@@ -381,11 +398,13 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
+        let column_resolver = PgColumnResolver::new(probe_pool.clone());
         PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
             zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_resolver,
         ))
     }
 
@@ -495,11 +514,13 @@ mod tests {
             .expect("connect_lazy only parses the URL; it must not touch the network");
         let cancel_pool = pool.clone();
         let probe_pool = pool.clone();
+        let column_resolver = PgColumnResolver::new(probe_pool.clone());
         let conn = PgConnection(zsql_sqlx::SqlxConnection::new(
             pool,
             cancel_pool,
             probe_pool,
             zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_resolver,
         ));
 
         let (tx, rx) = flume::unbounded();
@@ -581,9 +602,10 @@ mod tests {
 mod database_tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs};
+    use zsql_core::{ConnConfig, Connection, Driver, PreviewQueryArgs, value::UnknownValue};
 
-    use super::PostgresDriver;
+    use super::{PgConnection, PostgresDriver};
+    use crate::type_resolve::PgColumnResolver;
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         futures::executor::block_on(fut)
@@ -1840,5 +1862,276 @@ mod database_tests {
         assert_eq!(databases, sorted, "databases must be sorted by name");
 
         run_ddl(&*conn, &format!("DROP DATABASE {SECOND_DATABASE}"));
+    }
+
+    /// Whether the `citext` extension is installed on the connected
+    /// database, checked directly against `pg_extension` rather than
+    /// inferred from `CREATE EXTENSION IF NOT EXISTS citext` succeeding: a
+    /// permission error on that statement would otherwise be
+    /// indistinguishable from the extension genuinely being unavailable.
+    fn citext_extension_is_installed(conn: &dyn zsql_core::Connection) -> bool {
+        let rows = run_query_collecting_rows(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citext') AS installed",
+        );
+        matches!(rows.as_slice(), [row] if row[0] == zsql_core::Value::Bool(true))
+    }
+
+    /// A `citext` column's OID is assigned by its extension at
+    /// `CREATE EXTENSION` time, so it is never one of the compile-time-known
+    /// Postgres type OIDs this driver's name-based dispatch table
+    /// recognizes; its cell value must still decode to the server's own
+    /// text rendering (via the text-format fallback), not stay unresolved,
+    /// and its grid header badge must resolve to `citext` (via the
+    /// memoized `pg_type` lookup), not the unresolved placeholder.
+    #[test]
+    fn citext_column_decodes_via_the_text_fallback_and_resolves_its_type_badge_when_configured() {
+        let conn = live_connection();
+        let table = "zsql_test_citext";
+
+        run_ddl(&*conn, "CREATE EXTENSION IF NOT EXISTS citext");
+        assert!(
+            citext_extension_is_installed(&*conn),
+            "the citext extension is not installed on this postgres instance; \
+             the database image backing this test must make citext available \
+             (e.g. ship postgresql-contrib) for this test to prove anything"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(
+            &*conn,
+            &format!("CREATE TABLE {table} (label citext NOT NULL)"),
+        );
+        run_ddl(
+            &*conn,
+            &format!("INSERT INTO {table} (label) VALUES ('Hello World')"),
+        );
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(format!("SELECT label FROM {table}"), tx);
+        let columns = match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => columns,
+            other => panic!("expected Columns first, got {other:?}"),
+        };
+        assert_eq!(columns.len(), 1, "one column was selected");
+        assert!(
+            columns[0].type_name.to_lowercase() == "citext",
+            "the grid header type badge should report citext, not an unresolved \
+             placeholder; got {:?}",
+            columns[0].type_name
+        );
+
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 1, "the seeded table holds exactly one row");
+        assert_eq!(
+            rows[0].0[0],
+            zsql_core::Value::Unknown(UnknownValue::Text("Hello World".to_owned())),
+            "a citext value must carry the server's own text-format rendering \
+             rather than stay unresolved"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    /// `citext[]` carries its own OID, distinct from and assigned
+    /// independently of the scalar `citext` OID, so resolving one does not
+    /// resolve the other. A column with no per-element decode path decodes
+    /// as one raw value carrying the server's own array-literal text, not a
+    /// [`zsql_core::Value::Array`] of individually decoded elements.
+    #[test]
+    fn citext_array_column_decodes_via_the_text_fallback_and_resolves_its_type_badge_when_configured()
+     {
+        let conn = live_connection();
+        let table = "zsql_test_citext_array";
+
+        run_ddl(&*conn, "CREATE EXTENSION IF NOT EXISTS citext");
+        assert!(
+            citext_extension_is_installed(&*conn),
+            "the citext extension is not installed on this postgres instance; \
+             the database image backing this test must make citext available \
+             (e.g. ship postgresql-contrib) for this test to prove anything"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(
+            &*conn,
+            &format!("CREATE TABLE {table} (labels citext[] NOT NULL)"),
+        );
+        run_ddl(
+            &*conn,
+            &format!("INSERT INTO {table} (labels) VALUES (ARRAY['Hello', 'World']::citext[])"),
+        );
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(format!("SELECT labels FROM {table}"), tx);
+        let columns = match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => columns,
+            other => panic!("expected Columns first, got {other:?}"),
+        };
+        assert_eq!(columns.len(), 1, "one column was selected");
+        assert!(
+            columns[0].type_name.to_lowercase() == "citext[]",
+            "the grid header type badge should report citext[], not an unresolved \
+             placeholder; got {:?}",
+            columns[0].type_name
+        );
+
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 1, "the seeded table holds exactly one row");
+        assert_eq!(
+            rows[0].0[0],
+            zsql_core::Value::Unknown(UnknownValue::Text("{Hello,World}".to_owned())),
+            "a citext[] value must carry the server's own array-literal text \
+             rather than stay unresolved"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+    }
+
+    /// A user-defined enum, created with plain `CREATE TYPE ... AS ENUM` and
+    /// no extension, proves the OID resolution mechanism is general rather
+    /// than citext-specific: its label must decode via the text-format
+    /// fallback and its column header badge must resolve to the enum's own
+    /// type name.
+    #[test]
+    fn user_defined_enum_column_resolves_its_value_and_type_badge_when_configured() {
+        let conn = live_connection();
+        let enum_type = "zsql_test_mood";
+        let table = "zsql_test_enum_table";
+
+        run_ddl(&*conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(&*conn, &format!("DROP TYPE IF EXISTS {enum_type}"));
+        run_ddl(
+            &*conn,
+            &format!("CREATE TYPE {enum_type} AS ENUM ('sad', 'ok', 'happy')"),
+        );
+        run_ddl(
+            &*conn,
+            &format!("CREATE TABLE {table} (mood {enum_type} NOT NULL)"),
+        );
+        run_ddl(
+            &*conn,
+            &format!("INSERT INTO {table} (mood) VALUES ('happy')"),
+        );
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(format!("SELECT mood FROM {table}"), tx);
+        let columns = match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => columns,
+            other => panic!("expected Columns first, got {other:?}"),
+        };
+        assert_eq!(columns.len(), 1, "one column was selected");
+        assert_eq!(
+            columns[0].type_name, enum_type,
+            "the grid header type badge should resolve to the enum's own type \
+             name via the memoized pg_type lookup, not stay unresolved"
+        );
+
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 1, "the seeded table holds exactly one row");
+        assert_eq!(
+            rows[0].0[0],
+            zsql_core::Value::Unknown(UnknownValue::Text("happy".to_owned())),
+            "an enum column's label must decode via the text-format fallback \
+             rather than stay unresolved"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {table}"));
+        run_ddl(&*conn, &format!("DROP TYPE {enum_type}"));
+    }
+
+    /// Builds a [`PgConnection`] whose main pool is genuinely live but whose
+    /// column-resolution lookup pool can never connect, so the
+    /// `resolve_columns` hook's `pg_type` lookup is forced to fail on every
+    /// call.
+    fn connection_with_unreachable_column_resolver(url: &str) -> PgConnection {
+        let pool = block_on(sqlx::postgres::PgPoolOptions::new().connect(url))
+            .expect("the main pool must connect against a real database");
+        let cancel_pool = pool.clone();
+        let broken_probe_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@zsql-test-nonexistent-host.invalid/db")
+            .expect("connect_lazy only parses the URL; it must not touch the network");
+        let column_resolver = PgColumnResolver::new(broken_probe_pool.clone());
+        PgConnection(zsql_sqlx::SqlxConnection::new(
+            pool,
+            cancel_pool,
+            broken_probe_pool,
+            zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_resolver,
+        ))
+    }
+
+    /// A `pg_type` lookup failure must never fail the query it was trying to
+    /// label: the affected column's type badge simply stays at its
+    /// unresolved placeholder, and every row still streams to completion.
+    #[test]
+    fn column_resolution_failure_is_non_fatal_to_the_query_when_configured() {
+        let url = live_database_url();
+        let conn = connection_with_unreachable_column_resolver(&url);
+        let enum_type = "zsql_test_mood_resolve_failure";
+        let table = "zsql_test_enum_resolve_failure_table";
+
+        run_ddl(&conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(&conn, &format!("DROP TYPE IF EXISTS {enum_type}"));
+        run_ddl(
+            &conn,
+            &format!("CREATE TYPE {enum_type} AS ENUM ('a', 'b')"),
+        );
+        run_ddl(
+            &conn,
+            &format!("CREATE TABLE {table} (v {enum_type} NOT NULL)"),
+        );
+        run_ddl(&conn, &format!("INSERT INTO {table} (v) VALUES ('a')"));
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(format!("SELECT v FROM {table}"), tx);
+        let columns = match recv(&rx) {
+            Ok(zsql_core::QueryEvent::Columns(columns)) => columns,
+            other => panic!("expected Columns first, got {other:?}"),
+        };
+        assert_eq!(
+            columns[0].type_name, "?",
+            "a failed lookup must leave the column at its unresolved placeholder, \
+             not panic or otherwise disrupt the query"
+        );
+
+        let mut rows = Vec::new();
+        let affected = loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { affected }) => break affected,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        };
+        assert_eq!(affected, None);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the query must still stream its row despite the resolution failure"
+        );
+
+        run_ddl(&conn, &format!("DROP TABLE {table}"));
+        run_ddl(&conn, &format!("DROP TYPE {enum_type}"));
     }
 }

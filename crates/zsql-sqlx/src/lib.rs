@@ -23,6 +23,11 @@ pub trait SqlxZsqlDriver<DB: Database>: 'static {
     /// [`run_query`] cancel the in-flight query from a second connection.
     type Cancel: CancelHandle<DB>;
 
+    /// Per-connection context [`Self::resolve_columns`] needs, captured once
+    /// when [`SqlxConnection`] is built and cloned into every query. A
+    /// driver that never overrides `resolve_columns` uses `()`.
+    type ColumnContext: Clone + Send + Sync + 'static;
+
     /// Build the `Columns` metadata for a result set's own column list.
     fn column_metas(columns: &[DB::Column]) -> Vec<zsql_core::ColumnMeta>;
 
@@ -37,6 +42,20 @@ pub trait SqlxZsqlDriver<DB: Database>: 'static {
     fn cancel_handle(
         conn: &mut DB::Connection,
     ) -> impl Future<Output = Result<Self::Cancel, sqlx::Error>> + Send;
+
+    /// Patch `columns` (already built via [`Self::column_metas`] from this
+    /// very same `raw_columns`) in place, after they are collected and
+    /// before they are sent as the stream's `Columns` event. Default is a
+    /// no-op: only a driver whose backend can report a column's type as
+    /// unresolved (e.g. Postgres's dynamically assigned OIDs) needs to
+    /// override this.
+    fn resolve_columns(
+        _ctx: &Self::ColumnContext,
+        _raw_columns: &[DB::Column],
+        _columns: &mut [zsql_core::ColumnMeta],
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Backend-specific data needed to cancel an in-flight query from a second
@@ -68,7 +87,11 @@ impl<DB: Database> CancelHandle<DB> for NoServerSideCancel {
 /// The pool trio backing one sqlx-based driver connection, plus the shared
 /// query-streaming entry point. Drivers embed this and delegate
 /// [`zsql_core::Connection::stream_query`] to [`Self::stream_query`].
-pub struct SqlxConnection<DB: Database, D> {
+///
+/// `C` is the driver's [`SqlxZsqlDriver::ColumnContext`], captured once here
+/// at construction and cloned into every query; it defaults to `()` since
+/// most drivers never override [`SqlxZsqlDriver::resolve_columns`].
+pub struct SqlxConnection<DB: Database, D, C = ()> {
     pool: sqlx::Pool<DB>,
     /// Separate, independently-bounded pool used only for server-side
     /// cancellation
@@ -81,11 +104,12 @@ pub struct SqlxConnection<DB: Database, D> {
     /// [`run_query`], set at construction from the app's configured
     /// `query.batch_size`.
     batch_size: usize,
+    column_ctx: C,
 
     driver: PhantomData<D>,
 }
 
-impl<DB, D> SqlxConnection<DB, D>
+impl<DB, D> SqlxConnection<DB, D, D::ColumnContext>
 where
     DB: Database,
     D: SqlxZsqlDriver<DB>,
@@ -97,12 +121,14 @@ where
         cancel_pool: sqlx::Pool<DB>,
         probe_pool: sqlx::Pool<DB>,
         batch_size: usize,
+        column_ctx: D::ColumnContext,
     ) -> Self {
         Self {
             pool,
             cancel_pool,
             probe_pool,
             batch_size,
+            column_ctx,
             driver: PhantomData,
         }
     }
@@ -123,10 +149,12 @@ where
         let pool = self.pool.clone();
         let cancel_pool = self.cancel_pool.clone();
         let batch_size = self.batch_size;
+        let column_ctx = self.column_ctx.clone();
         // Run on the smol-based executor sqlx's `runtime-smol` feature uses.
         async_global_executor::spawn(run_query::<DB, D>(
             pool,
             cancel_pool,
+            column_ctx,
             sql,
             sink,
             cancel_rx,
@@ -137,7 +165,7 @@ where
     }
 }
 
-impl<DB: Database, D> SqlxConnection<DB, D> {
+impl<DB: Database, D, C> SqlxConnection<DB, D, C> {
     /// Close all three pools this connection owns (main, cancel, probe),
     /// releasing their background workers rather than leaving that to each
     /// pool's own `Drop`.
@@ -171,6 +199,7 @@ impl<DB: Database, D> SqlxConnection<DB, D> {
 pub async fn run_query<DB, D>(
     pool: sqlx::Pool<DB>,
     cancel_pool: sqlx::Pool<DB>,
+    column_ctx: D::ColumnContext,
     sql: String,
     sink: BatchSink,
     cancel_rx: flume::Receiver<()>,
@@ -232,7 +261,8 @@ pub async fn run_query<DB, D>(
             futures::future::Either::Right((None, _)) => break,
             futures::future::Either::Right((Some(Ok(sqlx::Either::Right(row))), _)) => {
                 if !columns_sent {
-                    let columns = D::column_metas(row.columns());
+                    let mut columns = D::column_metas(row.columns());
+                    D::resolve_columns(&column_ctx, row.columns(), &mut columns).await;
                     if sink
                         .send_async(Ok(QueryEvent::Columns(columns)))
                         .await
@@ -282,7 +312,11 @@ pub async fn run_query<DB, D>(
         false
     } else {
         let columns = match pool.prepare(AssertSqlSafe(sql).into_sql_str()).await {
-            Ok(statement) => D::column_metas(statement.columns()),
+            Ok(statement) => {
+                let mut columns = D::column_metas(statement.columns());
+                D::resolve_columns(&column_ctx, statement.columns(), &mut columns).await;
+                columns
+            }
             Err(_) => Vec::new(),
         };
         let reports_affected = columns.is_empty();
@@ -367,6 +401,7 @@ mod tests {
             cancel_pool,
             probe_pool,
             batch_size: zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            column_ctx: (),
             driver: PhantomData,
         };
 

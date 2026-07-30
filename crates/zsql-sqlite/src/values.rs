@@ -19,6 +19,7 @@
 
 use sqlx::sqlite::{SqliteColumn, SqliteRow};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
+use zsql_core::value::UnknownValue;
 use zsql_core::{ColumnMeta, Row as CoreRow, Value};
 
 /// Build the `Columns` metadata for a prepared statement's output columns.
@@ -50,7 +51,7 @@ pub(crate) fn decode_row(row: &SqliteRow) -> CoreRow {
 /// raw-value read failure.
 fn decode_value(row: &SqliteRow, idx: usize) -> Value {
     let Ok(raw) = row.try_get_raw(idx) else {
-        return Value::Unknown(String::new());
+        return Value::Unknown(UnknownValue::None);
     };
     // `is_null()` reads the value's actual runtime storage class; unlike
     // `type_info().name()` below it is never overridden by a NULL column's
@@ -67,20 +68,21 @@ fn decode_value(row: &SqliteRow, idx: usize) -> Value {
 /// `sqlite3_value_type` only ever returns one of those four codes for a
 /// non-null value) degrades to [`Value::Unknown`] rather than panicking.
 fn storage_class_value(row: &SqliteRow, idx: usize, storage_class: &str) -> Value {
+    let unknown = || Value::Unknown(UnknownValue::None);
     match storage_class {
         "INTEGER" => row
             .try_get::<i64, _>(idx)
-            .map_or_else(|_| Value::Unknown(storage_class.to_owned()), Value::Int),
+            .map_or_else(|_| unknown(), Value::Int),
         "REAL" => row
             .try_get::<f64, _>(idx)
-            .map_or_else(|_| Value::Unknown(storage_class.to_owned()), Value::Float),
+            .map_or_else(|_| unknown(), Value::Float),
         "TEXT" => row
             .try_get::<String, _>(idx)
-            .map_or_else(|_| Value::Unknown(storage_class.to_owned()), Value::Text),
+            .map_or_else(|_| unknown(), Value::Text),
         "BLOB" => row
             .try_get::<Vec<u8>, _>(idx)
-            .map_or_else(|_| Value::Unknown(storage_class.to_owned()), Value::Bytes),
-        other => Value::Unknown(other.to_owned()),
+            .map_or_else(|_| unknown(), Value::Bytes),
+        _ => unknown(),
     }
 }
 
@@ -89,7 +91,7 @@ mod tests {
     use futures::executor::block_on;
     use sqlx::Row as _;
     use sqlx::sqlite::SqlitePoolOptions;
-    use zsql_core::Value;
+    use zsql_core::{Value, value::UnknownValue};
 
     use super::{decode_row, storage_class_value};
 
@@ -196,7 +198,7 @@ mod tests {
         });
         assert_eq!(
             storage_class_value(&row, 0, "SOMETHING_UNMAPPED"),
-            Value::Unknown("SOMETHING_UNMAPPED".to_owned())
+            Value::Unknown(UnknownValue::None)
         );
     }
 }

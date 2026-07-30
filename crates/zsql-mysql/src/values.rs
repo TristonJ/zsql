@@ -9,6 +9,7 @@ use sqlx::mysql::{MySqlColumn, MySqlRow};
 use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::types::{BigDecimal, Json, JsonRawValue};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
+use zsql_core::value::UnknownValue;
 use zsql_core::{ColumnMeta, Row as CoreRow, Value};
 
 /// The largest `u64` [`Value::Int`] (backed by `i64`) can represent exactly.
@@ -45,7 +46,7 @@ pub(crate) fn decode_row(row: &MySqlRow) -> CoreRow {
 /// decode unexpectedly fails.
 fn decode_value(row: &MySqlRow, idx: usize) -> Value {
     let type_name = row.column(idx).type_info().name().to_owned();
-    known_value(row, idx, &type_name).unwrap_or_else(|| raw_fallback(row, idx, &type_name))
+    known_value(row, idx, &type_name).unwrap_or_else(|| raw_fallback(row, idx))
 }
 
 /// Attempt to decode `row[idx]` using a type-specific mapping. Returns
@@ -188,20 +189,18 @@ fn format_naive_timestamp(dt: NaiveDateTime) -> String {
 
 /// Fallback decode for a column whose type this module does not map: `NULL`
 /// still decodes to [`Value::Null`] regardless of declared type; otherwise
-/// [`Value::Unknown`] carries the column's own type name (sqlx's `MySQL`
-/// value accessors are private to its crate, so -- unlike the Postgres and
-/// `MSSQL` drivers -- there is no raw text/bytes form of the value available
-/// to carry here).
-fn raw_fallback(row: &MySqlRow, idx: usize, type_name: &str) -> Value {
+/// [`Value::Unknown`]. Unlike the Postgres and `MSSQL` drivers -- there is
+/// no raw text/bytes form of the value available to carry here).
+fn raw_fallback(row: &MySqlRow, idx: usize) -> Value {
     let is_null = row.try_get_raw(idx).is_ok_and(|raw| raw.is_null());
-    unknown_fallback(is_null, type_name)
+    unknown_fallback(is_null)
 }
 
-fn unknown_fallback(is_null: bool, type_name: &str) -> Value {
+fn unknown_fallback(is_null: bool) -> Value {
     if is_null {
         Value::Null
     } else {
-        Value::Unknown(type_name.to_owned())
+        Value::Unknown(UnknownValue::None)
     }
 }
 
@@ -215,6 +214,7 @@ mod tests {
     use sqlx::types::chrono::{NaiveDate, NaiveTime};
     use sqlx::types::{BigDecimal, Json, JsonRawValue};
     use zsql_core::Value;
+    use zsql_core::value::UnknownValue;
 
     #[test]
     fn bool_value_maps_a_boolean() {
@@ -368,15 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fallback_reports_the_type_name_for_a_non_null_value() {
-        assert_eq!(
-            unknown_fallback(false, "SET"),
-            Value::Unknown("SET".to_owned())
-        );
+    fn unknown_fallback_reports_unknown_for_a_non_null_value() {
+        assert_eq!(unknown_fallback(false), Value::Unknown(UnknownValue::None));
     }
 
     #[test]
-    fn unknown_fallback_reports_null_regardless_of_type_name() {
-        assert_eq!(unknown_fallback(true, "SET"), Value::Null);
+    fn unknown_fallback_reports_null() {
+        assert_eq!(unknown_fallback(true), Value::Null);
     }
 }

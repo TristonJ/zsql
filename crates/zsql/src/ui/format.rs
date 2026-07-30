@@ -4,8 +4,11 @@
 
 use std::fmt::Write as _;
 
-use zsql_core::{ColumnMeta, Row, Value};
+use zsql_core::{ColumnMeta, Row, Value, value::UnknownValue};
 use zsql_ui::theme::Theme;
+
+/// Displayed for a [`Value::Unknown`] that carries no backend text.
+const UNKNOWN_PLACEHOLDER: &str = "?";
 
 /// Semantic category of a formatted cell, used to select a per-kind text
 /// color/style in the results grid.
@@ -99,8 +102,12 @@ pub fn format_value(value: &Value) -> FormattedValue {
             text: format_array(items),
             kind: ValueKind::Unknown,
         },
-        Value::Unknown(text) => FormattedValue {
-            text: text.clone(),
+        Value::Unknown(v) => FormattedValue {
+            text: match v {
+                UnknownValue::Text(t) => t.clone(),
+                UnknownValue::Bytes(bytes) => format_bytes(bytes),
+                UnknownValue::None => UNKNOWN_PLACEHOLDER.to_owned(),
+            },
             kind: ValueKind::Unknown,
         },
     }
@@ -207,7 +214,11 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
             serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.clone()))
         }
         Value::Array(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
-        Value::Unknown(text) => serde_json::Value::String(text.clone()),
+        Value::Unknown(v) => match v {
+            UnknownValue::Text(text) => serde_json::Value::String(text.clone()),
+            UnknownValue::Bytes(bytes) => serde_json::Value::String(base64_encode(bytes)),
+            UnknownValue::None => serde_json::Value::String(UNKNOWN_PLACEHOLDER.to_owned()),
+        },
     }
 }
 
@@ -235,7 +246,7 @@ pub fn host_label(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use zsql_core::{ColumnMeta, Row, Value};
+    use zsql_core::{ColumnMeta, Row, Value, value::UnknownValue};
     use zsql_ui::theme::Theme;
 
     use super::{ValueKind, base64_encode, format_value, row_as_json, value_to_json};
@@ -359,9 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_passes_through_the_backends_text_rendering() {
-        let formatted = format_value(&Value::Unknown("(1,2)".to_owned()));
+    fn unknown_passes_through_the_backends_text_rendering_when_present() {
+        let formatted = format_value(&Value::Unknown(UnknownValue::Text("(1,2)".to_owned())));
         assert_eq!(formatted.text, "(1,2)");
+        assert_eq!(formatted.kind, ValueKind::Unknown);
+    }
+
+    #[test]
+    fn unknown_renders_a_placeholder_when_no_text_is_carried() {
+        let formatted = format_value(&Value::Unknown(UnknownValue::None));
+        assert_eq!(formatted.text, "?");
+        assert_eq!(formatted.kind, ValueKind::Unknown);
+    }
+
+    #[test]
+    fn unknown_bytes_render_as_hex_bytea_literal() {
+        let formatted = format_value(&Value::Unknown(UnknownValue::Bytes(vec![0x01, 0xAB, 0xff])));
+        assert_eq!(formatted.text, "\\x01abff");
         assert_eq!(formatted.kind, ValueKind::Unknown);
     }
 
@@ -471,8 +496,12 @@ mod tests {
         );
 
         assert_eq!(
-            value_to_json(&Value::Unknown("(1,2)".to_owned())),
+            value_to_json(&Value::Unknown(UnknownValue::Text("(1,2)".to_owned()))),
             serde_json::json!("(1,2)")
+        );
+        assert_eq!(
+            value_to_json(&Value::Unknown(UnknownValue::None)),
+            serde_json::json!("?")
         );
     }
 }

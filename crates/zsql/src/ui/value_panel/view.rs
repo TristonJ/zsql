@@ -334,10 +334,7 @@ impl ValuePanel {
                 root = root.child(Self::render_null_body(active_theme));
             }
             RendererKind::Unknown { type_name } => {
-                let text = match value {
-                    Value::Unknown(text) => text.clone(),
-                    other => format_value(other).text,
-                };
+                let text = format_value(value).text;
                 root = root
                     .child(Self::render_static_subbar(&type_name, active_theme))
                     .child(Self::render_mono_body(&text, active_theme));
@@ -872,6 +869,7 @@ impl ValuePanel {
 #[cfg(test)]
 mod tests {
     use gpui::AppContext as _;
+    use zsql_core::value::UnknownValue;
     use zsql_core::{ColumnMeta, Value};
 
     use super::{
@@ -1156,9 +1154,14 @@ mod tests {
 
         for (id, value, type_name) in [
             (2usize, Value::Bool(true), "bool"),
-            (3, Value::Unknown("(1,2)".to_owned()), "point"),
+            (
+                3,
+                Value::Unknown(UnknownValue::Text("(1,2)".to_owned())),
+                "point",
+            ),
             (4, Value::Null, "text"),
             (5, Value::Text(String::new()), "text"),
+            (6, Value::Unknown(UnknownValue::None), "point"),
         ] {
             panel.update(vcx, |p, _cx| {
                 p.update_content(Some(content(id, value, type_name)));

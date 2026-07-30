@@ -396,6 +396,16 @@ mod tests {
     }
 
     #[test]
+    fn column_detail_carries_the_catalogs_citext_type_name_through_unchanged() {
+        // `pg_catalog.format_type` already renders the citext extension
+        // type's own catalog name lower-case, so the column-detail builder
+        // needs no extension-specific handling: it simply passes the type
+        // name it is given straight through.
+        let (_, column) = column_detail(1, "email".to_owned(), "citext".to_owned(), false, None);
+        assert_eq!(column.type_name, "citext");
+    }
+
+    #[test]
     fn column_detail_carries_a_non_trivial_default_expression() {
         let (_, column) = column_detail(
             2,

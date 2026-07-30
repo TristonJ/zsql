@@ -625,6 +625,7 @@ impl ValuePanelState {
 mod tests {
     use std::collections::HashSet;
 
+    use zsql_core::value::UnknownValue;
     use zsql_core::{ColumnMeta, Value};
 
     use super::{
@@ -684,7 +685,16 @@ mod tests {
             RendererKind::Json
         );
         assert_eq!(
-            renderer_for(&Value::Unknown("(1,2)".to_owned()), "point"),
+            renderer_for(
+                &Value::Unknown(UnknownValue::Text("(1,2)".to_owned())),
+                "point"
+            ),
+            RendererKind::Unknown {
+                type_name: "point".to_owned()
+            }
+        );
+        assert_eq!(
+            renderer_for(&Value::Unknown(UnknownValue::None), "point"),
             RendererKind::Unknown {
                 type_name: "point".to_owned()
             }
