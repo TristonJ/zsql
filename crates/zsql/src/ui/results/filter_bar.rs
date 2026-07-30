@@ -7,7 +7,7 @@
 //! sort headers and pager already go inert for a detached tab.
 
 use gpui::{
-    Context, Div, Entity, Focusable, SharedString, Stateful, Window, div, prelude::*, px, rgb,
+    Context, Div, Entity, Focusable, SharedString, Stateful, Window, div, prelude::*, px, rgb, rgba,
 };
 use zsql_core::{
     ColumnMeta, FilterCondition, FilterConditionId, FilterConnector, FilterOperator,
@@ -342,10 +342,7 @@ impl ResultsView {
     }
 
     /// The column picker dropdown: one entry per column of the current
-    /// result, each opening a fresh filter editor targeting it. Opened by
-    /// [`ResultsView::begin_add_filter`], since v0's filter editor itself
-    /// has no column field -- the target column is fixed by whichever entry
-    /// was clicked here.
+    /// result, each opening a fresh filter editor targeting it
     fn render_column_picker(
         columns: &[ColumnMeta],
         active_theme: &zsql_ui::theme::Theme,
@@ -361,6 +358,7 @@ impl ResultsView {
             .rounded(px(app_theme::FILTER_OP_MENU_RADIUS))
             .border_1()
             .border_color(rgb(colors.border))
+            .block_mouse_except_scroll()
             .bg(rgb(colors.bg_overlay))
             .shadow_lg();
 
@@ -378,7 +376,7 @@ impl ResultsView {
                 .h(app_theme::FILTER_OP_MENU_ITEM_HEIGHT)
                 .px(app_theme::FILTER_OP_MENU_ITEM_PADDING_X)
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
-                .hover(|el| el.bg(rgb(colors.accent_wash())))
+                .hover(|el| el.bg(rgba(colors.accent_wash())))
                 .text_color(rgb(colors.text_primary))
                 .child(column.name.clone())
                 .child(
@@ -455,7 +453,7 @@ impl ResultsView {
             .rounded(px(app_theme::FILTER_CHIP_RADIUS))
             .border_1()
             .border_color(rgb(colors.accent))
-            .bg(rgb(colors.accent_wash_soft()))
+            .bg(rgba(colors.accent_wash_soft()))
             .child(
                 div()
                     .text_color(rgb(colors.text_primary))
@@ -525,7 +523,7 @@ impl ResultsView {
                 .h(app_theme::FILTER_OP_MENU_ITEM_HEIGHT)
                 .px(app_theme::FILTER_OP_MENU_ITEM_PADDING_X)
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
-                .hover(|el| el.bg(rgb(colors.accent_wash())))
+                .hover(|el| el.bg(rgba(colors.accent_wash())))
                 .text_color(rgb(colors.text_primary))
                 .child(
                     div()
