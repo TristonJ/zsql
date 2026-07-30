@@ -1595,7 +1595,12 @@ mod header_tests {
             Ok(())
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &zsql_core::FilterState,
+        ) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
 

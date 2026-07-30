@@ -225,6 +225,85 @@ pub fn generated_strip_accent(theme: &Theme) -> u32 {
     theme.colors.value_bytes
 }
 
+// ---- results pane: filter bar -------------------------------------------
+
+/// Minimum height of the filter bar strip under the results bar. Grows past
+/// this (via `flex_wrap`) once enough chips no longer fit one row.
+pub const FILTER_BAR_MIN_HEIGHT: Pixels = px(34.0);
+/// Horizontal gap between the filter bar's own chips/connectors/controls.
+pub const FILTER_BAR_GAP: Pixels = px(6.0);
+/// Text size of the filter bar's "FILTER" label, and every chip/connector.
+pub const FILTER_BAR_TEXT_SIZE: f32 = 11.5;
+
+/// Height of a committed filter chip.
+pub const FILTER_CHIP_HEIGHT: Pixels = px(24.0);
+/// Corner radius of a filter chip.
+pub const FILTER_CHIP_RADIUS: f32 = 5.0;
+/// Horizontal padding inside a filter chip.
+pub const FILTER_CHIP_PADDING_X: Pixels = px(8.0);
+/// Horizontal gap between a chip's own column/operator/value/remove parts.
+pub const FILTER_CHIP_INNER_GAP: Pixels = px(6.0);
+/// A committed chip's own right padding, past its trailing remove control
+/// (which carries its own tighter clickable margin, unlike
+/// [`FILTER_CHIP_PADDING_X`] on the left).
+pub const FILTER_CHIP_PADDING_RIGHT: Pixels = px(4.0);
+/// Side length of a chip's remove control.
+pub const FILTER_CHIP_REMOVE_SIZE: Pixels = px(16.0);
+/// Corner radius of a chip's remove control.
+pub const FILTER_CHIP_REMOVE_RADIUS: f32 = 3.0;
+/// Horizontal gap between an expression-classified value's text and its
+/// trailing `fx` tag.
+pub const FILTER_VALUE_EXPRESSION_GAP: Pixels = px(4.0);
+
+/// Height of the AND/OR connector pill between two chips.
+pub const FILTER_CONNECTOR_HEIGHT: Pixels = px(20.0);
+/// Horizontal padding inside the AND/OR connector pill.
+pub const FILTER_CONNECTOR_PADDING_X: Pixels = px(7.0);
+/// Corner radius of the AND/OR connector pill.
+pub const FILTER_CONNECTOR_RADIUS: f32 = 4.0;
+
+/// Height of the "+ filter" and "clear all" controls.
+pub const FILTER_CONTROL_HEIGHT: Pixels = px(24.0);
+/// Horizontal padding inside the "+ filter" control.
+pub const FILTER_ADD_PADDING_X: Pixels = px(9.0);
+/// Corner radius of the "+ filter" control.
+pub const FILTER_ADD_RADIUS: f32 = 5.0;
+/// Horizontal gap between the "+ filter" control's own "+" and "filter"
+/// parts.
+pub const FILTER_ADD_CONTROL_GAP: Pixels = px(5.0);
+/// Corner radius of the "clear all" control.
+pub const FILTER_CLEAR_ALL_RADIUS: f32 = 4.0;
+
+/// Width of the value text field shown while a chip is being edited.
+pub const FILTER_VALUE_FIELD_WIDTH: Pixels = px(120.0);
+
+/// Text size of the `fx` tag marking an expression-classified filter value.
+pub const FILTER_FX_TAG_TEXT_SIZE: f32 = 9.0;
+/// Horizontal padding inside the `fx` tag.
+pub const FILTER_FX_TAG_PADDING_X: Pixels = px(4.0);
+/// Corner radius of the `fx` tag.
+pub const FILTER_FX_TAG_RADIUS: f32 = 3.0;
+
+/// Top offset of a filter bar dropdown (the operator menu or the column
+/// picker) below the control it opens from.
+pub const FILTER_MENU_TOP_OFFSET: Pixels = px(27.0);
+
+/// Width of the operator menu shown while a chip is being edited.
+pub const FILTER_OP_MENU_WIDTH: Pixels = px(196.0);
+/// Corner radius of the operator menu.
+pub const FILTER_OP_MENU_RADIUS: f32 = 6.0;
+/// Padding around the operator menu's items.
+pub const FILTER_OP_MENU_PADDING: Pixels = px(4.0);
+/// Height of one operator menu item.
+pub const FILTER_OP_MENU_ITEM_HEIGHT: Pixels = px(26.0);
+/// Horizontal padding inside one operator menu item.
+pub const FILTER_OP_MENU_ITEM_PADDING_X: Pixels = px(8.0);
+/// Corner radius of one operator menu item.
+pub const FILTER_OP_MENU_ITEM_RADIUS: f32 = 4.0;
+/// Width of an operator menu item's fixed-width symbol column, so every
+/// item's trailing pattern hint (where present) lines up in a column.
+pub const FILTER_OP_MENU_SYMBOL_WIDTH: Pixels = px(38.0);
+
 /// Horizontal padding around the generated strip's trailing "generated" tag
 /// and hint text.
 pub const GENERATED_STRIP_TRAILING_PADDING_X: f32 = 14.0;

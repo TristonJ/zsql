@@ -970,6 +970,7 @@ mod render_tests {
             &self,
             _schema: &str,
             _relation: &str,
+            _filters: &zsql_core::FilterState,
         ) -> Result<zsql_core::RowCount, zsql_core::CoreError> {
             Ok(zsql_core::RowCount::Exact(1_240))
         }

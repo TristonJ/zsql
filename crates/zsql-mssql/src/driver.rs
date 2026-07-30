@@ -29,8 +29,9 @@ use futures::future::Either;
 use futures::{StreamExt as _, pin_mut};
 use tiberius::{Client, QueryItem};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, PreviewQueryArgs, QueryEvent,
-    QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
+    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree,
+    render_where_conditions,
 };
 
 use crate::error::{map_connect_error, map_io_connect_error, map_query_error};
@@ -223,16 +224,29 @@ impl Connection for MssqlConnection {
         liveness_check(&mut client).await.map(|_| ())
     }
 
-    #[tracing::instrument(name = "mssql_count_rows", skip(self))]
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
+    #[tracing::instrument(name = "mssql_count_rows", skip(self, filters), fields(filtered = !filters.is_empty()))]
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        filters: &FilterState,
+    ) -> Result<RowCount, CoreError> {
         let mut client = open_client(&self.config, self.dial_addr).await?;
-        let partition_row_count = fetch_partition_row_count(&mut client, schema, relation).await?;
-        if let Some(row_count) = row_count_from_partition_stats(partition_row_count) {
-            tracing::debug!(?row_count, "using partition-stats row-count estimate");
-            return Ok(row_count);
+        // `sys.dm_db_partition_stats` describes the whole relation, not a
+        // filtered subset of it, so any active filter falls straight to an
+        // exact, `WHERE`-qualified `COUNT_BIG(*)`.
+        if filters.is_empty() {
+            let partition_row_count =
+                fetch_partition_row_count(&mut client, schema, relation).await?;
+            if let Some(row_count) = row_count_from_partition_stats(partition_row_count) {
+                tracing::debug!(?row_count, "using partition-stats row-count estimate");
+                return Ok(row_count);
+            }
+            tracing::debug!(
+                "no reliable partition-stats row found; falling back to an exact count"
+            );
         }
-        tracing::debug!("no reliable partition-stats row found; falling back to an exact count");
-        let exact = exact_row_count(&mut client, schema, relation).await?;
+        let exact = exact_row_count(&mut client, schema, relation, filters).await?;
         Ok(RowCount::Exact(exact))
     }
 
@@ -247,8 +261,14 @@ impl Connection for MssqlConnection {
     }
 
     /// The click-to-preview query for `relation` in `schema`, capped at
-    /// `limit` rows, in this dialect's syntax.
+    /// `limit` rows, in this dialect's syntax: bracket-quoted identifiers
+    /// and, since `MSSQL` has no native `ILIKE`, an `ILIKE` filter mapped to
+    /// `LOWER(column) LIKE LOWER(value)`.
     fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        let where_clause =
+            render_where_conditions(&args.filters, crate::quoting::bracket_quote_ident, false)
+                .map(|clause| format!(" WHERE {clause}"))
+                .unwrap_or_default();
         if let Some(offset) = args.offset {
             let order_by = args.sort.map_or_else(
                 || "(SELECT NULL)".to_owned(),
@@ -261,14 +281,14 @@ impl Connection for MssqlConnection {
                 },
             );
             format!(
-                "SELECT * FROM {}.{} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY",
+                "SELECT * FROM {}.{}{where_clause} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY",
                 crate::quoting::bracket_quote_ident(schema),
                 crate::quoting::bracket_quote_ident(relation),
                 args.limit
             )
         } else {
             format!(
-                "SELECT TOP ({}) * FROM {}.{}",
+                "SELECT TOP ({}) * FROM {}.{}{where_clause}",
                 args.limit,
                 crate::quoting::bracket_quote_ident(schema),
                 crate::quoting::bracket_quote_ident(relation)
@@ -329,25 +349,36 @@ fn row_count_from_partition_stats(row_count: Option<u64>) -> Option<RowCount> {
 
 /// Build `SELECT COUNT_BIG(*) FROM [schema].[relation]`, bracket-quoting both
 /// identifiers so an adversarial schema/relation name cannot break out of
-/// the identifier position.
-fn exact_count_sql(schema: &str, relation: &str) -> String {
+/// the identifier position, plus `filters`' conditions as a `WHERE` clause
+/// (`ILIKE` mapped to `LOWER(column) LIKE LOWER(value)`, matching this
+/// driver's own `preview_query`).
+fn exact_count_sql(schema: &str, relation: &str, filters: &FilterState) -> String {
     // COUNT_BIG (not COUNT) returns bigint, so the count fits the neutral
     // u64 contract and cannot overflow on a relation with more than i32::MAX
     // rows the way COUNT's int result would.
-    format!(
+    let mut sql = format!(
         "SELECT COUNT_BIG(*) FROM {}.{}",
         crate::quoting::bracket_quote_ident(schema),
         crate::quoting::bracket_quote_ident(relation)
-    )
+    );
+    if let Some(where_clause) =
+        render_where_conditions(filters, crate::quoting::bracket_quote_ident, false)
+    {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+    sql
 }
 
-/// Run an exact `SELECT COUNT_BIG(*)` against `schema.relation`.
+/// Run an exact `SELECT COUNT_BIG(*)` against `schema.relation`, restricted
+/// to rows matching `filters`.
 async fn exact_row_count(
     client: &mut Client<TcpStream>,
     schema: &str,
     relation: &str,
+    filters: &FilterState,
 ) -> Result<u64, CoreError> {
-    let sql = exact_count_sql(schema, relation);
+    let sql = exact_count_sql(schema, relation, filters);
     let stream = client.simple_query(sql).await.map_err(map_query_error)?;
     let row = stream
         .into_row()
@@ -648,14 +679,18 @@ mod tests {
     #[test]
     fn exact_count_sql_quotes_both_identifiers() {
         assert_eq!(
-            super::exact_count_sql("dbo", "orders"),
+            super::exact_count_sql("dbo", "orders", &zsql_core::FilterState::new()),
             "SELECT COUNT_BIG(*) FROM [dbo].[orders]"
         );
     }
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
-        let sql = super::exact_count_sql("dbo", "orders]; DROP TABLE users; --");
+        let sql = super::exact_count_sql(
+            "dbo",
+            "orders]; DROP TABLE users; --",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT_BIG(*) FROM [dbo].[orders]]; DROP TABLE users; --]"
@@ -665,7 +700,11 @@ mod tests {
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
-        let sql = super::exact_count_sql("dbo]; DROP TABLE users; --", "orders");
+        let sql = super::exact_count_sql(
+            "dbo]; DROP TABLE users; --",
+            "orders",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT_BIG(*) FROM [dbo]]; DROP TABLE users; --].[orders]"
@@ -819,6 +858,95 @@ mod tests {
              OFFSET 0 ROWS FETCH NEXT 200 ROWS ONLY"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_renders_a_where_clause_from_filters() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT TOP (200) * FROM [dbo].[orders] WHERE [status] = 'paid'"
+        );
+    }
+
+    #[test]
+    fn preview_query_renders_where_before_order_by_when_offset_paginated() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .offset(200)
+                .filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM [dbo].[orders] WHERE [status] = 'paid' ORDER BY (SELECT NULL) \
+             OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn preview_query_maps_ilike_to_lower_like_lower_on_mssql() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "name",
+            "nvarchar",
+            zsql_core::FilterOperator::ILike,
+            "smith%",
+        );
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert!(
+            sql.contains("LOWER([name]) LIKE LOWER('smith%')"),
+            "mssql has no native ILIKE and must map it, got: {sql}"
+        );
+        assert!(!sql.contains("ILIKE"), "got: {sql}");
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_filter_column() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "total]; DROP TABLE users; --",
+            "int",
+            zsql_core::FilterOperator::Eq,
+            "1",
+        );
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT TOP (200) * FROM [dbo].[orders] WHERE [total]]; DROP TABLE users; --] = 1"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn exact_count_sql_renders_a_where_clause_from_filters() {
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        assert_eq!(
+            super::exact_count_sql("dbo", "orders", &filters),
+            "SELECT COUNT_BIG(*) FROM [dbo].[orders] WHERE [status] = 'paid'"
+        );
     }
 
     #[test]
@@ -1412,7 +1540,8 @@ mod database_tests {
             ),
         );
 
-        let row_count = block_on(conn.count_rows("dbo", table)).expect("count_rows must run");
+        let row_count = block_on(conn.count_rows("dbo", table, &zsql_core::FilterState::new()))
+            .expect("count_rows must run");
         tracing::info!(
             ?row_count,
             "count_rows_returns_an_estimated_count_when_configured executed against the live database"
@@ -1432,7 +1561,8 @@ mod database_tests {
         // A view has no `sys.dm_db_partition_stats` row of its own, so
         // `count_rows` must fall back to an exact `COUNT(*)`.
         let row_count =
-            block_on(conn.count_rows("dbo", "recent_orders")).expect("count_rows must run");
+            block_on(conn.count_rows("dbo", "recent_orders", &zsql_core::FilterState::new()))
+                .expect("count_rows must run");
         assert!(
             matches!(row_count, zsql_core::RowCount::Exact(_)),
             "expected Exact for a view, got {row_count:?}"

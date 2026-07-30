@@ -10,12 +10,11 @@ use zsql_core::{
     RowCount, SchemaTree,
 };
 
-use super::{
-    PreviewAction, PreviewControlsChanged, ResultsChanged, ResultsSnapshot, Tab, TabKind, TabModel,
-};
+use super::{PreviewControlsChanged, ResultsChanged, ResultsSnapshot, Tab, TabKind, TabModel};
 use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::ResultsView;
+use crate::ui::results::pager::PreviewAction;
 
 /// Test-only accessors: a tab's captured run, and its sort/page window (see
 /// [`Tab::preview_state`]'s field doc for when the latter is meaningful).
@@ -49,7 +48,12 @@ impl Connection for FakeConnection {
         Ok(())
     }
 
-    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         Ok(RowCount::Exact(0))
     }
 
@@ -89,7 +93,12 @@ impl Connection for RecordingConnection {
         Ok(())
     }
 
-    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         Ok(RowCount::Exact(self.total_rows))
     }
 
@@ -238,7 +247,12 @@ impl Connection for DialectRecordingConnection {
         Ok(())
     }
 
-    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         Ok(RowCount::Exact(0))
     }
 
@@ -1564,7 +1578,12 @@ impl Connection for PerRelationCountConnection {
         Ok(())
     }
 
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         let key = (schema.to_owned(), relation.to_owned());
         self.count_calls
             .lock()
@@ -1751,4 +1770,281 @@ fn an_edited_generated_tab_shows_no_total_row_count(cx: &mut TestAppContext) {
         "editing a generated tab must clear its pushed total row count"
     );
     let _ = sinks;
+}
+
+// -- filters --------------------------------------------------------------
+
+#[gpui::test]
+fn adding_a_filter_rewrites_the_buffer_reruns_and_refetches_the_count(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().filters().len(), 1);
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' LIMIT 200",
+            "the editor buffer must equal exactly the SQL that was rerun"
+        );
+    });
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before + 1,
+        "adding a filter to a live generated tab must re-run its query"
+    );
+}
+
+#[gpui::test]
+fn a_filter_value_that_parses_as_an_expression_is_never_quoted(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "placed_at".to_owned(),
+            type_name: "timestamptz".to_owned(),
+            operator: zsql_core::FilterOperator::Gt,
+            value: "now() - interval '7 days'".to_owned(),
+        },
+    );
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs()[0].editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" WHERE \"placed_at\" > now() - interval '7 days' \
+             LIMIT 200"
+        );
+    });
+}
+
+#[gpui::test]
+fn multiple_filters_combine_with_their_own_and_or_connectors_in_chip_order(
+    cx: &mut TestAppContext,
+) {
+    let (model, _sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "pending".to_owned(),
+        },
+    );
+
+    let first_id = model.read_with(cx, |model, _app| {
+        model.tabs()[0].preview_state().filters().conditions()[0].id()
+    });
+    dispatch(&model, cx, PreviewAction::ToggleFilterConnector(0));
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs()[0].editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' OR \"status\" = \
+             'pending' LIMIT 200"
+        );
+    });
+
+    dispatch(&model, cx, PreviewAction::RemoveFilter(first_id));
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs()[0].editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'pending' LIMIT 200"
+        );
+    });
+}
+
+#[gpui::test]
+fn updating_a_filters_operator_and_value_rewrites_the_buffer(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    let id = model.update(cx, |model, cx| {
+        model.dispatch_preview_action(
+            PreviewAction::AddFilter {
+                column: "total_cents".to_owned(),
+                type_name: "int4".to_owned(),
+                operator: zsql_core::FilterOperator::Eq,
+                value: "100".to_owned(),
+            },
+            cx,
+        );
+        model.tabs()[0].preview_state().filters().conditions()[0].id()
+    });
+    cx.run_until_parked();
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::UpdateFilter {
+            id,
+            operator: zsql_core::FilterOperator::Ge,
+            value: "500".to_owned(),
+        },
+    );
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs()[0].editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" WHERE \"total_cents\" >= 500 LIMIT 200"
+        );
+    });
+}
+
+#[gpui::test]
+fn clear_filters_removes_every_condition_and_reruns_unfiltered(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(&model, cx, PreviewAction::ClearFilters);
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert!(tab.preview_state().filters().is_empty());
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+    });
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before + 1,
+        "clearing filters on a live generated tab must re-run its query"
+    );
+}
+
+#[gpui::test]
+fn a_filter_change_re_anchors_the_page_to_one_dropping_any_offset(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 10_000);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::NextPage);
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs()[0].preview_state().page(), 2);
+    });
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+
+    model.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.preview_state().page(), 1);
+        assert!(
+            !tab.editor().read(app).text().contains("OFFSET"),
+            "page 1 must not carry an OFFSET clause: {}",
+            tab.editor().read(app).text()
+        );
+    });
+}
+
+#[gpui::test]
+fn editing_a_generated_tabs_buffer_makes_further_filter_actions_inert(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("-- edited\n", cx);
+    });
+    cx.run_until_parked();
+
+    let text_before = editor.read_with(cx, |editor, _app| editor.text());
+    let runs_before = sinks.lock().expect("sinks lock poisoned").len();
+
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+
+    let text_after = editor.read_with(cx, |editor, _app| editor.text());
+    assert_eq!(
+        text_before, text_after,
+        "a filter action on an edited (now Script) tab must not touch its buffer"
+    );
+    assert!(
+        model.read_with(cx, |model, _app| model.tabs()[0]
+            .preview_state()
+            .filters()
+            .is_empty()),
+        "a filter action on a detached tab must not commit a filter"
+    );
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        runs_before,
+        "a filter action on an edited tab must not dispatch a run"
+    );
 }

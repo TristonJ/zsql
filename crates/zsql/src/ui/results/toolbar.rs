@@ -5,7 +5,7 @@ use gpui::{ClickEvent, Context, Div, Window, div, prelude::*, px, rgb};
 use zsql_ui::button::ButtonSwitch;
 use zsql_ui::theme::{ActiveTheme, Theme};
 
-use super::{ResultsView, ViewMode, results_bar_count_text};
+use super::{ResultsView, ViewMode, filtered_count_summary, results_bar_count_text};
 use crate::ui::theme;
 
 impl ResultsView {
@@ -15,10 +15,16 @@ impl ResultsView {
     pub(super) fn render_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let document_lines = self.text_view.read(cx).line_count();
-        let count_text = results_bar_count_text(
-            self.effective_state(cx),
-            self.effective_result(cx).rows.len(),
-            document_lines,
+        let filtered_summary = filtered_count_summary(self.preview.as_ref());
+        let count_text = filtered_summary.as_ref().map_or_else(
+            || {
+                results_bar_count_text(
+                    self.effective_state(cx),
+                    self.effective_result(cx).rows.len(),
+                    document_lines,
+                )
+            },
+            |(filtered, _)| filtered.clone(),
         );
 
         div()
@@ -59,7 +65,14 @@ impl ResultsView {
                                     .font_family(&cx.theme().fonts.data)
                                     .text_color(rgb(colors.accent))
                                     .child(count_text),
-                            ),
+                            )
+                            .children(filtered_summary.map(|(_, suffix)| {
+                                div()
+                                    .font_family(&cx.theme().fonts.data)
+                                    .text_size(px(theme::RESULTS_META_TEXT_SIZE))
+                                    .text_color(rgb(colors.text_tertiary))
+                                    .child(suffix)
+                            })),
                     )
                     .child(
                         div()

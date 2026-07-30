@@ -1,14 +1,12 @@
 //! The results grid: a virtualized table view over a `Session`'s current
 //! [`SessionState`] and accumulated result set
 
-use std::ops::Range;
-
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
     MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
-use zsql_core::{ColumnMeta, ResultSet};
-use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
+use zsql_core::{ResultSet, group_thousands};
+use zsql_ui::table::TableState;
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::connections::ConnectionManagerView;
@@ -18,12 +16,15 @@ use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::session::{Session, SessionState};
 use crate::ui::format::format_value_for_clipboard;
+use crate::ui::results::filter_bar::FilterEditorState;
 use crate::ui::results::pager::PreviewControls;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
 mod cell_menu;
 mod empty_state;
+pub(crate) mod filter_bar;
+mod grid;
 pub(crate) mod pager;
 mod panel_host;
 mod text_view;
@@ -146,6 +147,15 @@ pub struct ResultsView {
     /// `ui::tabs::TabModel` whenever the active tab (or its dirty/kind
     /// state) changes.
     preview: Option<PreviewControls>,
+    /// The filter bar's in-progress chip edit (a brand-new filter or an
+    /// existing one being changed), if any. Cleared on every tab switch
+    /// (see [`ResultsView::show_live`]/[`ResultsView::show_snapshot`]) so a
+    /// draft never leaks onto a different tab's filter bar.
+    filter_editor: Option<FilterEditorState>,
+    /// Whether the "+ filter" column picker is currently open, so the next
+    /// click on one of its entries opens [`ResultsView::filter_editor`]
+    /// targeting that column. Cleared alongside `filter_editor`.
+    filter_column_picker_open: bool,
 }
 
 /// A results grid cell's open right-click context menu: the triggering
@@ -206,6 +216,8 @@ impl ResultsView {
             view_mode_defaulted: false,
             text_view,
             preview: None,
+            filter_editor: None,
+            filter_column_picker_open: false,
         };
         view.sync_dimensions(cx);
         view
@@ -247,6 +259,8 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) {
         self.preview = preview;
+        self.filter_editor = None;
+        self.filter_column_picker_open = false;
         cx.notify();
     }
 
@@ -265,16 +279,16 @@ impl ResultsView {
     /// page. A no-op with no visible side effect while `preview` is `None`
     /// (the active tab is not a live generated preview) or already on page
     /// 1, matching [`NextPage`]'s own symmetric behavior.
-    fn prev_page(&mut self, _action: &PrevPage, window: &mut Window, cx: &mut Context<Self>) {
+    fn prev_page(&mut self, _action: &PrevPage, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(preview) = &self.preview {
-            (preview.dispatch.clone())(pager::PreviewAction::PrevPage, window, cx);
+            (preview.dispatch.clone())(pager::PreviewAction::PrevPage, cx);
         }
     }
 
     /// [`NextPage`]'s handler; see [`ResultsView::prev_page`].
-    fn next_page(&mut self, _action: &NextPage, window: &mut Window, cx: &mut Context<Self>) {
+    fn next_page(&mut self, _action: &NextPage, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(preview) = &self.preview {
-            (preview.dispatch.clone())(pager::PreviewAction::NextPage, window, cx);
+            (preview.dispatch.clone())(pager::PreviewAction::NextPage, cx);
         }
     }
 
@@ -315,6 +329,8 @@ impl ResultsView {
         self.folded_row_count = 0;
         self.view_mode = ViewMode::Grid;
         self.view_mode_defaulted = false;
+        self.filter_editor = None;
+        self.filter_column_picker_open = false;
         self.text_view.update(cx, |tv, _c| tv.reset());
     }
 
@@ -411,7 +427,8 @@ impl ResultsView {
             .zip(self.column_max_body_chars.iter())
             .enumerate()
             .map(|(index, (column, &max_body_chars))| {
-                let auto_fit = || column_width_from_parts(column, max_body_chars, &table_style);
+                let auto_fit =
+                    || grid::column_width_from_parts(column, max_body_chars, &table_style);
                 if self
                     .column_width_overrides
                     .get(index)
@@ -595,124 +612,6 @@ impl ResultsView {
         }
     }
 
-    /// The two-pane virtualized grid (pinned row numbers + horizontally
-    /// scrolling data columns), built by composing `zsql_ui::table::Table`.
-    fn render_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let row_count = self.effective_result(cx).rows.len();
-        // Detached from `cx`'s borrow (rather than the usual `&Theme`) so it
-        // can still be read after `build_columns` needs `cx` mutably for its
-        // own header hover-state bookkeeping.
-        let active_theme = cx.theme().clone();
-        let columns = self.build_columns(window, cx);
-
-        Table::new("results-grid", &self.table_state)
-            .style(Self::table_style(&active_theme))
-            .columns(columns)
-            .row_count(row_count)
-            .gutter(Gutter::RowNumbers(RowNumberStyle {
-                char_width: theme::CELL_CHAR_WIDTH,
-                min_width: theme::ROW_NUMBER_MIN_WIDTH,
-            }))
-            .rows(Self::render_data_row_cells)
-            .selectable()
-            .focus_on_cell_click(self.focus_handle.clone())
-            .on_cell_double_click(Self::open_value_panel_for)
-            .on_cell_right_click(|view, row, col, event, _window, cx| {
-                view.open_cell_context_menu(row, col, event.position, cx);
-            })
-            .resizable_columns(px(theme::MIN_COLUMN_WIDTH), Self::resize_column)
-            .render(cx)
-    }
-
-    /// [`zsql_ui::table::Table::resizable_columns`]'s live-resize callback:
-    /// stores `column`'s new `width` and marks it so a later
-    /// [`ResultsView::sync_dimensions`] call leaves it alone, mirroring
-    /// [`ResultsView::value_panel_drag_move`]'s per-move update. Never
-    /// touches the grid's focused cell or keyboard focus.
-    fn resize_column(
-        &mut self,
-        column: usize,
-        width: Pixels,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let _span = tracing::trace_span!("results_resize_column", column).entered();
-        if let Some(slot) = self.column_widths.get_mut(column) {
-            *slot = width;
-        }
-        if let Some(overridden) = self.column_width_overrides.get_mut(column) {
-            *overridden = true;
-        }
-        cx.notify();
-    }
-
-    /// The one `TableStyle` both `render_grid`'s live `Table` and
-    /// `column_width_from_parts`'s width estimate use, so a column's
-    /// measured width can never drift from the padding it is actually
-    /// rendered with.
-    fn table_style(active_theme: &Theme) -> zsql_ui::table::TableStyle {
-        zsql_ui::table::TableStyle::themed(active_theme)
-    }
-
-    /// The data pane's columns: each column's cached width plus its header
-    /// content (name, type-tag badge, and the sort affordance from
-    /// [`ResultsView::preview`]).
-    fn build_columns(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<TableColumn> {
-        let active_theme = cx.theme().clone();
-        let preview = self.preview.as_ref();
-        let columns: Vec<ColumnMeta> = self.effective_result(cx).columns.clone();
-        columns
-            .iter()
-            .zip(self.column_widths.iter())
-            .map(|(column, &width)| {
-                let header =
-                    pager::sortable_column_header(column, &active_theme, preview, window, cx);
-                TableColumn::new(width, header)
-            })
-            .collect()
-    }
-
-    /// Render the data-cell rows in `range` for the data pane's virtualized
-    /// list
-    fn render_data_row_cells(
-        &mut self,
-        range: Range<usize>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<TableRow> {
-        let active_theme = cx.theme();
-        let rows: &[zsql_core::Row] = &self.effective_result(cx).rows;
-
-        range
-            .map(|ix| {
-                let cells = rows
-                    .get(ix)
-                    .map(|row| {
-                        row.0
-                            .iter()
-                            .map(|value| {
-                                let formatted = format_value(value);
-                                let is_null = formatted.kind == ValueKind::Null;
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_start()
-                                    .items_start()
-                                    .h_full()
-                                    .overflow_y_hidden()
-                                    .text_color(rgb(formatted.kind.color(active_theme)))
-                                    .when(is_null, gpui::prelude::Styled::italic)
-                                    .child(formatted.text)
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                TableRow::new(cells)
-            })
-            .collect()
-    }
-
     /// Copy the selected cell's full formatted value to the system
     /// clipboard while Grid is active, or the Text view's whole assembled
     /// document while Text is active. A NULL cell copies as an empty string
@@ -866,6 +765,7 @@ impl Render for ResultsView {
             .size_full()
             .bg(rgb(cx.theme().colors.bg_app))
             .child(self.render_bar(window, cx))
+            .child(self.render_filter_bar(window, cx))
             .child(self.render_body(window, cx))
             .children(self.render_cell_context_menu(cx))
     }
@@ -898,26 +798,23 @@ fn results_bar_count_text(
     }
 }
 
-/// Estimate a column's pixel width from its header (name + type tag) and
-/// `max_body_chars`, using `style`'s cell padding -- the same `TableStyle`
-/// the live grid renders with, so the estimate and the render never drift.
-fn column_width_from_parts(
-    column: &ColumnMeta,
-    max_body_chars: usize,
-    style: &zsql_ui::table::TableStyle,
-) -> Pixels {
-    let header_chars = column.name.chars().count() + column.type_name.chars().count();
-    measure::column_width(
-        header_chars,
-        max_body_chars,
-        style,
-        measure::ColumnWidthLimits {
-            char_width: theme::CELL_CHAR_WIDTH,
-            header_extra_width: theme::TYPE_TAG_EXTRA_WIDTH,
-            min_width: theme::MIN_COLUMN_WIDTH,
-            max_width: theme::MAX_COLUMN_WIDTH,
-        },
-    )
+/// The results bar's "N filtered of TOTAL" override for the row-count
+/// segment: `(filtered_text, suffix_text)`, e.g. `("3,102", "filtered of
+/// 12,480")`, once at least one filter is committed and both the filtered
+/// and base totals are known. `None` while unfiltered, or while either total
+/// has not resolved yet -- the results bar then keeps its ordinary
+/// [`results_bar_count_text`] instead.
+fn filtered_count_summary(preview: Option<&PreviewControls>) -> Option<(String, String)> {
+    let controls = preview?;
+    if controls.state.filters().is_empty() {
+        return None;
+    }
+    let filtered = controls.state.total_rows()?;
+    let base = controls.state.base_total_rows()?;
+    Some((
+        group_thousands(filtered.value()),
+        format!("filtered of {}", group_thousands(base.value())),
+    ))
 }
 
 #[cfg(test)]

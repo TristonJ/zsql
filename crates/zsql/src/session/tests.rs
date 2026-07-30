@@ -255,7 +255,12 @@ impl Connection for CloseCountingConnection {
         unimplemented!("not exercised by this test")
     }
 
-    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         unimplemented!("not exercised by this test")
     }
 
@@ -273,7 +278,7 @@ impl Connection for CloseCountingConnection {
 }
 
 /// A [`Connection`] double whose `list_databases` answers with a scripted
-/// outcome, for unit-testing [`super::fetch_available_databases`]'s mapping
+/// outcome, for unit-testing [`super::connect::fetch_available_databases`]'s mapping
 /// of a driver's `Option<Vec<String>>`/error result to the plain `Vec`
 /// `Session::available_databases` caches -- without a live driver. Every
 /// other method is unexercised.
@@ -295,7 +300,12 @@ impl Connection for ListDatabasesConnection {
         unimplemented!("not exercised by this test")
     }
 
-    async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
         unimplemented!("not exercised by this test")
     }
 
@@ -317,14 +327,14 @@ fn fetch_available_databases_returns_the_drivers_list_when_some() {
     let conn = ListDatabasesConnection {
         outcome: Ok(Some(vec!["alpha".to_owned(), "beta".to_owned()])),
     };
-    let databases = block_on(super::fetch_available_databases(&conn));
+    let databases = block_on(super::connect::fetch_available_databases(&conn));
     assert_eq!(databases, vec!["alpha".to_owned(), "beta".to_owned()]);
 }
 
 #[test]
 fn fetch_available_databases_is_empty_when_the_driver_reports_none() {
     let conn = ListDatabasesConnection { outcome: Ok(None) };
-    assert!(block_on(super::fetch_available_databases(&conn)).is_empty());
+    assert!(block_on(super::connect::fetch_available_databases(&conn)).is_empty());
 }
 
 #[test]
@@ -332,7 +342,7 @@ fn fetch_available_databases_is_empty_rather_than_panicking_on_a_query_error() {
     let conn = ListDatabasesConnection {
         outcome: Err("permission denied for pg_database".to_owned()),
     };
-    assert!(block_on(super::fetch_available_databases(&conn)).is_empty());
+    assert!(block_on(super::connect::fetch_available_databases(&conn)).is_empty());
 }
 
 fn session_with_no_url() -> Session {
@@ -643,7 +653,7 @@ fn a_batch_landing_exactly_on_the_limit_truncates_without_overshoot() {
 
 #[test]
 fn url_for_database_rewrites_only_the_database_segment() {
-    let rewritten = super::url_for_database(
+    let rewritten = super::connect::url_for_database(
         "postgres://app:pw@host:5432/original?sslmode=require",
         "other",
     )
@@ -661,7 +671,7 @@ fn url_for_database_rewrites_only_the_database_segment() {
 #[test]
 fn url_for_database_percent_encodes_a_name_with_reserved_characters() {
     let rewritten =
-        super::url_for_database("postgres://app@host:5432/original", "weird db?#&name's")
+        super::connect::url_for_database("postgres://app@host:5432/original", "weird db?#&name's")
             .expect("rewrite should succeed");
 
     let parsed = zsql_core::ConnectionUrl::parse(&rewritten).expect("rewritten URL must parse");
@@ -672,25 +682,31 @@ fn url_for_database_percent_encodes_a_name_with_reserved_characters() {
 
 #[test]
 fn url_for_database_rejects_an_unparseable_url() {
-    assert!(super::url_for_database("not-a-url", "other").is_err());
+    assert!(super::connect::url_for_database("not-a-url", "other").is_err());
 }
 
 #[test]
 fn current_database_from_url_reads_the_urls_database_segment() {
     assert_eq!(
-        super::current_database_from_url("postgres://host/app"),
+        super::connect::current_database_from_url("postgres://host/app"),
         Some("app".to_owned())
     );
 }
 
 #[test]
 fn current_database_from_url_is_none_for_a_sqlite_url() {
-    assert_eq!(super::current_database_from_url("sqlite::memory:"), None);
+    assert_eq!(
+        super::connect::current_database_from_url("sqlite::memory:"),
+        None
+    );
 }
 
 #[test]
 fn current_database_from_url_is_none_for_a_url_with_no_database_segment() {
-    assert_eq!(super::current_database_from_url("postgres://host"), None);
+    assert_eq!(
+        super::connect::current_database_from_url("postgres://host"),
+        None
+    );
 }
 
 // -- tunnel lifecycle ---------------------------------------------------
@@ -785,9 +801,8 @@ mod gpui_tests {
     };
 
     use super::{CloseCountingConnection, FakeTunnel};
-    use crate::session::{
-        Config, LivenessState, SchemaState, Session, SessionState, apply_connect_outcome,
-    };
+    use crate::session::connect::apply_connect_outcome;
+    use crate::session::{Config, LivenessState, SchemaState, Session, SessionState};
 
     fn session_with_no_url() -> Session {
         Session::new(&Config::default())
@@ -1141,7 +1156,7 @@ mod gpui_tests {
             // A newer attempt (generation 2) has already superseded the one
             // whose outcome (generation 1) is being applied here.
             session.connection_generation = 2;
-            let attempt = crate::session::ConnectAttempt {
+            let attempt = crate::session::connect::ConnectAttempt {
                 connection: discarded,
                 tunnel: None,
                 url: "sqlite::memory:".to_owned(),
@@ -1170,9 +1185,9 @@ mod gpui_tests {
     }
 
     /// A successful connect attempt's `available_databases` (as populated by
-    /// [`super::fetch_available_databases`] alongside the connection itself)
+    /// [`super::connect::fetch_available_databases`] alongside the connection itself)
     /// must land in `Session::available_databases`, not just the transient
-    /// [`crate::session::ConnectAttempt`] it arrives in -- proving the
+    /// [`crate::session::connect::ConnectAttempt`] it arrives in -- proving the
     /// assignment inside `apply_connect_outcome` actually wires the fetched
     /// list into session state, the same way `current_database` does.
     #[gpui::test]
@@ -1183,7 +1198,7 @@ mod gpui_tests {
         let session = cx.new(|_cx| session_with_no_url());
         let connected = session.update(cx, |session, cx| {
             let generation = session.connection_generation;
-            let attempt = crate::session::ConnectAttempt {
+            let attempt = crate::session::connect::ConnectAttempt {
                 connection,
                 tunnel: None,
                 url: "sqlite::memory:".to_owned(),
@@ -1433,7 +1448,12 @@ mod gpui_tests {
             })
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &zsql_core::FilterState,
+        ) -> Result<RowCount, CoreError> {
             self.count_calls.fetch_add(1, Ordering::SeqCst);
             let gate = self
                 .count_gate
@@ -1486,7 +1506,12 @@ mod gpui_tests {
             Ok(())
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &zsql_core::FilterState,
+        ) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
 

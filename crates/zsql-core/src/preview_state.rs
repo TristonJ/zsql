@@ -6,10 +6,11 @@
 //! window or a live database.
 
 use crate::RowCount;
+use crate::filter::{FilterConditionId, FilterOperator, FilterState};
 use crate::sql::SortDirection;
 
 /// One generated preview's current sort column, direction, page, page size,
-/// and (once known) the relation's total row count.
+/// filter conditions, and (once known) the relation's total row count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewQueryState {
     sort_column: Option<String>,
@@ -17,12 +18,19 @@ pub struct PreviewQueryState {
     page: u64,
     page_size: u64,
     total_rows: Option<RowCount>,
+    /// The relation's total row count with no filter applied, last observed
+    /// while [`PreviewQueryState::filters`] was empty. Kept distinct from
+    /// [`PreviewQueryState::total_rows`] (which tracks whatever is currently
+    /// active, filtered or not) so a renderer can show "N filtered of
+    /// TOTAL" once a filter narrows the result.
+    base_total_rows: Option<RowCount>,
+    filters: FilterState,
 }
 
 impl PreviewQueryState {
-    /// A fresh, unsorted preview at page 1 of `page_size` rows, with no
-    /// known total row count yet. `page_size` is clamped to at least 1: a
-    /// page of zero rows can never be paged through.
+    /// A fresh, unsorted, unfiltered preview at page 1 of `page_size` rows,
+    /// with no known total row count yet. `page_size` is clamped to at
+    /// least 1: a page of zero rows can never be paged through.
     #[must_use]
     pub fn new(page_size: u64) -> Self {
         Self {
@@ -31,6 +39,8 @@ impl PreviewQueryState {
             page: 1,
             page_size: page_size.max(1),
             total_rows: None,
+            base_total_rows: None,
+            filters: FilterState::new(),
         }
     }
 
@@ -82,14 +92,29 @@ impl PreviewQueryState {
         self.total_rows.is_some_and(RowCount::is_estimated)
     }
 
+    /// The relation's total row count with no filter applied, last observed
+    /// while unfiltered -- for a renderer to show alongside the current
+    /// (possibly filtered) [`PreviewQueryState::total_rows`] as "N filtered
+    /// of TOTAL". `None` until an unfiltered count has ever resolved.
+    #[must_use]
+    pub fn base_total_rows(&self) -> Option<RowCount> {
+        self.base_total_rows
+    }
+
     /// Record the relation's total row count (or clear it back to unknown).
-    /// An exact total can retroactively invalidate a page reached
-    /// optimistically while the count was still unknown, so the current page
-    /// is clamped back to the final page rather than left stranded past it
-    /// over an empty grid. An estimate never clamps: forward paging stays
-    /// optimistic past a possibly-low estimate.
+    /// While [`PreviewQueryState::filters`] is empty this also updates
+    /// [`PreviewQueryState::base_total_rows`], since an unfiltered count is
+    /// by definition the base total; a filtered count leaves the last known
+    /// base total untouched. An exact total can retroactively invalidate a
+    /// page reached optimistically while the count was still unknown, so the
+    /// current page is clamped back to the final page rather than left
+    /// stranded past it over an empty grid. An estimate never clamps:
+    /// forward paging stays optimistic past a possibly-low estimate.
     pub fn set_total_rows(&mut self, total: Option<RowCount>) {
         self.total_rows = total;
+        if self.filters.is_empty() {
+            self.base_total_rows = total;
+        }
         if let Some(RowCount::Exact(_)) = self.total_rows
             && let Some(last) = self.last_page_number()
             && self.page > last
@@ -198,6 +223,77 @@ impl PreviewQueryState {
         self.page = 1;
     }
 
+    /// The active filter conditions and their AND/OR connectors.
+    #[must_use]
+    pub fn filters(&self) -> &FilterState {
+        &self.filters
+    }
+
+    /// Commit a new filter condition against `column` (whose backend type is
+    /// `type_name`) and re-anchor to page 1: an added filter changes which
+    /// rows exist at all, making the previous page's row set meaningless.
+    /// Returns the new condition's id.
+    pub fn add_filter(
+        &mut self,
+        column: impl Into<String>,
+        type_name: impl Into<String>,
+        operator: FilterOperator,
+        value: impl Into<String>,
+    ) -> FilterConditionId {
+        let id = self
+            .filters
+            .add_condition(column, type_name, operator, value);
+        self.page = 1;
+        id
+    }
+
+    /// Remove the filter condition with `id` and, if one was actually
+    /// removed, re-anchor to page 1. Returns whether a condition was
+    /// removed.
+    pub fn remove_filter(&mut self, id: FilterConditionId) -> bool {
+        let changed = self.filters.remove_condition(id);
+        if changed {
+            self.page = 1;
+        }
+        changed
+    }
+
+    /// Replace the operator/value of the filter condition with `id` and, if
+    /// a matching condition was found, re-anchor to page 1. Returns whether
+    /// a condition was updated.
+    pub fn update_filter(
+        &mut self,
+        id: FilterConditionId,
+        operator: FilterOperator,
+        value: impl Into<String>,
+    ) -> bool {
+        let changed = self.filters.update_condition(id, operator, value);
+        if changed {
+            self.page = 1;
+        }
+        changed
+    }
+
+    /// Toggle the AND/OR connector at `index` and, if it was in bounds,
+    /// re-anchor to page 1. Returns whether a connector was toggled.
+    pub fn toggle_filter_connector(&mut self, index: usize) -> bool {
+        let changed = self.filters.toggle_connector(index);
+        if changed {
+            self.page = 1;
+        }
+        changed
+    }
+
+    /// Remove every filter condition and, if any existed, re-anchor to page
+    /// 1. Returns whether anything was actually cleared.
+    pub fn clear_filters(&mut self) -> bool {
+        let changed = self.filters.clear();
+        if changed {
+            self.page = 1;
+        }
+        changed
+    }
+
     /// Resize the page, re-anchoring the window to keep showing the same
     /// first row rather than resetting to page 1: the row at 0-based index
     /// `(page - 1) * old_page_size` lands on whichever new page contains
@@ -214,6 +310,7 @@ impl PreviewQueryState {
 mod tests {
     use super::PreviewQueryState;
     use crate::RowCount;
+    use crate::filter::FilterOperator;
     use crate::sql::SortDirection;
 
     #[test]
@@ -484,6 +581,121 @@ mod tests {
         // An estimate must never strand rows by clamping the page down.
         state.set_total_rows(Some(RowCount::Estimated(300)));
         assert_eq!(state.page(), 4);
+    }
+
+    // -- filters --------------------------------------------------------
+
+    #[test]
+    fn a_fresh_state_has_no_filters() {
+        let state = PreviewQueryState::new(200);
+        assert!(state.filters().is_empty());
+    }
+
+    #[test]
+    fn add_filter_re_anchors_to_page_one() {
+        let mut state = PreviewQueryState::new(200);
+        state.next_page();
+        state.next_page();
+        assert_eq!(state.page(), 3);
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        assert_eq!(state.page(), 1);
+        assert_eq!(state.filters().len(), 1);
+    }
+
+    #[test]
+    fn remove_filter_re_anchors_to_page_one() {
+        let mut state = PreviewQueryState::new(200);
+        let id = state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(state.remove_filter(id));
+        assert_eq!(state.page(), 1);
+        assert!(state.filters().is_empty());
+    }
+
+    #[test]
+    fn remove_filter_is_a_no_op_for_an_unknown_id_and_does_not_move_the_page() {
+        let mut state = PreviewQueryState::new(200);
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(!state.remove_filter(9999));
+        assert_eq!(state.page(), 2, "an unknown id must not re-anchor the page");
+    }
+
+    #[test]
+    fn update_filter_re_anchors_to_page_one() {
+        let mut state = PreviewQueryState::new(200);
+        let id = state.add_filter("total_cents", "int4", FilterOperator::Eq, "100");
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(state.update_filter(id, FilterOperator::Ge, "500"));
+        assert_eq!(state.page(), 1);
+        assert_eq!(state.filters().conditions()[0].value(), "500");
+    }
+
+    #[test]
+    fn toggle_filter_connector_re_anchors_to_page_one() {
+        let mut state = PreviewQueryState::new(200);
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.add_filter("status", "text", FilterOperator::Eq, "pending");
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(state.toggle_filter_connector(0));
+        assert_eq!(state.page(), 1);
+    }
+
+    #[test]
+    fn clear_filters_re_anchors_to_page_one() {
+        let mut state = PreviewQueryState::new(200);
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(state.clear_filters());
+        assert_eq!(state.page(), 1);
+        assert!(state.filters().is_empty());
+    }
+
+    #[test]
+    fn clear_filters_on_an_already_empty_state_does_not_move_the_page() {
+        let mut state = PreviewQueryState::new(200);
+        state.next_page();
+        assert_eq!(state.page(), 2);
+        assert!(!state.clear_filters());
+        assert_eq!(state.page(), 2);
+    }
+
+    #[test]
+    fn base_total_rows_tracks_the_total_while_unfiltered() {
+        let mut state = PreviewQueryState::new(200);
+        assert_eq!(state.base_total_rows(), None);
+        state.set_total_rows(Some(RowCount::Exact(12_480)));
+        assert_eq!(state.base_total_rows(), Some(RowCount::Exact(12_480)));
+    }
+
+    #[test]
+    fn base_total_rows_is_untouched_by_a_filtered_count() {
+        let mut state = PreviewQueryState::new(200);
+        state.set_total_rows(Some(RowCount::Exact(12_480)));
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.set_total_rows(Some(RowCount::Exact(3_102)));
+        assert_eq!(state.total_rows(), Some(RowCount::Exact(3_102)));
+        assert_eq!(
+            state.base_total_rows(),
+            Some(RowCount::Exact(12_480)),
+            "the base total must survive a filtered recount"
+        );
+    }
+
+    #[test]
+    fn base_total_rows_updates_again_once_filters_are_cleared() {
+        let mut state = PreviewQueryState::new(200);
+        state.set_total_rows(Some(RowCount::Exact(12_480)));
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.set_total_rows(Some(RowCount::Exact(3_102)));
+        state.clear_filters();
+        state.set_total_rows(Some(RowCount::Exact(12_480)));
+        assert_eq!(state.base_total_rows(), Some(RowCount::Exact(12_480)));
     }
 
     #[test]

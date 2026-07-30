@@ -2,22 +2,27 @@
 
 use std::fmt::Write as _;
 
+use crate::filter::{FilterState, render_where_conditions};
+
 /// Arguments for generating preview queries
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewQueryArgs {
     pub limit: u64,
     pub offset: Option<u64>,
     pub sort: Option<(String, SortDirection)>,
+    pub filters: FilterState,
 }
 
 impl PreviewQueryArgs {
-    /// Construct a new `PreviewQueryArgs` with the given limit and no offset or sort.
+    /// Construct a new `PreviewQueryArgs` with the given limit and no
+    /// offset, sort, or filters.
     #[must_use]
     pub fn from_limit(limit: u64) -> Self {
         Self {
             limit,
             offset: None,
             sort: None,
+            filters: FilterState::new(),
         }
     }
 
@@ -32,6 +37,13 @@ impl PreviewQueryArgs {
     #[must_use]
     pub fn sort(mut self, column: impl AsRef<str>, direction: SortDirection) -> Self {
         self.sort = Some((column.as_ref().to_string(), direction));
+        self
+    }
+
+    /// Set the filter conditions for the preview query.
+    #[must_use]
+    pub fn filters(mut self, filters: FilterState) -> Self {
+        self.filters = filters;
         self
     }
 }
@@ -82,7 +94,12 @@ pub fn quote_ident(ident: &str) -> String {
     out
 }
 
-/// The click-to-preview query for `relation` in `schema`
+/// The click-to-preview query for `relation` in `schema`. `args.filters`
+/// renders as a `WHERE` clause via [`render_where_conditions`], quoting
+/// column identifiers with [`quote_ident`] and mapping `ILIKE` natively --
+/// the same default this crate's own [`crate::driver::Connection::preview_query`]
+/// falls back to; a live driver overrides both quoting and the `ILIKE`
+/// mapping for its own dialect.
 #[must_use]
 pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
     let mut sql = format!(
@@ -90,6 +107,9 @@ pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArg
         quote_ident(schema),
         quote_ident(relation)
     );
+    if let Some(where_clause) = render_where_conditions(&args.filters, quote_ident, true) {
+        let _ = write!(sql, " WHERE {where_clause}");
+    }
     if let Some((column, direction)) = args.sort {
         let _ = write!(
             sql,
@@ -110,6 +130,7 @@ pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArg
 #[cfg(test)]
 mod tests {
     use super::{PreviewQueryArgs, SortDirection, default_preview_query, quote_ident};
+    use crate::filter::{FilterOperator, FilterState};
 
     #[test]
     fn quote_ident_wraps_a_plain_name_in_double_quotes() {
@@ -277,6 +298,46 @@ mod tests {
             "SELECT * FROM \"public\".\"orders\" ORDER BY \"total\"\"; DROP TABLE users; --\" ASC LIMIT 200"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn default_preview_query_has_no_where_clause_with_no_filters() {
+        let sql = default_preview_query("public", "orders", PreviewQueryArgs::from_limit(200));
+        assert!(!sql.contains("WHERE"));
+    }
+
+    #[test]
+    fn default_preview_query_renders_a_where_clause_from_filters() {
+        let mut filters = FilterState::new();
+        filters.add_condition("status", "text", FilterOperator::Eq, "paid");
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_places_where_before_order_by_and_limit() {
+        let mut filters = FilterState::new();
+        filters.add_condition("status", "text", FilterOperator::Eq, "paid");
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(filters)
+                .sort("total_cents", SortDirection::Desc)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' \
+             ORDER BY \"total_cents\" DESC LIMIT 200 OFFSET 200"
+        );
     }
 
     #[test]
