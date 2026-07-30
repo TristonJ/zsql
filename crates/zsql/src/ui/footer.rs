@@ -3,14 +3,19 @@
 //! connection (or invites connecting one). Clicking it opens the
 //! [`ConnectionManagerView`] modal.
 
-use gpui::{ClickEvent, Context, Entity, Render, Window, div, prelude::*, px, rgb};
-use zsql_ui::grid;
-use zsql_ui::theme::ActiveTheme;
+use gpui::{ClickEvent, Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb};
+use zsql_core::{RowCount, group_thousands};
+use zsql_ui::grid::{self, status_dot_outline};
+use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::connections::{ActiveConnection, ConnectionManagerView};
 use super::theme;
 use crate::session::{LivenessState, Session, SessionState};
+use crate::ui::appearance::AppearanceModalView;
 use crate::ui::format::host_label;
+use crate::ui::tabs::ResultsSnapshot;
+
+mod appearance_trigger;
 
 /// What the connection footer should render, derived from the session's
 /// lifecycle state and whichever connection (if any) is currently tracked as
@@ -82,6 +87,12 @@ pub fn footer_display(
 pub struct ConnectionFooterView {
     session: Entity<Session>,
     connections: Entity<ConnectionManagerView>,
+    /// The Appearance modal the status bar's theme trigger opens
+    appearance_modal: Entity<AppearanceModalView>,
+    /// Force a certain result rather than reading from the current session
+    result_snapshot: Option<ResultsSnapshot>,
+    /// The row count to display in the footer
+    row_count: Option<RowCount>,
 }
 
 impl ConnectionFooterView {
@@ -90,6 +101,7 @@ impl ConnectionFooterView {
     pub fn new(
         session: Entity<Session>,
         connections: Entity<ConnectionManagerView>,
+        appearance_modal: Entity<AppearanceModalView>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&session, |_view: &mut Self, _session, cx| cx.notify())
@@ -102,7 +114,28 @@ impl ConnectionFooterView {
         Self {
             session,
             connections,
+            appearance_modal,
+            result_snapshot: None,
+            row_count: None,
         }
+    }
+
+    /// Force the footer to render a certain result rather than reading from the
+    /// current session. `None` to stop forcing and return to the session's
+    /// current state.
+    pub fn set_result_snapshot(
+        &mut self,
+        snapshot: Option<ResultsSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_snapshot = snapshot;
+        cx.notify();
+    }
+
+    /// Set the row count to display, if any.
+    pub fn set_row_count(&mut self, row_count: Option<RowCount>, cx: &mut Context<Self>) {
+        self.row_count = row_count;
+        cx.notify();
     }
 
     /// Open the connection-manager modal and focus it, so `Escape` closes it
@@ -112,10 +145,28 @@ impl ConnectionFooterView {
         self.connections.update(cx, ConnectionManagerView::open);
         window.focus(&focus_handle);
     }
-}
 
-impl Render for ConnectionFooterView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The current state or the frozen state from `result_snapshot`, if any
+    fn effective_state<'a>(&'a self, cx: &'a Context<Self>) -> &'a SessionState {
+        match &self.result_snapshot {
+            Some(snapshot) => &snapshot.state,
+            None => self.session.read(cx).state(),
+        }
+    }
+
+    /// The current result or the frozen result from `result_snapshot`, if any
+    fn effective_result<'a>(&'a self, cx: &'a Context<Self>) -> &'a zsql_core::ResultSet {
+        match &self.result_snapshot {
+            Some(snapshot) => &snapshot.result,
+            None => self.session.read(cx).result(),
+        }
+    }
+
+    fn render_connection_status(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let session = self.session.read(cx);
         let display = footer_display(
             session.state(),
@@ -123,29 +174,31 @@ impl Render for ConnectionFooterView {
             session.is_connected(),
             self.connections.read(cx).active(),
         );
+        let dot_color = status_dot_color(session.state(), session.liveness(), cx.theme());
         let colors = cx.theme().colors;
 
-        let row = div()
-            .id("connection-footer")
+        let mut row = div()
+            .id("connection-footer-status")
             .flex()
             .flex_row()
             .items_center()
+            .h_full()
+            .max_w(theme::STATUS_BAR_CONNECTION_MAX_WIDTH)
             .gap_2()
-            .flex_shrink_0()
-            .w_full()
-            .h(theme::STATUS_BAR_HEIGHT)
             .px_3()
-            .border_t_1()
-            .border_color(rgb(colors.border))
             .cursor_pointer()
             .hover(|el| el.bg(rgb(colors.bg_raised)))
             .font_family(&cx.theme().fonts.data)
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
             .on_click(cx.listener(Self::open_modal));
 
+        row = match display {
+            FooterDisplay::Disconnected => row.child(status_dot_outline(dot_color)),
+            _ => row.child(grid::status_dot(dot_color)),
+        };
+
         match display {
             FooterDisplay::Connected { name, host } => row
-                .child(grid::status_dot(colors.accent))
                 .child(
                     div()
                         .flex_shrink_0()
@@ -161,14 +214,13 @@ impl Render for ConnectionFooterView {
                         .text_color(rgb(colors.text_tertiary))
                         .child(host),
                 ),
-            FooterDisplay::Connecting => row.child(grid::status_dot(colors.status_warn)).child(
+            FooterDisplay::Connecting => row.child(
                 div()
                     .flex_shrink_0()
                     .text_color(rgb(colors.text_secondary))
                     .child("Connecting..."),
             ),
             FooterDisplay::Disconnected => row
-                .child(grid::status_dot_outline(colors.text_tertiary))
                 .child(
                     div()
                         .flex_shrink_0()
@@ -179,10 +231,162 @@ impl Render for ConnectionFooterView {
                     div()
                         .flex_shrink_0()
                         .text_color(rgb(colors.accent))
-                        .child(". click to connect"),
+                        .child("\u{2022} click to connect"),
                 ),
         }
     }
+
+    fn render_appearance_trigger(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors;
+
+        let active_display_name = self.appearance_modal.read(cx).active_theme_display_name();
+
+        appearance_trigger::render_theme_trigger(
+            self.appearance_modal.clone(),
+            colors,
+            active_display_name.into(),
+            cx,
+        )
+    }
+
+    fn render_current_query_result(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut view = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_4()
+            .font_family(&cx.theme().fonts.data)
+            .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
+            .text_color(rgb(cx.theme().colors.text_secondary));
+        let state = self.effective_state(cx);
+        let result = self.effective_result(cx);
+        let error_message = match state {
+            SessionState::Error(message) => Some(message.clone()),
+            _ => None,
+        };
+
+        if let Some(message) = error_message {
+            view = view.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(cx.theme().colors.status_error))
+                    .child(message),
+            );
+            return view;
+        }
+
+        let mut status_area = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_4()
+            .w(theme::STATUS_BAR_QUERY_MESSAGE_WIDTH);
+        for message in query_messages(state, result.rows.len(), "rows") {
+            status_area = status_area.child(message);
+        }
+        view = view.child(status_area);
+
+        if let Some(total_row_count_text) = format_total_row_count(self.row_count) {
+            view = view.child(total_row_count_text);
+        }
+
+        view
+    }
+}
+
+impl Render for ConnectionFooterView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("connection-footer")
+            .flex()
+            .flex_row()
+            .w_full()
+            .h(theme::STATUS_BAR_HEIGHT)
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .border_t_1()
+            .border_color(rgb(cx.theme().colors.border))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .gap_2()
+                    .items_center()
+                    .h_full()
+                    .child(self.render_connection_status(window, cx))
+                    .child(self.render_current_query_result(window, cx)),
+            )
+            .child(self.render_appearance_trigger(window, cx))
+    }
+}
+
+fn status_dot_color(state: &SessionState, liveness: &LivenessState, active_theme: &Theme) -> u32 {
+    let colors = active_theme.colors;
+    if matches!(liveness, LivenessState::Unreachable(_)) {
+        return theme::status_disconnected(active_theme);
+    }
+    match state {
+        SessionState::Empty => colors.text_tertiary,
+        SessionState::Connecting => colors.status_warn,
+        SessionState::Connected | SessionState::Results(_) | SessionState::Running => colors.accent,
+        SessionState::Truncating { .. } | SessionState::Truncated { .. } => colors.status_limited,
+        SessionState::Error(_) => colors.status_error,
+    }
+}
+
+/// The bottom status bar's "N <unit>" / "N ms" text for `state`, given
+/// `count` and its `unit` word (`"rows"` for the grid, `"lines"` while the
+/// Text view is active). `None` for any state with no completed query to
+/// report timing/count for.
+fn query_messages(state: &SessionState, count: usize, unit: &str) -> Vec<String> {
+    match state {
+        SessionState::Results(elapsed) => vec![
+            format!("{count} {unit}"),
+            format!("{} ms", elapsed.as_millis()),
+        ],
+        SessionState::Truncated { elapsed, rows } => vec![
+            format!("Result limited to {count} {unit} ({rows} total)"),
+            format!("{} ms", elapsed.as_millis()),
+        ],
+        SessionState::Running | SessionState::Truncating { .. } => {
+            vec!["Running...".to_owned()]
+        }
+        _ => vec![],
+    }
+}
+
+const ESTIMATED_ROW_COUNT_SUFFIX: &str = " (estimated)";
+const TOTAL_ROW_COUNT_LABEL: &str = " total";
+
+/// The previewed relation's total row count, for the status bar: e.g.
+/// `"1,234 total"` for an exact count, or `"~1,234,567 total (estimated)"`
+/// when the driver could only provide a planner estimate. `None` when no
+/// count has been fetched (no preview yet, still fetching, or the fetch
+/// failed), so the caller can omit the segment entirely.
+fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
+    let row_count = row_count?;
+    let grouped = group_thousands(row_count.value());
+    Some(if row_count.is_estimated() {
+        format!(
+            "{}{grouped}{TOTAL_ROW_COUNT_LABEL}{ESTIMATED_ROW_COUNT_SUFFIX}",
+            zsql_core::ESTIMATE_MARKER
+        )
+    } else {
+        format!("{grouped}{TOTAL_ROW_COUNT_LABEL}")
+    })
 }
 
 #[cfg(test)]
@@ -349,7 +553,15 @@ mod tests {
                     cx,
                 )
             });
-            ConnectionFooterView::new(session, connections, cx)
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
         });
         vcx.run_until_parked();
 
@@ -383,7 +595,15 @@ mod tests {
                     cx,
                 )
             });
-            ConnectionFooterView::new(session, connections, cx)
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
         });
         vcx.run_until_parked();
 
@@ -396,5 +616,50 @@ mod tests {
                 "the footer must keep reflecting the session's Connecting state"
             );
         });
+    }
+
+    #[test]
+    fn format_total_row_count_renders_nothing_when_absent() {
+        assert_eq!(super::format_total_row_count(None), None);
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_exact_count_with_thousands_separators() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(1_234))),
+            Some("1,234 total".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_estimated_count_marked_distinctly() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Estimated(1_234_567))),
+            Some("~1,234,567 total (estimated)".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_labels_the_total_distinctly_from_the_streamed_rows_metric() {
+        // The streamed-rows metric reads "N rows"; the total must not, or the
+        // two segments are indistinguishable in the status bar.
+        let exact = super::format_total_row_count(Some(zsql_core::RowCount::Exact(1_234))).unwrap();
+        let estimated =
+            super::format_total_row_count(Some(zsql_core::RowCount::Estimated(1_234))).unwrap();
+        assert!(!exact.ends_with(" rows"));
+        assert!(exact.contains("total"));
+        assert!(estimated.contains("total"));
+    }
+
+    #[test]
+    fn format_total_row_count_handles_small_counts_with_no_separator_needed() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(7))),
+            Some("7 total".to_owned())
+        );
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(0))),
+            Some("0 total".to_owned())
+        );
     }
 }

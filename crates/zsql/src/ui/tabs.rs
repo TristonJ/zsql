@@ -11,13 +11,12 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task};
 use zsql_core::preview_state::PreviewQueryState;
 use zsql_core::{RelationKind, ResultSet};
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
-use super::results::ResultsView;
 use super::results::pager::{PreviewAction, PreviewControls, PreviewDispatch};
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
@@ -198,7 +197,6 @@ pub struct TabModel {
     /// tab until a different tab's run replaces it.
     live_owner: Option<TabId>,
     session: Entity<Session>,
-    results: Entity<ResultsView>,
     /// The single callback every sort/pager control routes its clicks
     /// through, built once and shared by every rendered control (see
     /// [`TabModel::preview_controls_for_active_tab`]) rather than a fresh
@@ -206,17 +204,24 @@ pub struct TabModel {
     preview_dispatch: PreviewDispatch,
 }
 
+pub enum ResultsChanged {
+    /// Results are live - fetch them from the session
+    Live(SharedString),
+    /// Results are loaded from a snapshot
+    Snapshot(ResultsSnapshot),
+}
+pub struct PreviewControlsChanged(pub Option<PreviewControls>);
+
+impl EventEmitter<ResultsChanged> for TabModel {}
+impl EventEmitter<PreviewControlsChanged> for TabModel {}
+
 impl TabModel {
     /// Build an empty tab model over `session`/`results`, the same pair
     /// every tab's editor runs its queries through. Starts with no tabs;
     /// callers that always want an initial tab (e.g. the workspace, on
     /// startup) call [`TabModel::new_script_tab`] right after construction.
     #[must_use]
-    pub fn new(
-        session: Entity<Session>,
-        results: Entity<ResultsView>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let model = cx.entity();
         // Reused, not re-fetched: a sort or page change previews the same
         // relation the tab's initial `preview_relation` call already
@@ -260,7 +265,6 @@ impl TabModel {
             next_script_number: 1,
             live_owner: None,
             session,
-            results,
             preview_dispatch: Rc::new(move |action, _window, cx| {
                 model.update(cx, |model, cx| model.dispatch_preview_action(action, cx));
             }),
@@ -349,34 +353,26 @@ impl TabModel {
         let label = SharedString::from(display_label(tab));
 
         if self.live_owner == Some(id) {
-            self.results
-                .update(cx, |results, cx| results.show_live(label, cx));
+            cx.emit(ResultsChanged::Live(label));
             return;
         }
 
         if let Some(snapshot) = tab.last_run.clone() {
-            self.results
-                .update(cx, |results, cx| results.show_snapshot(snapshot, cx));
+            cx.emit(ResultsChanged::Snapshot(snapshot));
             return;
         }
 
         let state = self.session.read(cx).state().clone();
         if matches!(state, SessionState::Empty | SessionState::Connecting) {
-            self.results
-                .update(cx, |results, cx| results.show_live(label, cx));
+            cx.emit(ResultsChanged::Live(label));
             return;
         }
 
-        self.results.update(cx, |results, cx| {
-            results.show_snapshot(
-                ResultsSnapshot {
-                    source_label: label,
-                    state: SessionState::Connected,
-                    result: ResultSet::default(),
-                },
-                cx,
-            );
-        });
+        cx.emit(ResultsChanged::Snapshot(ResultsSnapshot {
+            source_label: label,
+            state: SessionState::Connected,
+            result: ResultSet::default(),
+        }));
     }
 
     /// Dispatch `task` (a run just started for `id`, labeled `label`) as
@@ -387,8 +383,10 @@ impl TabModel {
     fn dispatch_run(&mut self, id: TabId, label: String, task: Task<()>, cx: &mut Context<Self>) {
         let label = SharedString::from(label);
         self.live_owner = Some(id);
-        self.results
-            .update(cx, |results, cx| results.show_live(label.clone(), cx));
+
+        cx.emit(ResultsChanged::Live(label.clone()));
+        // self.results
+        //     .update(cx, |results, cx| results.show_live(label.clone(), cx));
 
         cx.spawn(async move |this, cx| {
             task.await;
@@ -839,9 +837,10 @@ impl TabModel {
                 dispatch: self.preview_dispatch.clone(),
             })
         });
-        self.results.update(cx, |results, cx| {
-            results.set_preview_controls(controls, cx);
-        });
+        cx.emit(PreviewControlsChanged(controls));
+        // self.results.update(cx, |results, cx| {
+        //     results.set_preview_controls(controls, cx);
+        // });
     }
 
     /// This model's entire tab state as a persistable, window-independent

@@ -68,6 +68,8 @@ pub const RUN_BUTTON_HINT_TEXT_SIZE: f32 = 10.0;
 pub const RESULTS_BAR_HEIGHT: Pixels = px(32.0);
 /// Height of the bottom connection/status bar.
 pub const STATUS_BAR_HEIGHT: Pixels = px(26.0);
+/// Maximum width of the connection panel in the status bar
+pub const STATUS_BAR_CONNECTION_MAX_WIDTH: Pixels = px(300.0);
 
 /// Approximate advance width (px) of one monospace glyph at the grid's text
 /// size; used to estimate column widths from cell content length so columns
@@ -137,6 +139,8 @@ pub const RESULTS_TAB_TEXT_SIZE: f32 = 11.5;
 pub const RESULTS_META_TEXT_SIZE: f32 = 11.0;
 /// Text size of the bottom connection/status bar.
 pub const STATUS_BAR_TEXT_SIZE: f32 = 10.5;
+/// The width of the query messages in the status bar area
+pub const STATUS_BAR_QUERY_MESSAGE_WIDTH: Pixels = px(150.0);
 
 // ---- results pane: Text view -------------------------------------------
 

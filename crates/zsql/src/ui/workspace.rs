@@ -25,6 +25,7 @@ use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::connections::ConnectionStore;
 use crate::session::Session;
 use crate::tab_session::{self, TabSessionStore};
+use crate::ui::tabs::{PreviewControlsChanged, ResultsChanged};
 
 /// Which pane boundary a divider drag is currently resizing, and the pane
 /// size/pointer position it started from. Tracking the drag's origin (not
@@ -135,17 +136,8 @@ impl WorkspaceView {
         results.update(cx, |results, cx| {
             results.configure_value_panel(cx, &layout, value_panel);
         });
-        let tabs = cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx));
-        // Every workspace opens with one empty script tab so the editor
-        // pane is never blank; `TabModel::new` itself stays tab-less so its
-        // own constructor never has to call back into an entity that has
-        // not finished being built yet. A connection tracked as active by
-        // the time this workspace is built (never true today, since
-        // `connection_store` carries no notion of "last connected") would
-        // otherwise leave this default tab in place until the next switch.
-        tabs.update(cx, |tabs, cx| {
-            tabs.new_script_tab(cx);
-        });
+        let tabs = cx.new(|cx| TabModel::new(session.clone(), cx));
+
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), tabs.clone(), cx));
         let connections = cx.new(|cx| {
             ConnectionManagerView::new(
@@ -161,10 +153,18 @@ impl WorkspaceView {
         });
         let appearance =
             cx.new(|cx| AppearanceModalView::new(active_theme_name, themes_dir, config_path, cx));
-        results.update(cx, |results, _cx| {
-            results.set_appearance_modal(appearance.clone());
+        let footer = cx.new(|cx| {
+            ConnectionFooterView::new(session, connections.clone(), appearance.clone(), cx)
         });
-        let footer = cx.new(|cx| ConnectionFooterView::new(session, connections.clone(), cx));
+
+        Self::subscribe_to_tab_events(&tabs, &results, &footer, cx);
+
+        // Every workspace opens with one empty script tab so the editor
+        // pane is never blank
+        tabs.update(cx, |tabs, cx| {
+            tabs.new_script_tab(cx);
+        });
+
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
         let tab_width = layout.tab_width;
@@ -227,6 +227,46 @@ impl WorkspaceView {
             tab_bar: tab_bar_state,
             tab_width,
         }
+    }
+
+    fn subscribe_to_tab_events(
+        tabs: &Entity<TabModel>,
+        results: &Entity<ResultsView>,
+        footer: &Entity<ConnectionFooterView>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed_results = results.clone();
+        cx.subscribe(tabs, move |_v, _tabs, evt: &ResultsChanged, cx| {
+            changed_results.update(cx, |results, cx| match evt {
+                ResultsChanged::Live(label) => results.show_live(label, cx),
+                ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
+            });
+        })
+        .detach();
+        let preview_results = results.clone();
+        cx.subscribe(tabs, move |_v, _tabs, evt: &PreviewControlsChanged, cx| {
+            preview_results.update(cx, |results, cx| {
+                results.set_preview_controls(evt.0.clone(), cx);
+            });
+        })
+        .detach();
+        let changed_footer = footer.clone();
+        cx.subscribe(tabs, move |_v, _tabs, evt: &ResultsChanged, cx| {
+            changed_footer.update(cx, |footer, cx| match evt {
+                ResultsChanged::Live(_) => footer.set_result_snapshot(None, cx),
+                ResultsChanged::Snapshot(snap) => {
+                    footer.set_result_snapshot(Some(snap.clone()), cx);
+                }
+            });
+        })
+        .detach();
+        let preview_footer = footer.clone();
+        cx.subscribe(tabs, move |_v, _tabs, evt: &PreviewControlsChanged, cx| {
+            preview_footer.update(cx, |footer, cx| {
+                footer.set_row_count(evt.0.as_ref().and_then(|c| c.state.total_rows()), cx);
+            });
+        })
+        .detach();
     }
 
     /// The active tab's editor focus handle, so the app can focus it on
@@ -689,8 +729,7 @@ impl Render for WorkspaceView {
                             .flex_shrink_0()
                             .w(self.sidebar_width)
                             .h_full()
-                            .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
-                            .child(self.footer.clone()),
+                            .child(div().flex_1().min_h_0().child(self.sidebar.clone())),
                     )
                     .child(
                         div()
@@ -738,6 +777,7 @@ impl Render for WorkspaceView {
                             .children(self.render_main_pane(cx)),
                     ),
             )
+            .child(self.footer.clone())
             .when(modal_open, |el| el.child(self.connections.clone()))
             .when(appearance_open, |el| el.child(self.appearance.clone()))
     }

@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,7 +10,9 @@ use zsql_core::{
     RowCount, SchemaTree,
 };
 
-use super::{PreviewAction, ResultsSnapshot, Tab, TabKind, TabModel};
+use super::{
+    PreviewAction, PreviewControlsChanged, ResultsChanged, ResultsSnapshot, Tab, TabKind, TabModel,
+};
 use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::ResultsView;
@@ -98,6 +102,41 @@ impl Connection for RecordingConnection {
     }
 }
 
+/// Mirror the workspace's tab-event wiring: a standalone [`ResultsView`]
+/// fed by the model's [`ResultsChanged`]/[`PreviewControlsChanged`] events,
+/// plus the latest total those events would push to the footer's row count.
+fn wire_display(
+    model: &Entity<TabModel>,
+    session: Entity<Session>,
+    cx: &mut TestAppContext,
+) -> (Entity<ResultsView>, Rc<RefCell<Option<RowCount>>>) {
+    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session, "", cx)));
+    let row_count: Rc<RefCell<Option<RowCount>>> = Rc::new(RefCell::new(None));
+    let results_for_changed = results.clone();
+    let results_for_controls = results.clone();
+    let row_count_for_controls = row_count.clone();
+    cx.update(|cx| {
+        cx.subscribe(model, move |_model, evt: &ResultsChanged, cx| {
+            results_for_changed.update(cx, |results, cx| match evt {
+                ResultsChanged::Live(label) => results.show_live(label, cx),
+                ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
+            });
+        })
+        .detach();
+        cx.subscribe(model, move |_model, evt: &PreviewControlsChanged, cx| {
+            results_for_controls.update(cx, |results, cx| {
+                results.set_preview_controls(evt.0.clone(), cx);
+            });
+            *row_count_for_controls.borrow_mut() = evt
+                .0
+                .as_ref()
+                .and_then(|controls| controls.state.total_rows());
+        })
+        .detach();
+    });
+    (results, row_count)
+}
+
 /// Like [`build_model_with_results`], but backed by a
 /// [`RecordingConnection`] so a test can independently complete (or
 /// leave in flight) each tab's own dispatched run, by sending directly
@@ -116,8 +155,7 @@ fn re_running_a_generated_preview_tab_refreshes_the_relation_row_count(cx: &mut 
         total_rows: 0,
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results, cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
 
     // Opening a generated preview tab fetches the relation's total row count.
     let id = model.update(cx, |model, cx| {
@@ -152,10 +190,8 @@ fn build_model(cx: &mut TestAppContext) -> Entity<TabModel> {
 fn build_model_with_results(cx: &mut TestAppContext) -> (Entity<TabModel>, Entity<ResultsView>) {
     let connection: Arc<dyn Connection> = Arc::new(FakeConnection);
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let session_for_results = session.clone();
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session_for_results, "", cx)));
-    let results_for_model = results.clone();
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results_for_model, cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (results, _row_count) = wire_display(&model, session, cx);
     (model, results)
 }
 
@@ -231,8 +267,7 @@ fn a_generated_tabs_displayed_sql_matches_what_preview_relation_executes(cx: &mu
         queries: queries.clone(),
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
 
     model.update(cx, |model, cx| {
         model.open_or_reuse_generated("dbo", "orders", cx);
@@ -1220,9 +1255,7 @@ fn build_model_with_recording_connection_and_total_rows(
         total_rows,
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let session_for_results = session.clone();
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session_for_results, "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, results, cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
     (model, sinks)
 }
 
@@ -1484,8 +1517,8 @@ fn the_rendered_pager_snapshot_reflects_the_total_once_the_async_count_resolves(
         total_rows: 450, // 3 pages at the default 200/page.
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (results, _row_count) = wire_display(&model, session, cx);
 
     model.update(cx, |model, cx| {
         model.open_or_reuse_generated("public", "orders", cx)
@@ -1575,37 +1608,28 @@ fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_co
         count_calls: count_calls.clone(),
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (results, row_count) = wire_display(&model, session.clone(), cx);
 
     let orders_id = model.update(cx, |model, cx| {
         model.open_or_reuse_generated("public", "orders", cx)
     });
     cx.run_until_parked();
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            Some(RowCount::Exact(300)),
-            "orders' own count must be shown while its tab is active"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        Some(RowCount::Exact(300)),
+        "orders' own count must be pushed for display while its tab is active"
+    );
 
     model.update(cx, |model, cx| {
         model.open_or_reuse_generated("public", "customers", cx)
     });
     cx.run_until_parked();
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            Some(RowCount::Exact(999)),
-            "customers' own count must be shown while its tab is active"
-        );
-        assert_eq!(
-            results.status_bar_total_row_count_text_for_test(),
-            Some("999 total".to_owned()),
-            "the status bar's rendered text must reflect customers' own total"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        Some(RowCount::Exact(999)),
+        "customers' own count must be pushed for display while its tab is active"
+    );
 
     let calls_before_switch = count_calls.lock().expect("count_calls lock poisoned").len();
 
@@ -1624,17 +1648,12 @@ fn switching_back_to_a_previously_previewed_tab_shows_that_tabs_own_total_row_co
         );
     });
 
+    assert_eq!(
+        *row_count.borrow(),
+        Some(RowCount::Exact(300)),
+        "switching back to orders' tab must push its own total, not customers'"
+    );
     results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            Some(RowCount::Exact(300)),
-            "switching back to orders' tab must show its own total, not customers'"
-        );
-        assert_eq!(
-            results.status_bar_total_row_count_text_for_test(),
-            Some("300 total".to_owned()),
-            "the status bar's rendered text must follow orders' own total, not customers'"
-        );
         assert_eq!(
             results.preview_last_page_number_for_test(),
             Some(2), // 300 rows at 200/page.
@@ -1667,44 +1686,33 @@ fn a_tab_whose_count_fetch_is_still_pending_shows_no_total_across_a_tab_switch(
         count_calls,
     });
     let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
-    let results = cx.update(|cx| cx.new(|cx| ResultsView::new(session.clone(), "", cx)));
-    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), results.clone(), cx)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (_results, row_count) = wire_display(&model, session.clone(), cx);
 
     let orders_id = model.update(cx, |model, cx| {
         model.open_or_reuse_generated("public", "orders", cx)
     });
     // Deliberately not parked: the count fetch for "orders" has not
     // resolved yet.
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            None,
-            "a not-yet-resolved count must render as absent, not zero or borrowed"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        None,
+        "a not-yet-resolved count must be pushed as absent, not zero or borrowed"
+    );
 
     let script_id = model.update(cx, TabModel::new_script_tab);
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            None,
-            "a script tab that has never run a preview shows no total"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        None,
+        "a script tab that has never run a preview pushes no total"
+    );
 
     model.update(cx, |model, cx| model.set_active(orders_id, cx));
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            None,
-            "switching back to a tab whose count is still pending must not fabricate a total"
-        );
-        assert_eq!(
-            results.status_bar_total_row_count_text_for_test(),
-            None,
-            "the status bar must render no total text while the count is still pending"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        None,
+        "switching back to a tab whose count is still pending must not fabricate a total"
+    );
 
     let _ = script_id;
 }
@@ -1713,19 +1721,23 @@ fn a_tab_whose_count_fetch_is_still_pending_shows_no_total_across_a_tab_switch(
 /// total row count, unchanged by which tab was active before it.
 #[gpui::test]
 fn an_edited_generated_tab_shows_no_total_row_count(cx: &mut TestAppContext) {
-    let (model, sinks) = build_model_with_recording_connection_and_total_rows(cx, 450);
-    let results = model.read_with(cx, |model, _app| model.results.clone());
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks: sinks.clone(),
+        total_rows: 450,
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (_results, row_count) = wire_display(&model, session, cx);
     let id = model.update(cx, |model, cx| {
         model.open_or_reuse_generated("public", "orders", cx)
     });
     cx.run_until_parked();
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            Some(RowCount::Exact(450)),
-            "a live generated tab shows its own resolved total"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        Some(RowCount::Exact(450)),
+        "a live generated tab shows its own resolved total"
+    );
 
     let editor = model.read_with(cx, |model, _app| model.tab(id).unwrap().editor().clone());
     editor.update(cx, |editor, cx| {
@@ -1733,17 +1745,10 @@ fn an_edited_generated_tab_shows_no_total_row_count(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    results.read_with(cx, |results, _cx| {
-        assert_eq!(
-            results.active_total_row_count_for_test(),
-            None,
-            "editing a generated tab must clear its displayed total row count"
-        );
-        assert_eq!(
-            results.status_bar_total_row_count_text_for_test(),
-            None,
-            "the status bar must render no total text for an edited generated tab"
-        );
-    });
+    assert_eq!(
+        *row_count.borrow(),
+        None,
+        "editing a generated tab must clear its pushed total row count"
+    );
     let _ = sinks;
 }

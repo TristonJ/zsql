@@ -7,28 +7,25 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
     MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
-use zsql_core::{ColumnMeta, ResultSet, RowCount, group_thousands};
+use zsql_core::{ColumnMeta, ResultSet};
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, TableState, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
-use super::appearance::AppearanceModalView;
 use super::connections::ConnectionManagerView;
 use super::format::{ValueKind, format_value};
 use super::tabs::ResultsSnapshot;
 use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
-use crate::session::{LivenessState, Session, SessionState};
+use crate::session::{Session, SessionState};
 use crate::ui::format::format_value_for_clipboard;
 use crate::ui::results::pager::PreviewControls;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
-mod appearance_trigger;
 mod cell_menu;
 mod empty_state;
 pub(crate) mod pager;
 mod panel_host;
-mod status_bar;
 mod text_view;
 mod toolbar;
 
@@ -114,8 +111,6 @@ pub struct ResultsView {
     /// The connection-manager modal the Empty-state "Add connection" button
     /// opens
     connections_modal: Option<Entity<ConnectionManagerView>>,
-    /// The Appearance modal the status bar's theme trigger opens
-    appearance_modal: Option<Entity<AppearanceModalView>>,
     /// The value panel
     value_panel: Entity<ValuePanel>,
     /// The panel's current dock width, draggable between
@@ -196,7 +191,6 @@ impl ResultsView {
             focus_handle,
             cell_context_menu: None,
             connections_modal: None,
-            appearance_modal: None,
             value_panel,
             // A view built without `configure_value_panel` (any caller other
             // than `WorkspaceView::new`, e.g. a test) still opens to a
@@ -243,13 +237,6 @@ impl ResultsView {
         self.connections_modal = Some(connections);
     }
 
-    /// Wire the Appearance modal the status bar's theme trigger opens, so
-    /// clicking it opens this workspace's shared instance rather than
-    /// constructing a new one on each click.
-    pub fn set_appearance_modal(&mut self, appearance: Entity<AppearanceModalView>) {
-        self.appearance_modal = Some(appearance);
-    }
-
     /// Set (or clear) the active tab's sort/page controls. Called by
     /// `ui::tabs::TabModel` every time the active tab, or that tab's
     /// dirty/kind state, changes -- see [`ResultsView::preview`]'s own doc
@@ -272,26 +259,6 @@ impl ResultsView {
         self.preview
             .as_ref()
             .and_then(|preview| preview.state.last_page_number())
-    }
-
-    /// The active tab's own total row count, once known: the value the
-    /// status bar renders via [`format_total_row_count`]. Sourced from
-    /// [`ResultsView::preview`] -- the active tab's own frozen sort/page
-    /// state -- rather than from `session` directly, so a tab that is not
-    /// currently live never shows a different tab's most recently fetched
-    /// total. `None` while the active tab is not a live, unedited generated
-    /// preview, or that preview's own count fetch has not resolved yet.
-    fn active_total_row_count(&self) -> Option<RowCount> {
-        self.preview
-            .as_ref()
-            .and_then(|preview| preview.state.total_rows())
-    }
-
-    /// Test-only mirror of [`ResultsView::active_total_row_count`], for
-    /// asserting on the exact value the status bar would render.
-    #[cfg(test)]
-    pub(crate) fn active_total_row_count_for_test(&self) -> Option<RowCount> {
-        self.active_total_row_count()
     }
 
     /// [`PrevPage`]'s handler: step the active preview's pager back one
@@ -900,34 +867,7 @@ impl Render for ResultsView {
             .bg(rgb(cx.theme().colors.bg_app))
             .child(self.render_bar(window, cx))
             .child(self.render_body(window, cx))
-            .child(self.render_status_bar(cx))
             .children(self.render_cell_context_menu(cx))
-    }
-}
-
-/// The bottom status bar's dot color and label for `state`. A `liveness` of
-/// [`LivenessState::Unreachable`] overrides every state's normal indicator
-/// with a distinct "Disconnected" one, since the probe result is
-/// independent of (and can contradict) whatever `state` currently holds -
-/// for instance a query can still be `Running` against a connection the
-/// probe has just found unreachable.
-fn status_indicator(
-    state: &SessionState,
-    liveness: &LivenessState,
-    active_theme: &Theme,
-) -> (u32, &'static str) {
-    let colors = active_theme.colors;
-    if matches!(liveness, LivenessState::Unreachable(_)) {
-        return (theme::status_disconnected(active_theme), "Disconnected");
-    }
-    match state {
-        SessionState::Empty => (colors.text_tertiary, "Not connected"),
-        SessionState::Connecting => (colors.status_warn, "Connecting..."),
-        SessionState::Connected | SessionState::Results(_) => (colors.accent, "Connected"),
-        SessionState::Running => (colors.accent, "Running..."),
-        SessionState::Truncating { .. } => (colors.status_limited, "Running... (truncated)"),
-        SessionState::Truncated { .. } => (colors.status_limited, "Truncated"),
-        SessionState::Error(_) => (colors.status_error, "Error"),
     }
 }
 
@@ -956,53 +896,6 @@ fn results_bar_count_text(
         | SessionState::Connected
         | SessionState::Error(_) => "-".to_owned(),
     }
-}
-
-/// The bottom status bar's "N <unit>" / "N ms" text for `state`, given
-/// `count` and its `unit` word (`"rows"` for the grid, `"lines"` while the
-/// Text view is active). `None` for any state with no completed query to
-/// report timing/count for.
-fn status_metrics(state: &SessionState, count: usize, unit: &str) -> Option<(String, String)> {
-    match state {
-        SessionState::Results(elapsed) => Some((
-            format!("{count} {unit}"),
-            format!("{} ms", elapsed.as_millis()),
-        )),
-        SessionState::Truncated { elapsed, rows } => Some((
-            format!("Result limited to {count} {unit} ({rows} total)"),
-            format!("{} ms", elapsed.as_millis()),
-        )),
-        _ => None,
-    }
-}
-
-/// Appended after the number when a total row count is a planner estimate
-/// rather than an exact count, so the distinction reads clearly even without
-/// color.
-const ESTIMATED_ROW_COUNT_SUFFIX: &str = " (estimated)";
-
-/// Labels the whole-relation total so it never reads as the streamed-rows
-/// metric beside it. That metric renders as `"200 rows"` (capped at the
-/// preview limit), so the total drops the bare `"rows"` word for `"total"`
-/// and the two can no longer be confused.
-const TOTAL_ROW_COUNT_LABEL: &str = " total";
-
-/// The previewed relation's total row count, for the status bar: e.g.
-/// `"1,234 total"` for an exact count, or `"~1,234,567 total (estimated)"`
-/// when the driver could only provide a planner estimate. `None` when no
-/// count has been fetched (no preview yet, still fetching, or the fetch
-/// failed), so the caller can omit the segment entirely.
-fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
-    let row_count = row_count?;
-    let grouped = group_thousands(row_count.value());
-    Some(if row_count.is_estimated() {
-        format!(
-            "{}{grouped}{TOTAL_ROW_COUNT_LABEL}{ESTIMATED_ROW_COUNT_SUFFIX}",
-            zsql_core::ESTIMATE_MARKER
-        )
-    } else {
-        format!("{grouped}{TOTAL_ROW_COUNT_LABEL}")
-    })
 }
 
 /// Estimate a column's pixel width from its header (name + type tag) and

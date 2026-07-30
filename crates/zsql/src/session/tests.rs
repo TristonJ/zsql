@@ -70,12 +70,6 @@ impl Session {
         self.row_count = row_count;
     }
 
-    /// Set the exposed liveness state directly, simulating a completed
-    /// probe result without waiting for the recurring probe to tick.
-    pub(crate) fn set_liveness_for_test(&mut self, liveness: LivenessState) {
-        self.liveness = liveness;
-    }
-
     /// Set the exposed schema state directly, letting a test stand up a
     /// session that already holds a given schema without going through a
     /// real introspection.

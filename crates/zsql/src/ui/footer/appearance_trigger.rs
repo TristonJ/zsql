@@ -4,13 +4,13 @@
 //! [`ResultsView::set_appearance_modal`] rather than constructed fresh on
 //! each click.
 
-use gpui::{Context, Div, Entity, SharedString, Stateful, div, prelude::*, px, rgb};
+use gpui::{App, Div, Entity, SharedString, Stateful, div, prelude::*, px, rgb};
 use zsql_ui::theme::Colors;
 
 use crate::ui::appearance::AppearanceModalView;
 use crate::ui::theme;
 
-use super::ResultsView;
+// use super::ResultsView;
 
 /// Element id for [`render_theme_trigger`], so tests can locate its painted
 /// bounds.
@@ -29,10 +29,10 @@ pub(super) fn swatch_colors(colors: &Colors) -> [u32; 3] {
 /// focuses) `appearance_modal` -- a no-op click while it is `None`, e.g. a
 /// [`ResultsView`] built without [`ResultsView::set_appearance_modal`].
 pub(super) fn render_theme_trigger(
-    appearance_modal: Option<Entity<AppearanceModalView>>,
+    modal: Entity<AppearanceModalView>,
     active_colors: Colors,
     active_display_name: SharedString,
-    cx: &Context<ResultsView>,
+    _cx: &App,
 ) -> Stateful<Div> {
     let chips = swatch_colors(&active_colors);
 
@@ -62,10 +62,7 @@ pub(super) fn render_theme_trigger(
                 .text_color(rgb(active_colors.text_secondary))
                 .child("\u{25be}"),
         )
-        .on_click(cx.listener(move |_view, _event, window, cx| {
-            let Some(modal) = appearance_modal.as_ref() else {
-                return;
-            };
+        .on_click(move |_event, window, cx| {
             modal.update(cx, AppearanceModalView::open);
             // Focus the checked card itself, not the modal overlay: arrow
             // keys are handled by a listener on the card grid, a descendant
@@ -75,7 +72,7 @@ pub(super) fn render_theme_trigger(
             // closes the modal from here.
             let focus_handle = modal.read(cx).focused_card_handle();
             window.focus(&focus_handle);
-        }))
+        })
 }
 
 /// The trigger's 3-chip swatch: one small square per color in `chips`.
