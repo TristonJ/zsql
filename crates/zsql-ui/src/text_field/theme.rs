@@ -21,3 +21,7 @@ pub const FIELD_LINE_HEIGHT: Pixels = px(16.0);
 pub const FIELD_TEXT_SIZE: f32 = 13.0;
 /// Width of the blinking text cursor.
 pub const FIELD_CURSOR_WIDTH: Pixels = px(2.0);
+/// Minimum distance kept between the caret and the field's viewport edge
+/// when scrolled content is caret-followed: the caret never paints glued to
+/// the field's inner border.
+pub const FIELD_CARET_SCROLL_MARGIN: Pixels = px(6.0);

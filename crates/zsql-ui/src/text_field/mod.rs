@@ -6,6 +6,7 @@
 //! app, driver, or session type.
 
 mod model;
+mod scroll;
 // Crate-visible (not just module-private) so the shared theme's metric
 // defaults can assert they still match this field's own established radius.
 pub(crate) mod theme;
