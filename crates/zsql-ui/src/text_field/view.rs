@@ -11,7 +11,6 @@ use gpui::{
     InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px, relative, rgb,
-    rgba,
 };
 
 use crate::text_field::model::{
@@ -118,6 +117,35 @@ pub struct TextFieldState {
     last_line: Option<ShapedLine>,
     /// The content element's bounds from the most recent paint.
     last_bounds: Option<Bounds<Pixels>>,
+    /// Style options for the text field
+    style: TextFieldStyle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextFieldStyle {
+    pub height: Pixels,
+    pub padding_x: Pixels,
+    pub padding_y: Pixels,
+    pub text_size: Pixels,
+    pub border_radius: Pixels,
+    pub border_w: Pixels,
+    pub line_height: Pixels,
+    pub cursor_width: Pixels,
+}
+
+impl Default for TextFieldStyle {
+    fn default() -> Self {
+        Self {
+            height: theme::FIELD_HEIGHT,
+            padding_x: px(theme::FIELD_PADDING_X),
+            padding_y: px(theme::FIELD_PADDING_Y),
+            text_size: px(theme::FIELD_TEXT_SIZE),
+            border_radius: px(theme::FIELD_RADIUS),
+            border_w: px(1.0),
+            line_height: theme::FIELD_LINE_HEIGHT,
+            cursor_width: theme::FIELD_CURSOR_WIDTH,
+        }
+    }
 }
 
 impl TextFieldState {
@@ -141,9 +169,17 @@ impl TextFieldState {
             focused: false,
             last_line: None,
             last_bounds: None,
+            style: TextFieldStyle::default(),
         };
         Self::spawn_blink_loop(cx);
         state
+    }
+
+    /// Update field's style options, e.g. padding.
+    #[must_use]
+    pub fn style(mut self, style: TextFieldStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The field's current content.
@@ -457,13 +493,13 @@ impl Render for TextFieldState {
             // the field's own box.
             .min_w_0()
             .overflow_hidden()
-            .h(theme::FIELD_HEIGHT)
-            .px(px(theme::FIELD_PADDING_X))
-            .rounded(px(theme::FIELD_RADIUS))
-            .border_1()
+            .h(self.style.height)
+            .px(self.style.padding_x)
+            .rounded(self.style.border_radius)
+            .border(self.style.border_w)
             .border_color(rgb(border_color))
             .bg(rgb(colors.bg_app))
-            .text_size(px(theme::FIELD_TEXT_SIZE))
+            .text_size(self.style.text_size)
             .text_color(rgb(colors.text_primary))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
@@ -484,7 +520,10 @@ impl Render for TextFieldState {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(TextFieldContentElement { field: cx.entity() })
+            .child(TextFieldContentElement {
+                field: cx.entity(),
+                style: self.style,
+            })
     }
 }
 
@@ -563,7 +602,7 @@ impl EntityInputHandler for TextFieldState {
             range_utf16,
             element_bounds,
             lines,
-            theme::FIELD_LINE_HEIGHT,
+            self.style.line_height,
         )
     }
 
@@ -583,6 +622,7 @@ impl EntityInputHandler for TextFieldState {
 /// `window.handle_input`.
 struct TextFieldContentElement {
     field: Entity<TextFieldState>,
+    style: TextFieldStyle,
 }
 
 struct TextFieldPrepaintState {
@@ -620,7 +660,7 @@ impl Element for TextFieldContentElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = theme::FIELD_LINE_HEIGHT.into();
+        style.size.height = self.style.line_height.into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -691,8 +731,8 @@ impl Element for TextFieldContentElement {
                 bounds,
                 x,
                 0,
-                theme::FIELD_LINE_HEIGHT,
-                theme::FIELD_CURSOR_WIDTH,
+                self.style.line_height,
+                self.style.cursor_width,
                 rgb(theme_colors.accent),
             )
         });
@@ -706,8 +746,8 @@ impl Element for TextFieldContentElement {
             text_input::selection_quad(
                 &span,
                 bounds,
-                theme::FIELD_LINE_HEIGHT,
-                rgba(theme_colors.accent_wash_hover()),
+                self.style.line_height,
+                theme_colors.accent_wash_hover(),
             )
         });
 

@@ -1,6 +1,6 @@
 use gpui::{
     App, ClickEvent, Div, ElementId, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
-    rems, rgb, rgba,
+    rems, rgb,
 };
 
 use crate::theme::ActiveTheme;
@@ -49,7 +49,7 @@ pub fn primary_button(
     btn.border_color(rgb(theme.colors.accent_dim()))
         .text_color(rgb(theme.colors.accent_strong()))
         .when(*hovered.read(cx), |b| {
-            b.bg(rgba(theme.colors.accent_wash_hover()))
+            b.bg(theme.colors.accent_wash_hover())
         })
 }
 
@@ -79,9 +79,9 @@ pub fn destructive_button(
     let (btn, hovered) = button_base(id, window, cx);
     let theme = cx.theme();
 
-    btn.border_color(rgb(theme.colors.error_outline()))
+    btn.border_color(theme.colors.error_outline())
         .text_color(rgb(theme.colors.status_error))
-        .when(*hovered.read(cx), |b| b.bg(rgba(theme.colors.error_wash())))
+        .when(*hovered.read(cx), |b| b.bg(theme.colors.error_wash()))
 }
 
 /// A button switch - allowing toggling between multiple options. Only one option can
@@ -167,8 +167,8 @@ impl RenderOnce for ButtonSwitch {
             let is_selected = self.selected.as_ref() == Some(&id);
             let option = match (is_selected, self.is_disabled) {
                 (true, disabled) => option
-                    .bg(rgba(theme.colors.accent_wash()))
-                    .border_color(rgba(theme.colors.accent_wash()))
+                    .bg(theme.colors.accent_wash())
+                    .border_color(theme.colors.accent_wash())
                     .text_color(rgb(theme.colors.accent))
                     .when(disabled, gpui::Styled::cursor_not_allowed),
                 (false, false) => option,

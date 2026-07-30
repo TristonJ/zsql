@@ -65,10 +65,10 @@ pub struct TableStyle {
     pub row_number_color: u32,
     /// Background of a data cell holding the table's currently selected
     /// cell.
-    pub selection_wash: u32,
+    pub selection_wash: gpui::Rgba,
     /// Border color of a data cell holding the table's currently selected
     /// cell.
-    pub selection_ring: u32,
+    pub selection_ring: gpui::Rgba,
 }
 
 impl Default for TableStyle {

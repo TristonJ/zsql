@@ -145,7 +145,7 @@ impl ResultsView {
 
         if active {
             button = button
-                .bg(rgb(theme::view_switch_active_bg(active_theme)))
+                .bg(theme::view_switch_active_bg(active_theme))
                 .text_color(rgb(theme::view_switch_active_text(active_theme)));
         } else {
             button = button

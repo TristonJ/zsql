@@ -8,7 +8,7 @@ use std::time::Duration;
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, canvas, div,
-    prelude::*, px, rgb, rgba,
+    prelude::*, px, rgb,
 };
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::theme::ActiveTheme;
@@ -548,7 +548,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
-                            .text_color(rgba(theme::run_button_hint(active_theme)))
+                            .text_color(theme::run_button_hint(active_theme))
                             .child(run_shortcut),
                     ),
             )
@@ -632,7 +632,7 @@ impl WorkspaceView {
             .flex_shrink_0()
             .w_full()
             .h(theme::GENERATED_STRIP_HEIGHT)
-            .bg(gpui::rgba(theme::generated_strip_bg(active_theme)))
+            .bg(theme::generated_strip_bg(active_theme))
             .border_color(rgb(theme::generated_strip_accent(active_theme)))
             .child(
                 div()

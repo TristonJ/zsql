@@ -12,4 +12,4 @@ pub(crate) mod theme;
 mod view;
 
 pub use model::{BlinkState, CURSOR_BLINK_INTERVAL, CURSOR_BLINK_RESUME_DELAY, FieldModel};
-pub use view::{KEY_CONTEXT, TextFieldEvent, TextFieldState, init};
+pub use view::{KEY_CONTEXT, TextFieldEvent, TextFieldState, TextFieldStyle, init};

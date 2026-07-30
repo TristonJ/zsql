@@ -4,7 +4,7 @@
 //! other view in the window keeps rendering with whatever theme is actually
 //! active.
 
-use gpui::{ElementId, FocusHandle, Stateful, div, prelude::*, px, rgb, rgba};
+use gpui::{ElementId, FocusHandle, Stateful, div, prelude::*, px, rgb};
 use zsql_ui::theme::Colors;
 
 use crate::theme_resolve::{ThemeEntry, Tone};
@@ -46,7 +46,7 @@ pub(super) fn render_card(
         )
         .child(render_meta(entry, is_active, chrome))
         .on_click(on_click)
-        .focus(move |style| style.border_color(rgba(Colors::wash(chrome.accent, 0x66))))
+        .focus(move |style| style.border_color(Colors::wash(chrome.accent, 0x66)))
 }
 
 /// The name/tone row below a card's preview: the theme's display name, plus
@@ -208,7 +208,7 @@ fn render_mini_header(colors: Colors) -> impl IntoElement {
                         .text_size(px(theme::MINI_TAG_TEXT_SIZE))
                         .text_color(rgb(colors.accent))
                         .border_1()
-                        .border_color(rgba(Colors::wash(colors.accent, 0x6b)))
+                        .border_color(Colors::wash(colors.accent, 0x6b))
                         .px(theme::MINI_TAG_PADDING_X)
                         .rounded(px(theme::MINI_TAG_RADIUS))
                         .child(tag),

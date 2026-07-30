@@ -197,12 +197,15 @@ const fn catppuccin(palette: &CatppuccinPalette) -> Colors {
         kind_matview: palette.yellow,
         kind_partitioned: palette.lavender,
         key_fk: palette.blue,
-        hover_wash: Colors::wash(palette.hover_wash.0, palette.hover_wash.1),
-        scrim: Colors::wash(palette.scrim.0, palette.scrim.1),
-        shadow_dialog: Colors::wash(palette.shadow_dialog.0, palette.shadow_dialog.1),
-        shadow_overlay: Colors::wash(palette.shadow_overlay.0, palette.shadow_overlay.1),
-        scrollbar_thumb: Colors::wash(palette.scrollbar_thumb.0, palette.scrollbar_thumb.1),
-        scrollbar_thumb_hover: Colors::wash(
+        hover_wash: super::colors::wash_hex(palette.hover_wash.0, palette.hover_wash.1),
+        scrim: super::colors::wash_hex(palette.scrim.0, palette.scrim.1),
+        shadow_dialog: super::colors::wash_hex(palette.shadow_dialog.0, palette.shadow_dialog.1),
+        shadow_overlay: super::colors::wash_hex(palette.shadow_overlay.0, palette.shadow_overlay.1),
+        scrollbar_thumb: super::colors::wash_hex(
+            palette.scrollbar_thumb.0,
+            palette.scrollbar_thumb.1,
+        ),
+        scrollbar_thumb_hover: super::colors::wash_hex(
             palette.scrollbar_thumb_hover.0,
             palette.scrollbar_thumb_hover.1,
         ),

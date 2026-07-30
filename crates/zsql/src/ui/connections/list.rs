@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, ClickEvent, Context, Div, FocusHandle, Render, RenderOnce, Stateful, Window, div,
-    prelude::*, px, rgb, rgba,
+    prelude::*, px, rgb,
 };
 use uuid::Uuid;
 use zsql_ui::{
@@ -330,7 +330,7 @@ impl RenderOnce for ConnectionListItem {
             );
 
         if self.is_active {
-            item = item.bg(rgba(theme::modal_row_active_bg(active_theme)));
+            item = item.bg(theme::modal_row_active_bg(active_theme));
         }
         item
     }

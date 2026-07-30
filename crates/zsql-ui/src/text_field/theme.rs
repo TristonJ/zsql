@@ -9,6 +9,8 @@ use gpui::{Pixels, px};
 pub const FIELD_HEIGHT: Pixels = px(34.0);
 /// Horizontal padding inside the field, between the border and the text.
 pub const FIELD_PADDING_X: f32 = 11.0;
+/// Default vertical padding inside the field, between the border and the text
+pub const FIELD_PADDING_Y: f32 = 11.0;
 /// Corner radius of the field's border.
 pub const FIELD_RADIUS: f32 = 7.0;
 /// Height of the text line the field shapes and paints: the cursor and

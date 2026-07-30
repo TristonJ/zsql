@@ -31,7 +31,7 @@ pub const EDITOR_HISTORY_CAP: usize = 200;
 
 /// The active selection highlight's background: the theme's accent wash.
 #[must_use]
-pub fn selection_bg(theme: &Theme) -> u32 {
+pub fn selection_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_hover()
 }
 

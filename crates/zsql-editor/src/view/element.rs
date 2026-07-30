@@ -8,7 +8,7 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Element, ElementId, ElementInputHandler, Entity, Font, GlobalElementId, Hsla,
     InspectorElementId, LayoutId, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
-    UnderlineStyle, Window, point, prelude::*, px, relative, rgb, rgba,
+    UnderlineStyle, Window, point, prelude::*, px, relative, rgb,
 };
 use zsql_ui::text_input::{self, SelectionLineSpan};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -231,7 +231,7 @@ fn selection_highlight_quads(
         &spans,
         bounds,
         px(theme::EDITOR_LINE_HEIGHT),
-        rgba(theme::selection_bg(active_theme)),
+        theme::selection_bg(active_theme),
     )
 }
 

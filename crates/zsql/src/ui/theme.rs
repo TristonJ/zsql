@@ -30,7 +30,7 @@ pub fn run_button_hover_bg(theme: &Theme) -> u32 {
 /// Run button shortcut-hint color: the page background at reduced opacity,
 /// so it reads as secondary against the accent fill.
 #[must_use]
-pub fn run_button_hint(theme: &Theme) -> u32 {
+pub fn run_button_hint(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.bg_app, 0xb3)
 }
 
@@ -129,7 +129,7 @@ pub const SIDEBAR_DB_SWITCHER_GAP: Pixels = px(4.0);
 /// Background tint for the selected relation row: the accent color at low
 /// opacity.
 #[must_use]
-pub fn sidebar_selected_bg(theme: &Theme) -> u32 {
+pub fn sidebar_selected_bg(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.accent, 0x1a)
 }
 
@@ -187,7 +187,7 @@ pub const PAGER_DISABLED_OPACITY: f32 = 0.45;
 /// wrap toggle when wrap is on: the accent wash used elsewhere for a
 /// selected/active control.
 #[must_use]
-pub fn view_switch_active_bg(theme: &Theme) -> u32 {
+pub fn view_switch_active_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash()
 }
 
@@ -201,7 +201,7 @@ pub fn view_switch_active_text(theme: &Theme) -> u32 {
 /// Background of the Text view's selected-line highlight: the same accent
 /// wash the SQL editor pane uses for its own text selection.
 #[must_use]
-pub fn text_selection_bg(theme: &Theme) -> u32 {
+pub fn text_selection_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_hover()
 }
 
@@ -212,7 +212,7 @@ pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
 /// Background tint of a `Generated` tab's compact strip: the accent color
 /// at very low opacity.
 #[must_use]
-pub fn generated_strip_bg(theme: &Theme) -> u32 {
+pub fn generated_strip_bg(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.accent, 0x0b)
 }
 
@@ -251,6 +251,8 @@ pub const FILTER_CHIP_PADDING_RIGHT: Pixels = px(4.0);
 pub const FILTER_CHIP_REMOVE_SIZE: Pixels = px(16.0);
 /// Corner radius of a chip's remove control.
 pub const FILTER_CHIP_REMOVE_RADIUS: f32 = 3.0;
+/// Size of the chip's remove control's "X" glyph.
+pub const FILTER_CHIP_REMOVE_ICON_SIZE: Pixels = px(10.0);
 /// Horizontal gap between an expression-classified value's text and its
 /// trailing `fx` tag.
 pub const FILTER_VALUE_EXPRESSION_GAP: Pixels = px(4.0);
@@ -329,7 +331,7 @@ pub const MODAL_LIST_SCROLLBAR_GAP: Pixels = px(4.0);
 pub const MODAL_ROW_RADIUS: f32 = 7.0;
 /// Background tint marking the currently-connected row in the modal list.
 #[must_use]
-pub fn modal_row_active_bg(theme: &Theme) -> u32 {
+pub fn modal_row_active_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_soft()
 }
 /// Text size of a connection-list row's name.
@@ -376,19 +378,19 @@ pub const CONNECTION_FORM_RESULT_TEXT_SIZE: f32 = 12.0;
 
 /// Background wash for the Test button's "connected" result banner.
 #[must_use]
-pub fn connection_test_ok_bg(theme: &Theme) -> u32 {
+pub fn connection_test_ok_bg(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.accent, 0x1f)
 }
 
 /// Background wash for the Test button's failure result banner.
 #[must_use]
-pub fn connection_test_error_bg(theme: &Theme) -> u32 {
+pub fn connection_test_error_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.error_wash()
 }
 
 /// Background wash for the Test button's pending result banner.
 #[must_use]
-pub fn connection_test_pending_bg(theme: &Theme) -> u32 {
+pub fn connection_test_pending_bg(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.status_warn, 0x1f)
 }
 
@@ -416,7 +418,7 @@ pub const VALUE_PANEL_TREE_INDENT: f32 = 14.0;
 /// Text color of a disabled mode-switcher button (JSON Tree/Pretty while a
 /// json/jsonb cell has failed to parse or has not been fully loaded yet).
 #[must_use]
-pub fn value_panel_disabled_button_text(theme: &Theme) -> u32 {
+pub fn value_panel_disabled_button_text(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.text_tertiary, 0x80)
 }
 
@@ -467,7 +469,7 @@ pub const SCHEMA_BADGE_RADIUS: f32 = 4.0;
 /// Border color of the primary-key badge: the accent at a badge-strength
 /// alpha distinct from [`zsql_ui::theme::Colors::accent_outline`]'s.
 #[must_use]
-pub fn schema_badge_pk_border(theme: &Theme) -> u32 {
+pub fn schema_badge_pk_border(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.accent, 0x52)
 }
 
@@ -613,19 +615,19 @@ mod tests {
         // was theme::STATUS_DISCONNECTED.
         assert_eq!(status_disconnected(&theme), 0xe2_6d_78);
         // was theme::SIDEBAR_SELECTED_BG.
-        assert_eq!(sidebar_selected_bg(&theme), 0x33_c2_ac_1a);
+        assert_eq!(sidebar_selected_bg(&theme), gpui::rgba(0x33_c2_ac_1a));
         // was theme::GENERATED_STRIP_BG.
-        assert_eq!(generated_strip_bg(&theme), 0x33_c2_ac_0b);
+        assert_eq!(generated_strip_bg(&theme), gpui::rgba(0x33_c2_ac_0b));
         // was theme::GENERATED_STRIP_ACCENT (colors::TEAL_DIM).
         assert_eq!(generated_strip_accent(&theme), 0x2b_85_79);
         // was theme::SCHEMA_BADGE_PK_BORDER.
-        assert_eq!(schema_badge_pk_border(&theme), 0x33_c2_ac_52);
+        assert_eq!(schema_badge_pk_border(&theme), gpui::rgba(0x33_c2_ac_52));
         // was theme::RUN_BUTTON_HOVER_BG.
         assert_eq!(run_button_hover_bg(&theme), 0x46_cf_ba);
         // was theme::RUN_BUTTON_HINT.
-        assert_eq!(run_button_hint(&theme), 0x10_12_17_b3);
+        assert_eq!(run_button_hint(&theme), gpui::rgba(0x10_12_17_b3));
         // was theme::MODAL_ROW_ACTIVE_BG.
-        assert_eq!(modal_row_active_bg(&theme), 0x33_c2_ac_17);
+        assert_eq!(modal_row_active_bg(&theme), gpui::rgba(0x33_c2_ac_17));
     }
 
     /// The disabled Run button fill must be a dimmer shade of the accent,

@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use gpui::{
     Context, Div, ElementId, Entity, FocusHandle, MouseButton, Pixels, Render, SharedString,
-    UniformList, UniformListScrollHandle, div, prelude::*, rgb, rgba, uniform_list,
+    UniformList, UniformListScrollHandle, div, prelude::*, rgb, uniform_list,
 };
 
 use crate::scrollable::restrict_wheel_to_own_axis;
@@ -365,9 +365,9 @@ fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_
         if ctx.selectable {
             if ctx.focused_cell == Some((row_index, cell_index)) {
                 shell = shell
-                    .bg(rgba(style.selection_wash))
+                    .bg(style.selection_wash)
                     .border_1()
-                    .border_color(rgba(style.selection_ring));
+                    .border_color(style.selection_ring);
             }
             let cell_id = SharedString::from(format!(
                 "zsql-ui-table-cell-{row_index}-{cell_index}-{}",

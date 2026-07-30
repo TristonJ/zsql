@@ -10,7 +10,7 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, Context, CursorStyle, Div, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Stateful, Window, div, prelude::*,
-    px, rgb, rgba,
+    px, rgb,
 };
 
 use super::builder::{cell_content, cell_frame, cell_shell};
@@ -138,7 +138,7 @@ fn build_resize_handle(
         .right(px(-(f32::from(COLUMN_RESIZE_HANDLE_WIDTH) / 2.0)))
         .w(COLUMN_RESIZE_HANDLE_WIDTH)
         .cursor(CursorStyle::ResizeLeftRight)
-        .hover(|el| el.bg(rgba(style.selection_ring)))
+        .hover(|el| el.bg(style.selection_ring))
         .on_mouse_down(
             MouseButton::Left,
             begin_resize_listener(index, width, state),

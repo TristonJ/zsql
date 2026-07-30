@@ -7,14 +7,17 @@
 //! sort headers and pager already go inert for a detached tab.
 
 use gpui::{
-    Context, Div, Entity, Focusable, SharedString, Stateful, Window, div, prelude::*, px, rgb, rgba,
+    Context, Div, Entity, Focusable, SharedString, Stateful, Window, deferred, div, prelude::*, px,
+    rems, rgb,
 };
 use zsql_core::{
     ColumnMeta, FilterCondition, FilterConditionId, FilterConnector, FilterOperator,
     FilterValueRender,
 };
-use zsql_ui::text_field::{TextFieldEvent, TextFieldState};
+use zsql_ui::icon::{IconName, icon};
+use zsql_ui::text_field::{TextFieldEvent, TextFieldState, TextFieldStyle};
 use zsql_ui::theme::ActiveTheme;
+use zsql_ui::utils::OnHoverState;
 
 use super::ResultsView;
 use super::pager::PreviewAction;
@@ -41,11 +44,7 @@ impl ResultsView {
     /// chip if one is open, and the "+ filter"/"clear all" controls. Every
     /// interactive part is disabled while [`ResultsView::preview`] is
     /// `None` -- the active tab is not a live, unedited generated preview.
-    pub(super) fn render_filter_bar(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    pub(super) fn render_filter_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let active_theme = cx.theme().clone();
         let colors = active_theme.colors;
         let interactive = self.preview.is_some();
@@ -70,6 +69,7 @@ impl ResultsView {
             .flex_shrink_0()
             .min_h(app_theme::FILTER_BAR_MIN_HEIGHT)
             .gap(app_theme::FILTER_BAR_GAP)
+            .w_full()
             .px_3()
             .py_1()
             .bg(rgb(colors.bg_panel))
@@ -121,13 +121,21 @@ impl ResultsView {
             bar = bar.child(self.render_filter_editor(&active_theme, cx));
         }
 
-        bar = bar.child(self.render_add_filter_area(interactive, &columns, &active_theme, cx));
+        bar = bar.child(self.render_add_filter_area(
+            interactive,
+            &columns,
+            &active_theme,
+            window,
+            cx,
+        ));
 
         if !conditions.is_empty() {
             bar = bar.child(Self::render_clear_all_control(
                 interactive,
                 &active_theme,
                 dispatch,
+                window,
+                cx,
             ));
         }
 
@@ -184,8 +192,15 @@ impl ResultsView {
                 }));
         }
 
+        let icon = icon(
+            IconName::Close,
+            app_theme::FILTER_CHIP_REMOVE_ICON_SIZE,
+            colors.text_tertiary,
+        );
+
         let remove = div()
             .id(SharedString::from(format!("filter-chip-remove-{id}")))
+            .group(format!("filter-chip-remove-{id}"))
             .w(app_theme::FILTER_CHIP_REMOVE_SIZE)
             .h(app_theme::FILTER_CHIP_REMOVE_SIZE)
             .flex()
@@ -193,8 +208,12 @@ impl ResultsView {
             .justify_center()
             .rounded(px(app_theme::FILTER_CHIP_REMOVE_RADIUS))
             .text_color(rgb(colors.text_tertiary));
+
         let remove = if let Some(dispatch) = dispatch {
             remove
+                .child(icon.group_hover(format!("filter-chip-remove-{id}"), |el| {
+                    el.text_color(rgb(colors.status_error))
+                }))
                 .cursor_pointer()
                 .hover(|el| el.text_color(rgb(colors.status_error)))
                 .on_click(move |_event, _window, cx| {
@@ -202,7 +221,9 @@ impl ResultsView {
                     dispatch(PreviewAction::RemoveFilter(id), cx);
                 })
         } else {
-            remove.opacity(app_theme::PAGER_DISABLED_OPACITY)
+            remove
+                .child(icon)
+                .opacity(app_theme::PAGER_DISABLED_OPACITY)
         };
 
         chip.child(remove)
@@ -226,7 +247,7 @@ impl ResultsView {
                         .px(app_theme::FILTER_FX_TAG_PADDING_X)
                         .rounded(px(app_theme::FILTER_FX_TAG_RADIUS))
                         .border_1()
-                        .border_color(rgb(colors.accent_outline()))
+                        .border_color(colors.accent_outline())
                         .text_color(rgb(colors.accent))
                         .child("fx"),
                 ),
@@ -291,12 +312,14 @@ impl ResultsView {
         interactive: bool,
         columns: &[ColumnMeta],
         active_theme: &zsql_ui::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut wrap = div().relative().child(Self::render_add_filter_control(
             interactive,
             !columns.is_empty(),
             active_theme,
+            window,
             cx,
         ));
         if self.filter_column_picker_open {
@@ -311,6 +334,7 @@ impl ResultsView {
         interactive: bool,
         has_column: bool,
         active_theme: &zsql_ui::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let colors = active_theme.colors;
@@ -332,7 +356,7 @@ impl ResultsView {
         if interactive && has_column {
             control
                 .cursor_pointer()
-                .hover(|el| el.text_color(rgb(colors.text_secondary)))
+                .on_hover_state(window, cx, |el| el.text_color(rgb(colors.text_secondary)))
                 .on_click(cx.listener(|view, _event, window, cx| {
                     view.begin_add_filter(window, cx);
                 }))
@@ -347,7 +371,7 @@ impl ResultsView {
         columns: &[ColumnMeta],
         active_theme: &zsql_ui::theme::Theme,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> impl IntoElement {
         let colors = active_theme.colors;
         let mut menu = div()
             .absolute()
@@ -376,7 +400,7 @@ impl ResultsView {
                 .h(app_theme::FILTER_OP_MENU_ITEM_HEIGHT)
                 .px(app_theme::FILTER_OP_MENU_ITEM_PADDING_X)
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
-                .hover(|el| el.bg(rgba(colors.accent_wash())))
+                .hover(|el| el.bg(colors.accent_wash()))
                 .text_color(rgb(colors.text_primary))
                 .child(column.name.clone())
                 .child(
@@ -391,7 +415,7 @@ impl ResultsView {
             menu = menu.child(item);
         }
 
-        menu
+        deferred(menu)
     }
 
     /// The "clear all" control, shown only while at least one filter is
@@ -400,11 +424,12 @@ impl ResultsView {
         interactive: bool,
         active_theme: &zsql_ui::theme::Theme,
         dispatch: Option<super::pager::PreviewDispatch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let colors = active_theme.colors;
         let control = div()
             .id("filter-clear-all")
-            .ml_auto()
             .flex()
             .items_center()
             .h(app_theme::FILTER_CONTROL_HEIGHT)
@@ -417,7 +442,7 @@ impl ResultsView {
         match (interactive, dispatch) {
             (true, Some(dispatch)) => control
                 .cursor_pointer()
-                .hover(|el| el.text_color(rgb(colors.status_error)))
+                .on_hover_state(window, cx, |el| el.text_color(rgb(colors.status_error)))
                 .on_click(move |_event, _window, cx| {
                     dispatch(PreviewAction::ClearFilters, cx);
                 }),
@@ -453,7 +478,7 @@ impl ResultsView {
             .rounded(px(app_theme::FILTER_CHIP_RADIUS))
             .border_1()
             .border_color(rgb(colors.accent))
-            .bg(rgba(colors.accent_wash_soft()))
+            .bg(colors.accent_wash_soft())
             .child(
                 div()
                     .text_color(rgb(colors.text_primary))
@@ -495,7 +520,10 @@ impl ResultsView {
 
     /// The operator menu, documenting the v0 set exactly (no other operator
     /// is reachable from it): `like`/`ilike` carry their pattern hints.
-    fn render_operator_menu(active_theme: &zsql_ui::theme::Theme, cx: &mut Context<Self>) -> Div {
+    fn render_operator_menu(
+        active_theme: &zsql_ui::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let colors = active_theme.colors;
         let mut menu = div()
             .absolute()
@@ -507,6 +535,7 @@ impl ResultsView {
             .border_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.bg_overlay))
+            .block_mouse_except_scroll()
             .shadow_lg();
 
         for operator in FilterOperator::ALL {
@@ -523,7 +552,7 @@ impl ResultsView {
                 .h(app_theme::FILTER_OP_MENU_ITEM_HEIGHT)
                 .px(app_theme::FILTER_OP_MENU_ITEM_PADDING_X)
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
-                .hover(|el| el.bg(rgba(colors.accent_wash())))
+                .hover(|el| el.bg(colors.accent_wash()))
                 .text_color(rgb(colors.text_primary))
                 .child(
                     div()
@@ -546,7 +575,7 @@ impl ResultsView {
             menu = menu.child(item);
         }
 
-        menu
+        deferred(menu)
     }
 
     /// Toggle the column picker open, so the next click picks which column
@@ -622,7 +651,14 @@ impl ResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let value_field = cx.new(|cx| TextFieldState::new("value", Some(value), cx));
+        let value_field = cx.new(|cx| {
+            TextFieldState::new("value", Some(value), cx).style(TextFieldStyle {
+                height: app_theme::FILTER_CHIP_HEIGHT,
+                padding_y: px(0.0),
+                border_w: px(0.0),
+                ..Default::default()
+            })
+        });
         cx.subscribe(&value_field, |view, _field, event, cx| {
             if matches!(event, TextFieldEvent::Submit) {
                 view.commit_filter_edit(cx);

@@ -407,7 +407,7 @@ impl Render for TextView {
         let font_family: SharedString = active_theme.fonts.data.clone().into();
         let run_font = font(active_theme.fonts.data.clone());
         let base_color = Hsla::from(rgb(colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(active_theme)));
+        let selection_bg = Hsla::from(theme::text_selection_bg(active_theme));
         let selection = self.selection;
         let line_runs: Rc<[Vec<TextRun>]> = lines
             .iter()
@@ -810,7 +810,7 @@ mod tests {
         let theme = Theme::default();
         let run_font = font(theme.fonts.data.clone());
         let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+        let selection_bg = Hsla::from(theme::text_selection_bg(&theme));
 
         let line = "select 1";
         let runs = text_view_line_runs(line, &[], None, &run_font, base, selection_bg, &theme);
@@ -826,7 +826,7 @@ mod tests {
         let theme = Theme::default();
         let run_font = font(theme.fonts.data.clone());
         let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+        let selection_bg = Hsla::from(theme::text_selection_bg(&theme));
 
         // A lowercase e with an acute accent is two bytes, so char index 1 is
         // byte 2: a span over chars 1..3 must start after the whole accented
@@ -861,7 +861,7 @@ mod tests {
         let theme = Theme::default();
         let run_font = font(theme.fonts.data.clone());
         let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+        let selection_bg = Hsla::from(theme::text_selection_bg(&theme));
 
         let line = "select";
         let selection = 2..4;
@@ -900,7 +900,7 @@ mod tests {
         let theme = Theme::default();
         let run_font = font(theme.fonts.data.clone());
         let base = Hsla::from(rgb(theme.colors.text_primary));
-        let selection_bg = Hsla::from(rgb(theme::text_selection_bg(&theme)));
+        let selection_bg = Hsla::from(theme::text_selection_bg(&theme));
 
         // Two touching spans of the same kind must collapse into one run.
         let line = "abcd";
