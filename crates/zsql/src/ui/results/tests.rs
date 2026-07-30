@@ -2089,6 +2089,40 @@ fn begin_add_filter_is_a_noop_with_no_active_preview_controls(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
+fn typing_a_space_into_the_filter_value_editor_inserts_it_instead_of_driving_the_grid(
+    cx: &mut gpui::TestAppContext,
+) {
+    // The grid binds plain keys (space, arrows) on its own key context, and
+    // the filter editors render inside that context: the real keymap must be
+    // registered so this test exercises the contention between the grid's
+    // `space` binding and plain text insertion.
+    cx.update(|cx| {
+        super::init(cx);
+        zsql_ui::text_field::init(cx);
+    });
+    let (controls, _recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("status", "text"), window, cx);
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("a space b");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |view, cx| {
+        assert_eq!(
+            view.filter_editor_value_for_test(cx).as_deref(),
+            Some("a b"),
+            "space must insert text into the focused filter value editor, not fire the grid's \
+             value-panel binding"
+        );
+    });
+}
+
+#[gpui::test]
 fn picking_the_first_column_opens_an_editor_targeting_it(cx: &mut gpui::TestAppContext) {
     let (controls, _recorded) = recording_preview_controls();
     let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));

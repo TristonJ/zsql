@@ -50,20 +50,26 @@ actions!(
     ]
 );
 
+/// The context predicate the grid's bindings match against: the grid's own
+/// context, but never while keyboard focus sits inside a text field (the
+/// filter bar's editors render within the grid's context, and a plain key
+/// like `space` must insert text there rather than drive the grid).
+const BINDING_CONTEXT: &str = "ResultsGrid && !TextField";
+
 /// Register the results grid's and value panel's key bindings. Call once at
 /// startup, before any window that hosts a [`ResultsView`] is opened.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("secondary-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("up", CellUp, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", CellDown, Some(KEY_CONTEXT)),
-        KeyBinding::new("left", CellLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("right", CellRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("space", ToggleValuePanel, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", CloseValuePanel, Some(KEY_CONTEXT)),
-        KeyBinding::new("tab", FocusValuePanel, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-[", PrevPage, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-]", NextPage, Some(KEY_CONTEXT)),
+        KeyBinding::new("secondary-c", Copy, Some(BINDING_CONTEXT)),
+        KeyBinding::new("up", CellUp, Some(BINDING_CONTEXT)),
+        KeyBinding::new("down", CellDown, Some(BINDING_CONTEXT)),
+        KeyBinding::new("left", CellLeft, Some(BINDING_CONTEXT)),
+        KeyBinding::new("right", CellRight, Some(BINDING_CONTEXT)),
+        KeyBinding::new("space", ToggleValuePanel, Some(BINDING_CONTEXT)),
+        KeyBinding::new("escape", CloseValuePanel, Some(BINDING_CONTEXT)),
+        KeyBinding::new("tab", FocusValuePanel, Some(BINDING_CONTEXT)),
+        KeyBinding::new("ctrl-[", PrevPage, Some(BINDING_CONTEXT)),
+        KeyBinding::new("ctrl-]", NextPage, Some(BINDING_CONTEXT)),
     ]);
     value_panel::init(cx);
 }
