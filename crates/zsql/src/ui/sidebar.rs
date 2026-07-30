@@ -981,7 +981,7 @@ mod render_tests {
     use super::{SidebarPlaceholder, SidebarView, qualified_relation_name, sidebar_placeholder};
     use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
-    use crate::ui::tabs::TabModel;
+    use crate::ui::tabs::{ResultsChanged, TabModel};
 
     /// A `Connection` double whose `introspect` hands back a fixed,
     /// distinctively-named tree, so a test can tell a fresh introspection
@@ -1270,6 +1270,18 @@ mod render_tests {
         let session_for_results = session.clone();
         let results = cx.new(|cx| ResultsView::new(session_for_results, "", cx));
         let tabs = cx.new(|cx| TabModel::new(session.clone(), cx));
+        // Mirror the workspace's wiring: the results view learns what to
+        // show from the tab model's events, not from the model directly.
+        let results_for_events = results.clone();
+        cx.update(|cx| {
+            cx.subscribe(&tabs, move |_tabs, evt: &ResultsChanged, cx| {
+                results_for_events.update(cx, |results, cx| match evt {
+                    ResultsChanged::Live(label) => results.show_live(label, cx),
+                    ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
+                });
+            })
+            .detach();
+        });
         let tabs_for_view = tabs.clone();
         let (sidebar, vcx) =
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));

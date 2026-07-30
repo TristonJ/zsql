@@ -137,16 +137,6 @@ impl WorkspaceView {
             results.configure_value_panel(cx, &layout, value_panel);
         });
         let tabs = cx.new(|cx| TabModel::new(session.clone(), cx));
-        // Every workspace opens with one empty script tab so the editor
-        // pane is never blank; `TabModel::new` itself stays tab-less so its
-        // own constructor never has to call back into an entity that has
-        // not finished being built yet. A connection tracked as active by
-        // the time this workspace is built (never true today, since
-        // `connection_store` carries no notion of "last connected") would
-        // otherwise leave this default tab in place until the next switch.
-        tabs.update(cx, |tabs, cx| {
-            tabs.new_script_tab(cx);
-        });
 
         let sidebar = cx.new(|cx| SidebarView::new(session.clone(), tabs.clone(), cx));
         let connections = cx.new(|cx| {
@@ -168,6 +158,12 @@ impl WorkspaceView {
         });
 
         Self::subscribe_to_tab_events(&tabs, &results, &footer, cx);
+
+        // Every workspace opens with one empty script tab so the editor
+        // pane is never blank
+        tabs.update(cx, |tabs, cx| {
+            tabs.new_script_tab(cx);
+        });
 
         let sidebar_width = layout.sidebar_default_width;
         let editor_height = layout.editor_default_height;
@@ -251,7 +247,7 @@ impl WorkspaceView {
         cx.subscribe(tabs, move |_v, _tabs, evt: &PreviewControlsChanged, cx| {
             preview_results.update(cx, |results, cx| {
                 results.set_preview_controls(evt.0.clone(), cx);
-            })
+            });
         })
         .detach();
         let changed_footer = footer.clone();
@@ -259,7 +255,7 @@ impl WorkspaceView {
             changed_footer.update(cx, |footer, cx| match evt {
                 ResultsChanged::Live(_) => footer.set_result_snapshot(None, cx),
                 ResultsChanged::Snapshot(snap) => {
-                    footer.set_result_snapshot(Some(snap.clone()), cx)
+                    footer.set_result_snapshot(Some(snap.clone()), cx);
                 }
             });
         })
@@ -268,7 +264,7 @@ impl WorkspaceView {
         cx.subscribe(tabs, move |_v, _tabs, evt: &PreviewControlsChanged, cx| {
             preview_footer.update(cx, |footer, cx| {
                 footer.set_row_count(evt.0.as_ref().and_then(|c| c.state.total_rows()), cx);
-            })
+            });
         })
         .detach();
     }

@@ -268,7 +268,6 @@ impl ConnectionFooterView {
             .text_color(rgb(cx.theme().colors.text_secondary));
         let state = self.effective_state(cx);
         let result = self.effective_result(cx);
-        let live_state = self.session.read(cx).state();
         let error_message = match state {
             SessionState::Error(message) => Some(message.clone()),
             _ => None,
@@ -342,10 +341,8 @@ fn status_dot_color(state: &SessionState, liveness: &LivenessState, active_theme
     match state {
         SessionState::Empty => colors.text_tertiary,
         SessionState::Connecting => colors.status_warn,
-        SessionState::Connected | SessionState::Results(_) => colors.accent,
-        SessionState::Running => colors.accent,
-        SessionState::Truncating { .. } => colors.status_limited,
-        SessionState::Truncated { .. } => colors.status_limited,
+        SessionState::Connected | SessionState::Results(_) | SessionState::Running => colors.accent,
+        SessionState::Truncating { .. } | SessionState::Truncated { .. } => colors.status_limited,
         SessionState::Error(_) => colors.status_error,
     }
 }
@@ -364,8 +361,9 @@ fn query_messages(state: &SessionState, count: usize, unit: &str) -> Vec<String>
             format!("Result limited to {count} {unit} ({rows} total)"),
             format!("{} ms", elapsed.as_millis()),
         ],
-        SessionState::Running => vec![format!("Running...")],
-        SessionState::Truncating { .. } => vec![format!("Running...")],
+        SessionState::Running | SessionState::Truncating { .. } => {
+            vec!["Running...".to_owned()]
+        }
         _ => vec![],
     }
 }
@@ -555,7 +553,15 @@ mod tests {
                     cx,
                 )
             });
-            ConnectionFooterView::new(session, connections, cx)
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
         });
         vcx.run_until_parked();
 
@@ -589,7 +595,15 @@ mod tests {
                     cx,
                 )
             });
-            ConnectionFooterView::new(session, connections, cx)
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
         });
         vcx.run_until_parked();
 
@@ -602,5 +616,50 @@ mod tests {
                 "the footer must keep reflecting the session's Connecting state"
             );
         });
+    }
+
+    #[test]
+    fn format_total_row_count_renders_nothing_when_absent() {
+        assert_eq!(super::format_total_row_count(None), None);
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_exact_count_with_thousands_separators() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(1_234))),
+            Some("1,234 total".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_renders_an_estimated_count_marked_distinctly() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Estimated(1_234_567))),
+            Some("~1,234,567 total (estimated)".to_owned())
+        );
+    }
+
+    #[test]
+    fn format_total_row_count_labels_the_total_distinctly_from_the_streamed_rows_metric() {
+        // The streamed-rows metric reads "N rows"; the total must not, or the
+        // two segments are indistinguishable in the status bar.
+        let exact = super::format_total_row_count(Some(zsql_core::RowCount::Exact(1_234))).unwrap();
+        let estimated =
+            super::format_total_row_count(Some(zsql_core::RowCount::Estimated(1_234))).unwrap();
+        assert!(!exact.ends_with(" rows"));
+        assert!(exact.contains("total"));
+        assert!(estimated.contains("total"));
+    }
+
+    #[test]
+    fn format_total_row_count_handles_small_counts_with_no_separator_needed() {
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(7))),
+            Some("7 total".to_owned())
+        );
+        assert_eq!(
+            super::format_total_row_count(Some(zsql_core::RowCount::Exact(0))),
+            Some("0 total".to_owned())
+        );
     }
 }
