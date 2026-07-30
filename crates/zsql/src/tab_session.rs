@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use zsql_core::preview_state::PreviewQueryState;
 
 use crate::ui::connections::ActiveConnection;
 
@@ -51,29 +52,33 @@ impl ConnectionKey {
 }
 
 /// What kind of tab a persisted entry was, mirroring `ui::tabs::TabKind`
-/// without any of its gpui state.
+/// without any of its gpui state. Only a `Script` or a live (never-edited)
+/// `Generated` tab is ever persisted this way -- `ui::tabs::TabModel`
+/// converts a generated tab to a script the moment it is first edited, so
+/// there is no "edited generated" state for this shape to represent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabEntryKind {
-    /// A normal, freely-editable script buffer.
-    Script,
-    /// Auto-generated preview SQL for `schema.relation`. `edited` is `true`
-    /// once the buffer received a manual edit -- such an entry restores as
-    /// [`TabEntryKind::Script`] instead, consistent with the live
-    /// generated-to-script conversion `ui::tabs::TabModel` performs on first
-    /// edit.
+    /// A normal, freely-editable script buffer, carrying its full text as
+    /// last saved.
+    Script { buffer_text: String },
+    /// Auto-generated preview SQL for `schema.relation`, entirely defined by
+    /// `preview_state`'s sort, page, and filters. No buffer text is stored:
+    /// restoring this entry regenerates its SQL from `preview_state` via the
+    /// same windowed query builder a live sort, page, or filter change uses,
+    /// so the restored buffer and controls can never disagree.
     Generated {
         schema: String,
         relation: String,
-        edited: bool,
+        preview_state: PreviewQueryState,
     },
 }
 
-/// One persisted tab: its kind, display title, and full buffer text.
+/// One persisted tab: its kind (carrying whatever payload that kind needs)
+/// and its display title.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabEntrySnapshot {
     pub kind: TabEntryKind,
     pub title: String,
-    pub buffer_text: String,
 }
 
 /// A connection's entire open-tab state: every tab in order, and which one
@@ -393,21 +398,23 @@ mod tests {
     }
 
     fn sample_snapshot() -> TabSessionSnapshot {
+        use zsql_core::preview_state::PreviewQueryState;
+
         TabSessionSnapshot {
             tabs: vec![
                 TabEntrySnapshot {
                     kind: TabEntryKind::Generated {
                         schema: "public".to_owned(),
                         relation: "orders".to_owned(),
-                        edited: false,
+                        preview_state: PreviewQueryState::new(200),
                     },
                     title: "orders".to_owned(),
-                    buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200".to_owned(),
                 },
                 TabEntrySnapshot {
-                    kind: TabEntryKind::Script,
+                    kind: TabEntryKind::Script {
+                        buffer_text: "select 1;\nselect 2;\n".to_owned(),
+                    },
                     title: "query-1.sql".to_owned(),
-                    buffer_text: "select 1;\nselect 2;\n".to_owned(),
                 },
             ],
             active_index: Some(1),
@@ -442,9 +449,10 @@ mod tests {
         let snapshot_a = sample_snapshot();
         let snapshot_b = TabSessionSnapshot {
             tabs: vec![TabEntrySnapshot {
-                kind: TabEntryKind::Script,
+                kind: TabEntryKind::Script {
+                    buffer_text: "select 'b';".to_owned(),
+                },
                 title: "query-1.sql".to_owned(),
-                buffer_text: "select 'b';".to_owned(),
             }],
             active_index: Some(0),
         };
@@ -489,9 +497,10 @@ mod tests {
         let temp = TempStorePath::new("unsaved-vs-saved");
         let unsaved_snapshot = TabSessionSnapshot {
             tabs: vec![TabEntrySnapshot {
-                kind: TabEntryKind::Script,
+                kind: TabEntryKind::Script {
+                    buffer_text: "select 'fallback';".to_owned(),
+                },
                 title: "query-1.sql".to_owned(),
-                buffer_text: "select 'fallback';".to_owned(),
             }],
             active_index: Some(0),
         };
@@ -539,6 +548,38 @@ mod tests {
         assert!(
             matches!(result, Err(TabSessionStoreError::Serde(_))),
             "a corrupt store file must surface as a Serde error, got {result:?}"
+        );
+    }
+
+    /// A store file carrying a top-level `buffer_text` on every entry and an
+    /// `edited` flag on `Generated` -- an on-disk shape this build does not
+    /// accept -- is not specially migrated: it fails to parse against the
+    /// current shape and surfaces the same way any other corrupt file does,
+    /// letting the existing fallback-to-default handling take over.
+    #[test]
+    fn loading_an_old_format_store_file_surfaces_as_a_serde_error() {
+        let temp = TempStorePath::new("old-format");
+        let old_format = r#"{
+            "connections": {
+                "saved:conn-a": {
+                    "tabs": [
+                        {
+                            "kind": "Script",
+                            "title": "query-1.sql",
+                            "buffer_text": "select 1;"
+                        }
+                    ],
+                    "active_index": 0
+                }
+            }
+        }"#;
+        std::fs::write(&temp.0, old_format).expect("must write the old-format fixture");
+
+        let result = load_snapshot(&temp.0, &ConnectionKey::Saved("conn-a".to_owned()));
+
+        assert!(
+            matches!(result, Err(TabSessionStoreError::Serde(_))),
+            "an old-format store file must surface as a Serde error, got {result:?}"
         );
     }
 
@@ -600,9 +641,10 @@ mod store_tests {
         TabSessionSnapshot {
             tabs: (0..count)
                 .map(|i| TabEntrySnapshot {
-                    kind: TabEntryKind::Script,
+                    kind: TabEntryKind::Script {
+                        buffer_text: format!("select {i};"),
+                    },
                     title: format!("query-{i}.sql"),
-                    buffer_text: format!("select {i};"),
                 })
                 .collect(),
             active_index: if count == 0 { None } else { Some(0) },

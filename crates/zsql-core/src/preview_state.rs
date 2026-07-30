@@ -5,24 +5,36 @@
 //! future preview-shaping ticket (e.g. filtering) and testable without a
 //! window or a live database.
 
+use serde::{Deserialize, Serialize};
+
 use crate::RowCount;
 use crate::filter::{FilterConditionId, FilterOperator, FilterState};
 use crate::sql::SortDirection;
 
 /// One generated preview's current sort column, direction, page, page size,
 /// filter conditions, and (once known) the relation's total row count.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The sort, page, and filters define the query window and are persisted by
+/// this type's `Serialize`/`Deserialize` impls; the row counts below are
+/// volatile results of the last fetch against a live connection, so they are
+/// never part of the persisted representation -- a deserialized value always
+/// reports both as unknown (`None`), regardless of what a hand-edited or
+/// stale source document might contain for them, ready for the count path
+/// that produced them originally to refetch on the next run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewQueryState {
     sort_column: Option<String>,
     sort_direction: SortDirection,
     page: u64,
     page_size: u64,
+    #[serde(skip)]
     total_rows: Option<RowCount>,
     /// The relation's total row count with no filter applied, last observed
     /// while [`PreviewQueryState::filters`] was empty. Kept distinct from
     /// [`PreviewQueryState::total_rows`] (which tracks whatever is currently
     /// active, filtered or not) so a renderer can show "N filtered of
     /// TOTAL" once a filter narrows the result.
+    #[serde(skip)]
     base_total_rows: Option<RowCount>,
     filters: FilterState,
 }
@@ -127,6 +139,18 @@ impl PreviewQueryState {
     #[must_use]
     pub fn offset(&self) -> u64 {
         (self.page - 1) * self.page_size
+    }
+
+    /// Clear both row-count fields back to unknown outright, independent of
+    /// [`PreviewQueryState::filters`] and of whichever value either field
+    /// currently holds. A tab restored from a snapshot -- whether read back
+    /// from disk (where `#[serde(skip)]` already keeps these fields out of
+    /// the file) or handed an in-memory cached snapshot directly (where no
+    /// serialization ever runs) -- calls this so both paths leave identical,
+    /// unresolved totals for the next run's count path to refill.
+    pub fn clear_resolved_totals(&mut self) {
+        self.total_rows = None;
+        self.base_total_rows = None;
     }
 
     /// The last page number, derived from [`PreviewQueryState::total_rows`]
@@ -706,5 +730,60 @@ mod tests {
         assert!(!state.total_is_estimated());
         state.set_total_rows(Some(RowCount::Estimated(10)));
         assert!(state.total_is_estimated());
+    }
+
+    // -- serde round-trips ----------------------------------------------------
+
+    #[test]
+    fn sort_page_and_filters_round_trip_through_json() {
+        let mut state = PreviewQueryState::new(500);
+        state.toggle_sort("total_cents");
+        state.add_filter("status", "text", FilterOperator::Eq, "paid");
+        state.next_page();
+        state.next_page();
+
+        let text = serde_json::to_string(&state).expect("must serialize");
+        let parsed: PreviewQueryState = serde_json::from_str(&text).expect("must parse back");
+
+        assert_eq!(parsed, state);
+    }
+
+    #[test]
+    fn total_rows_and_base_total_rows_never_survive_a_round_trip() {
+        let mut state = PreviewQueryState::new(200);
+        state.set_total_rows(Some(RowCount::Exact(12_480)));
+        assert_eq!(state.total_rows(), Some(RowCount::Exact(12_480)));
+
+        let text = serde_json::to_string(&state).expect("must serialize");
+        assert!(
+            !text.contains("12480") && !text.contains("total_rows"),
+            "row counts must never appear in the persisted representation: {text}"
+        );
+
+        let parsed: PreviewQueryState = serde_json::from_str(&text).expect("must parse back");
+        assert_eq!(parsed.total_rows(), None);
+        assert_eq!(parsed.base_total_rows(), None);
+    }
+
+    #[test]
+    fn a_hand_edited_document_carrying_total_rows_is_still_ignored_on_load() {
+        // Even if a source document (e.g. hand-edited, or from a future
+        // format) carries a total_rows-shaped field, it must never resurface
+        // on the parsed value: the count path that resolved it originally is
+        // the only source of truth, refetched on the next run.
+        let text = r#"{
+            "sort_column": null,
+            "sort_direction": "Asc",
+            "page": 1,
+            "page_size": 200,
+            "total_rows": {"Exact": 999},
+            "base_total_rows": {"Exact": 999},
+            "filters": {"conditions": [], "connectors": [], "next_id": 0}
+        }"#;
+
+        let parsed: PreviewQueryState = serde_json::from_str(text).expect("must parse back");
+
+        assert_eq!(parsed.total_rows(), None);
+        assert_eq!(parsed.base_total_rows(), None);
     }
 }
