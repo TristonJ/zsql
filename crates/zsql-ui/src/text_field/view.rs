@@ -8,15 +8,17 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
-    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun,
-    UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px, relative, rgb,
+    InspectorElementId, IsZero, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px,
+    relative, rgb,
 };
 
 use crate::text_field::model::{
     BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_for_char_count, char_count_before,
     should_show_placeholder,
 };
+use crate::text_field::scroll;
 use crate::text_field::theme;
 use crate::text_input::{self, TextSource};
 use crate::theme::ActiveTheme;
@@ -117,6 +119,17 @@ pub struct TextFieldState {
     last_line: Option<ShapedLine>,
     /// The content element's bounds from the most recent paint.
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the content is scrolled left, in pixels, so text and the
+    /// caret past the field's right edge stay reachable. Zero whenever the
+    /// content fits the field; re-clamped every paint against the field's
+    /// current content and viewport widths, so it never goes stale.
+    scroll_offset: Pixels,
+    /// The cursor byte offset as of the last paint that nudged
+    /// `scroll_offset` to keep it visible. Lets the caret-follow nudge run
+    /// only when the cursor actually moved since then, rather than on every
+    /// repaint -- otherwise it would immediately re-snap a wheel-scrolled
+    /// offset back to the caret on the very next frame.
+    last_followed_cursor: Option<usize>,
     /// Style options for the text field
     style: TextFieldStyle,
 }
@@ -169,6 +182,8 @@ impl TextFieldState {
             focused: false,
             last_line: None,
             last_bounds: None,
+            scroll_offset: Pixels::ZERO,
+            last_followed_cursor: None,
             style: TextFieldStyle::default(),
         };
         Self::spawn_blink_loop(cx);
@@ -250,6 +265,11 @@ impl TextFieldState {
     /// Any keydown pauses blinking (forces the caret solid) and repaints.
     fn note_keystroke(&mut self, cx: &mut Context<Self>) {
         self.blink.on_keystroke();
+        // An explicit keystroke always re-follows the caret, even when the
+        // cursor's offset did not change (End while already at the end, Home
+        // at offset 0): a prior wheel scroll may have moved the viewport
+        // away, and the keystroke's intent is to look at the caret.
+        self.last_followed_cursor = None;
         cx.notify();
     }
 
@@ -395,20 +415,75 @@ impl TextFieldState {
     }
 
     /// The byte offset into the real content under `point`, using the most
-    /// recent paint's shaped line and bounds. `None` before the first paint.
-    /// When masked, the shaped line is the masked display string, so its
-    /// hit-tested index is converted back to a content byte offset via
-    /// [`byte_offset_for_char_count`].
+    /// recent paint's shaped line and bounds, corrected for the field's
+    /// current scroll offset so a scrolled field's visible pixel positions
+    /// resolve to the character actually under the pointer. `None` before
+    /// the first paint. When masked, the shaped line is the masked display
+    /// string, so its hit-tested index is converted back to a content byte
+    /// offset via [`byte_offset_for_char_count`].
     fn byte_offset_for_point(&self, point: Point<Pixels>) -> Option<usize> {
         let bounds = self.last_bounds?;
         let line = self.last_line.as_ref()?;
-        let x = (point.x - bounds.left()).max(Pixels::ZERO);
+        let x = (point.x - bounds.left() + self.scroll_offset).max(Pixels::ZERO);
         let display_index = line.closest_index_for_x(x);
         Some(if self.masked {
             byte_offset_for_char_count(self.model.text(), display_index)
         } else {
             display_index
         })
+    }
+
+    // -- wheel -------------------------------------------------------------
+
+    /// The horizontal component of a wheel gesture over the field: a native
+    /// horizontal delta (trackpad swipe) always pans it; a plain vertical
+    /// delta only does when shift is held, so a bare wheel notch over a
+    /// field embedded in a scrollable page still scrolls the page.
+    fn wheel_delta_x(event: &ScrollWheelEvent, window: &Window) -> Pixels {
+        let delta = event.delta.pixel_delta(window.line_height());
+        if !delta.x.is_zero() {
+            delta.x
+        } else if event.modifiers.shift {
+            delta.y
+        } else {
+            Pixels::ZERO
+        }
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let Some(line) = self.last_line.as_ref() else {
+            return;
+        };
+
+        let delta_x = Self::wheel_delta_x(event, window);
+        if delta_x.is_zero() {
+            return;
+        }
+
+        let max_offset = scroll::max_scroll_offset(line.width, bounds.size.width);
+        if max_offset <= Pixels::ZERO {
+            return;
+        }
+
+        let new_offset = scroll::clamp_scroll_offset(
+            self.scroll_offset - delta_x,
+            line.width,
+            bounds.size.width,
+        );
+        if new_offset == self.scroll_offset {
+            return;
+        }
+
+        self.scroll_offset = new_offset;
+        cx.notify();
     }
 }
 
@@ -520,6 +595,7 @@ impl Render for TextFieldState {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(TextFieldContentElement {
                 field: cx.entity(),
                 style: self.style,
@@ -597,13 +673,19 @@ impl EntityInputHandler for TextFieldState {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let lines = self.last_line.as_slice();
-        text_input::bounds_for_range(
+        let bounds = text_input::bounds_for_range(
             self,
             range_utf16,
             element_bounds,
             lines,
             self.style.line_height,
-        )
+        )?;
+        // Shifted by the scroll offset so the IME candidate window anchors
+        // to the caret's actual on-screen position on a scrolled field.
+        Some(Bounds::new(
+            point(bounds.origin.x - self.scroll_offset, bounds.origin.y),
+            bounds.size,
+        ))
     }
 
     fn character_index_for_point(
@@ -629,6 +711,10 @@ struct TextFieldPrepaintState {
     line: ShapedLine,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// The horizontal scroll offset this frame's geometry was computed
+    /// against, so `paint` shifts the shaped line's paint origin to match
+    /// the already-offset cursor and selection quads.
+    scroll_offset: Pixels,
 }
 
 impl IntoElement for TextFieldContentElement {
@@ -674,26 +760,37 @@ impl Element for TextFieldContentElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let theme_colors = cx.theme().colors;
-        let field = self.field.read(cx);
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let font = text_style.font();
 
-        let content = field.model.text();
-        let showing_placeholder = should_show_placeholder(content);
+        // Pulled into owned/copied locals up front so the field's read
+        // borrow ends before this frame's new scroll offset is written back
+        // to it below.
+        let field = self.field.read(cx);
+        let content = field.model.text().to_owned();
+        let showing_placeholder = should_show_placeholder(&content);
+        let masked = field.masked;
+        let placeholder = field.placeholder.clone();
+        let marked_range = field.marked_range.clone();
+        let focused = field.focus_handle.is_focused(window);
+        let blink_visible = field.blink.visible();
+        let cursor_offset = field.model.cursor();
+        let active_selection = field.model.selection();
+        let old_scroll_offset = field.scroll_offset;
+        let cursor_moved = field.last_followed_cursor != Some(cursor_offset);
 
         let (display_text, runs): (SharedString, Vec<TextRun>) = if showing_placeholder {
-            let text = field.placeholder.clone();
             let run = TextRun {
-                len: text.len(),
+                len: placeholder.len(),
                 font: font.clone(),
                 color: rgb(theme_colors.text_secondary).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            (text, vec![run])
-        } else if field.masked {
+            (placeholder, vec![run])
+        } else if masked {
             let text = SharedString::from(MASK_GLYPH.to_string().repeat(content.chars().count()));
             let run = TextRun {
                 len: text.len(),
@@ -705,8 +802,8 @@ impl Element for TextFieldContentElement {
             };
             (text, vec![run])
         } else {
-            let text = SharedString::from(content.to_owned());
-            let runs = build_runs(field, &text, &font, text_style.color);
+            let text = SharedString::from(content.clone());
+            let runs = build_runs(marked_range.as_ref(), &text, &font, text_style.color);
             (text, runs)
         };
 
@@ -714,8 +811,8 @@ impl Element for TextFieldContentElement {
         // unless masked (in which case it is content's char count, since
         // `MASK_GLYPH` is one ASCII byte per char -- see `char_count_before`).
         let display_index = |byte_offset: usize| {
-            if field.masked {
-                char_count_before(content, byte_offset)
+            if masked {
+                char_count_before(&content, byte_offset)
             } else {
                 byte_offset
             }
@@ -725,11 +822,29 @@ impl Element for TextFieldContentElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
-        let cursor = (field.focus_handle.is_focused(window) && field.blink.visible()).then(|| {
-            let x = line.x_for_index(display_index(field.model.cursor()));
+        // Re-clamped every paint against the content just shaped and this
+        // frame's own layout bounds (already resolved by the time
+        // `prepaint` runs, so no measurement lag across frames) so an edit
+        // or a resize never leaves a stale offset. Only nudged to keep the
+        // caret visible when the cursor has actually moved since the last
+        // paint that did so -- otherwise a manual wheel-scroll would be
+        // re-snapped back to the caret on its very next repaint.
+        let caret_x = line.x_for_index(display_index(cursor_offset));
+        let mut scroll_offset =
+            scroll::clamp_scroll_offset(old_scroll_offset, line.width, bounds.size.width);
+        if cursor_moved {
+            scroll_offset =
+                scroll::follow_caret(scroll_offset, caret_x, line.width, bounds.size.width);
+        }
+        self.field.update(cx, |field, _cx| {
+            field.scroll_offset = scroll_offset;
+            field.last_followed_cursor = Some(cursor_offset);
+        });
+
+        let cursor = (focused && blink_visible).then(|| {
             text_input::caret_quad(
                 bounds,
-                x,
+                caret_x - scroll_offset,
                 0,
                 self.style.line_height,
                 self.style.cursor_width,
@@ -737,11 +852,11 @@ impl Element for TextFieldContentElement {
             )
         });
 
-        let selection = field.model.selection().map(|range| {
+        let selection = active_selection.map(|range| {
             let span = text_input::SelectionLineSpan {
                 line_index: 0,
-                start_x: line.x_for_index(display_index(range.start)),
-                end_x: line.x_for_index(display_index(range.end)),
+                start_x: line.x_for_index(display_index(range.start)) - scroll_offset,
+                end_x: line.x_for_index(display_index(range.end)) - scroll_offset,
             };
             text_input::selection_quad(
                 &span,
@@ -755,6 +870,7 @@ impl Element for TextFieldContentElement {
             line,
             cursor,
             selection,
+            scroll_offset,
         }
     }
 
@@ -779,7 +895,7 @@ impl Element for TextFieldContentElement {
             window.paint_quad(quad);
         }
 
-        let origin = point(bounds.left(), bounds.top());
+        let origin = point(bounds.left() - prepaint.scroll_offset, bounds.top());
         prepaint
             .line
             .paint(origin, theme::FIELD_LINE_HEIGHT, window, cx)
@@ -799,7 +915,12 @@ impl Element for TextFieldContentElement {
 
 /// Style runs for the field's displayed text: an underlined run for the
 /// active IME composition (if any), plain runs either side of it.
-fn build_runs(field: &TextFieldState, text: &str, font: &Font, color: Hsla) -> Vec<TextRun> {
+fn build_runs(
+    marked_range: Option<&Range<usize>>,
+    text: &str,
+    font: &Font,
+    color: Hsla,
+) -> Vec<TextRun> {
     let base_run = |len: usize| TextRun {
         len,
         font: font.clone(),
@@ -809,7 +930,7 @@ fn build_runs(field: &TextFieldState, text: &str, font: &Font, color: Hsla) -> V
         strikethrough: None,
     };
 
-    let Some(marked_range) = field.marked_range.as_ref() else {
+    let Some(marked_range) = marked_range else {
         return vec![base_run(text.len())];
     };
 

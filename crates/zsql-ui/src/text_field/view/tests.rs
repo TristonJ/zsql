@@ -1,18 +1,25 @@
 use std::sync::{Arc, Mutex};
 
-use gpui::{Bounds, EntityInputHandler, Modifiers, Pixels, Point, TestAppContext, point};
+use gpui::{
+    Bounds, Context, Entity, EntityInputHandler, IntoElement, Modifiers, Pixels, Point, Render,
+    TestAppContext, VisualTestContext, Window, div, point, prelude::*, px,
+};
 
 use super::{
-    Backspace, Copy, Cut, DeleteForward, MoveEnd, MoveLeft, MoveRight, Paste, SelectAll,
+    Backspace, Copy, Cut, DeleteForward, MoveEnd, MoveHome, MoveLeft, MoveRight, Paste, SelectAll,
     SelectLeft, SelectRight, Submit, TextFieldEvent, TextFieldState,
 };
+use crate::text_field::scroll;
 use crate::text_field::theme;
+use crate::theme::ActiveTheme;
 
 impl TextFieldState {
     /// The pixel point that hit-tests back to `offset`, computed from the
-    /// most recent paint's shaped line and bounds. Lets mouse-handling tests
-    /// drive `on_mouse_down`/`on_mouse_move` with real, paint-derived
-    /// coordinates instead of guessed pixel offsets.
+    /// most recent paint's shaped line and bounds, and corrected for the
+    /// field's current scroll offset. Lets mouse-handling tests drive
+    /// `on_mouse_down`/`on_mouse_move` with real, paint-derived coordinates
+    /// instead of guessed pixel offsets, whether or not the field is
+    /// scrolled.
     ///
     /// # Panics
     ///
@@ -25,8 +32,41 @@ impl TextFieldState {
             .last_line
             .as_ref()
             .expect("a paint must run before computing a point for an offset");
-        point(bounds.left() + line.x_for_index(offset), bounds.top())
+        let x = line.x_for_index(offset) - self.scroll_offset;
+        point(bounds.left() + x, bounds.top())
     }
+}
+
+// -- horizontal scroll test harness -------------------------------------
+
+/// Width of the fixed-width wrapper the horizontal-scroll tests embed a
+/// field in, narrow enough that a moderately long value overflows it.
+const NARROW_FIELD_WIDTH: Pixels = px(150.0);
+
+/// Wraps a `TextFieldState` in a fixed-width container, since the field
+/// itself always fills its parent's width (`w_full`) -- the scroll tests
+/// need a parent narrower than the test window to force real overflow.
+struct NarrowFieldHarness {
+    field: Entity<TextFieldState>,
+}
+
+impl Render for NarrowFieldHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(NARROW_FIELD_WIDTH).child(self.field.clone())
+    }
+}
+
+fn build_narrow_field<'a>(
+    cx: &'a mut TestAppContext,
+    initial_value: Option<&str>,
+) -> (Entity<TextFieldState>, &'a mut VisualTestContext) {
+    let (harness, vcx) = cx.add_window_view(|window, cx| {
+        let field = cx.new(|cx| TextFieldState::new("Search", initial_value, cx));
+        window.focus(&field.read(cx).focus_handle);
+        NarrowFieldHarness { field }
+    });
+    let field = harness.read_with(vcx, |harness, _cx| harness.field.clone());
+    (field, vcx)
 }
 
 fn build_field<'a>(
@@ -128,6 +168,44 @@ fn clicking_a_masked_field_places_the_cursor_at_the_content_offset_not_the_mask_
 
     field.read_with(vcx, |field, _cx| {
         assert_eq!(field.model.cursor(), 4);
+    });
+}
+
+#[gpui::test]
+fn clicking_a_scrolled_masked_field_places_the_cursor_at_the_correct_content_offset(
+    cx: &mut TestAppContext,
+) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    field.update(vcx, |field, cx| field.set_masked(true, cx));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert!(
+            field.scroll_offset > Pixels::ZERO,
+            "the field must be scrolled for this test to be meaningful"
+        );
+    });
+
+    // OVERFLOWING_VALUE is ASCII, so its char count equals its byte offset:
+    // the mask glyph's display index and the content byte offset coincide,
+    // letting the assertion below pin the content offset directly while
+    // still exercising the scroll-offset correction against a masked line.
+    let target_offset = OVERFLOWING_VALUE.len() - 3;
+    let click_point = field.read_with(vcx, |field, _cx| {
+        field.point_for_offset_for_test(target_offset)
+    });
+    vcx.simulate_click(click_point, Modifiers::default());
+    vcx.run_until_parked();
+
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.model.cursor(),
+            target_offset,
+            "a click on a scrolled masked field must resolve to the content byte offset \
+             under the pointer, not the character position it would be at offset 0"
+        );
     });
 }
 
@@ -500,6 +578,51 @@ fn bounds_for_range_returns_correct_geometry(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn bounds_for_range_shifts_by_the_scroll_offset_on_a_scrolled_field(cx: &mut TestAppContext) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    let scroll_offset = field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        scroll_offset > Pixels::ZERO,
+        "the field must be scrolled for this test to be meaningful"
+    );
+
+    let target = OVERFLOWING_VALUE.len() - 4;
+    let bounds = vcx.update(|window, cx| {
+        field.update(cx, |field, cx| {
+            let element_bounds = field.last_bounds.expect("paint must have run");
+            field.bounds_for_range(target..target + 1, element_bounds, window, cx)
+        })
+    });
+
+    field.read_with(vcx, |field, _cx| {
+        let line = field.last_line.as_ref().expect("paint must have run");
+        let element_bounds = field.last_bounds.expect("paint must have run");
+
+        let unshifted_left = element_bounds.left() + line.x_for_index(target);
+        let unshifted_right = element_bounds.left() + line.x_for_index(target + 1);
+        let expected_bounds = Bounds::from_corners(
+            point(unshifted_left - scroll_offset, element_bounds.top()),
+            point(
+                unshifted_right - scroll_offset,
+                element_bounds.top() + theme::FIELD_LINE_HEIGHT,
+            ),
+        );
+
+        assert_eq!(
+            bounds,
+            Some(expected_bounds),
+            "bounds_for_range on a scrolled field must shift the unscrolled bounds left by \
+             the current scroll_offset so the IME candidate window anchors to the caret's \
+             actual on-screen position"
+        );
+    });
+}
+
+#[gpui::test]
 fn unmark_text_clears_the_ime_composition(cx: &mut TestAppContext) {
     let (field, vcx) = build_field(cx, None);
     vcx.update(|window, cx| {
@@ -617,5 +740,487 @@ fn drag_extends_a_selection(cx: &mut TestAppContext) {
 
     field.read_with(vcx, |field, _cx| {
         assert_eq!(field.model.selection(), Some(0..5));
+    });
+}
+
+// -- horizontal scroll ---------------------------------------------------
+
+/// A value long enough to overflow [`NARROW_FIELD_WIDTH`] regardless of
+/// glyph metrics, so the scroll tests exercise a genuinely scrolled field
+/// rather than one whose content still fits.
+const OVERFLOWING_VALUE: &str = "the quick brown fox jumps over the lazy dog, repeatedly";
+
+fn last_content_and_viewport_width(field: &TextFieldState) -> (Pixels, Pixels) {
+    let bounds = field
+        .last_bounds
+        .expect("a paint must have run before measuring widths");
+    let line = field
+        .last_line
+        .as_ref()
+        .expect("a paint must have run before measuring widths");
+    (line.width, bounds.size.width)
+}
+
+#[gpui::test]
+fn typing_past_the_right_edge_keeps_the_caret_visible(cx: &mut TestAppContext) {
+    let (field, vcx) = build_narrow_field(cx, None);
+    vcx.run_until_parked();
+
+    vcx.simulate_input(OVERFLOWING_VALUE);
+    vcx.run_until_parked();
+
+    let (caret_x, viewport_width, offset) = field.read_with(vcx, |field, _cx| {
+        let (content_width, viewport_width) = last_content_and_viewport_width(field);
+        let line = field.last_line.as_ref().expect("paint must have run");
+        let caret_x = line.x_for_index(field.model.cursor()) - field.scroll_offset;
+        assert!(
+            content_width > viewport_width,
+            "the typed value must actually overflow the narrow field for this test to be meaningful"
+        );
+        (caret_x, viewport_width, field.scroll_offset)
+    });
+
+    assert!(
+        caret_x >= Pixels::ZERO && caret_x <= viewport_width,
+        "the caret painted at {caret_x:?} must stay within the field's [0, {viewport_width:?}] viewport"
+    );
+    assert!(
+        offset > Pixels::ZERO,
+        "the field must actually have scrolled to keep the caret visible"
+    );
+}
+
+#[gpui::test]
+fn home_and_end_jump_the_offset_to_the_content_ends(cx: &mut TestAppContext) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    let (offset_at_end, max_offset) = field.read_with(vcx, |field, _cx| {
+        let (content_width, viewport_width) = last_content_and_viewport_width(field);
+        (
+            field.scroll_offset,
+            scroll::max_scroll_offset(content_width, viewport_width),
+        )
+    });
+    assert!(
+        max_offset > Pixels::ZERO,
+        "the field's content must actually overflow for this test to be meaningful"
+    );
+    assert_eq!(
+        offset_at_end, max_offset,
+        "End should scroll the offset to its maximum clamp"
+    );
+
+    vcx.dispatch_action(MoveHome);
+    vcx.run_until_parked();
+    let offset_at_home = field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert_eq!(
+        offset_at_home,
+        Pixels::ZERO,
+        "Home should scroll the offset back to zero"
+    );
+}
+
+#[gpui::test]
+fn clicking_a_visible_position_on_a_scrolled_field_places_the_cursor_at_the_right_offset(
+    cx: &mut TestAppContext,
+) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert!(
+            field.scroll_offset > Pixels::ZERO,
+            "the field must be scrolled for this test to be meaningful"
+        );
+    });
+
+    let target_offset = OVERFLOWING_VALUE.len() - 3;
+    let click_point = field.read_with(vcx, |field, _cx| {
+        field.point_for_offset_for_test(target_offset)
+    });
+    vcx.simulate_click(click_point, Modifiers::default());
+    vcx.run_until_parked();
+
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.model.cursor(),
+            target_offset,
+            "a click on a scrolled field must resolve to the character under the pointer"
+        );
+    });
+}
+
+#[gpui::test]
+fn shift_wheel_scrolls_a_long_value_and_is_a_no_op_on_a_value_that_fits(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    // -- a long value: shift-wheel scrolls it --
+    // The field's initial value places the cursor (and so the caret-follow
+    // offset) at the content's end already, so the wheel gesture below
+    // scrolls back toward the start to exercise a real offset change.
+    let (long_field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+    let offset_before = long_field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        offset_before > Pixels::ZERO,
+        "the field must start scrolled for this test to be meaningful"
+    );
+
+    let bounds = long_field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(40.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+
+    let offset_after = long_field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        offset_after < offset_before,
+        "a shift-held wheel gesture over an overflowing field must scroll it toward the start"
+    );
+
+    // -- a short value that fits: the same gesture is a no-op --
+    let (short_field, vcx) = build_narrow_field(cx, Some("short"));
+    vcx.run_until_parked();
+
+    let short_bounds = short_field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: short_bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+
+    short_field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset,
+            Pixels::ZERO,
+            "a field whose content already fits must not scroll on a shift-held wheel gesture"
+        );
+    });
+}
+
+#[gpui::test]
+fn an_end_or_home_keystroke_re_follows_the_caret_after_a_wheel_scroll_away(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    // The cursor sits at the content's end, so the initial caret-follow
+    // leaves the field scrolled to its maximum offset.
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+    let end_offset = field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(end_offset > Pixels::ZERO);
+
+    let bounds = field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(40.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    assert!(
+        field.read_with(vcx, |field, _cx| field.scroll_offset) < end_offset,
+        "the wheel gesture must have scrolled the viewport away from the caret"
+    );
+
+    // End with the cursor already at the end moves no cursor, but must
+    // still bring the caret back into view.
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset, end_offset,
+            "End must re-follow the caret to the content's end even when the cursor did not move"
+        );
+    });
+
+    // The mirrored case: cursor at the start, wheel toward the end, then
+    // Home with the cursor already at offset 0.
+    vcx.dispatch_action(MoveHome);
+    vcx.run_until_parked();
+    assert_eq!(
+        field.read_with(vcx, |field, _cx| field.scroll_offset),
+        Pixels::ZERO
+    );
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    assert!(field.read_with(vcx, |field, _cx| field.scroll_offset) > Pixels::ZERO);
+    vcx.dispatch_action(MoveHome);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset,
+            Pixels::ZERO,
+            "Home must re-follow the caret to the start even when the cursor did not move"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_wheel_past_the_clamp_boundary_leaves_the_offset_at_its_maximum(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    // Cursor at the end: the field starts saturated at its maximum offset.
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+    let max_offset = field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(max_offset > Pixels::ZERO);
+
+    let bounds = field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+        modifiers: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset, max_offset,
+            "a wheel gesture past the clamp boundary must leave the offset saturated, unchanged"
+        );
+    });
+}
+
+#[gpui::test]
+fn native_horizontal_wheel_scrolls_a_long_value_and_is_a_no_op_on_a_value_that_fits(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    // -- a long value: a native horizontal delta scrolls it, no shift held --
+    let (long_field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+    let offset_before = long_field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        offset_before > Pixels::ZERO,
+        "the field must start scrolled for this test to be meaningful"
+    );
+
+    let bounds = long_field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(40.0), px(0.0))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+
+    let offset_after = long_field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        offset_after < offset_before,
+        "a native horizontal wheel delta over an overflowing field must scroll it toward the \
+         start, matching the sign of a shift-held vertical delta"
+    );
+
+    // -- a short value that fits: the same gesture is a no-op --
+    let (short_field, vcx) = build_narrow_field(cx, Some("short"));
+    vcx.run_until_parked();
+
+    let short_bounds = short_field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: short_bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(-40.0), px(0.0))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+
+    short_field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset,
+            Pixels::ZERO,
+            "a field whose content already fits must not scroll on a native horizontal wheel delta"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_plain_vertical_wheel_over_an_overflowing_field_does_not_scroll_it(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    // No shift held and no horizontal component: this is the bare wheel
+    // notch a field embedded in a scrollable page would receive, and it
+    // must leave the field's own scroll offset untouched so the page (not
+    // the field) is the thing that scrolls.
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+    let offset_before = field.read_with(vcx, |field, _cx| field.scroll_offset);
+    assert!(
+        offset_before > Pixels::ZERO,
+        "the field must start scrolled for this test to be meaningful"
+    );
+
+    let bounds = field.read_with(vcx, |field, _cx| {
+        field.last_bounds.expect("paint must have run")
+    });
+    vcx.simulate_event(ScrollWheelEvent {
+        position: bounds.center(),
+        delta: ScrollDelta::Pixels(point(px(0.0), px(40.0))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset, offset_before,
+            "a plain vertical wheel notch (no shift, no horizontal delta) over an \
+             overflowing field must not change its scroll offset"
+        );
+    });
+}
+
+#[gpui::test]
+fn deleting_most_of_a_scrolled_fields_text_re_clamps_the_offset(cx: &mut TestAppContext) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert!(
+            field.scroll_offset > Pixels::ZERO,
+            "the field must be scrolled for this test to be meaningful"
+        );
+    });
+
+    field.update(vcx, |field, cx| {
+        field.set_value("hi", cx);
+    });
+    vcx.run_until_parked();
+
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.scroll_offset,
+            Pixels::ZERO,
+            "the offset must re-clamp to zero once the remaining content fits, \
+             not show stale trailing blank space"
+        );
+    });
+}
+
+#[gpui::test]
+fn selection_painting_on_scrolled_content_stays_aligned_with_the_glyphs(cx: &mut TestAppContext) {
+    let (field, vcx) = build_narrow_field(cx, Some(OVERFLOWING_VALUE));
+    vcx.run_until_parked();
+
+    vcx.dispatch_action(MoveEnd);
+    vcx.run_until_parked();
+    field.read_with(vcx, |field, _cx| {
+        assert!(
+            field.scroll_offset > Pixels::ZERO,
+            "the field must be scrolled for this test to be meaningful"
+        );
+    });
+
+    let select_from = OVERFLOWING_VALUE.len() - 10;
+    let select_to = OVERFLOWING_VALUE.len();
+
+    // The selection span's paint geometry (via the same shared
+    // `text_input::selection_quad` helper the field's own paint pass
+    // calls), built from the scroll-shifted x's the field would use --
+    // both edges must land inside the visible viewport, not off to the
+    // side where the click below could never have reached them.
+    let (start_x, end_x, viewport_width) = field.read_with(vcx, |field, cx| {
+        let bounds = field.last_bounds.expect("paint must have run");
+        let line = field.last_line.as_ref().expect("paint must have run");
+        let offset = field.scroll_offset;
+        let span = crate::text_input::SelectionLineSpan {
+            line_index: 0,
+            start_x: line.x_for_index(select_from) - offset,
+            end_x: line.x_for_index(select_to) - offset,
+        };
+        let quad = crate::text_input::selection_quad(
+            &span,
+            bounds,
+            theme::FIELD_LINE_HEIGHT,
+            cx.theme().colors.accent_wash_hover(),
+        );
+        (
+            quad.bounds.origin.x - bounds.left(),
+            quad.bounds.origin.x + quad.bounds.size.width - bounds.left(),
+            bounds.size.width,
+        )
+    });
+    assert!(
+        start_x >= Pixels::ZERO && start_x <= viewport_width,
+        "the selection's start edge at {start_x:?} must paint inside the [0, {viewport_width:?}] viewport"
+    );
+    assert!(
+        end_x >= Pixels::ZERO && end_x <= viewport_width,
+        "the selection's end edge at {end_x:?} must paint inside the [0, {viewport_width:?}] viewport"
+    );
+
+    // The same two content offsets, hit-tested back through the field's own
+    // offset-aware point-for-offset helper and driven through a real
+    // click-then-shift-click, must resolve to exactly this span -- proving
+    // the paint geometry and the hit-test geometry agree on where the
+    // glyphs sit once the field is scrolled. Each point is (re)computed
+    // just before its click, against whatever the prior action's repaint
+    // just settled the offset to.
+    let start_point = field.read_with(vcx, |field, _cx| {
+        field.point_for_offset_for_test(select_from)
+    });
+    vcx.simulate_click(start_point, Modifiers::default());
+    vcx.run_until_parked();
+
+    let end_point = field.read_with(vcx, |field, _cx| field.point_for_offset_for_test(select_to));
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    vcx.simulate_click(end_point, shift);
+    vcx.run_until_parked();
+
+    field.read_with(vcx, |field, _cx| {
+        assert_eq!(
+            field.model.selection(),
+            Some(select_from..select_to),
+            "a click then a shift-click at the selection's own painted edges must reselect it exactly"
+        );
     });
 }
