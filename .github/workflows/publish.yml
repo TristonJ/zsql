@@ -1,0 +1,62 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        # TODO: Mac/Windows builds
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Verify Tag
+        if: github.ref_type != 'tag'
+        run: echo "This workflow should only be triggered by a tag push." && exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tests (all)
+        run: sh scripts/test-all.sh
+
+      - name: Build
+        run: |
+            cargo install cargo-packager
+            cargo packager -p zsql --release
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsql-${{ matrix.os }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zsql-*
+          path: release-artifacts/
+          merge-multiple: true
+
+      - name: Generate Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-artifacts/*
