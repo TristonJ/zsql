@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run tests (all)
-        run: sh scripts/test-all.sh
+        run: bash scripts/test-all.sh
 
       - name: Build
         run: |
