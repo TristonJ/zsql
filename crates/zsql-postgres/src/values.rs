@@ -268,21 +268,19 @@ fn raw_fallback(row: &PgRow, idx: usize) -> Value {
     if raw.is_null() {
         return Value::Null;
     }
-    Value::Unknown(unknown_value(raw))
+    Value::Unknown(unknown_value(&raw))
 }
 
-/// Map a PgValueRef to an UnknownValue - this is assuming that a null check
-/// has already been performed.
-fn unknown_value(value: PgValueRef<'_>) -> UnknownValue {
+/// Map a [`PgValueRef`] to an [`UnknownValue`] - this is assuming that a
+/// null check has already been performed.
+fn unknown_value(value: &PgValueRef<'_>) -> UnknownValue {
     match value.format() {
-        PgValueFormat::Text => {
-            let text = value.as_str().ok().map(str::to_owned);
-            text.map(UnknownValue::Text).unwrap_or(UnknownValue::None)
-        }
-        PgValueFormat::Binary => {
-            let bytes = value.as_bytes().ok().map(|b| b.to_vec());
-            bytes.map(UnknownValue::Bytes).unwrap_or(UnknownValue::None)
-        }
+        PgValueFormat::Text => value.as_str().ok().map_or(UnknownValue::None, |text| {
+            UnknownValue::Text(text.to_owned())
+        }),
+        PgValueFormat::Binary => value.as_bytes().ok().map_or(UnknownValue::None, |bytes| {
+            UnknownValue::Bytes(bytes.to_vec())
+        }),
     }
 }
 
