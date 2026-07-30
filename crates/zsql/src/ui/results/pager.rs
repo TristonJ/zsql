@@ -7,16 +7,20 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, Div, ElementId, SharedString, Window, div, prelude::*, px, rgb};
 use zsql_core::preview_state::PreviewQueryState;
-use zsql_core::{ColumnMeta, ESTIMATE_MARKER, SortDirection};
+use zsql_core::{ColumnMeta, ESTIMATE_MARKER, FilterConditionId, FilterOperator, SortDirection};
 use zsql_ui::grid;
 use zsql_ui::theme::Theme;
 
 use crate::ui::theme as app_theme;
 
-/// One pager/sort interaction a live generated preview's controls can
-/// dispatch. Carried as data (rather than several separate closures) so
-/// every control in the results bar and grid header routes through a
-/// single callback on [`PreviewControls`].
+/// The grid header's funnel marker for a column carrying an active filter,
+/// mirroring the sort arrow's own per-column marker.
+const FUNNEL_GLYPH: &str = "\u{2378}";
+
+/// One pager/sort/filter interaction a live generated preview's controls
+/// can dispatch. Carried as data (rather than several separate closures) so
+/// every control in the results bar, filter bar, and grid header routes
+/// through a single callback on [`PreviewControls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreviewAction {
     /// Sort by (or, if already active, flip the direction of) the named
@@ -28,10 +32,34 @@ pub(crate) enum PreviewAction {
     LastPage,
     /// Advance to the next configured page size, wrapping around.
     CyclePageSize,
+    /// Commit a new filter chip against `column` (whose backend type is
+    /// `type_name`).
+    AddFilter {
+        column: String,
+        type_name: String,
+        operator: FilterOperator,
+        value: String,
+    },
+    /// Remove the filter chip with this id.
+    RemoveFilter(FilterConditionId),
+    /// Replace the operator/value of the filter chip with this id.
+    UpdateFilter {
+        id: FilterConditionId,
+        operator: FilterOperator,
+        value: String,
+    },
+    /// Toggle the AND/OR connector pill at this index between adjacent
+    /// chips.
+    ToggleFilterConnector(usize),
+    /// Remove every filter chip in one action.
+    ClearFilters,
 }
 
-/// The callback every sort/pager control routes its clicks through.
-pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut Window, &mut App)>;
+/// The callback every sort/pager/filter control routes its clicks through.
+/// Takes no `Window`: nothing a [`PreviewAction`] does needs one, and a
+/// filter chip's edit commits from a [`zsql_ui::text_field::TextFieldEvent`]
+/// subscription, which has no `Window` to offer.
+pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut App)>;
 
 /// The active generated tab's current sort/page snapshot, plus the
 /// dispatcher every pager/sort control routes its clicks through.
@@ -43,6 +71,13 @@ pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut Window, &mut App
 pub(crate) struct PreviewControls {
     pub state: PreviewQueryState,
     pub dispatch: PreviewDispatch,
+}
+
+/// Whether `column_name`'s header should carry the funnel marker: `controls`
+/// is `Some` and its filter state currently has at least one active
+/// condition against that column.
+fn column_carries_a_funnel(controls: Option<&PreviewControls>, column_name: &str) -> bool {
+    controls.is_some_and(|c| c.state.filters().column_is_filtered(column_name))
 }
 
 /// A data column's header content: its name, type-name badge, and (while
@@ -90,18 +125,29 @@ pub(crate) fn sortable_column_header(
     if let Some(controls) = controls {
         let dispatch = controls.dispatch.clone();
         let column_name = column.name.clone();
-        header = header.cursor_pointer().on_click(move |_event, window, cx| {
-            dispatch(PreviewAction::Sort(column_name.clone()), window, cx);
-        });
+        header = header
+            .cursor_pointer()
+            .on_click(move |_event, _window, cx| {
+                dispatch(PreviewAction::Sort(column_name.clone()), cx);
+            });
     }
 
-    header = header
-        .child(
+    let is_filtered = column_carries_a_funnel(controls, &column.name);
+
+    header = header.child(
+        div()
+            .text_color(rgb(colors.text_primary))
+            .child(column.name.clone()),
+    );
+    if is_filtered {
+        header = header.child(
             div()
-                .text_color(rgb(colors.text_primary))
-                .child(column.name.clone()),
-        )
-        .child(grid::type_tag_tertiary(&column.type_name, active_theme));
+                .text_size(px(app_theme::PAGER_TEXT_SIZE))
+                .text_color(rgb(colors.accent))
+                .child(FUNNEL_GLYPH),
+        );
+    }
+    header = header.child(grid::type_tag_tertiary(&column.type_name, active_theme));
 
     if is_sorted {
         let controls = controls.expect("is_sorted implies controls is Some");
@@ -283,7 +329,7 @@ fn pager_button(
             .cursor_pointer()
             .text_color(rgb(colors.text_primary))
             .hover(|el| el.bg(rgb(colors.bg_raised)))
-            .on_click(move |_event, window, cx| dispatch(action.clone(), window, cx)),
+            .on_click(move |_event, _window, cx| dispatch(action.clone(), cx)),
         None => button
             .text_color(rgb(colors.text_tertiary))
             .opacity(app_theme::PAGER_DISABLED_OPACITY),
@@ -292,9 +338,41 @@ fn pager_button(
 
 #[cfg(test)]
 mod tests {
-    use super::page_readout_text;
+    use std::rc::Rc;
+
+    use super::{PreviewControls, column_carries_a_funnel, page_readout_text};
     use zsql_core::RowCount;
     use zsql_core::preview_state::PreviewQueryState;
+
+    fn controls_for(state: PreviewQueryState) -> PreviewControls {
+        PreviewControls {
+            state,
+            dispatch: Rc::new(|_action, _cx| {}),
+        }
+    }
+
+    #[test]
+    fn no_column_carries_a_funnel_with_no_active_controls() {
+        assert!(!column_carries_a_funnel(None, "status"));
+    }
+
+    #[test]
+    fn a_filtered_column_carries_a_funnel() {
+        let mut state = PreviewQueryState::new(200);
+        state.add_filter("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        let controls = controls_for(state);
+        assert!(column_carries_a_funnel(Some(&controls), "status"));
+        assert!(!column_carries_a_funnel(Some(&controls), "placed_at"));
+    }
+
+    #[test]
+    fn removing_the_only_filter_drops_the_funnel() {
+        let mut state = PreviewQueryState::new(200);
+        let id = state.add_filter("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        state.remove_filter(id);
+        let controls = controls_for(state);
+        assert!(!column_carries_a_funnel(Some(&controls), "status"));
+    }
 
     #[test]
     fn page_readout_shows_the_current_page_alone_when_the_total_is_unknown() {

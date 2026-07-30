@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::config::ConnConfig;
 use crate::error::CoreError;
+use crate::filter::FilterState;
 use crate::row_count::RowCount;
 use crate::schema::SchemaTree;
 use crate::schema_detail::RelationSchema;
@@ -108,15 +109,25 @@ pub trait Connection: Send + Sync {
     /// fails.
     async fn ping(&self) -> Result<(), CoreError>;
 
-    /// The total row count for `relation` in `schema`. Whether the result is
+    /// The total row count for `relation` in `schema`, restricted to rows
+    /// matching `filters` (the same conditions [`Connection::preview_query`]
+    /// renders as a `WHERE` clause). Whether the result is
     /// [`RowCount::Exact`] or [`RowCount::Estimated`] is entirely up to the
     /// implementation: a driver with a cheap planner statistic available
-    /// should prefer it over an exact `COUNT(*)`.
+    /// should prefer it over an exact `COUNT(*)`, but only while `filters`
+    /// is empty -- a planner statistic describes the whole relation, not a
+    /// filtered subset of it, so a non-empty `filters` should always fall
+    /// back to an exact, `WHERE`-qualified `COUNT(*)`.
     ///
     /// # Errors
     /// Returns an error if the count cannot be determined (e.g. the relation
     /// does not exist, or the underlying query fails).
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError>;
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        filters: &FilterState,
+    ) -> Result<RowCount, CoreError>;
 
     /// The full structural detail of `relation` in `schema`: its columns
     /// (with key/default detail beyond [`crate::value::ColumnMeta`]),
@@ -166,6 +177,7 @@ pub trait Connection: Send + Sync {
 mod tests {
     use super::{BatchSink, Connection, QueryHandle};
     use crate::error::CoreError;
+    use crate::filter::FilterState;
     use crate::row_count::RowCount;
     use crate::schema::SchemaTree;
     use crate::schema_detail::RelationSchema;
@@ -189,7 +201,12 @@ mod tests {
             unimplemented!("not exercised by this test")
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &FilterState,
+        ) -> Result<RowCount, CoreError> {
             unimplemented!("not exercised by this test")
         }
 

@@ -4,7 +4,7 @@
 //! primitives (a pixel width, a color, a string) and returns an `Element`,
 //! so the caller owns all row/column data.
 
-use gpui::{Div, div, prelude::*, px, rgb, rgba};
+use gpui::{Div, div, prelude::*, px, rgb};
 
 use crate::theme::{Colors, Theme};
 
@@ -24,7 +24,7 @@ pub const STATUS_DOT_SIZE: f32 = 6.0;
 pub fn type_tag_accent(type_name: &str, theme: &Theme) -> Div {
     type_tag_base(type_name)
         .text_color(rgb(theme.colors.accent))
-        .border_color(rgba(Colors::wash(theme.colors.accent, 0x47)))
+        .border_color(Colors::wash(theme.colors.accent, 0x47))
 }
 
 /// A small type-name badge, when it's not the primary display piece

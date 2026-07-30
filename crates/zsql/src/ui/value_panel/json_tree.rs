@@ -1,7 +1,7 @@
 //! The value panel's JSON tree renderer and its keyboard navigation
 //! (up/down/collapse/expand).
 
-use gpui::{ClickEvent, Context, SharedString, Stateful, Window, div, prelude::*, rgb, rgba};
+use gpui::{ClickEvent, Context, SharedString, Stateful, Window, div, prelude::*, rgb};
 use zsql_ui::theme::Theme;
 use zsql_ui::tree::{disclosure_glyph, disclosure_spacer, row_meta, row_shell};
 
@@ -109,7 +109,7 @@ impl ValuePanel {
 
         if is_selected {
             shell = shell
-                .bg(rgba(theme::sidebar_selected_bg(active_theme)))
+                .bg(theme::sidebar_selected_bg(active_theme))
                 .border_l_2()
                 .border_color(rgb(colors.accent));
         }

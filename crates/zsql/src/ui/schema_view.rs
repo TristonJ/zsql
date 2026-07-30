@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use gpui::{Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb, rgba};
+use gpui::{Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb};
 use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, KeyCellBadge, RelationKind,
     RelationSchema, RowCount, classify_default, key_cell_badge,
@@ -219,7 +219,7 @@ impl SchemaTabView {
                     .text_size(px(theme::SCHEMA_KIND_PILL_TEXT_SIZE))
                     .text_color(rgb(colors.accent))
                     .border_1()
-                    .border_color(rgba(colors.accent_outline()))
+                    .border_color(colors.accent_outline())
                     .rounded(px(theme::SCHEMA_KIND_PILL_RADIUS))
                     .px(theme::SCHEMA_KIND_PILL_PADDING_X)
                     .child(relation_kind_pill_text(self.kind)),
@@ -523,7 +523,7 @@ impl SchemaTabView {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(constraint.name.clone())
                         .into_any_element(),
-                    key_badge(kind_label, kind_color, colors.border).into_any_element(),
+                    key_badge(kind_label, kind_color, rgb(colors.border)).into_any_element(),
                     div()
                         .text_color(rgb(colors.text_secondary))
                         .child(constraint.definition.clone())
@@ -711,7 +711,7 @@ fn render_keys_cell(
         Some(KeyCellBadge::Check) => key_badge(
             theme::SCHEMA_BADGE_CHECK_LABEL,
             colors.text_secondary,
-            colors.border,
+            rgb(colors.border),
         )
         .into_any_element(),
         Some(KeyCellBadge::Foreign(target)) => {
@@ -721,12 +721,12 @@ fn render_keys_cell(
 }
 
 /// A small outlined badge for the Keys cell (PK, unique, or check).
-fn key_badge(label: &str, text_color: u32, border_color: u32) -> gpui::Div {
+fn key_badge(label: &str, text_color: u32, border_color: gpui::Rgba) -> gpui::Div {
     div()
         .text_size(px(theme::SCHEMA_BADGE_TEXT_SIZE))
         .text_color(rgb(text_color))
         .border_1()
-        .border_color(rgba(border_color))
+        .border_color(border_color)
         .rounded(px(theme::SCHEMA_BADGE_RADIUS))
         .px(theme::SCHEMA_BADGE_PADDING_X)
         .child(label.to_owned())
@@ -743,9 +743,9 @@ fn fk_link_chip(target: &str, active_theme: &Theme) -> gpui::Div {
         .text_size(px(theme::SCHEMA_FK_CHIP_TEXT_SIZE))
         .font_family(&active_theme.fonts.data)
         .text_color(rgb(colors.key_fk))
-        .bg(rgba(colors.fk_wash()))
+        .bg(colors.fk_wash())
         .border_1()
-        .border_color(rgba(colors.fk_outline()))
+        .border_color(colors.fk_outline())
         .rounded(px(theme::SCHEMA_FK_CHIP_RADIUS))
         .px(theme::SCHEMA_BADGE_PADDING_X)
         .child(theme::SCHEMA_FK_ARROW)
@@ -970,6 +970,7 @@ mod render_tests {
             &self,
             _schema: &str,
             _relation: &str,
+            _filters: &zsql_core::FilterState,
         ) -> Result<zsql_core::RowCount, zsql_core::CoreError> {
             Ok(zsql_core::RowCount::Exact(1_240))
         }

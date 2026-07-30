@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::{AssertSqlSafe, Column, Postgres, Row as _, TypeInfo};
 use zsql_core::{
-    BatchSink, ColumnMeta, ConnConfig, Connection, CoreError, Driver, QueryHandle, RelationSchema,
-    RowCount, SchemaTree, quote_ident,
+    BatchSink, ColumnMeta, ConnConfig, Connection, CoreError, Driver, FilterState, QueryHandle,
+    RelationSchema, RowCount, SchemaTree, quote_ident, render_where_conditions,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{
@@ -148,9 +148,23 @@ impl Connection for PgConnection {
         Ok(())
     }
 
-    #[tracing::instrument(name = "pg_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(reltuples) = fetch_reltuples(self.0.pool(), schema, relation).await? {
+    #[tracing::instrument(
+        name = "pg_count_rows",
+        skip(self, filters),
+        fields(pool_size = self.0.pool().size(), filtered = !filters.is_empty())
+    )]
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        filters: &FilterState,
+    ) -> Result<RowCount, CoreError> {
+        // A planner statistic describes the whole relation, not a filtered
+        // subset of it, so any active filter always falls straight to an
+        // exact, `WHERE`-qualified `COUNT(*)`.
+        if filters.is_empty()
+            && let Some(reltuples) = fetch_reltuples(self.0.pool(), schema, relation).await?
+        {
             if reltuples_is_reliable(reltuples) {
                 tracing::debug!(reltuples, "using planner row-count estimate");
                 return Ok(RowCount::Estimated(reltuples_to_row_count(reltuples)));
@@ -160,10 +174,10 @@ impl Connection for PgConnection {
                 "planner estimate unreliable (relation never analyzed); \
                  falling back to an exact count"
             );
-        } else {
+        } else if filters.is_empty() {
             tracing::debug!("no pg_class row found; falling back to an exact count");
         }
-        let exact = exact_row_count(self.0.pool(), schema, relation).await?;
+        let exact = exact_row_count(self.0.pool(), schema, relation, filters).await?;
         Ok(RowCount::Exact(exact))
     }
 
@@ -257,18 +271,32 @@ fn reltuples_to_row_count(reltuples: f32) -> u64 {
 
 /// Build `SELECT COUNT(*) FROM <quoted schema>.<quoted relation>`, quoting
 /// both identifiers so an adversarial schema/relation name cannot break out
-/// of the identifier position.
-fn exact_count_sql(schema: &str, relation: &str) -> String {
-    format!(
+/// of the identifier position, plus `filters`' conditions as a `WHERE`
+/// clause (native `ILIKE`, matching [`PgConnection`]'s `preview_query`,
+/// which -- carrying no override of its own -- takes the same native-`ILIKE`
+/// default from [`zsql_core::default_preview_query`]).
+fn exact_count_sql(schema: &str, relation: &str, filters: &FilterState) -> String {
+    let mut sql = format!(
         "SELECT COUNT(*) FROM {}.{}",
         quote_ident(schema),
         quote_ident(relation)
-    )
+    );
+    if let Some(where_clause) = render_where_conditions(filters, quote_ident, true) {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+    sql
 }
 
-/// Run an exact `SELECT COUNT(*)` against `schema.relation`.
-async fn exact_row_count(pool: &PgPool, schema: &str, relation: &str) -> Result<u64, CoreError> {
-    let sql = exact_count_sql(schema, relation);
+/// Run an exact `SELECT COUNT(*)` against `schema.relation`, restricted to
+/// rows matching `filters`.
+async fn exact_row_count(
+    pool: &PgPool,
+    schema: &str,
+    relation: &str,
+    filters: &FilterState,
+) -> Result<u64, CoreError> {
+    let sql = exact_count_sql(schema, relation, filters);
     // `sql` is built entirely from `quote_ident`-escaped identifiers via
     // `exact_count_sql`, never from unescaped runtime text.
     let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
@@ -508,6 +536,96 @@ mod tests {
     }
 
     #[test]
+    fn preview_query_renders_a_where_clause_from_filters() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        let sql = conn.preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_maps_ilike_natively_on_postgres() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("name", "text", zsql_core::FilterOperator::ILike, "smith%");
+        let sql = conn.preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert!(
+            sql.contains("\"name\" ILIKE 'smith%'"),
+            "postgres must use native ILIKE, got: {sql}"
+        );
+        assert!(!sql.contains("LOWER("), "got: {sql}");
+    }
+
+    #[test]
+    fn preview_query_combines_and_or_filters_verbatim_in_chip_order() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "pending");
+        filters.toggle_connector(0);
+        filters.add_condition(
+            "placed_at",
+            "timestamptz",
+            zsql_core::FilterOperator::Gt,
+            "now() - interval '7 days'",
+        );
+        let sql = conn.preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' OR \"status\" = 'pending' \
+             AND \"placed_at\" > now() - interval '7 days' LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_filter_column() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "total\"; DROP TABLE users; --",
+            "int4",
+            zsql_core::FilterOperator::Eq,
+            "1",
+        );
+        let sql = conn.preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\" WHERE \"total\"\"; DROP TABLE users; --\" = 1 LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn exact_count_sql_renders_a_where_clause_from_filters() {
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        assert_eq!(
+            super::exact_count_sql("public", "orders", &filters),
+            "SELECT COUNT(*) FROM \"public\".\"orders\" WHERE \"status\" = 'paid'"
+        );
+    }
+
+    #[test]
     fn stream_query_pushes_single_error_when_pool_is_unreachable() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(UNREACHABLE_URL)
@@ -544,14 +662,18 @@ mod tests {
     #[test]
     fn exact_count_sql_quotes_both_identifiers() {
         assert_eq!(
-            super::exact_count_sql("public", "orders"),
+            super::exact_count_sql("public", "orders", &zsql_core::FilterState::new()),
             "SELECT COUNT(*) FROM \"public\".\"orders\""
         );
     }
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
-        let sql = super::exact_count_sql("public", "orders\"; DROP TABLE users; --");
+        let sql = super::exact_count_sql(
+            "public",
+            "orders\"; DROP TABLE users; --",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM \"public\".\"orders\"\"; DROP TABLE users; --\""
@@ -561,7 +683,11 @@ mod tests {
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
-        let sql = super::exact_count_sql("public\"; DROP TABLE users; --", "orders");
+        let sql = super::exact_count_sql(
+            "public\"; DROP TABLE users; --",
+            "orders",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM \"public\"\"; DROP TABLE users; --\".\"orders\""
@@ -1492,7 +1618,8 @@ mod database_tests {
         );
         run_ddl(&*conn, &format!("ANALYZE {table}"));
 
-        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        let row_count = block_on(conn.count_rows("public", table, &zsql_core::FilterState::new()))
+            .expect("count_rows must run");
         tracing::info!(
             ?row_count,
             "count_rows_returns_an_estimated_count_within_tolerance_after_analyze_when_configured executed against the live database"
@@ -1538,7 +1665,8 @@ mod database_tests {
         );
         // Deliberately no ANALYZE here: this is the whole point of the test.
 
-        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        let row_count = block_on(conn.count_rows("public", table, &zsql_core::FilterState::new()))
+            .expect("count_rows must run");
         tracing::info!(
             ?row_count,
             "count_rows_falls_back_to_exact_for_an_unanalyzed_table_when_configured executed against the live database"
@@ -1569,7 +1697,8 @@ mod database_tests {
         run_ddl(&*conn, &format!("CREATE TABLE {table} (n integer)"));
         run_ddl(&*conn, &format!("ANALYZE {table}"));
 
-        let row_count = block_on(conn.count_rows("public", table)).expect("count_rows must run");
+        let row_count = block_on(conn.count_rows("public", table, &zsql_core::FilterState::new()))
+            .expect("count_rows must run");
         tracing::info!(
             ?row_count,
             "count_rows_returns_an_estimated_zero_for_an_analyzed_empty_table_when_configured executed against the live database"
@@ -1595,7 +1724,11 @@ mod database_tests {
     fn count_rows_errors_for_a_relation_absent_from_pg_class_when_configured() {
         let conn = live_connection();
 
-        let result = block_on(conn.count_rows("public", "zsql_test_relation_that_does_not_exist"));
+        let result = block_on(conn.count_rows(
+            "public",
+            "zsql_test_relation_that_does_not_exist",
+            &zsql_core::FilterState::new(),
+        ));
         tracing::info!(
             ?result,
             "count_rows_errors_for_a_relation_absent_from_pg_class_when_configured executed against the live database"
@@ -1823,6 +1956,86 @@ mod database_tests {
         );
 
         run_ddl(&*conn, &format!("DROP TABLE {SORTED_PREVIEW_TABLE}"));
+    }
+
+    /// Table [`seed_filtered_preview_table`] creates.
+    const FILTERED_PREVIEW_TABLE: &str = "zsql_test_filtered_preview";
+
+    /// Seeds a self-contained table of 10 rows, half `status = 'paid'` and
+    /// half `status = 'pending'`, with a distinct `n` in each.
+    fn seed_filtered_preview_table(conn: &dyn zsql_core::Connection) {
+        let table = FILTERED_PREVIEW_TABLE;
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(
+            conn,
+            &format!("CREATE TABLE {table} (n integer NOT NULL, status text NOT NULL)"),
+        );
+        let values: Vec<String> = (1..=10)
+            .map(|n| {
+                let status = if n % 2 == 0 { "paid" } else { "pending" };
+                format!("({n}, '{status}')")
+            })
+            .collect();
+        run_ddl(
+            conn,
+            &format!(
+                "INSERT INTO {table} (n, status) VALUES {}",
+                values.join(", ")
+            ),
+        );
+    }
+
+    /// A filtered windowed preview must both return exactly the matching
+    /// rows and report a filtered total that excludes the rows the filter
+    /// dropped -- not merely "a query ran".
+    #[test]
+    fn filtered_preview_query_and_count_return_only_matching_rows_when_configured() {
+        let conn = live_connection();
+        seed_filtered_preview_table(&*conn);
+
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+
+        let sql = conn.preview_query(
+            "public",
+            FILTERED_PREVIEW_TABLE,
+            PreviewQueryArgs::from_limit(10)
+                .sort("n", zsql_core::SortDirection::Asc)
+                .filters(filters.clone()),
+        );
+        assert!(sql.contains("WHERE \"status\" = 'paid'"), "{sql}");
+
+        let rows = run_query_collecting_rows(&*conn, &sql);
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|row| match &row[0] {
+                zsql_core::Value::Int(n) => *n,
+                other => panic!("expected an Int cell, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![2, 4, 6, 8, 10],
+            "the filtered preview must return only status='paid' rows"
+        );
+
+        let filtered_count = block_on(conn.count_rows("public", FILTERED_PREVIEW_TABLE, &filters))
+            .expect("filtered count_rows must run");
+        assert_eq!(
+            filtered_count,
+            zsql_core::RowCount::Exact(5),
+            "the filtered count must reflect only the matching rows, not the whole table"
+        );
+
+        let unfiltered_count = block_on(conn.count_rows(
+            "public",
+            FILTERED_PREVIEW_TABLE,
+            &zsql_core::FilterState::new(),
+        ))
+        .expect("unfiltered count_rows must run");
+        assert_eq!(unfiltered_count.value(), 10);
+
+        run_ddl(&*conn, &format!("DROP TABLE {FILTERED_PREVIEW_TABLE}"));
     }
 
     /// A second database this test creates and drops, to prove

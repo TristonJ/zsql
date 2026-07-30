@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use gpui::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
     Pixels, Point, Render, Stateful, UniformListScrollHandle, Window, div, point, prelude::*, px,
-    rgb, rgba, uniform_list,
+    rgb, uniform_list,
 };
 use zsql_core::RelationKind;
 use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
@@ -735,7 +735,7 @@ impl SidebarView {
 
         if selected {
             shell = shell
-                .bg(rgba(theme::sidebar_selected_bg(active_theme)))
+                .bg(theme::sidebar_selected_bg(active_theme))
                 .border_l_2()
                 .border_color(rgb(active_theme.colors.accent));
         }
@@ -1016,7 +1016,12 @@ mod render_tests {
             Ok(())
         }
 
-        async fn count_rows(&self, _schema: &str, _relation: &str) -> Result<RowCount, CoreError> {
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &zsql_core::FilterState,
+        ) -> Result<RowCount, CoreError> {
             Ok(RowCount::Exact(0))
         }
 

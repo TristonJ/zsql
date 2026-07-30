@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, PreviewQueryArgs, QueryHandle,
-    RelationSchema, RowCount, SchemaTree,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
+    QueryHandle, RelationSchema, RowCount, SchemaTree, render_where_conditions,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{
@@ -152,9 +152,24 @@ impl Connection for MySqlConnection {
         Ok(())
     }
 
-    #[tracing::instrument(name = "mysql_count_rows", skip(self), fields(pool_size = self.0.pool().size()))]
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        if let Some(estimate) = fetch_table_rows_estimate(self.0.pool(), schema, relation).await? {
+    #[tracing::instrument(
+        name = "mysql_count_rows",
+        skip(self, filters),
+        fields(pool_size = self.0.pool().size(), filtered = !filters.is_empty())
+    )]
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        filters: &FilterState,
+    ) -> Result<RowCount, CoreError> {
+        // `information_schema.TABLES.TABLE_ROWS` describes the whole
+        // relation, not a filtered subset of it, so any active filter falls
+        // straight to an exact, `WHERE`-qualified `COUNT(*)`.
+        if filters.is_empty()
+            && let Some(estimate) =
+                fetch_table_rows_estimate(self.0.pool(), schema, relation).await?
+        {
             tracing::debug!(
                 estimate,
                 "using information_schema.TABLES row-count estimate"
@@ -162,10 +177,10 @@ impl Connection for MySqlConnection {
             return Ok(RowCount::Estimated(estimate));
         }
         tracing::debug!(
-            "no reliable TABLE_ROWS estimate (view, or relation not found); \
-             falling back to an exact count"
+            "no reliable TABLE_ROWS estimate (view, or relation not found), \
+             or a filter is active; falling back to an exact count"
         );
-        let exact = exact_row_count(self.0.pool(), schema, relation).await?;
+        let exact = exact_row_count(self.0.pool(), schema, relation, filters).await?;
         Ok(RowCount::Exact(exact))
     }
 
@@ -183,13 +198,20 @@ impl Connection for MySqlConnection {
     }
 
     /// The click-to-preview query for `relation` in `schema`, capped at
-    /// `limit` rows, in this dialect's syntax: backtick-quoted identifiers.
+    /// `limit` rows, in this dialect's syntax: backtick-quoted identifiers
+    /// and, since `MySQL`/`MariaDB` have no native `ILIKE`, an `ILIKE`
+    /// filter mapped to `LOWER(column) LIKE LOWER(value)`.
     fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
         let mut sql = format!(
             "SELECT * FROM {}.{}",
             backtick_quote_ident(schema),
             backtick_quote_ident(relation)
         );
+        if let Some(where_clause) =
+            render_where_conditions(&args.filters, backtick_quote_ident, false)
+        {
+            let _ = write!(sql, " WHERE {where_clause}");
+        }
         if let Some((column, direction)) = args.sort {
             let _ = write!(
                 sql,
@@ -243,18 +265,30 @@ async fn fetch_table_rows_estimate(
 
 /// Build a `SELECT COUNT(*)` statement against `schema.relation`, with both
 /// identifiers backtick-quoted so an adversarial schema/relation name cannot
-/// break out of the identifier position.
-fn exact_count_sql(schema: &str, relation: &str) -> String {
-    format!(
+/// break out of the identifier position, plus `filters`' conditions as a
+/// `WHERE` clause (`ILIKE` mapped to `LOWER(column) LIKE LOWER(value)`,
+/// matching this driver's own `preview_query`).
+fn exact_count_sql(schema: &str, relation: &str, filters: &FilterState) -> String {
+    let mut sql = format!(
         "SELECT COUNT(*) FROM {}.{}",
         backtick_quote_ident(schema),
         backtick_quote_ident(relation)
-    )
+    );
+    if let Some(where_clause) = render_where_conditions(filters, backtick_quote_ident, false) {
+        let _ = write!(sql, " WHERE {where_clause}");
+    }
+    sql
 }
 
-/// Run an exact `SELECT COUNT(*)` against `schema.relation`.
-async fn exact_row_count(pool: &MySqlPool, schema: &str, relation: &str) -> Result<u64, CoreError> {
-    let sql = exact_count_sql(schema, relation);
+/// Run an exact `SELECT COUNT(*)` against `schema.relation`, restricted to
+/// rows matching `filters`.
+async fn exact_row_count(
+    pool: &MySqlPool,
+    schema: &str,
+    relation: &str,
+    filters: &FilterState,
+) -> Result<u64, CoreError> {
+    let sql = exact_count_sql(schema, relation, filters);
     // `sql` is built entirely from `backtick_quote_ident`-escaped
     // identifiers via `exact_count_sql`, never from unescaped runtime text.
     let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
@@ -488,6 +522,71 @@ mod tests {
     }
 
     #[test]
+    fn preview_query_renders_a_where_clause_from_filters() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        let sql = conn.preview_query(
+            "zsql",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM `zsql`.`orders` WHERE `status` = 'paid' LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_maps_ilike_to_lower_like_lower_on_mysql() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("name", "text", zsql_core::FilterOperator::ILike, "smith%");
+        let sql = conn.preview_query(
+            "zsql",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert!(
+            sql.contains("LOWER(`name`) LIKE LOWER('smith%')"),
+            "mysql has no native ILIKE and must map it, got: {sql}"
+        );
+        assert!(!sql.contains("ILIKE"), "got: {sql}");
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_filter_column() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "total`; DROP TABLE users; --",
+            "int",
+            zsql_core::FilterOperator::Eq,
+            "1",
+        );
+        let sql = conn.preview_query(
+            "zsql",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM `zsql`.`orders` WHERE `total``; DROP TABLE users; --` = 1 LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn exact_count_sql_renders_a_where_clause_from_filters() {
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        assert_eq!(
+            super::exact_count_sql("zsql", "orders", &filters),
+            "SELECT COUNT(*) FROM `zsql`.`orders` WHERE `status` = 'paid'"
+        );
+    }
+
+    #[test]
     fn stream_query_pushes_single_error_when_pool_is_unreachable() {
         let conn = connection_for_test();
 
@@ -512,14 +611,18 @@ mod tests {
     #[test]
     fn exact_count_sql_quotes_both_identifiers() {
         assert_eq!(
-            super::exact_count_sql("zsql", "orders"),
+            super::exact_count_sql("zsql", "orders", &zsql_core::FilterState::new()),
             "SELECT COUNT(*) FROM `zsql`.`orders`"
         );
     }
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_relation_name() {
-        let sql = super::exact_count_sql("zsql", "orders`; DROP TABLE users; --");
+        let sql = super::exact_count_sql(
+            "zsql",
+            "orders`; DROP TABLE users; --",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM `zsql`.`orders``; DROP TABLE users; --`"
@@ -529,7 +632,11 @@ mod tests {
 
     #[test]
     fn exact_count_sql_is_safe_against_an_injection_shaped_schema_name() {
-        let sql = super::exact_count_sql("zsql`; DROP TABLE users; --", "orders");
+        let sql = super::exact_count_sql(
+            "zsql`; DROP TABLE users; --",
+            "orders",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM `zsql``; DROP TABLE users; --`.`orders`"
@@ -1116,7 +1223,8 @@ mod database_tests {
     #[test]
     fn count_rows_returns_an_estimated_count_for_a_seeded_table_when_configured() {
         let conn = live_connection();
-        let row_count = block_on(conn.count_rows("zsql", "users")).expect("count_rows must run");
+        let row_count = block_on(conn.count_rows("zsql", "users", &zsql_core::FilterState::new()))
+            .expect("count_rows must run");
         tracing::info!(
             ?row_count,
             "count_rows_returns_an_estimated_count_for_a_seeded_table_when_configured executed \
@@ -1138,7 +1246,8 @@ mod database_tests {
         // own (it is always `NULL`), so `count_rows` must fall back to an
         // exact `COUNT(*)`.
         let row_count =
-            block_on(conn.count_rows("zsql", "recent_orders")).expect("count_rows must run");
+            block_on(conn.count_rows("zsql", "recent_orders", &zsql_core::FilterState::new()))
+                .expect("count_rows must run");
         assert!(
             matches!(row_count, zsql_core::RowCount::Exact(_)),
             "expected Exact for a view, got {row_count:?}"
@@ -1768,5 +1877,92 @@ mod database_tests {
                 "expected Value::Unknown carrying UnknownValue::None for an unmapped geometry type, got {other:?}"
             ),
         }
+    }
+
+    /// Table [`seed_filtered_preview_table`] creates.
+    const FILTERED_PREVIEW_TABLE: &str = "zsql_test_filtered_preview";
+
+    /// Seeds a self-contained table of 10 rows, half `status = 'paid'` and
+    /// half `status = 'pending'`, with a distinct `n` in each.
+    fn seed_filtered_preview_table(conn: &dyn zsql_core::Connection) {
+        let table = FILTERED_PREVIEW_TABLE;
+        run_ddl(conn, &format!("DROP TABLE IF EXISTS {table}"));
+        run_ddl(
+            conn,
+            &format!("CREATE TABLE {table} (n INT NOT NULL, status VARCHAR(16) NOT NULL)"),
+        );
+        let values: Vec<String> = (1..=10)
+            .map(|n| {
+                let status = if n % 2 == 0 { "paid" } else { "pending" };
+                format!("({n}, '{status}')")
+            })
+            .collect();
+        run_ddl(
+            conn,
+            &format!(
+                "INSERT INTO {table} (n, status) VALUES {}",
+                values.join(", ")
+            ),
+        );
+    }
+
+    /// A filtered windowed preview must both return exactly the matching
+    /// rows and report a filtered total that excludes the rows the filter
+    /// dropped -- not merely "a query ran".
+    #[test]
+    fn filtered_preview_query_and_count_return_only_matching_rows_when_configured() {
+        let conn = live_connection();
+        seed_filtered_preview_table(&*conn);
+
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "status",
+            "varchar(16)",
+            zsql_core::FilterOperator::Eq,
+            "paid",
+        );
+
+        let sql = conn.preview_query(
+            "zsql",
+            FILTERED_PREVIEW_TABLE,
+            PreviewQueryArgs::from_limit(10)
+                .sort("n", zsql_core::SortDirection::Asc)
+                .filters(filters.clone()),
+        );
+        assert!(sql.contains("WHERE `status` = 'paid'"), "{sql}");
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+        let mut rows = Vec::new();
+        loop {
+            match recv(&rx) {
+                Ok(zsql_core::QueryEvent::Columns(_)) => {}
+                Ok(zsql_core::QueryEvent::Batch(batch)) => rows.extend(batch.rows),
+                Ok(zsql_core::QueryEvent::Done { .. }) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|row| match &row.0[0] {
+                zsql_core::Value::Int(n) => *n,
+                other => panic!("expected an Int cell, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![2, 4, 6, 8, 10],
+            "the filtered preview must return only status='paid' rows"
+        );
+
+        let filtered_count = block_on(conn.count_rows("zsql", FILTERED_PREVIEW_TABLE, &filters))
+            .expect("filtered count_rows must run");
+        assert_eq!(
+            filtered_count,
+            zsql_core::RowCount::Exact(5),
+            "the filtered count must reflect only the matching rows, not the whole table"
+        );
+
+        run_ddl(&*conn, &format!("DROP TABLE {FILTERED_PREVIEW_TABLE}"));
     }
 }

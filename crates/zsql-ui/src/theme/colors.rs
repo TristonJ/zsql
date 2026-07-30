@@ -3,6 +3,7 @@
 //! so a re-themed base color always carries its washes and outlines along
 //! with it.
 
+use gpui::Rgba;
 use serde::Deserialize;
 
 /// The active theme's semantic color roles, plus alpha-blend/mix
@@ -322,7 +323,13 @@ const fn mix(a: u32, b: u32, a_pct: u32) -> u32 {
 /// `base`'s own color at `alpha` opacity, carried as an explicit alpha
 /// byte rather than a blend against a surface -- the alpha channel does the
 /// blending wherever this paints.
-const fn wash(base: u32, alpha: u8) -> u32 {
+const fn wash(base: u32, alpha: u8) -> Rgba {
+    rgba(wash_hex(base, alpha))
+}
+
+/// [`wash`], but as the `0xRRGGBBAA` hex form the alpha-carrying [`Colors`]
+/// fields (and their theme-file deserialization) store.
+pub(super) const fn wash_hex(base: u32, alpha: u8) -> u32 {
     let (r, g, b) = channels(base);
     ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | alpha as u32
 }
@@ -339,18 +346,27 @@ const fn lighten(base: u32, dr: u8, dg: u8, db: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+/// A const version of [`gpui::rgba`]
+const fn rgba(color: u32) -> Rgba {
+    let r = ((color >> 24) & 0xff) as u8 as f32 / 255.0;
+    let g = ((color >> 16) & 0xff) as u8 as f32 / 255.0;
+    let b = ((color >> 8) & 0xff) as u8 as f32 / 255.0;
+    let a = (color & 0xff) as u8 as f32 / 255.0;
+    Rgba { r, g, b, a }
+}
+
 impl Colors {
     /// [`Colors::accent`] at 13% opacity: a faint fill for a hovered or
     /// selected row.
     #[must_use]
-    pub const fn accent_wash(&self) -> u32 {
+    pub const fn accent_wash(&self) -> Rgba {
         wash(self.accent, 33)
     }
 
     /// [`Colors::accent`] at 20% opacity: a stronger fill than
     /// [`Colors::accent_wash`], e.g. a text selection highlight.
     #[must_use]
-    pub const fn accent_wash_hover(&self) -> u32 {
+    pub const fn accent_wash_hover(&self) -> Rgba {
         wash(self.accent, 51)
     }
 
@@ -358,19 +374,19 @@ impl Colors {
     /// [`Colors::accent_wash`], e.g. an active-row highlight in a dense
     /// list.
     #[must_use]
-    pub const fn accent_wash_soft(&self) -> u32 {
+    pub const fn accent_wash_soft(&self) -> Rgba {
         wash(self.accent, 23)
     }
 
     /// [`Colors::accent`] at 14% opacity: a focus/selection ring.
     #[must_use]
-    pub const fn accent_ring(&self) -> u32 {
+    pub const fn accent_ring(&self) -> Rgba {
         wash(self.accent, 36)
     }
 
     /// [`Colors::accent`] at 30% opacity: a pill/badge outline.
     #[must_use]
-    pub const fn accent_outline(&self) -> u32 {
+    pub const fn accent_outline(&self) -> Rgba {
         wash(self.accent, 77)
     }
 
@@ -390,31 +406,31 @@ impl Colors {
 
     /// [`Colors::status_error`] at 32% opacity: an error-state outline.
     #[must_use]
-    pub const fn error_outline(&self) -> u32 {
+    pub const fn error_outline(&self) -> Rgba {
         wash(self.status_error, 82)
     }
 
     /// [`Colors::status_error`] at 10% opacity: a faint error-state fill.
     #[must_use]
-    pub const fn error_wash(&self) -> u32 {
+    pub const fn error_wash(&self) -> Rgba {
         wash(self.status_error, 26)
     }
 
     /// [`Colors::status_warn`] at 32% opacity: a warn-state outline.
     #[must_use]
-    pub const fn warn_outline(&self) -> u32 {
+    pub const fn warn_outline(&self) -> Rgba {
         wash(self.status_warn, 82)
     }
 
     /// [`Colors::key_fk`] at 30% opacity: a foreign-key chip's outline.
     #[must_use]
-    pub const fn fk_outline(&self) -> u32 {
+    pub const fn fk_outline(&self) -> Rgba {
         wash(self.key_fk, 77)
     }
 
     /// [`Colors::key_fk`] at 7% opacity: a foreign-key chip's fill.
     #[must_use]
-    pub const fn fk_wash(&self) -> u32 {
+    pub const fn fk_wash(&self) -> Rgba {
         wash(self.key_fk, 18)
     }
 
@@ -423,7 +439,7 @@ impl Colors {
     /// exposed for a caller whose wash does not fit one of those named
     /// percentages.
     #[must_use]
-    pub const fn wash(base: u32, alpha: u8) -> u32 {
+    pub const fn wash(base: u32, alpha: u8) -> Rgba {
         wash(base, alpha)
     }
 
@@ -519,6 +535,14 @@ mod tests {
         assert_eq!(colors.scrim, 0x08_09_0c_9e, "was theme::MODAL_BACKDROP");
     }
 
+    #[test]
+    fn const_rgba_equals_non_const_rgba() {
+        let colors = Colors::default();
+        let const_rgba = super::rgba(colors.scrim);
+        let non_const_rgba = gpui::rgba(colors.scrim);
+        assert_eq!(const_rgba, non_const_rgba);
+    }
+
     /// [`Colors::value_unknown`] and [`Colors::status_error`] are separate
     /// roles that happen to share a default hue, not one role doing double
     /// duty.
@@ -547,29 +571,29 @@ mod tests {
 
         // was zsql::ui::theme::SIDEBAR_SELECTED_BG-adjacent but exact via
         // accent_wash_soft: zsql::ui::theme::MODAL_ROW_ACTIVE_BG.
-        assert_eq!(colors.accent_wash_soft(), 0x33_c2_ac_17);
+        assert_eq!(colors.accent_wash_soft(), gpui::rgba(0x33_c2_ac_17));
         // was zsql_editor::theme::EDITOR_SELECTION_BG and
         // zsql_ui::text_field::theme::FIELD_SELECTION_BG.
-        assert_eq!(colors.accent_wash_hover(), 0x33_c2_ac_33);
+        assert_eq!(colors.accent_wash_hover(), gpui::rgba(0x33_c2_ac_33));
         // was zsql::ui::theme::SCHEMA_KIND_PILL_BORDER.
-        assert_eq!(colors.accent_outline(), 0x33_c2_ac_4d);
+        assert_eq!(colors.accent_outline(), gpui::rgba(0x33_c2_ac_4d));
         // was zsql::ui::theme::SCHEMA_BADGE_UNIQUE_BORDER.
-        assert_eq!(colors.warn_outline(), 0xd9_a2_5a_52);
+        assert_eq!(colors.warn_outline(), gpui::rgba(0xd9_a2_5a_52));
         // was zsql::ui::theme::SCHEMA_BADGE_LINK_BORDER.
-        assert_eq!(colors.fk_outline(), 0x7f_9c_ff_4d);
+        assert_eq!(colors.fk_outline(), gpui::rgba(0x7f_9c_ff_4d));
         // was zsql::ui::theme::SCHEMA_BADGE_LINK_BG.
-        assert_eq!(colors.fk_wash(), 0x7f_9c_ff_12);
+        assert_eq!(colors.fk_wash(), gpui::rgba(0x7f_9c_ff_12));
         // was zsql::ui::theme::SIDEBAR_SELECTED_BG.
-        assert_eq!(Colors::wash(colors.accent, 0x1a), 0x33_c2_ac_1a);
+        assert_eq!(Colors::wash(colors.accent, 0x1a), gpui::rgba(0x33_c2_ac_1a));
         // was zsql::ui::theme::GENERATED_STRIP_BG.
-        assert_eq!(Colors::wash(colors.accent, 0x0b), 0x33_c2_ac_0b);
+        assert_eq!(Colors::wash(colors.accent, 0x0b), gpui::rgba(0x33_c2_ac_0b));
         // was zsql_ui::grid::TYPE_TAG_BORDER.
-        assert_eq!(Colors::wash(colors.accent, 0x47), 0x33_c2_ac_47);
+        assert_eq!(Colors::wash(colors.accent, 0x47), gpui::rgba(0x33_c2_ac_47));
         // was zsql::ui::theme::SCHEMA_BADGE_PK_BORDER.
-        assert_eq!(Colors::wash(colors.accent, 0x52), 0x33_c2_ac_52);
+        assert_eq!(Colors::wash(colors.accent, 0x52), gpui::rgba(0x33_c2_ac_52));
         // was zsql::ui::theme::RUN_BUTTON_HINT: the page ink at reduced
         // opacity.
-        assert_eq!(Colors::wash(colors.bg_app, 0xb3), 0x10_12_17_b3);
+        assert_eq!(Colors::wash(colors.bg_app, 0xb3), gpui::rgba(0x10_12_17_b3));
         // was zsql::ui::theme::RUN_BUTTON_HOVER_BG: a lighter teal than the
         // resting accent.
         assert_eq!(Colors::lighten(colors.accent, 19, 13, 14), 0x46_cf_ba);
@@ -586,10 +610,10 @@ mod tests {
     fn unused_derived_colors_match_the_style_guides_alpha_and_mix_values() {
         let colors = Colors::default();
 
-        assert_eq!(colors.accent_wash(), 0x33_c2_ac_21);
-        assert_eq!(colors.accent_ring(), 0x33_c2_ac_24);
-        assert_eq!(colors.error_outline(), 0xe2_6d_78_52);
-        assert_eq!(colors.error_wash(), 0xe2_6d_78_1a);
+        assert_eq!(colors.accent_wash(), gpui::rgba(0x33_c2_ac_21));
+        assert_eq!(colors.accent_ring(), gpui::rgba(0x33_c2_ac_24));
+        assert_eq!(colors.error_outline(), gpui::rgba(0xe2_6d_78_52));
+        assert_eq!(colors.error_wash(), gpui::rgba(0xe2_6d_78_1a));
         // accent mixed 62% toward bg_panel.
         assert_eq!(colors.accent_dim(), 0x28_82_78);
         // accent mixed 78% toward text_primary.

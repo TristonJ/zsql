@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, KeyBinding, Render,
-    Stateful, Window, actions, div, prelude::*, px, rgb, rgba,
+    Stateful, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, Value};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -416,11 +416,11 @@ impl ValuePanel {
             .text_size(px(theme::VALUE_PANEL_LABEL_TEXT_SIZE))
             .child(label);
         if disabled {
-            btn = btn.text_color(rgba(theme::value_panel_disabled_button_text(active_theme)));
+            btn = btn.text_color(theme::value_panel_disabled_button_text(active_theme));
         } else if active {
             btn = btn
                 .cursor_pointer()
-                .bg(rgba(theme::sidebar_selected_bg(active_theme)))
+                .bg(theme::sidebar_selected_bg(active_theme))
                 .text_color(rgb(colors.accent))
                 .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
                     on_click(view, window, cx);
@@ -561,7 +561,7 @@ impl ValuePanel {
                     .flex()
                     .items_center()
                     .rounded(px(theme::VALUE_PANEL_BUTTON_RADIUS))
-                    .bg(rgba(theme::sidebar_selected_bg(active_theme)))
+                    .bg(theme::sidebar_selected_bg(active_theme))
                     .text_color(rgb(colors.accent))
                     .text_size(px(theme::VALUE_PANEL_LABEL_TEXT_SIZE))
                     .child("Load full value")

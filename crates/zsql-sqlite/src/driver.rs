@@ -14,8 +14,9 @@ use futures::StreamExt as _;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
-    BatchSink, ConnConfig, Connection, CoreError, Driver, QueryEvent, QueryHandle, RelationSchema,
-    RowBatch, RowCount, SchemaTree, quote_ident,
+    BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
+    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree, quote_ident,
+    render_where_conditions,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{POOL_ACQUIRE_TIMEOUT, build_pool, liveness_check_or_skip_if_busy};
@@ -112,10 +113,20 @@ impl Connection for SqliteConnectionImpl {
     /// `sqlite_stat1`/`sqlite_stat4` tables estimate index selectivity, not
     /// a table's total row count, and only exist at all once `ANALYZE` has
     /// been run. There is therefore no cheap estimate to prefer here; this
-    /// always executes an exact `COUNT(*)` and reports [`RowCount::Exact`].
-    #[tracing::instrument(name = "sqlite_count_rows", skip(self), fields(pool_size = self.pool.size()))]
-    async fn count_rows(&self, schema: &str, relation: &str) -> Result<RowCount, CoreError> {
-        let sql = count_sql(schema, relation);
+    /// always executes an exact `COUNT(*)` (restricted to rows matching
+    /// `filters`, if any) and reports [`RowCount::Exact`].
+    #[tracing::instrument(
+        name = "sqlite_count_rows",
+        skip(self, filters),
+        fields(pool_size = self.pool.size(), filtered = !filters.is_empty())
+    )]
+    async fn count_rows(
+        &self,
+        schema: &str,
+        relation: &str,
+        filters: &FilterState,
+    ) -> Result<RowCount, CoreError> {
+        let sql = count_sql(schema, relation, filters);
         // `sql` is built entirely from `quote_ident`-escaped identifiers via
         // `count_sql`, never from unescaped runtime text.
         let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
@@ -138,6 +149,37 @@ impl Connection for SqliteConnectionImpl {
         crate::describe::describe_relation(&self.pool, schema, relation).await
     }
 
+    /// The click-to-preview query for `relation` in `schema`, capped at
+    /// `limit` rows: identical to [`zsql_core::default_preview_query`]
+    /// (double-quoted identifiers) except for `ILIKE`, which `SQLite` has no
+    /// native support for and so maps to `LOWER(column) LIKE LOWER(value)`.
+    fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        let mut sql = format!(
+            "SELECT * FROM {}.{}",
+            quote_ident(schema),
+            quote_ident(relation)
+        );
+        if let Some(where_clause) = render_where_conditions(&args.filters, quote_ident, false) {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clause);
+        }
+        if let Some((column, direction)) = args.sort {
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&quote_ident(&column));
+            sql.push(' ');
+            sql.push_str(direction.as_sql());
+        }
+        sql.push_str(" LIMIT ");
+        sql.push_str(&args.limit.to_string());
+        if let Some(offset) = args.offset
+            && offset > 0
+        {
+            sql.push_str(" OFFSET ");
+            sql.push_str(&offset.to_string());
+        }
+        sql
+    }
+
     /// Close the underlying pool, checkpointing rather than relying on
     /// however/whenever its `Drop` runs.
     #[tracing::instrument(name = "sqlite_close", skip_all)]
@@ -149,13 +191,20 @@ impl Connection for SqliteConnectionImpl {
 
 /// Build `SELECT COUNT(*) FROM <quoted schema>.<quoted relation>`, quoting
 /// both identifiers so an adversarial schema/relation name cannot break out
-/// of the identifier position.
-fn count_sql(schema: &str, relation: &str) -> String {
-    format!(
+/// of the identifier position, plus `filters`' conditions as a `WHERE`
+/// clause (`ILIKE` mapped to `LOWER(column) LIKE LOWER(value)`, matching
+/// this driver's own `preview_query`).
+fn count_sql(schema: &str, relation: &str, filters: &FilterState) -> String {
+    let mut sql = format!(
         "SELECT COUNT(*) FROM {}.{}",
         quote_ident(schema),
         quote_ident(relation)
-    )
+    );
+    if let Some(where_clause) = render_where_conditions(filters, quote_ident, false) {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+    sql
 }
 
 /// Stream a query's results into `sink`. `sql` may hold several statements;
@@ -515,6 +564,77 @@ mod tests {
     }
 
     #[test]
+    fn preview_query_renders_a_where_clause_from_filters() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "TEXT", zsql_core::FilterOperator::Eq, "paid");
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"main\".\"orders\" WHERE \"status\" = 'paid' LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_maps_ilike_to_lower_like_lower_on_sqlite() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("name", "TEXT", zsql_core::FilterOperator::ILike, "smith%");
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert!(
+            sql.contains("LOWER(\"name\") LIKE LOWER('smith%')"),
+            "sqlite has no native ILIKE and must map it, got: {sql}"
+        );
+        assert!(!sql.contains("ILIKE"), "got: {sql}");
+    }
+
+    #[test]
+    fn preview_query_is_safe_against_an_injection_shaped_filter_column() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition(
+            "total\"; DROP TABLE users; --",
+            "INTEGER",
+            zsql_core::FilterOperator::Eq,
+            "1",
+        );
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"main\".\"orders\" WHERE \"total\"\"; DROP TABLE users; --\" = 1 LIMIT 200"
+        );
+        assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn count_sql_renders_a_where_clause_from_filters() {
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "TEXT", zsql_core::FilterOperator::Eq, "paid");
+        assert_eq!(
+            super::count_sql("main", "items", &filters),
+            "SELECT COUNT(*) FROM \"main\".\"items\" WHERE \"status\" = 'paid'"
+        );
+    }
+
+    #[test]
     fn close_shuts_down_the_underlying_pool_through_the_trait_object() {
         let pool = block_on(
             sqlx::sqlite::SqlitePoolOptions::new()
@@ -846,14 +966,18 @@ mod tests {
     #[test]
     fn count_sql_quotes_both_identifiers() {
         assert_eq!(
-            super::count_sql("main", "items"),
+            super::count_sql("main", "items", &zsql_core::FilterState::new()),
             "SELECT COUNT(*) FROM \"main\".\"items\""
         );
     }
 
     #[test]
     fn count_sql_is_safe_against_an_injection_shaped_relation_name() {
-        let sql = super::count_sql("main", "items\"; DROP TABLE users; --");
+        let sql = super::count_sql(
+            "main",
+            "items\"; DROP TABLE users; --",
+            &zsql_core::FilterState::new(),
+        );
         assert_eq!(
             sql,
             "SELECT COUNT(*) FROM \"main\".\"items\"\"; DROP TABLE users; --\""
@@ -878,8 +1002,8 @@ mod tests {
              INSERT INTO items DEFAULT VALUES",
         );
 
-        let row_count =
-            block_on(conn.count_rows("main", "items")).expect("count_rows should succeed");
+        let row_count = block_on(conn.count_rows("main", "items", &zsql_core::FilterState::new()))
+            .expect("count_rows should succeed");
         assert_eq!(row_count, zsql_core::RowCount::Exact(5));
     }
 
@@ -893,7 +1017,8 @@ mod tests {
         run_ddl(&*conn, "CREATE TABLE empty_items(id INTEGER PRIMARY KEY)");
 
         let row_count =
-            block_on(conn.count_rows("main", "empty_items")).expect("count_rows should succeed");
+            block_on(conn.count_rows("main", "empty_items", &zsql_core::FilterState::new()))
+                .expect("count_rows should succeed");
         assert_eq!(row_count, zsql_core::RowCount::Exact(0));
     }
 
@@ -904,7 +1029,11 @@ mod tests {
         let cfg = ConnConfig::from_url(&db.url()).unwrap();
         let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
 
-        let result = block_on(conn.count_rows("main", "zsql_test_relation_that_does_not_exist"));
+        let result = block_on(conn.count_rows(
+            "main",
+            "zsql_test_relation_that_does_not_exist",
+            &zsql_core::FilterState::new(),
+        ));
         match result {
             Err(zsql_core::CoreError::Query { message, .. }) => {
                 assert!(!message.is_empty(), "error message should not be empty");
@@ -914,6 +1043,71 @@ mod tests {
                 panic!("counting a nonexistent relation must fail, got {row_count:?}")
             }
         }
+    }
+
+    /// A filtered windowed preview must both return exactly the matching
+    /// rows and report a filtered total that excludes the rows the filter
+    /// dropped -- not merely "a query ran".
+    #[test]
+    fn filtered_preview_query_and_count_return_only_matching_rows() {
+        let db = TempDbPath::new("filtered-preview");
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url(&db.url()).unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+
+        run_ddl(
+            &*conn,
+            "CREATE TABLE orders(n INTEGER NOT NULL, status TEXT NOT NULL); \
+             INSERT INTO orders (n, status) VALUES \
+             (1, 'pending'), (2, 'paid'), (3, 'pending'), (4, 'paid'), \
+             (5, 'pending'), (6, 'paid'), (7, 'pending'), (8, 'paid'), \
+             (9, 'pending'), (10, 'paid')",
+        );
+
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "TEXT", zsql_core::FilterOperator::Eq, "paid");
+
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(10)
+                .sort("n", zsql_core::SortDirection::Asc)
+                .filters(filters.clone()),
+        );
+        assert!(sql.contains("WHERE \"status\" = 'paid'"), "{sql}");
+
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query(sql, tx);
+        let mut rows = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Columns(_))) => {}
+                Ok(Ok(zsql_core::QueryEvent::Batch(batch))) => rows.extend(batch.rows),
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => break,
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        let values: Vec<i64> = rows
+            .iter()
+            .map(|row| match &row.0[0] {
+                zsql_core::Value::Int(n) => *n,
+                other => panic!("expected an Int cell, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![2, 4, 6, 8, 10],
+            "the filtered preview must return only status='paid' rows"
+        );
+
+        let filtered_count = block_on(conn.count_rows("main", "orders", &filters))
+            .expect("filtered count_rows should succeed");
+        assert_eq!(filtered_count, zsql_core::RowCount::Exact(5));
+
+        let unfiltered_count =
+            block_on(conn.count_rows("main", "orders", &zsql_core::FilterState::new()))
+                .expect("unfiltered count_rows should succeed");
+        assert_eq!(unfiltered_count, zsql_core::RowCount::Exact(10));
     }
 
     #[test]

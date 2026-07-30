@@ -6,6 +6,7 @@ pub mod config;
 pub mod connection_url;
 pub mod driver;
 pub mod error;
+pub mod filter;
 pub mod preview_state;
 pub mod registry;
 pub mod row_count;
@@ -22,6 +23,10 @@ pub use connection_url::{
 };
 pub use driver::{BatchSink, Connection, Driver, QueryEvent, QueryHandle};
 pub use error::CoreError;
+pub use filter::{
+    FilterCondition, FilterConditionId, FilterConnector, FilterOperator, FilterState,
+    FilterValueRender, classify_filter_value, quote_sql_string, render_where_conditions,
+};
 pub use preview_state::PreviewQueryState;
 pub use registry::select_driver;
 pub use row_count::{ESTIMATE_MARKER, RowCount, group_thousands};

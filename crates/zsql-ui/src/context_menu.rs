@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, ClickEvent, Corner, Div, MouseButton, Pixels, Point, RenderOnce, SharedString, Window,
-    anchored, deferred, div, prelude::*, px, rgb, rgba,
+    anchored, deferred, div, prelude::*, px, rgb,
 };
 
 use crate::theme::{ActiveTheme, Colors, Theme};
@@ -251,7 +251,7 @@ impl RenderOnce for ContextMenuItem {
             .cursor_pointer()
             .text_size(px(self.style.item_text_size))
             .text_color(rgb(theme.colors.text_primary))
-            .hover(|el| el.bg(rgba(Colors::wash(theme.colors.accent, 0x1a))))
+            .hover(|el| el.bg(Colors::wash(theme.colors.accent, 0x1a)))
             .child(self.label)
             .when_some(self.on_click, |el, on_click| el.on_click(on_click))
     }

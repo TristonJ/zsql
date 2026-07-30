@@ -7,9 +7,10 @@ use gpui::{
 use zsql_core::value::UnknownValue;
 use zsql_core::{ColumnMeta, ResultSet, Row, RowCount, Value};
 
+use super::grid::column_width_from_parts;
 use super::{
     CellDown, CellLeft, CellRight, CellUp, Copy, NextPage, PrevPage, ResultsView, SessionState,
-    ViewMode, column_width_from_parts, results_bar_count_text,
+    ViewMode, filtered_count_summary, results_bar_count_text,
 };
 
 use crate::session::Session;
@@ -104,6 +105,66 @@ fn sample_result() -> ResultSet {
     }
 }
 
+// -- filtered_count_summary --------------------------------------------------
+
+fn preview_controls_for_summary(
+    filtered: bool,
+    base_total: Option<RowCount>,
+    filtered_total: Option<RowCount>,
+) -> super::pager::PreviewControls {
+    let mut state = zsql_core::preview_state::PreviewQueryState::new(200);
+    if let Some(base) = base_total {
+        state.set_total_rows(Some(base));
+    }
+    if filtered {
+        state.add_filter("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        // Re-set the (possibly still-unknown) filtered total explicitly:
+        // adding a filter alone leaves any previously-set total in place,
+        // exactly like a real requery clears it back to `None` until the
+        // filtered count fetch resolves.
+        state.set_total_rows(filtered_total);
+    }
+    super::pager::PreviewControls {
+        state,
+        dispatch: std::rc::Rc::new(|_action, _cx| {}),
+    }
+}
+
+#[test]
+fn filtered_count_summary_is_none_with_no_active_preview() {
+    assert_eq!(filtered_count_summary(None), None);
+}
+
+#[test]
+fn filtered_count_summary_is_none_with_no_filters_committed() {
+    let controls = preview_controls_for_summary(false, Some(RowCount::Exact(12_480)), None);
+    assert_eq!(filtered_count_summary(Some(&controls)), None);
+}
+
+#[test]
+fn filtered_count_summary_is_none_while_the_filtered_total_is_not_yet_known() {
+    let controls = preview_controls_for_summary(true, Some(RowCount::Exact(12_480)), None);
+    assert_eq!(filtered_count_summary(Some(&controls)), None);
+}
+
+#[test]
+fn filtered_count_summary_is_none_while_the_base_total_is_not_yet_known() {
+    let controls = preview_controls_for_summary(true, None, Some(RowCount::Exact(3_102)));
+    assert_eq!(filtered_count_summary(Some(&controls)), None);
+}
+
+#[test]
+fn filtered_count_summary_formats_both_totals_once_known() {
+    let controls = preview_controls_for_summary(
+        true,
+        Some(RowCount::Exact(12_480)),
+        Some(RowCount::Exact(3_102)),
+    );
+    assert_eq!(
+        filtered_count_summary(Some(&controls)),
+        Some(("3,102".to_owned(), "filtered of 12,480".to_owned()))
+    );
+}
 #[gpui::test]
 fn renders_one_frame_without_panicking(cx: &mut gpui::TestAppContext) {
     let mut result = sample_result();
@@ -1881,7 +1942,7 @@ fn recording_preview_controls() -> (
     let recorded_for_dispatch = recorded.clone();
     let controls = super::pager::PreviewControls {
         state: zsql_core::preview_state::PreviewQueryState::new(200),
-        dispatch: std::rc::Rc::new(move |action, _window, _cx| {
+        dispatch: std::rc::Rc::new(move |action, _cx| {
             recorded_for_dispatch.borrow_mut().push(action);
         }),
     };
@@ -1931,4 +1992,342 @@ fn prev_page_and_next_page_actions_reach_the_active_tabs_preview_dispatch(
             super::pager::PreviewAction::NextPage
         ]
     );
+}
+
+// -- filter bar -------------------------------------------------------------
+
+fn preview_controls_with_filters(
+    filters: &zsql_core::FilterState,
+) -> (
+    super::pager::PreviewControls,
+    std::rc::Rc<std::cell::RefCell<Vec<super::pager::PreviewAction>>>,
+) {
+    let mut state = zsql_core::preview_state::PreviewQueryState::new(200);
+    for condition in filters.conditions() {
+        state.add_filter(
+            condition.column(),
+            condition.type_name(),
+            condition.operator(),
+            condition.value(),
+        );
+    }
+    let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorded_for_dispatch = recorded.clone();
+    let controls = super::pager::PreviewControls {
+        state,
+        dispatch: std::rc::Rc::new(move |action, _cx| {
+            recorded_for_dispatch.borrow_mut().push(action);
+        }),
+    };
+    (controls, recorded)
+}
+
+fn view_with_sample_result_and_controls(
+    cx: &mut gpui::TestAppContext,
+    controls: Option<super::pager::PreviewControls>,
+) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
+    let session = cx.new(|_cx| {
+        Session::new_for_render_test(SessionState::Results(Duration::default()), sample_result())
+    });
+    let (view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+    if let Some(controls) = controls {
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(controls), cx);
+        });
+    }
+    (view, vcx)
+}
+
+#[gpui::test]
+fn begin_add_filter_opens_the_column_picker(cx: &mut gpui::TestAppContext) {
+    let (controls, _recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert!(view.filter_column_picker_is_open_for_test());
+        assert!(
+            !view.filter_editor_is_open_for_test(),
+            "the editor only opens once a column is picked"
+        );
+    });
+}
+
+#[gpui::test]
+fn begin_add_filter_toggles_the_column_picker_closed_again(cx: &mut gpui::TestAppContext) {
+    let (controls, _recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.begin_add_filter(window, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert!(!view.filter_column_picker_is_open_for_test());
+    });
+}
+
+#[gpui::test]
+fn begin_add_filter_is_a_noop_with_no_active_preview_controls(cx: &mut gpui::TestAppContext) {
+    let (view, vcx) = view_with_sample_result_and_controls(cx, None);
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert!(
+            !view.filter_column_picker_is_open_for_test(),
+            "a detached tab's filter bar must not open the column picker"
+        );
+        assert!(!view.filter_editor_is_open_for_test());
+    });
+}
+
+#[gpui::test]
+fn picking_the_first_column_opens_an_editor_targeting_it(cx: &mut gpui::TestAppContext) {
+    let (controls, _recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("id", "int8"), window, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert!(
+            !view.filter_column_picker_is_open_for_test(),
+            "picking a column must close the picker"
+        );
+        assert!(view.filter_editor_is_open_for_test());
+        assert_eq!(
+            view.filter_editor_operator_for_test(),
+            Some(zsql_core::FilterOperator::Eq),
+            "a fresh filter defaults to the equals operator"
+        );
+    });
+}
+
+#[gpui::test]
+fn picking_a_non_first_column_opens_an_editor_targeting_it(cx: &mut gpui::TestAppContext) {
+    let (controls, recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("status", "text"), window, cx);
+        view.set_filter_editor_value_for_test("paid", cx);
+        view.commit_filter_edit(cx);
+    });
+
+    assert_eq!(
+        recorded.borrow().as_slice(),
+        [super::pager::PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        }],
+        "a filter must be reachable against any column, not only the first"
+    );
+}
+
+#[gpui::test]
+fn the_filter_bar_reactivates_once_a_detached_tab_is_replaced_by_a_live_generated_tab(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, vcx) = view_with_sample_result_and_controls(cx, None);
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+    });
+    view.read_with(vcx, |view, _app| {
+        assert!(!view.filter_column_picker_is_open_for_test());
+    });
+
+    let (controls, _recorded) = recording_preview_controls();
+    view.update(vcx, |view, cx| {
+        view.set_preview_controls(Some(controls), cx);
+    });
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("id", "int8"), window, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert!(
+            view.filter_editor_is_open_for_test(),
+            "regenerating the tab must reactivate the filter bar"
+        );
+    });
+}
+
+#[gpui::test]
+fn committing_a_new_filter_dispatches_add_filter_with_the_typed_value(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (controls, recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("id", "int8"), window, cx);
+        view.set_filter_editor_value_for_test("paid", cx);
+        view.commit_filter_edit(cx);
+    });
+
+    assert_eq!(
+        recorded.borrow().as_slice(),
+        [super::pager::PreviewAction::AddFilter {
+            column: "id".to_owned(),
+            type_name: "int8".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        }]
+    );
+    view.read_with(vcx, |view, _app| {
+        assert!(
+            !view.filter_editor_is_open_for_test(),
+            "committing must close the editor"
+        );
+    });
+}
+
+#[gpui::test]
+fn the_operator_menu_updates_the_editor_and_closes_itself(cx: &mut gpui::TestAppContext) {
+    let (controls, _recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("id", "int8"), window, cx);
+        view.toggle_filter_editor_menu(cx);
+    });
+    view.read_with(vcx, |view, _app| {
+        assert!(view.filter_editor_menu_open_for_test());
+    });
+
+    view.update(vcx, |view, cx| {
+        view.set_filter_editor_operator(zsql_core::FilterOperator::Ge, cx);
+    });
+
+    view.read_with(vcx, |view, _app| {
+        assert_eq!(
+            view.filter_editor_operator_for_test(),
+            Some(zsql_core::FilterOperator::Ge)
+        );
+        assert!(
+            !view.filter_editor_menu_open_for_test(),
+            "picking an operator must close the menu"
+        );
+    });
+}
+
+#[gpui::test]
+fn cancel_filter_edit_closes_the_editor_without_dispatching(cx: &mut gpui::TestAppContext) {
+    let (controls, recorded) = recording_preview_controls();
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+        view.pick_filter_column(&column("id", "int8"), window, cx);
+        view.set_filter_editor_value_for_test("paid", cx);
+        view.cancel_filter_edit(cx);
+    });
+
+    assert!(recorded.borrow().is_empty(), "cancel must not dispatch");
+    view.read_with(vcx, |view, _app| {
+        assert!(!view.filter_editor_is_open_for_test());
+    });
+}
+
+#[gpui::test]
+fn begin_edit_filter_prefills_the_editor_from_the_existing_condition(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut filters = zsql_core::FilterState::new();
+    filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+    let condition = filters.conditions()[0].clone();
+    let (controls, _recorded) = preview_controls_with_filters(&filters);
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_edit_filter(&condition, window, cx);
+    });
+
+    view.read_with(vcx, |view, cx| {
+        assert_eq!(
+            view.filter_editor_operator_for_test(),
+            Some(zsql_core::FilterOperator::Eq)
+        );
+        assert_eq!(
+            view.filter_editor_value_for_test(cx).as_deref(),
+            Some("paid")
+        );
+    });
+}
+
+#[gpui::test]
+fn committing_an_edited_filter_dispatches_update_filter(cx: &mut gpui::TestAppContext) {
+    let mut filters = zsql_core::FilterState::new();
+    let id = filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+    let condition = filters.conditions()[0].clone();
+    let (controls, recorded) = preview_controls_with_filters(&filters);
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_edit_filter(&condition, window, cx);
+        view.set_filter_editor_value_for_test("pending", cx);
+        view.commit_filter_edit(cx);
+    });
+
+    assert_eq!(
+        recorded.borrow().as_slice(),
+        [super::pager::PreviewAction::UpdateFilter {
+            id,
+            operator: zsql_core::FilterOperator::Eq,
+            value: "pending".to_owned(),
+        }]
+    );
+}
+
+#[gpui::test]
+fn render_filter_bar_does_not_panic_across_every_editing_state(cx: &mut gpui::TestAppContext) {
+    let mut filters = zsql_core::FilterState::new();
+    filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+    filters.add_condition(
+        "id",
+        "int8",
+        zsql_core::FilterOperator::Gt,
+        "now() - interval '1 day'",
+    );
+    let (controls, _recorded) = preview_controls_with_filters(&filters);
+    let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
+
+    // Committed chips (including an fx-tagged expression value) and a live
+    // dispatcher, with no editor open: covered by the window's initial draw.
+    vcx.run_until_parked();
+
+    // The column picker open, before a target column is chosen. Each state
+    // renders through the window's own draw rather than a direct
+    // render_filter_bar call: hover-state hooks inside the bar may only run
+    // during a draw pass.
+    view.update_in(vcx, |view, window, cx| {
+        view.begin_add_filter(window, cx);
+    });
+    vcx.run_until_parked();
+
+    // Mid-edit, with the operator menu open.
+    view.update_in(vcx, |view, window, cx| {
+        view.pick_filter_column(&column("status", "text"), window, cx);
+        view.toggle_filter_editor_menu(cx);
+    });
+    vcx.run_until_parked();
+
+    // Detached (no active preview controls): every control renders inert.
+    view.update(vcx, |view, cx| view.set_preview_controls(None, cx));
+    vcx.run_until_parked();
 }

@@ -13,7 +13,7 @@
 
 use gpui::{
     App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Window, div,
-    prelude::*, px, rgb, rgba,
+    prelude::*, px, rgb,
 };
 use uuid::Uuid;
 use zsql_core::ConnectionUrl;
@@ -523,7 +523,7 @@ impl ConnectionForm {
             .px_3()
             .py_2()
             .rounded(px(theme::MODAL_ROW_RADIUS))
-            .bg(rgba(bg))
+            .bg(bg)
             .text_size(px(theme::CONNECTION_FORM_RESULT_TEXT_SIZE))
             .text_color(rgb(dot_color))
             .overflow_hidden()
