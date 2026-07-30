@@ -683,8 +683,11 @@ impl TabModel {
     }
 
     /// This model's entire tab state as a persistable, window-independent
-    /// snapshot: every tab's kind/title/buffer text, in order, plus which
-    /// one is active.
+    /// snapshot: every tab's kind/title and kind-specific payload, in order,
+    /// plus which one is active. A `Generated` tab's SQL is never itself
+    /// part of the payload -- it is always machine-written from
+    /// `preview_state`, so only that state is captured; a `Script` tab's
+    /// text is user-authored, so its full buffer is captured instead.
     #[must_use]
     pub fn snapshot(&self, cx: &App) -> TabSessionSnapshot {
         let tabs = self
@@ -692,19 +695,17 @@ impl TabModel {
             .iter()
             .filter_map(|tab| {
                 let kind = match &tab.kind {
-                    TabKind::Script => TabEntryKind::Script,
+                    TabKind::Script => TabEntryKind::Script {
+                        buffer_text: tab.editor.read(cx).text(),
+                    },
                     // `tab.dirty` is always `false` here: `mark_edited`
                     // converts a `Generated` tab to `TabKind::Script` in the
                     // same call that would otherwise set it, so a live tab
-                    // can never be both still-`Generated` and dirty. The
-                    // field exists so the persisted shape has somewhere to
-                    // carry that conversion if the live behavior ever
-                    // changes, and so `restore_tabs` has a single rule
-                    // (check `edited`) instead of two.
+                    // can never be both still-`Generated` and dirty.
                     TabKind::Generated { schema, relation } => TabEntryKind::Generated {
                         schema: schema.clone(),
                         relation: relation.clone(),
-                        edited: tab.dirty,
+                        preview_state: tab.preview_state.clone(),
                     },
                     // A schema tab is a read-only view re-openable from the
                     // sidebar at any time and carries no editable buffer, so
@@ -714,7 +715,6 @@ impl TabModel {
                 Some(TabEntrySnapshot {
                     kind,
                     title: tab.title.clone(),
-                    buffer_text: tab.editor.read(cx).text(),
                 })
             })
             .collect();
@@ -768,11 +768,19 @@ impl TabModel {
         cx.notify();
     }
 
-    /// Rebuild `self.tabs` from `snapshot`'s entries: same order, kind,
-    /// title, and buffer text. A `Generated` entry whose persisted `edited`
-    /// flag is set restores as [`TabKind::Script`] instead, consistent with
-    /// the live conversion [`TabModel::mark_edited`] performs on a
-    /// generated tab's first edit.
+    /// Rebuild `self.tabs` from `snapshot`'s entries: same order, kind, and
+    /// title. A `Script` entry's buffer text is restored verbatim. A
+    /// `Generated` entry's buffer text is instead regenerated from its
+    /// persisted `preview_state` via [`Session::preview_sql_windowed`] --
+    /// the same windowed builder call a live sort/page/filter change rewrites
+    /// a tab's buffer with (see `preview_actions`) -- so a restored tab's
+    /// text and controls can never disagree. `snapshot` may come straight
+    /// from disk or, on a connection switch-back, from an in-memory cache
+    /// that was never serialized, so a `Generated` entry's row-count fields
+    /// are cleared explicitly via
+    /// [`PreviewQueryState::clear_resolved_totals`] rather than left to
+    /// `#[serde(skip)]`, keeping both restore paths identical; the next run
+    /// refetches them through the existing count path.
     ///
     /// Never triggers a query: [`EditorView::set_text`] does not invoke the
     /// on-edit listener, so restoring a buffer's text neither marks a
@@ -789,38 +797,64 @@ impl TabModel {
         for entry in &snapshot.tabs {
             let id = self.allocate_id();
             let editor = Self::build_editor(id, cx);
-            editor.update(cx, |editor, cx| editor.set_text(&entry.buffer_text, cx));
 
-            let (kind, dirty) = match &entry.kind {
-                TabEntryKind::Script => (TabKind::Script, false),
-                TabEntryKind::Generated { edited: true, .. } => (TabKind::Script, true),
+            let (kind, preview_state) = match &entry.kind {
+                TabEntryKind::Script { buffer_text } => {
+                    editor.update(cx, |editor, cx| editor.set_text(buffer_text, cx));
+                    (TabKind::Script, PreviewQueryState::new(page_size))
+                }
                 TabEntryKind::Generated {
                     schema,
                     relation,
-                    edited: false,
-                } => (
-                    TabKind::Generated {
-                        schema: schema.clone(),
-                        relation: relation.clone(),
-                    },
-                    false,
-                ),
+                    preview_state,
+                } => {
+                    let filters = preview_state.filters();
+                    let _span = tracing::info_span!(
+                        "tab_session_restore_generated",
+                        tab_id = id,
+                        schema = %schema,
+                        relation = %relation,
+                        limit = preview_state.page_size(),
+                        offset = preview_state.offset(),
+                        filtered = !filters.is_empty()
+                    )
+                    .entered();
+                    let sql = self.session.read(cx).preview_sql_windowed(
+                        schema,
+                        relation,
+                        preview_state.sort_pair(),
+                        preview_state.page_size(),
+                        preview_state.offset(),
+                        filters,
+                    );
+                    tracing::info!("regenerated a restored generated tab's buffer");
+                    editor.update(cx, |editor, cx| {
+                        editor.set_text(&sql, cx);
+                        editor.set_compact(true);
+                    });
+                    self.generated_by_relation
+                        .insert((schema.clone(), relation.clone()), id);
+                    let mut preview_state = preview_state.clone();
+                    preview_state.clear_resolved_totals();
+                    (
+                        TabKind::Generated {
+                            schema: schema.clone(),
+                            relation: relation.clone(),
+                        },
+                        preview_state,
+                    )
+                }
             };
-            if let TabKind::Generated { schema, relation } = &kind {
-                self.generated_by_relation
-                    .insert((schema.clone(), relation.clone()), id);
-                editor.update(cx, |editor, _cx| editor.set_compact(true));
-            }
 
             self.tabs.push(Tab {
                 id,
                 kind,
                 title: entry.title.clone(),
                 editor,
-                dirty,
+                dirty: false,
                 last_run: None,
                 schema_view: None,
-                preview_state: PreviewQueryState::new(page_size),
+                preview_state,
             });
         }
 

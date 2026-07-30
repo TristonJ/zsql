@@ -8,9 +8,11 @@
 
 use std::fmt::Write as _;
 
+use serde::{Deserialize, Serialize};
+
 /// The v0 filter operator set. No other operator is reachable from
 /// [`FilterState`]'s API or the UI's operator menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterOperator {
     Eq,
     Lt,
@@ -63,7 +65,7 @@ impl FilterOperator {
 /// The connector joining one filter chip to the next. Emitted into the
 /// generated `WHERE` clause verbatim, in chip order, with no added
 /// parentheses: precedence is SQL's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterConnector {
     And,
     Or,
@@ -257,13 +259,16 @@ pub fn classify_filter_value(raw: &str, type_name: &str) -> FilterValueRender {
 }
 
 /// Stable identity for one [`FilterState`] condition, unique within that
-/// state for its lifetime.
+/// state for its lifetime. Persisted verbatim by [`FilterState`]'s
+/// `Serialize`/`Deserialize` impls alongside the next id to assign, so a
+/// deserialized [`FilterState`]'s ids stay exactly what they were before
+/// serialization: unique within it and stable for the rest of the session.
 pub type FilterConditionId = u64;
 
 /// One committed filter chip: the column it targets, that column's backend
 /// type (captured at add/edit time so rendering never needs a fresh column
 /// lookup), the v0 operator, and the value as typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterCondition {
     id: FilterConditionId,
     column: String,
@@ -310,7 +315,7 @@ impl FilterCondition {
 /// between adjacent ones: `connectors[i]` joins `conditions[i]` to
 /// `conditions[i + 1]`, so `connectors.len() == conditions.len() - 1`
 /// whenever `conditions` is non-empty (`0` when it holds 0 or 1 condition).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FilterState {
     conditions: Vec<FilterCondition>,
     connectors: Vec<FilterConnector>,
@@ -483,8 +488,8 @@ pub fn render_where_conditions(
 #[cfg(test)]
 mod tests {
     use super::{
-        FilterConnector, FilterOperator, FilterState, FilterValueRender, classify_filter_value,
-        quote_sql_string, render_where_conditions,
+        FilterCondition, FilterConnector, FilterOperator, FilterState, FilterValueRender,
+        classify_filter_value, quote_sql_string, render_where_conditions,
     };
 
     // -- quote_sql_string ---------------------------------------------------
@@ -1036,5 +1041,46 @@ mod tests {
         state.add_condition("weird\"col", "text", FilterOperator::Eq, "x");
         let rendered = render_where_conditions(&state, crate::sql::quote_ident, true);
         assert_eq!(rendered, Some("\"weird\"\"col\" = 'x'".to_owned()));
+    }
+
+    // -- serde round-trips ----------------------------------------------------
+
+    #[test]
+    fn a_filter_state_with_an_expression_value_round_trips_through_json() {
+        let mut state = FilterState::new();
+        state.add_condition(
+            "placed_at",
+            "timestamptz",
+            FilterOperator::Gt,
+            "now() - interval '7 days'",
+        );
+
+        let text = serde_json::to_string(&state).expect("must serialize");
+        let parsed: FilterState = serde_json::from_str(&text).expect("must parse back");
+
+        assert_eq!(parsed, state);
+        assert!(parsed.conditions()[0].rendered_value().is_expression());
+    }
+
+    #[test]
+    fn a_filter_state_with_an_or_connector_round_trips_through_json() {
+        let mut state = FilterState::new();
+        let paid = state.add_condition("status", "text", FilterOperator::Eq, "paid");
+        let pending = state.add_condition("status", "text", FilterOperator::Eq, "pending");
+        state.toggle_connector(0);
+
+        let text = serde_json::to_string(&state).expect("must serialize");
+        let parsed: FilterState = serde_json::from_str(&text).expect("must parse back");
+
+        assert_eq!(parsed, state);
+        assert_eq!(parsed.connectors(), [FilterConnector::Or]);
+        assert_eq!(
+            parsed
+                .conditions()
+                .iter()
+                .map(FilterCondition::id)
+                .collect::<Vec<_>>(),
+            [paid, pending]
+        );
     }
 }

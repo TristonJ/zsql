@@ -10,6 +10,8 @@ use zsql_core::{
     RowCount, SchemaTree,
 };
 
+use zsql_core::preview_state::PreviewQueryState;
+
 use super::{PreviewControlsChanged, ResultsChanged, ResultsSnapshot, Tab, TabKind, TabModel};
 use crate::session::Session;
 use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
@@ -902,15 +904,15 @@ fn two_tab_snapshot() -> TabSessionSnapshot {
                 kind: TabEntryKind::Generated {
                     schema: "public".to_owned(),
                     relation: "orders".to_owned(),
-                    edited: false,
+                    preview_state: PreviewQueryState::new(200),
                 },
                 title: "orders".to_owned(),
-                buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200".to_owned(),
             },
             TabEntrySnapshot {
-                kind: TabEntryKind::Script,
+                kind: TabEntryKind::Script {
+                    buffer_text: "select 1;\n".to_owned(),
+                },
                 title: "query-1.sql".to_owned(),
-                buffer_text: "select 1;\n".to_owned(),
             },
         ],
         active_index: Some(1),
@@ -945,16 +947,18 @@ fn snapshot_captures_every_tabs_kind_title_buffer_and_the_active_index(cx: &mut 
         TabEntryKind::Generated {
             schema: "public".to_owned(),
             relation: "orders".to_owned(),
-            edited: false,
-        }
-    );
-    assert_eq!(
-        snapshot.tabs[0].buffer_text,
-        "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+            preview_state: PreviewQueryState::new(200),
+        },
+        "a freshly opened generated tab's captured preview state matches a \
+         fresh, unsorted, unfiltered page one"
     );
     assert_eq!(snapshot.tabs[0].title, "orders");
-    assert_eq!(snapshot.tabs[1].kind, TabEntryKind::Script);
-    assert_eq!(snapshot.tabs[1].buffer_text, "select 1;");
+    assert_eq!(
+        snapshot.tabs[1].kind,
+        TabEntryKind::Script {
+            buffer_text: "select 1;".to_owned()
+        }
+    );
     assert_eq!(snapshot.tabs[1].title, "query-1.sql");
     assert_eq!(
         snapshot.active_index,
@@ -1037,9 +1041,10 @@ fn a_new_tab_after_restoring_query_1_sql_gets_a_distinct_title(cx: &mut TestAppC
     let model = build_model(cx);
     let snapshot = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script,
+            kind: TabEntryKind::Script {
+                buffer_text: String::new(),
+            },
             title: "query-1.sql".to_owned(),
-            buffer_text: String::new(),
         }],
         active_index: Some(0),
     };
@@ -1065,9 +1070,10 @@ fn connecting_with_no_snapshot_resets_script_numbering_to_one(cx: &mut TestAppCo
     let model = build_model(cx);
     let snapshot = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script,
+            kind: TabEntryKind::Script {
+                buffer_text: String::new(),
+            },
             title: "query-5.sql".to_owned(),
-            buffer_text: String::new(),
         }],
         active_index: Some(0),
     };
@@ -1106,58 +1112,6 @@ fn a_restored_unedited_generated_tab_stays_eligible_for_reuse(cx: &mut TestAppCo
         "a restored, never-edited generated tab must still be reused rather \
          than duplicated"
     );
-}
-
-/// `TabModel::snapshot` can never actually produce a `Generated` entry
-/// with `edited: true` -- `mark_edited` converts a tab to
-/// `TabKind::Script` in the same call that would otherwise dirty it, so
-/// a live tab is never simultaneously `Generated` and dirty. This test
-/// constructs that combination by hand to pin `restore_tabs`'s defensive
-/// handling of it, in case a future change to the persisted shape (or a
-/// hand-edited store file) ever produces it.
-#[gpui::test]
-fn a_restored_generated_tab_marked_edited_comes_back_as_a_script(cx: &mut TestAppContext) {
-    let model = build_model(cx);
-    let snapshot = TabSessionSnapshot {
-        tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Generated {
-                schema: "public".to_owned(),
-                relation: "orders".to_owned(),
-                edited: true,
-            },
-            title: "orders".to_owned(),
-            buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200 -- edited".to_owned(),
-        }],
-        active_index: Some(0),
-    };
-
-    model.update(cx, |model, cx| {
-        model.load_for_connection(Some(&snapshot), cx);
-    });
-
-    model.read_with(cx, |model, app| {
-        let tab = &model.tabs()[0];
-        assert_eq!(
-            tab.kind(),
-            &TabKind::Script,
-            "an edited generated entry must restore as a script"
-        );
-        assert!(tab.dirty());
-        assert_eq!(
-            tab.editor().read(app).text(),
-            "SELECT * FROM \"public\".\"orders\" LIMIT 200 -- edited"
-        );
-    });
-
-    // A restored, edited tab's relation must not have been registered
-    // for live reuse: reopening it must create a fresh generated tab.
-    let new_id = model.update(cx, |model, cx| {
-        model.open_or_reuse_generated("public", "orders", cx)
-    });
-    model.read_with(cx, |model, _app| {
-        assert_eq!(model.tabs().len(), 2);
-        assert_ne!(new_id, model.tabs()[0].id());
-    });
 }
 
 #[gpui::test]
@@ -1226,9 +1180,10 @@ fn switching_between_two_connections_snapshots_swaps_the_whole_tab_set(cx: &mut 
     let snapshot_a = two_tab_snapshot();
     let snapshot_b = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script,
+            kind: TabEntryKind::Script {
+                buffer_text: "select 'b';".to_owned(),
+            },
             title: "b-query.sql".to_owned(),
-            buffer_text: "select 'b';".to_owned(),
         }],
         active_index: Some(0),
     };
@@ -2047,4 +2002,211 @@ fn editing_a_generated_tabs_buffer_makes_further_filter_actions_inert(cx: &mut T
         runs_before,
         "a filter action on an edited tab must not dispatch a run"
     );
+}
+
+// -- persisted preview state round-trips -----------------------------------
+
+/// A generated tab's sort, an OR-connected filter set (including an
+/// fx-classified expression value), and its page all survive a full
+/// snapshot -> JSON -> restore round trip: the regenerated buffer text
+/// matches a direct `preview_sql_windowed` call against that exact window,
+/// and the restored `PreviewQueryState` matches the original in every field
+/// but its row counts, which a fresh restore never carries.
+#[gpui::test]
+fn a_filtered_sorted_paged_generated_tab_round_trips_through_a_snapshot(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 10_000);
+    let session = model.read_with(cx, |model, _app| model.session.clone());
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    dispatch(&model, cx, PreviewAction::Sort("total_cents".to_owned()));
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "status".to_owned(),
+            type_name: "text".to_owned(),
+            operator: zsql_core::FilterOperator::Eq,
+            value: "paid".to_owned(),
+        },
+    );
+    dispatch(
+        &model,
+        cx,
+        PreviewAction::AddFilter {
+            column: "placed_at".to_owned(),
+            type_name: "timestamptz".to_owned(),
+            operator: zsql_core::FilterOperator::Gt,
+            value: "now() - interval '7 days'".to_owned(),
+        },
+    );
+    dispatch(&model, cx, PreviewAction::ToggleFilterConnector(0));
+    dispatch(&model, cx, PreviewAction::NextPage);
+    dispatch(&model, cx, PreviewAction::NextPage);
+
+    let original = model.read_with(cx, |model, _app| model.tabs()[0].preview_state().clone());
+    assert_eq!(original.page(), 3);
+    assert_eq!(
+        original.filters().connectors(),
+        [zsql_core::FilterConnector::Or]
+    );
+    assert_eq!(
+        original.total_rows(),
+        Some(RowCount::Exact(10_000)),
+        "the live tab's total must be resolved before snapshotting it"
+    );
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    let json = serde_json::to_string(&snapshot).expect("must serialize");
+    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+
+    let expected_sql = session.read_with(cx, |session, _app| {
+        session.preview_sql_windowed(
+            "public",
+            "orders",
+            original.sort_pair(),
+            original.page_size(),
+            original.offset(),
+            original.filters(),
+        )
+    });
+
+    let restored = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+    restored.update(cx, |model, cx| {
+        model.load_for_connection(Some(&parsed), cx);
+    });
+
+    restored.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.editor().read(app).text(), expected_sql);
+
+        let restored_state = tab.preview_state();
+        assert_eq!(restored_state.sort_column(), original.sort_column());
+        assert_eq!(restored_state.sort_direction(), original.sort_direction());
+        assert_eq!(restored_state.page(), original.page());
+        assert_eq!(restored_state.page_size(), original.page_size());
+        assert_eq!(restored_state.filters(), original.filters());
+        assert_eq!(
+            restored_state.total_rows(),
+            None,
+            "a restored preview state never carries its old total row count"
+        );
+        assert_eq!(restored_state.base_total_rows(), None);
+    });
+}
+
+/// A generated tab's total row count is cleared by a restore and refetched
+/// the moment the restored tab runs again, through the same count path any
+/// other run uses -- no restore-specific special-casing.
+#[gpui::test]
+fn restoring_a_snapshot_clears_totals_and_a_rerun_refetches_them(cx: &mut TestAppContext) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 300);
+    let session = model.read_with(cx, |model, _app| model.session.clone());
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs()[0].preview_state().total_rows(),
+            Some(RowCount::Exact(300))
+        );
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    let json = serde_json::to_string(&snapshot).expect("must serialize");
+    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+
+    let restored = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+    restored.update(cx, |model, cx| {
+        model.load_for_connection(Some(&parsed), cx);
+    });
+    restored.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs()[0].preview_state().total_rows(),
+            None,
+            "restore must clear the persisted total row count"
+        );
+        assert_eq!(model.tabs()[0].preview_state().base_total_rows(), None);
+    });
+
+    let restored_id = restored.read_with(cx, |model, _app| model.tabs()[0].id());
+    restored.update(cx, |model, cx| {
+        model.run_for_tab(restored_id, String::new(), cx);
+    });
+    cx.run_until_parked();
+
+    restored.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs()[0].preview_state().total_rows(),
+            Some(RowCount::Exact(300)),
+            "rerunning a restored tab must refetch its total through the existing count path"
+        );
+    });
+}
+
+/// A connection switch-back hands `load_for_connection` a `TabSessionSnapshot`
+/// straight from the in-memory session cache, never through JSON -- so
+/// clearing a `Generated` tab's totals cannot rely on `#[serde(skip)]` alone.
+/// Restoring from such a snapshot must clear them just as reliably as
+/// restoring from disk does.
+#[gpui::test]
+fn switching_back_to_a_cached_session_clears_totals_without_a_serde_round_trip(
+    cx: &mut TestAppContext,
+) {
+    let (model, _sinks) = build_model_with_recording_connection_and_total_rows(cx, 300);
+    let session = model.read_with(cx, |model, _app| model.session.clone());
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs()[0].preview_state().total_rows(),
+            Some(RowCount::Exact(300))
+        );
+    });
+
+    let cached_snapshot = model.read_with(cx, TabModel::snapshot);
+
+    let restored = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+    restored.update(cx, |model, cx| {
+        model.load_for_connection(Some(&cached_snapshot), cx);
+    });
+
+    restored.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs()[0].preview_state().total_rows(),
+            None,
+            "a cache-backed restore must clear the previous total row count"
+        );
+        assert_eq!(model.tabs()[0].preview_state().base_total_rows(), None);
+    });
+}
+
+/// A script tab's buffer text -- including surrounding whitespace and
+/// non-ASCII content a user typed -- survives a snapshot/serialize/
+/// deserialize/restore round trip byte for byte.
+#[gpui::test]
+fn a_script_tabs_buffer_text_round_trips_byte_for_byte(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    let text = "  select 'caf\u{e9}', '\u{1f600}';\n\n\t".to_owned();
+    editor.update(cx, |editor, cx| editor.set_text(&text, cx));
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    let json = serde_json::to_string(&snapshot).expect("must serialize");
+    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, cx| {
+        model.load_for_connection(Some(&parsed), cx);
+    });
+
+    restored.read_with(cx, |model, app| {
+        assert_eq!(model.tabs()[0].editor().read(app).text(), text);
+    });
 }

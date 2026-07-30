@@ -912,18 +912,18 @@ mod render_tests {
         let seeded = tab_session::TabSessionSnapshot {
             tabs: vec![
                 tab_session::TabEntrySnapshot {
-                    kind: tab_session::TabEntryKind::Script,
+                    kind: tab_session::TabEntryKind::Script {
+                        buffer_text: "select 1;".to_owned(),
+                    },
                     title: "query-1.sql".to_owned(),
-                    buffer_text: "select 1;".to_owned(),
                 },
                 tab_session::TabEntrySnapshot {
                     kind: tab_session::TabEntryKind::Generated {
                         schema: "public".to_owned(),
                         relation: "orders".to_owned(),
-                        edited: false,
+                        preview_state: zsql_core::preview_state::PreviewQueryState::new(200),
                     },
                     title: "orders".to_owned(),
-                    buffer_text: "SELECT * FROM \"public\".\"orders\" LIMIT 200".to_owned(),
                 },
             ],
             active_index: Some(1),
@@ -1052,7 +1052,12 @@ mod render_tests {
         .expect("load must succeed")
         .expect("flush_tab_session_on_quit must have written conn-a's tabs");
         assert_eq!(saved.tabs.len(), 1);
-        assert_eq!(saved.tabs[0].buffer_text, "select 42;");
+        assert_eq!(
+            saved.tabs[0].kind,
+            tab_session::TabEntryKind::Script {
+                buffer_text: "select 42;".to_owned()
+            }
+        );
     }
 
     /// A workspace with no saved connections, so `WorkspaceView::new`'s
@@ -1319,9 +1324,10 @@ mod render_tests {
         let snapshot = tab_session::TabSessionSnapshot {
             tabs: (0..tab_count)
                 .map(|i| tab_session::TabEntrySnapshot {
-                    kind: tab_session::TabEntryKind::Script,
+                    kind: tab_session::TabEntryKind::Script {
+                        buffer_text: String::new(),
+                    },
                     title: format!("query-{i}.sql"),
-                    buffer_text: String::new(),
                 })
                 .collect(),
             active_index: Some(tab_count - 1),

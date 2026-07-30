@@ -49,7 +49,7 @@ impl PreviewQueryArgs {
 }
 
 /// Which way a preview's `ORDER BY` sorts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortDirection {
     Asc,
     Desc,
