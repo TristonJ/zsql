@@ -1,9 +1,10 @@
 //! Mapping from Postgres wire values to the engine-neutral [`zsql_core::Value`].
 
-use sqlx::postgres::{PgRow, PgValueFormat};
+use sqlx::postgres::{PgRow, PgValueFormat, PgValueRef};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{BigDecimal, Json, JsonRawValue, Uuid};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
+use zsql_core::value::UnknownValue;
 use zsql_core::{Row as CoreRow, Value};
 
 /// Decode one Postgres row into an engine-neutral [`CoreRow`].
@@ -20,6 +21,101 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
     known_value(row, idx, type_name).unwrap_or_else(|| raw_fallback(row, idx))
 }
 
+/// Which per-type decode path a column's runtime type name resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeKind {
+    Bool,
+    BoolArray,
+    Int2,
+    Int2Array,
+    Int4,
+    Int4Array,
+    Int8,
+    Int8Array,
+    Float4,
+    Float4Array,
+    Float8,
+    Float8Array,
+    Numeric,
+    NumericArray,
+    Text,
+    TextArray,
+    Uuid,
+    UuidArray,
+    Date,
+    DateArray,
+    Time,
+    TimeArray,
+    Timestamp,
+    TimestampArray,
+    Timestamptz,
+    TimestamptzArray,
+    Json,
+    JsonArray,
+    Bytea,
+    ByteaArray,
+}
+
+/// Every Postgres type name this module maps, paired with the decode path it
+/// resolves to. `citext` is Postgres's case-insensitive text extension type:
+/// its wire representation and decode path are plain text, just like
+/// `TEXT`/`VARCHAR`/`CHAR`/`NAME`.
+const TYPE_KINDS: &[(&str, DecodeKind)] = &[
+    ("BOOL", DecodeKind::Bool),
+    ("BOOL[]", DecodeKind::BoolArray),
+    ("INT2", DecodeKind::Int2),
+    ("INT2[]", DecodeKind::Int2Array),
+    ("INT4", DecodeKind::Int4),
+    ("INT4[]", DecodeKind::Int4Array),
+    ("INT8", DecodeKind::Int8),
+    ("INT8[]", DecodeKind::Int8Array),
+    ("FLOAT4", DecodeKind::Float4),
+    ("FLOAT4[]", DecodeKind::Float4Array),
+    ("FLOAT8", DecodeKind::Float8),
+    ("FLOAT8[]", DecodeKind::Float8Array),
+    ("NUMERIC", DecodeKind::Numeric),
+    ("NUMERIC[]", DecodeKind::NumericArray),
+    ("TEXT", DecodeKind::Text),
+    ("VARCHAR", DecodeKind::Text),
+    ("CHAR", DecodeKind::Text),
+    ("NAME", DecodeKind::Text),
+    ("CITEXT", DecodeKind::Text),
+    ("TEXT[]", DecodeKind::TextArray),
+    ("VARCHAR[]", DecodeKind::TextArray),
+    ("CHAR[]", DecodeKind::TextArray),
+    ("NAME[]", DecodeKind::TextArray),
+    ("CITEXT[]", DecodeKind::TextArray),
+    ("UUID", DecodeKind::Uuid),
+    ("UUID[]", DecodeKind::UuidArray),
+    ("DATE", DecodeKind::Date),
+    ("DATE[]", DecodeKind::DateArray),
+    ("TIME", DecodeKind::Time),
+    ("TIME[]", DecodeKind::TimeArray),
+    ("TIMESTAMP", DecodeKind::Timestamp),
+    ("TIMESTAMP[]", DecodeKind::TimestampArray),
+    ("TIMESTAMPTZ", DecodeKind::Timestamptz),
+    ("TIMESTAMPTZ[]", DecodeKind::TimestamptzArray),
+    ("JSON", DecodeKind::Json),
+    ("JSONB", DecodeKind::Json),
+    ("JSON[]", DecodeKind::JsonArray),
+    ("JSONB[]", DecodeKind::JsonArray),
+    ("BYTEA", DecodeKind::Bytea),
+    ("BYTEA[]", DecodeKind::ByteaArray),
+];
+
+/// Classify a Postgres type name (as reported by `type_info().name()`) into
+/// the decode path that should handle it, or `None` if this module does not
+/// map it. Matching is case-insensitive without allocating: a compile-time-
+/// known type is always reported upper-case, but an extension type without a
+/// stable OID (such as `citext`) is reported using its catalog name verbatim,
+/// whatever case that happens to be, and this runs once per decoded cell.
+fn decode_kind(type_name: &str) -> Option<DecodeKind> {
+    TYPE_KINDS
+        .iter()
+        .find(|(name, _)| type_name.eq_ignore_ascii_case(name))
+        .map(|(_, kind)| *kind)
+}
+
 /// Attempt to decode `row[idx]` using a type-specific mapping. Returns
 /// `None` when the type name is not one this module maps (including array
 /// suffixes it does not recognize) or when decoding it unexpectedly errors.
@@ -28,69 +124,78 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
 /// [`array_value`]), so the actual `Value` construction logic underneath is
 /// testable without a live row.
 fn known_value(row: &PgRow, idx: usize, type_name: &str) -> Option<Value> {
-    match type_name {
-        "BOOL" => decode::<bool>(row, idx).map(|v| scalar_value(v, Value::Bool)),
-        "BOOL[]" => decode_array::<bool>(row, idx).map(|v| array_value(v, Value::Bool)),
-        "INT2" => decode::<i16>(row, idx).map(|v| scalar_value(v, |x| Value::Int(i64::from(x)))),
-        "INT2[]" => {
+    match decode_kind(type_name)? {
+        DecodeKind::Bool => decode::<bool>(row, idx).map(|v| scalar_value(v, Value::Bool)),
+        DecodeKind::BoolArray => {
+            decode_array::<bool>(row, idx).map(|v| array_value(v, Value::Bool))
+        }
+        DecodeKind::Int2 => {
+            decode::<i16>(row, idx).map(|v| scalar_value(v, |x| Value::Int(i64::from(x))))
+        }
+        DecodeKind::Int2Array => {
             decode_array::<i16>(row, idx).map(|v| array_value(v, |x| Value::Int(i64::from(x))))
         }
-        "INT4" => decode::<i32>(row, idx).map(|v| scalar_value(v, |x| Value::Int(i64::from(x)))),
-        "INT4[]" => {
+        DecodeKind::Int4 => {
+            decode::<i32>(row, idx).map(|v| scalar_value(v, |x| Value::Int(i64::from(x))))
+        }
+        DecodeKind::Int4Array => {
             decode_array::<i32>(row, idx).map(|v| array_value(v, |x| Value::Int(i64::from(x))))
         }
-        "INT8" => decode::<i64>(row, idx).map(|v| scalar_value(v, Value::Int)),
-        "INT8[]" => decode_array::<i64>(row, idx).map(|v| array_value(v, Value::Int)),
-        "FLOAT4" => {
+        DecodeKind::Int8 => decode::<i64>(row, idx).map(|v| scalar_value(v, Value::Int)),
+        DecodeKind::Int8Array => decode_array::<i64>(row, idx).map(|v| array_value(v, Value::Int)),
+        DecodeKind::Float4 => {
             decode::<f32>(row, idx).map(|v| scalar_value(v, |x| Value::Float(f64::from(x))))
         }
-        "FLOAT4[]" => {
+        DecodeKind::Float4Array => {
             decode_array::<f32>(row, idx).map(|v| array_value(v, |x| Value::Float(f64::from(x))))
         }
-        "FLOAT8" => decode::<f64>(row, idx).map(|v| scalar_value(v, Value::Float)),
-        "FLOAT8[]" => decode_array::<f64>(row, idx).map(|v| array_value(v, Value::Float)),
-        "NUMERIC" => decode::<BigDecimal>(row, idx)
-            .map(|v| scalar_value(v, |d| Value::Numeric(d.to_string()))),
-        "NUMERIC[]" => decode_array::<BigDecimal>(row, idx)
-            .map(|v| array_value(v, |d| Value::Numeric(d.to_string()))),
-        "TEXT" | "VARCHAR" | "CHAR" | "NAME" => {
-            decode::<String>(row, idx).map(|v| scalar_value(v, Value::Text))
+        DecodeKind::Float8 => decode::<f64>(row, idx).map(|v| scalar_value(v, Value::Float)),
+        DecodeKind::Float8Array => {
+            decode_array::<f64>(row, idx).map(|v| array_value(v, Value::Float))
         }
-        "TEXT[]" | "VARCHAR[]" | "CHAR[]" | "NAME[]" => {
+        DecodeKind::Numeric => decode::<BigDecimal>(row, idx)
+            .map(|v| scalar_value(v, |d| Value::Numeric(d.to_string()))),
+        DecodeKind::NumericArray => decode_array::<BigDecimal>(row, idx)
+            .map(|v| array_value(v, |d| Value::Numeric(d.to_string()))),
+        DecodeKind::Text => decode::<String>(row, idx).map(|v| scalar_value(v, Value::Text)),
+        DecodeKind::TextArray => {
             decode_array::<String>(row, idx).map(|v| array_value(v, Value::Text))
         }
-        "UUID" => decode::<Uuid>(row, idx).map(|v| scalar_value(v, |u| Value::Uuid(u.to_string()))),
-        "UUID[]" => {
+        DecodeKind::Uuid => {
+            decode::<Uuid>(row, idx).map(|v| scalar_value(v, |u| Value::Uuid(u.to_string())))
+        }
+        DecodeKind::UuidArray => {
             decode_array::<Uuid>(row, idx).map(|v| array_value(v, |u| Value::Uuid(u.to_string())))
         }
-        "DATE" => decode::<NaiveDate>(row, idx)
+        DecodeKind::Date => decode::<NaiveDate>(row, idx)
             .map(|v| scalar_value(v, |d| Value::Timestamp(d.to_string()))),
-        "DATE[]" => decode_array::<NaiveDate>(row, idx)
+        DecodeKind::DateArray => decode_array::<NaiveDate>(row, idx)
             .map(|v| array_value(v, |d| Value::Timestamp(d.to_string()))),
-        "TIME" => decode::<NaiveTime>(row, idx)
+        DecodeKind::Time => decode::<NaiveTime>(row, idx)
             .map(|v| scalar_value(v, |t| Value::Timestamp(t.to_string()))),
-        "TIME[]" => decode_array::<NaiveTime>(row, idx)
+        DecodeKind::TimeArray => decode_array::<NaiveTime>(row, idx)
             .map(|v| array_value(v, |t| Value::Timestamp(t.to_string()))),
-        "TIMESTAMP" => decode::<NaiveDateTime>(row, idx)
+        DecodeKind::Timestamp => decode::<NaiveDateTime>(row, idx)
             .map(|v| scalar_value(v, |dt| Value::Timestamp(format_naive_timestamp(dt)))),
-        "TIMESTAMP[]" => decode_array::<NaiveDateTime>(row, idx)
+        DecodeKind::TimestampArray => decode_array::<NaiveDateTime>(row, idx)
             .map(|v| array_value(v, |dt| Value::Timestamp(format_naive_timestamp(dt)))),
-        "TIMESTAMPTZ" => decode::<DateTime<Utc>>(row, idx)
+        DecodeKind::Timestamptz => decode::<DateTime<Utc>>(row, idx)
             .map(|v| scalar_value(v, |dt| Value::Timestamp(dt.to_rfc3339()))),
-        "TIMESTAMPTZ[]" => decode_array::<DateTime<Utc>>(row, idx)
+        DecodeKind::TimestamptzArray => decode_array::<DateTime<Utc>>(row, idx)
             .map(|v| array_value(v, |dt| Value::Timestamp(dt.to_rfc3339()))),
         // `String`'s sqlx `Type::compatible` only accepts text-family OIDs
         // (text/varchar/bpchar/name/unknown), not json/jsonb, so
         // `try_get::<String>` on a json/jsonb column always errors and would
         // silently fall through to the raw-text `Unknown` fallback below
-        "JSON" | "JSONB" => {
+        DecodeKind::Json => {
             decode::<Json<Box<JsonRawValue>>>(row, idx).map(|v| scalar_value(v, |j| json_text(&j)))
         }
-        "JSON[]" | "JSONB[]" => decode_array::<Json<Box<JsonRawValue>>>(row, idx)
+        DecodeKind::JsonArray => decode_array::<Json<Box<JsonRawValue>>>(row, idx)
             .map(|v| array_value(v, |j| json_text(&j))),
-        "BYTEA" => decode::<Vec<u8>>(row, idx).map(|v| scalar_value(v, Value::Bytes)),
-        "BYTEA[]" => decode_array::<Vec<u8>>(row, idx).map(|v| array_value(v, Value::Bytes)),
-        _ => None,
+        DecodeKind::Bytea => decode::<Vec<u8>>(row, idx).map(|v| scalar_value(v, Value::Bytes)),
+        DecodeKind::ByteaArray => {
+            decode_array::<Vec<u8>>(row, idx).map(|v| array_value(v, Value::Bytes))
+        }
     }
 }
 
@@ -154,52 +259,38 @@ fn array_value<T>(items: Option<Vec<Option<T>>>, to_value: impl Fn(T) -> Value) 
 }
 
 /// Fallback decode for a column whose type this module does not map (or
-/// whose typed decode unexpectedly failed): read it as raw text
+/// whose typed decode unexpectedly failed): carry the server's own display
+/// text when the wire format guarantees it is available.
 fn raw_fallback(row: &PgRow, idx: usize) -> Value {
     let Ok(raw) = row.try_get_raw(idx) else {
-        return Value::Unknown(String::new());
+        return Value::Unknown(UnknownValue::None);
     };
     if raw.is_null() {
         return Value::Null;
     }
-    let bytes = raw.as_bytes().unwrap_or_default();
-    let text = raw.as_str().ok();
-    raw_fallback_value(raw.format(), text, bytes)
+    Value::Unknown(unknown_value(raw))
 }
 
-/// Render an already-null-checked raw wire value's fallback text: the
-/// server's own text-protocol rendering when available, otherwise a
-/// hex-encoded dump of its raw bytes (always the case for a binary-protocol
-/// value, and the degraded case for a text-protocol value whose bytes are
-/// not valid UTF-8).
-fn raw_fallback_value(format: PgValueFormat, text: Option<&str>, bytes: &[u8]) -> Value {
-    match format {
-        PgValueFormat::Text => text.map_or_else(
-            || Value::Unknown(hex_encode(bytes)),
-            |s| Value::Unknown(s.to_owned()),
-        ),
-        PgValueFormat::Binary => Value::Unknown(hex_encode(bytes)),
+/// Map a PgValueRef to an UnknownValue - this is assuming that a null check
+/// has already been performed.
+fn unknown_value(value: PgValueRef<'_>) -> UnknownValue {
+    match value.format() {
+        PgValueFormat::Text => {
+            let text = value.as_str().ok().map(str::to_owned);
+            text.map(UnknownValue::Text).unwrap_or(UnknownValue::None)
+        }
+        PgValueFormat::Binary => {
+            let bytes = value.as_bytes().ok().map(|b| b.to_vec());
+            bytes.map(UnknownValue::Bytes).unwrap_or(UnknownValue::None)
+        }
     }
-}
-
-/// Render `bytes` as a lowercase hex string, Postgres `bytea`-literal style.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("\\x");
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        array_value, format_naive_timestamp, hex_encode, json_text, raw_fallback_value,
-        scalar_value,
+        DecodeKind, array_value, decode_kind, format_naive_timestamp, json_text, scalar_value,
     };
-    use sqlx::postgres::PgValueFormat;
     use sqlx::types::chrono::{NaiveDate, NaiveTime};
     use sqlx::types::{BigDecimal, Json, JsonRawValue};
     use zsql_core::Value;
@@ -315,31 +406,40 @@ mod tests {
     }
 
     #[test]
-    fn raw_fallback_value_uses_the_servers_own_text_rendering() {
-        assert_eq!(
-            raw_fallback_value(PgValueFormat::Text, Some("19.99"), b""),
-            Value::Unknown("19.99".to_owned())
-        );
+    fn decode_kind_dispatch_is_case_insensitive_for_a_built_in_type() {
+        assert_eq!(decode_kind("BOOL"), Some(DecodeKind::Bool));
+        assert_eq!(decode_kind("bool"), Some(DecodeKind::Bool));
+        assert_eq!(decode_kind("Bool"), Some(DecodeKind::Bool));
+        assert_eq!(decode_kind("bOoL"), Some(DecodeKind::Bool));
     }
 
     #[test]
-    fn raw_fallback_value_hex_encodes_a_binary_format_value() {
-        assert_eq!(
-            raw_fallback_value(PgValueFormat::Binary, None, &[0xDE, 0xAD, 0xBE, 0xEF]),
-            Value::Unknown("\\xdeadbeef".to_owned())
-        );
+    fn decode_kind_dispatch_is_case_insensitive_for_text_and_its_array_form() {
+        assert_eq!(decode_kind("text"), Some(DecodeKind::Text));
+        assert_eq!(decode_kind("Text"), Some(DecodeKind::Text));
+        assert_eq!(decode_kind("text[]"), Some(DecodeKind::TextArray));
+        assert_eq!(decode_kind("Text[]"), Some(DecodeKind::TextArray));
     }
 
     #[test]
-    fn raw_fallback_value_hex_encodes_a_text_format_value_with_no_text_rendering() {
-        assert_eq!(
-            raw_fallback_value(PgValueFormat::Text, None, &[1, 2]),
-            Value::Unknown(hex_encode(&[1, 2]))
-        );
+    fn decode_kind_maps_citext_to_the_same_arm_as_text_regardless_of_case() {
+        assert_eq!(decode_kind("citext"), Some(DecodeKind::Text));
+        assert_eq!(decode_kind("CITEXT"), Some(DecodeKind::Text));
+        assert_eq!(decode_kind("CiText"), Some(DecodeKind::Text));
+        assert_eq!(decode_kind("TEXT"), decode_kind("CITEXT"));
     }
 
     #[test]
-    fn hex_encode_uses_a_backslash_x_prefix() {
-        assert_eq!(hex_encode(&[0xAB, 0x01]), "\\xab01");
+    fn decode_kind_maps_the_citext_array_form_to_the_same_arm_as_the_text_array_regardless_of_case()
+    {
+        assert_eq!(decode_kind("citext[]"), Some(DecodeKind::TextArray));
+        assert_eq!(decode_kind("CITEXT[]"), Some(DecodeKind::TextArray));
+        assert_eq!(decode_kind("TEXT[]"), decode_kind("CITEXT[]"));
+    }
+
+    #[test]
+    fn decode_kind_returns_none_for_an_unmapped_type_name() {
+        assert_eq!(decode_kind("HSTORE"), None);
+        assert_eq!(decode_kind("POINT"), None);
     }
 }

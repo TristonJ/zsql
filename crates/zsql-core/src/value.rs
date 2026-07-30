@@ -38,8 +38,23 @@ pub enum Value {
     Json(String),
     /// Array of values.
     Array(Vec<Value>),
-    /// Fallback: the backend's own text rendering for an unmapped type.
-    Unknown(String),
+    /// Fallback for an unmapped type, carrying the backend's own display
+    /// text when the backend's wire protocol makes that text available
+    /// (`None` otherwise, e.g. a binary-format value with no guaranteed
+    /// text rendering).
+    Unknown(UnknownValue),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnknownValue {
+    /// A value of an unknown type, with the backend's own display text when
+    /// available
+    Text(String),
+    /// A value of an unknown type, but the backend did not provide any text
+    /// for it, but we have the bytes
+    Bytes(Vec<u8>),
+    /// A value of an unkown type & we don't have any text or bytes for it.
+    None,
 }
 
 /// One result row: a positional list of cells matching the column list.

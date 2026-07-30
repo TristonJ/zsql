@@ -3,6 +3,7 @@
 
 use tiberius::time::chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use tiberius::{Column, ColumnData, ColumnType, FromSql, Row as MssqlRow, Uuid};
+use zsql_core::value::UnknownValue;
 use zsql_core::{ColumnMeta, Row as CoreRow, Value};
 
 /// Build the `Columns` metadata for a result set from tiberius's own column
@@ -185,32 +186,20 @@ fn raw_fallback(data: &ColumnData<'static>) -> Value {
         return Value::Null;
     }
     match data {
-        ColumnData::U8(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::I16(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::I32(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::I64(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::F32(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::F64(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::Bit(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::String(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::Guid(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::Binary(Some(bytes)) => Value::Unknown(hex_encode(bytes)),
-        ColumnData::Numeric(Some(v)) => Value::Unknown(v.to_string()),
-        ColumnData::Xml(Some(v)) => Value::Unknown(v.to_string()),
-        _ => Value::Unknown(format!("{data:?}")),
+        ColumnData::U8(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::I16(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::I32(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::I64(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::F32(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::F64(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::Bit(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::String(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::Guid(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::Binary(Some(bytes)) => Value::Unknown(UnknownValue::Bytes(bytes.to_vec())),
+        ColumnData::Numeric(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        ColumnData::Xml(Some(v)) => Value::Unknown(UnknownValue::Text(v.to_string())),
+        _ => Value::Unknown(UnknownValue::Text(format!("{data:?}"))),
     }
-}
-
-/// Render `bytes` as a `0x`-prefixed lowercase hex string, matching a
-/// `varbinary` literal's own text form in Transact-SQL.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(2 + bytes.len() * 2);
-    out.push_str("0x");
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Whether a [`ColumnData`] holds SQL NULL, regardless of which variant it
@@ -245,6 +234,7 @@ mod tests {
     use tiberius::time::chrono::NaiveDate;
     use tiberius::{ColumnData, ColumnType, Uuid};
     use zsql_core::Value;
+    use zsql_core::value::UnknownValue;
 
     #[test]
     fn maps_bit_to_bool() {
@@ -459,20 +449,19 @@ mod tests {
         let data = ColumnData::F64(Some(19.99));
         assert_eq!(
             decode_value(ColumnType::Money, &data),
-            Value::Unknown("19.99".to_owned())
+            Value::Unknown(UnknownValue::Text("19.99".to_owned()))
         );
     }
 
     #[test]
-    fn an_unmapped_binary_type_falls_back_to_a_hex_string() {
+    fn an_unmapped_binary_type_falls_back_to_unknown_bytes() {
         // `image` decodes on the wire into `ColumnData::Binary`, but this
         // module maps only `BigBinary`/`BigVarBin` (`varbinary`), not
-        // `Image`, so it must degrade to `Value::Unknown` carrying a
-        // Transact-SQL-style hex literal rather than a debug dump.
+        // `Image`, so it must degrade to `Value::Unknown`
         let data = ColumnData::Binary(Some(vec![0xDE, 0xAD, 0xBE, 0xEF].into()));
         assert_eq!(
             decode_value(ColumnType::Image, &data),
-            Value::Unknown("0xdeadbeef".to_owned())
+            Value::Unknown(UnknownValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]))
         );
     }
 

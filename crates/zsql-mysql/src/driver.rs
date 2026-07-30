@@ -80,6 +80,7 @@ impl Driver for MysqlDriver {
             cancel_pool,
             probe_pool,
             cfg.batch_size,
+            (),
         ))))
     }
 }
@@ -88,6 +89,7 @@ impl SqlxZsqlDriver<MySql> for MysqlDriver {
     const NAME: &'static str = "mysql";
 
     type Cancel = MySqlCancelHandle;
+    type ColumnContext = ();
 
     fn column_metas(columns: &[<MySql as sqlx::Database>::Column]) -> Vec<zsql_core::ColumnMeta> {
         column_metas(columns)
@@ -371,6 +373,7 @@ mod tests {
             cancel_pool,
             probe_pool,
             zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+            (),
         ))
     }
 
@@ -540,7 +543,7 @@ mod tests {
 mod database_tests {
     use std::time::Duration;
 
-    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs};
+    use zsql_core::{ConnConfig, Driver, PreviewQueryArgs, value::UnknownValue};
 
     use super::MysqlDriver;
 
@@ -1760,10 +1763,10 @@ mod database_tests {
             }
         }
         match &rows[0].0[0] {
-            zsql_core::Value::Unknown(type_name) => {
-                assert!(!type_name.is_empty(), "type name must not be empty");
-            }
-            other => panic!("expected Value::Unknown for an unmapped geometry type, got {other:?}"),
+            zsql_core::Value::Unknown(UnknownValue::None) => {}
+            other => panic!(
+                "expected Value::Unknown carrying UnknownValue::None for an unmapped geometry type, got {other:?}"
+            ),
         }
     }
 }
