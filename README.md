@@ -1,6 +1,35 @@
 # ZSQL
-A lightweight developer-first SQL editor. Intended to be fast & simple, but provide useful features
-for a developer workflow.
+A lightweight developer-first SQL editor.
+
+## Screenshots
+
+<details>
+<summary>Basic Query Editor</summary>
+
+<p align="center"><img src="./docs/screenshot_simple.jpg" width="800"/></p>
+
+</details>
+
+<details>
+<summary>Schema Explorer</summary>
+
+<p align="center"><img src="./docs/screenshot_schema.jpg" width="800"/></p>
+</details>
+
+## Features
+- Lightweight - built with Zed's [gpui](https://docs.rs/gpui/latest/gpui/)
+- Multi-database support
+- Simple query generation (with filters, pagination, and sorting)
+- Simple schema exploration (table & column metadata)
+- Custom SQL scripts with syntax highlighting
+- Detailed value viewer (JSON, hex, etc.)
+- Multiple theme & custom theme support
+
+## Database Support
+- PostgreSQL
+- MySQL
+- SQLite
+- Microsoft SQL Server
 
 ## Installing
 For now, you must clone the repo and use cargo to install the binary:
