@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -1185,7 +1186,7 @@ fn switching_to_a_new_result_discards_a_manual_view_choice_and_recomputes_the_de
             super::ResultsSnapshot {
                 source_label: "doc".into(),
                 state: SessionState::Results(Duration::from_millis(1)),
-                result: document,
+                result: Rc::new(document),
             },
             cx,
         );
@@ -1208,10 +1209,10 @@ fn switching_to_a_new_result_discards_a_manual_view_choice_and_recomputes_the_de
             super::ResultsSnapshot {
                 source_label: "doc2".into(),
                 state: SessionState::Results(Duration::from_millis(1)),
-                result: text_column_result(vec![
+                result: Rc::new(text_column_result(vec![
                     Row(vec![Value::Text("x".to_owned())]),
                     Row(vec![Value::Text("y".to_owned())]),
-                ]),
+                ])),
             },
             cx,
         );
@@ -1449,7 +1450,7 @@ fn switching_to_a_new_result_clears_any_text_selection(cx: &mut gpui::TestAppCon
             super::ResultsSnapshot {
                 source_label: "doc".into(),
                 state: SessionState::Results(Duration::from_millis(1)),
-                result: sample_result(),
+                result: Rc::new(sample_result()),
             },
             cx,
         );

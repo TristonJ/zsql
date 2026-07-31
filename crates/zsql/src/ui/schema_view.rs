@@ -5,7 +5,10 @@
 
 use std::ops::Range;
 
-use gpui::{Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, FontWeight, KeyBinding, Render,
+    Window, actions, div, prelude::*, px, rgb,
+};
 use zsql_core::{
     ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, KeyCellBadge, RelationKind,
     RelationSchema, RowCount, classify_default, key_cell_badge,
@@ -59,6 +62,17 @@ pub struct SchemaTabView {
     /// Vertical scroll for the whole tab body: the three `Fit` tables never
     /// scroll themselves, so the page scrolls all of them together.
     page_scroll: ScrollView,
+    /// Focus handle for selecting table elements
+    focus_handle: FocusHandle,
+}
+
+actions!(zsql_schema_view, [Copy]);
+
+const BINDING_CONTEXT: &str = "schema-tab-vie";
+
+/// Register the schema view's key bindings. Call on startup
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("secondary-c", Copy, Some(BINDING_CONTEXT))]);
 }
 
 impl SchemaTabView {
@@ -85,6 +99,7 @@ impl SchemaTabView {
             indexes_table: cx.new(TableState::new),
             constraints_table: cx.new(TableState::new),
             page_scroll: ScrollView::new(cx),
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -296,6 +311,9 @@ impl SchemaTabView {
                 .row_count(detail.columns.len())
                 .rows(Self::render_columns_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
+                .selectable()
+                .focus_on_cell_click(self.focus_handle.clone())
+                .on_cell_click(Self::create_unfocus_handler(false, true, true))
                 .render(cx),
             cx.theme(),
         )
@@ -321,50 +339,82 @@ impl SchemaTabView {
                 let Some(column) = schema.columns.get(ix) else {
                     return TableRow::new(vec![]);
                 };
-                let cells = vec![
-                    div()
-                        .when_some(rail_color(column, active_theme), |el, color| {
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(theme::SCHEMA_RAIL_WIDTH)
-                                    .bg(rgb(color)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .text_color(rgb(active_theme.colors.text_primary))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(column.name.clone()),
-                        )
-                        .px(cell_x_padding())
-                        .into_any_element(),
-                    div()
-                        .px(cell_x_padding())
-                        .child(
-                            grid::type_tag_accent(&column.type_name, active_theme)
-                                .flex_shrink_0()
-                                .into_any_element(),
-                        )
-                        .into_any_element(),
-                    null_label(column.nullable, active_theme)
-                        .px(cell_x_padding())
-                        .into_any_element(),
-                    render_default_cell(column.default.as_deref(), active_theme)
-                        .px(cell_x_padding())
-                        .into_any_element(),
-                    div()
-                        .px(cell_x_padding())
-                        .child(render_keys_cell(column, &schema.constraints, active_theme))
-                        .into_any_element(),
-                ];
-
+                let cells = Self::columns_table_cells(column, schema, active_theme)
+                    .into_iter()
+                    .map(|(cell, _value)| cell)
+                    .collect();
                 TableRow::new(cells)
             })
             .collect()
+    }
+
+    fn columns_table_cells(
+        column: &ColumnDetail,
+        schema: &RelationSchema,
+        active_theme: &Theme,
+    ) -> Vec<(AnyElement, String)> {
+        let column_name = div()
+            .when_some(rail_color(column, active_theme), |el, color| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(theme::SCHEMA_RAIL_WIDTH)
+                        .bg(rgb(color)),
+                )
+            })
+            .child(
+                div()
+                    .text_color(rgb(active_theme.colors.text_primary))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(column.name.clone()),
+            )
+            .px(cell_x_padding())
+            .into_any_element();
+        let type_name = div()
+            .px(cell_x_padding())
+            .child(
+                grid::type_tag_accent(&column.type_name, active_theme)
+                    .flex_shrink_0()
+                    .into_any_element(),
+            )
+            .into_any_element();
+        let null_label = null_label(column.nullable, active_theme)
+            .px(cell_x_padding())
+            .into_any_element();
+        let default_cell = render_default_cell(column.default.as_deref(), active_theme)
+            .px(cell_x_padding())
+            .into_any_element();
+        let keys_cell = div()
+            .px(cell_x_padding())
+            .child(render_keys_cell(column, &schema.constraints, active_theme))
+            .into_any_element();
+        vec![
+            (column_name, column.name.clone()),
+            (type_name, column.type_name.clone()),
+            (
+                null_label,
+                if column.nullable {
+                    theme::SCHEMA_NULLABLE_LABEL.to_string()
+                } else {
+                    theme::SCHEMA_NOT_NULL_LABEL.to_string()
+                },
+            ),
+            (default_cell, column.default.clone().unwrap_or_default()),
+            (
+                keys_cell,
+                key_cell_badge(column, &schema.constraints).map_or_else(String::new, |badge| {
+                    match badge {
+                        KeyCellBadge::Primary => theme::SCHEMA_BADGE_PK_LABEL.to_string(),
+                        KeyCellBadge::Unique => theme::SCHEMA_BADGE_UNIQUE_LABEL.to_string(),
+                        KeyCellBadge::Check => theme::SCHEMA_BADGE_CHECK_LABEL.to_string(),
+                        KeyCellBadge::Foreign(target) => format!("-> {target}"),
+                    }
+                }),
+            ),
+        ]
     }
 
     /// The Indexes table.
@@ -400,6 +450,9 @@ impl SchemaTabView {
                 .row_count(detail.indexes.len())
                 .rows(Self::render_index_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
+                .selectable()
+                .focus_on_cell_click(self.focus_handle.clone())
+                .on_cell_click(Self::create_unfocus_handler(true, false, true))
                 .render(cx),
             cx.theme(),
         )
@@ -411,7 +464,6 @@ impl SchemaTabView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
-        let colors = cx.theme().colors;
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -425,36 +477,56 @@ impl SchemaTabView {
                 let Some(index) = schema.indexes.get(ix) else {
                     return TableRow::new(vec![]);
                 };
-                let cells = vec![
-                    div()
-                        .text_color(rgb(colors.text_primary))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(index.name.clone())
-                        .into_any_element(),
-                    div()
-                        .text_color(rgb(colors.text_secondary))
-                        .child(index.method.clone())
-                        .into_any_element(),
-                    if index.unique {
-                        div()
-                            .text_color(rgb(colors.value_bool))
-                            .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_color(rgb(colors.text_tertiary))
-                            .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
-                            .into_any_element()
-                    },
-                    div()
-                        .text_color(rgb(colors.text_secondary))
-                        .child(index.definition.clone())
-                        .into_any_element(),
-                ];
-
+                let cells = Self::indexes_table_cells(index, cx.theme())
+                    .into_iter()
+                    .map(|(cell, _value)| cell)
+                    .collect();
                 TableRow::new(cells)
             })
             .collect()
+    }
+
+    fn indexes_table_cells(
+        index: &zsql_core::IndexInfo,
+        active_theme: &Theme,
+    ) -> Vec<(AnyElement, String)> {
+        let colors = active_theme.colors;
+        let name = div()
+            .text_color(rgb(colors.text_primary))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(index.name.clone())
+            .into_any_element();
+        let method = div()
+            .text_color(rgb(colors.text_secondary))
+            .child(index.method.clone())
+            .into_any_element();
+        let unique = if index.unique {
+            (
+                div()
+                    .text_color(rgb(colors.value_bool))
+                    .child(theme::SCHEMA_INDEX_UNIQUE_LABEL)
+                    .into_any_element(),
+                theme::SCHEMA_INDEX_UNIQUE_LABEL.to_string(),
+            )
+        } else {
+            (
+                div()
+                    .text_color(rgb(colors.text_tertiary))
+                    .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER)
+                    .into_any_element(),
+                theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER.to_string(),
+            )
+        };
+        let definition = div()
+            .text_color(rgb(colors.text_secondary))
+            .child(index.definition.clone())
+            .into_any_element();
+        vec![
+            (name, index.name.clone()),
+            (method, index.method.clone()),
+            unique,
+            (definition, index.definition.clone()),
+        ]
     }
 
     /// The Constraints table.
@@ -490,6 +562,9 @@ impl SchemaTabView {
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)
                 .vertical_sizing(TableSizing::Fit)
+                .selectable()
+                .on_cell_click(Self::create_unfocus_handler(true, true, false))
+                .focus_on_cell_click(self.focus_handle.clone())
                 .render(cx),
             cx.theme(),
         )
@@ -502,7 +577,6 @@ impl SchemaTabView {
         cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
         let active_theme = cx.theme();
-        let colors = active_theme.colors;
         let Some(schema) = self.schema() else {
             debug_assert!(
                 false,
@@ -516,23 +590,137 @@ impl SchemaTabView {
                 let Some(constraint) = schema.constraints.get(ix) else {
                     return TableRow::new(vec![]);
                 };
-                let (kind_label, kind_color) = constraint_kind_badge(constraint.kind, active_theme);
-                let cells = vec![
-                    div()
-                        .text_color(rgb(colors.text_primary))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(constraint.name.clone())
-                        .into_any_element(),
-                    key_badge(kind_label, kind_color, rgb(colors.border)).into_any_element(),
-                    div()
-                        .text_color(rgb(colors.text_secondary))
-                        .child(constraint.definition.clone())
-                        .into_any_element(),
-                ];
-
+                let cells = Self::constraints_table_cells(constraint, active_theme)
+                    .into_iter()
+                    .map(|(cell, _value)| cell)
+                    .collect();
                 TableRow::new(cells)
             })
             .collect()
+    }
+
+    fn constraints_table_cells(
+        constraint: &ConstraintInfo,
+        active_theme: &Theme,
+    ) -> Vec<(AnyElement, String)> {
+        let colors = active_theme.colors;
+        let (kind_label, kind_color) = constraint_kind_badge(constraint.kind, active_theme);
+        vec![
+            (
+                div()
+                    .text_color(rgb(colors.text_primary))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(constraint.name.clone())
+                    .into_any_element(),
+                constraint.name.clone(),
+            ),
+            (
+                key_badge(kind_label, kind_color, rgb(colors.border)).into_any_element(),
+                kind_label.to_string(),
+            ),
+            (
+                div()
+                    .text_color(rgb(colors.text_secondary))
+                    .child(constraint.definition.clone())
+                    .into_any_element(),
+                constraint.definition.clone(),
+            ),
+        ]
+    }
+
+    fn create_unfocus_handler(
+        unfocus_columns: bool,
+        unfocus_indexes: bool,
+        unfocus_constraints: bool,
+    ) -> impl Fn(&mut SchemaTabView, usize, usize, &mut Window, &mut Context<SchemaTabView>) + 'static
+    {
+        let handler = |state: &mut TableState, cx: &mut Context<TableState>| {
+            state.clear_focused_cell();
+            cx.notify();
+        };
+        move |view, _row, _col, _window, cx| {
+            tracing::debug!(
+                "unfocus handler: columns={}, indexes={}, constraints={}",
+                unfocus_columns,
+                unfocus_indexes,
+                unfocus_constraints
+            );
+            if unfocus_columns {
+                view.columns_table.update(cx, handler);
+            }
+            if unfocus_indexes {
+                view.indexes_table.update(cx, handler);
+            }
+            if unfocus_constraints {
+                view.constraints_table.update(cx, handler);
+            }
+        }
+    }
+
+    #[tracing::instrument(name = "schema_view_copy_focused_cell", skip_all)]
+    fn copy_focused_cell(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        tracing::debug!("got a copy request for the schema view");
+        let Some(schema) = self.schema() else {
+            tracing::debug!("copy request ignored: schema not ready");
+            return;
+        };
+        let theme = cx.theme();
+
+        let text = if let Some((row, col)) = self.columns_table.read(cx).focused_cell() {
+            Self::columns_table_cell_value(schema, theme, row, col)
+        } else if let Some((row, col)) = self.indexes_table.read(cx).focused_cell() {
+            Self::indexes_table_cell_value(schema, theme, row, col)
+        } else if let Some((row, col)) = self.constraints_table.read(cx).focused_cell() {
+            Self::constraints_table_cell_value(schema, theme, row, col)
+        } else {
+            None
+        };
+        let Some(text) = text else {
+            tracing::debug!("copy request ignored: no focused cell in any schema table");
+            return;
+        };
+
+        tracing::debug!("copying focused schema cell to clipboard: {text}");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn columns_table_cell_value(
+        schema: &RelationSchema,
+        theme: &Theme,
+        row: usize,
+        col: usize,
+    ) -> Option<String> {
+        schema.columns.get(row).and_then(|column| {
+            Self::columns_table_cells(column, schema, theme)
+                .get(col)
+                .map(|(_cell, value)| value.clone())
+        })
+    }
+
+    fn indexes_table_cell_value(
+        schema: &RelationSchema,
+        theme: &Theme,
+        row: usize,
+        col: usize,
+    ) -> Option<String> {
+        schema.indexes.get(row).and_then(|index| {
+            Self::indexes_table_cells(index, theme)
+                .get(col)
+                .map(|(_cell, value)| value.clone())
+        })
+    }
+
+    fn constraints_table_cell_value(
+        schema: &RelationSchema,
+        theme: &Theme,
+        row: usize,
+        col: usize,
+    ) -> Option<String> {
+        schema.constraints.get(row).and_then(|constraint| {
+            Self::constraints_table_cells(constraint, theme)
+                .get(col)
+                .map(|(_cell, value)| value.clone())
+        })
     }
 }
 
@@ -586,6 +774,10 @@ impl Render for SchemaTabView {
         };
 
         div()
+            .id("schema-tab-view")
+            .key_context(BINDING_CONTEXT)
+            .on_action(cx.listener(Self::copy_focused_cell))
+            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .min_h_0()
