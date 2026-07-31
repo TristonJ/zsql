@@ -9,20 +9,26 @@
 //! (framework-agnostic) or `zsql-core` (driver-agnostic).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task};
-use zsql_core::preview_state::PreviewQueryState;
-use zsql_core::{RelationKind, ResultSet};
+use zsql_core::ResultSet;
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
 use super::results::pager::{PreviewControls, PreviewDispatch};
 use super::schema_view::SchemaTabView;
 use crate::session::{Session, SessionState};
-use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
+use crate::session_store::{ScriptBacking, TabEntrySnapshot, TabKind, TabSessionSnapshot};
 
+mod constructors;
+mod open_requests;
 mod preview_actions;
+mod save_requests;
+
+pub use open_requests::OpenRequested;
+pub use save_requests::{SaveRequested, ScriptOpenFailed};
 
 /// Identifies one open tab, stable for its lifetime and never reused within
 /// a single `TabModel`.
@@ -41,27 +47,12 @@ pub struct ResultsSnapshot {
     pub result: Rc<ResultSet>,
 }
 
-/// What kind of buffer a tab holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TabKind {
-    /// Auto-generated preview SQL for `schema.relation`, live for reuse
-    /// (see [`TabModel::open_or_reuse_generated`]) until the buffer receives
-    /// a manual edit.
-    Generated { schema: String, relation: String },
-    /// A normal, freely-editable script buffer.
-    Script,
-    /// A read-only structural view of `schema.relation`'s columns, indexes,
-    /// and constraints (see [`TabModel::open_or_reuse_schema`]). Never
-    /// editable and never converts to `Script`.
-    Schema { schema: String, relation: String },
-}
-
 /// Leading text of every title [`TabModel::new_script_tab`] mints, before
 /// the number.
 const SCRIPT_TITLE_PREFIX: &str = "query-";
 /// Trailing text of every title [`TabModel::new_script_tab`] mints, after
 /// the number.
-const SCRIPT_TITLE_SUFFIX: &str = ".sql";
+const SCRIPT_TITLE_SUFFIX: &str = crate::session_store::SCRIPT_FILE_EXTENSION;
 
 /// The title [`TabModel::new_script_tab`] gives its `n`th script tab.
 fn script_title(n: u64) -> String {
@@ -70,7 +61,7 @@ fn script_title(n: u64) -> String {
 
 /// The number a title matching [`script_title`]'s pattern was minted with,
 /// or `None` for any other title (a `Generated` tab's relation name, or a
-/// script tab renamed by the user, once renaming exists).
+/// script tab renamed by the user).
 fn parse_script_number(title: &str) -> Option<u64> {
     title
         .strip_prefix(SCRIPT_TITLE_PREFIX)?
@@ -105,13 +96,6 @@ pub struct Tab {
     /// The read-only schema view for a `Schema` tab; `None` for every other
     /// kind.
     schema_view: Option<Entity<SchemaTabView>>,
-    /// This tab's own sort/page window, keyed per tab rather than shared,
-    /// so switching between two open generated tabs never leaks one's sort
-    /// or page into the other's grid or editor buffer. Only meaningful
-    /// while `kind` is `Generated` and the tab is not yet `dirty`; carried
-    /// (but ignored) on every other tab so `Tab`'s fields never need to be
-    /// optional just for this one kind.
-    preview_state: PreviewQueryState,
 }
 
 impl Tab {
@@ -135,7 +119,10 @@ impl Tab {
         &self.editor
     }
 
+    /// Whether the buffer has ever received a manual edit. Superseded by
+    /// [`Self::diverged`] for the tab-bar marker
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dirty(&self) -> bool {
         self.dirty
     }
@@ -156,6 +143,48 @@ impl Tab {
     pub fn schema_view(&self) -> Option<&Entity<SchemaTabView>> {
         self.schema_view.as_ref()
     }
+
+    /// This tab's pure, gpui-free backing (see [`ScriptBacking`]), for a
+    /// `Script` tab. `None` for every other kind.
+    #[must_use]
+    pub fn script_backing(&self) -> Option<&ScriptBacking> {
+        match &self.kind {
+            TabKind::Script { backing } => Some(backing),
+            TabKind::Generated { .. } | TabKind::Schema { .. } => None,
+        }
+    }
+
+    /// This tab's library file's bare name, for a library-backed tab.
+    #[must_use]
+    pub fn library_name(&self) -> Option<&str> {
+        self.script_backing().and_then(ScriptBacking::library_name)
+    }
+
+    /// This tab's absolute backing path, for an external-backed tab.
+    #[must_use]
+    pub fn external_path(&self) -> Option<&std::path::Path> {
+        self.script_backing().and_then(ScriptBacking::external_path)
+    }
+
+    /// Whether this tab's own sibling file currently lives under the
+    /// session directory's `scratch/` subdirectory, for a session-owned
+    /// `Script` tab.
+    #[must_use]
+    fn is_session_scratch(&self) -> bool {
+        matches!(
+            self.script_backing(),
+            Some(ScriptBacking::SessionScratch { .. })
+        )
+    }
+
+    /// Whether this tab's live buffer currently diverges from its backing's
+    /// last explicitly-saved content. Always `false` for a non-`Script` tab
+    /// or a session-owned one
+    #[must_use]
+    pub fn diverged(&self, cx: &App) -> bool {
+        self.script_backing()
+            .is_some_and(|backing| backing.diverged(&self.editor.read(cx).text()))
+    }
 }
 
 /// The results-header label a tab's runs are shown under: `schema.relation`
@@ -163,10 +192,13 @@ impl Tab {
 /// shares (matching `editor_adapter`'s label for a plain, ungenerated run).
 fn display_label(tab: &Tab) -> String {
     match &tab.kind {
-        TabKind::Generated { schema, relation } | TabKind::Schema { schema, relation } => {
+        TabKind::Generated {
+            schema, relation, ..
+        }
+        | TabKind::Schema { schema, relation } => {
             format!("{schema}.{relation}")
         }
-        TabKind::Script => "query".to_owned(),
+        TabKind::Script { .. } => "query".to_owned(),
     }
 }
 
@@ -204,6 +236,26 @@ pub struct TabModel {
     /// [`TabModel::preview_controls_for_active_tab`]) rather than a fresh
     /// closure per render.
     preview_dispatch: PreviewDispatch,
+    /// Root directory the shared library's flat pool of `.sql` files lives
+    /// under (typically [`crate::config::Config::library_dir`]). `None`
+    /// disables library restore/lookup entirely
+    library_dir: Option<PathBuf>,
+    /// The active connection's own session directory, for opening a named
+    /// session script by file name that is not already open as a tab
+    session_dir: Option<PathBuf>,
+    /// The shared claim factory [`Self::open_or_focus_session_script`].
+    /// `None` in a test that drives this model directly without wiring one up.
+    claims: Option<crate::session_store::SaveClaimFactory>,
+    /// Debounce interval [`Self::mark_edited`] waits after any edit past a
+    /// tab's first before notifying
+    edit_debounce: std::time::Duration,
+    /// Generation counter [`Self::mark_edited`]'s debounce timer checks
+    /// before notifying
+    edit_debounce_generation: Rc<std::cell::Cell<u64>>,
+    /// External-backed entries the last restore could not open (the file
+    /// was temporarily unavailable, e.g. an unmounted volume, with no draft
+    /// to fall back to) but must not silently drop from `tabs.toml`
+    carried_forward_entries: Vec<TabEntrySnapshot>,
 }
 
 pub enum ResultsChanged {
@@ -240,10 +292,10 @@ impl TabModel {
             let total = session.read(cx).row_count();
             let mut changed = false;
             if let Some(tab) = model.tabs.iter_mut().find(|tab| tab.id == id)
-                && tab.is_generated()
-                && tab.preview_state.total_rows() != total
+                && let TabKind::Generated { preview, .. } = &mut tab.kind
+                && preview.total_rows() != total
             {
-                tab.preview_state.set_total_rows(total);
+                preview.set_total_rows(total);
                 changed = true;
             }
             // The pager and page readout render from a snapshot pushed by
@@ -270,7 +322,35 @@ impl TabModel {
             preview_dispatch: Rc::new(move |action, cx| {
                 model.update(cx, |model, cx| model.dispatch_preview_action(action, cx));
             }),
+            library_dir: None,
+            session_dir: None,
+            claims: None,
+            edit_debounce: crate::config::AutosaveConfig::default().edit_debounce(),
+            edit_debounce_generation: Rc::new(std::cell::Cell::new(0)),
+            carried_forward_entries: Vec::new(),
         }
+    }
+
+    /// Set the root directory the shared library lives under
+    pub fn set_library_dir(&mut self, library_dir: Option<PathBuf>) {
+        self.library_dir = library_dir;
+    }
+
+    /// Update the active connection's own session directory, for opening a
+    /// named session script by file name that is not already open as a tab
+    pub fn set_session_dir(&mut self, session_dir: Option<PathBuf>) {
+        self.session_dir = session_dir;
+    }
+
+    /// Set the shared claim factory
+    pub fn set_claim_factory(&mut self, claims: crate::session_store::SaveClaimFactory) {
+        self.claims = Some(claims);
+    }
+
+    /// Override the debounce interval [`Self::mark_edited`] uses past a
+    /// tab's first edit
+    pub(crate) fn set_edit_debounce(&mut self, duration: std::time::Duration) {
+        self.edit_debounce = duration;
     }
 
     #[must_use]
@@ -313,9 +393,28 @@ impl TabModel {
             })
         };
         let editor = cx.new(|cx| editor_adapter::new_tab_editor_view(run_query, cx));
+        let edit_model = model.clone();
+        let save_model = model.clone();
+        let save_as_model = model.clone();
         editor.update(cx, |editor, _cx| {
             editor.set_on_edit(Box::new(move |cx| {
-                model.update(cx, |model, cx| model.mark_edited(id, cx));
+                edit_model.update(cx, |model, cx| model.mark_edited(id, cx));
+            }));
+            editor.set_save_requester(Box::new(move |cx| {
+                save_model.update(cx, |model, cx| model.request_save(id, cx));
+            }));
+            editor.set_save_as_requester(Box::new(move |cx| {
+                save_as_model.update(cx, |model, cx| model.request_save_as(id, cx));
+            }));
+        });
+        let open_model = model.clone();
+        let browse_model = model;
+        editor.update(cx, |editor, _cx| {
+            editor.set_open_requester(Box::new(move |cx| {
+                open_model.update(cx, TabModel::request_open);
+            }));
+            editor.set_browse_requester(Box::new(move |cx| {
+                browse_model.update(cx, TabModel::request_browse);
             }));
         });
         editor
@@ -387,8 +486,6 @@ impl TabModel {
         self.live_owner = Some(id);
 
         cx.emit(ResultsChanged::Live(label.clone()));
-        // self.results
-        //     .update(cx, |results, cx| results.show_live(label.clone(), cx));
 
         cx.spawn(async move |this, cx| {
             task.await;
@@ -417,10 +514,12 @@ impl TabModel {
         // leave it cleared. Once edited (kind Script) the tab is an ordinary
         // query and runs its own text verbatim.
         let task = match kind {
-            TabKind::Generated { schema, relation } => self.session.update(cx, |session, cx| {
+            TabKind::Generated {
+                schema, relation, ..
+            } => self.session.update(cx, |session, cx| {
                 session.preview_relation(&schema, &relation, cx)
             }),
-            TabKind::Script => self
+            TabKind::Script { .. } => self
                 .session
                 .update(cx, |session, cx| session.run_query(sql, cx)),
             // A schema tab is read-only and has no query to run.
@@ -459,147 +558,6 @@ impl TabModel {
         cx.notify();
     }
 
-    /// Open a `Generated` tab for `schema.relation` and make it active,
-    /// showing exactly the SQL text `Session::preview_relation` itself
-    /// executes for it. Reuses the relation's existing live (never-edited)
-    /// generated tab instead of creating a duplicate, if one exists --
-    /// re-focusing it with whatever it last showed rather than re-running
-    /// the query, since a live generated tab's buffer (and thus its SQL)
-    /// cannot have changed since that run.
-    pub fn open_or_reuse_generated(
-        &mut self,
-        schema: &str,
-        relation: &str,
-        cx: &mut Context<Self>,
-    ) -> TabId {
-        let key = (schema.to_owned(), relation.to_owned());
-        if let Some(&id) = self.generated_by_relation.get(&key) {
-            tracing::info!(tab_id = id, schema, relation, "reusing live generated tab");
-            self.set_active(id, cx);
-            return id;
-        }
-
-        let id = self.allocate_id();
-        let editor = Self::build_editor(id, cx);
-        // Read the exact text `preview_relation` (dispatched below) is about
-        // to execute, so the buffer a user sees can never drift from what
-        // actually runs.
-        let sql = self.session.read(cx).preview_sql(schema, relation);
-        editor.update(cx, |editor, cx| {
-            editor.set_text(&sql, cx);
-            editor.set_compact(true);
-        });
-
-        let page_size = self.session.read(cx).preview_limit();
-        self.tabs.push(Tab {
-            id,
-            kind: TabKind::Generated {
-                schema: schema.to_owned(),
-                relation: relation.to_owned(),
-            },
-            title: relation.to_owned(),
-            editor,
-            dirty: false,
-            last_run: None,
-            schema_view: None,
-            preview_state: PreviewQueryState::new(page_size),
-        });
-        self.generated_by_relation.insert(key, id);
-        self.active = Some(id);
-
-        let task = self.session.update(cx, |session, cx| {
-            session.preview_relation(schema, relation, cx)
-        });
-        self.dispatch_run(id, format!("{schema}.{relation}"), task, cx);
-        self.sync_preview_controls(cx);
-
-        tracing::info!(tab_id = id, schema, relation, "opened generated tab");
-        cx.notify();
-        id
-    }
-
-    /// Open a new, empty `Script` tab titled `query-N.sql` and make it
-    /// active. The `+` tab-bar affordance's action.
-    pub fn new_script_tab(&mut self, cx: &mut Context<Self>) -> TabId {
-        let id = self.allocate_id();
-        let editor = Self::build_editor(id, cx);
-        let title = script_title(self.next_script_number);
-        self.next_script_number += 1;
-
-        tracing::info!(tab_id = id, title = %title, "opened new script tab");
-        let page_size = self.session.read(cx).preview_limit();
-        self.tabs.push(Tab {
-            id,
-            kind: TabKind::Script,
-            title,
-            editor,
-            dirty: false,
-            last_run: None,
-            schema_view: None,
-            preview_state: PreviewQueryState::new(page_size),
-        });
-        self.active = Some(id);
-        self.sync_results_to_active(cx);
-        self.sync_preview_controls(cx);
-        cx.notify();
-        id
-    }
-
-    /// Open (or, if `schema.relation` already has one open, reuse/activate)
-    /// a read-only `Schema` tab for `schema.relation` and make it active.
-    /// `kind` is the relation's [`RelationKind`], shown in the tab's header
-    /// kind pill. The tab dispatches its own `describe_relation` (and
-    /// row-count) fetches independently of `session`'s shared
-    /// query-lifecycle state -- see [`SchemaTabView::new`].
-    pub fn open_or_reuse_schema(
-        &mut self,
-        schema: &str,
-        relation: &str,
-        kind: RelationKind,
-        cx: &mut Context<Self>,
-    ) -> TabId {
-        let key = (schema.to_owned(), relation.to_owned());
-        if let Some(&id) = self.schema_by_relation.get(&key) {
-            tracing::info!(tab_id = id, schema, relation, "reusing open schema tab");
-            self.set_active(id, cx);
-            return id;
-        }
-
-        let id = self.allocate_id();
-        // A schema tab has no editable buffer: this editor is built for
-        // uniformity with every other tab kind (e.g. `Tab::editor` stays
-        // infallible) but is never rendered or focused for a `Schema` tab,
-        // so its `RunQuery`/edit wiring is simply never triggered.
-        let editor = Self::build_editor(id, cx);
-        let session = self.session.clone();
-        let schema_view = cx.new(|cx| {
-            SchemaTabView::new(&session, schema.to_owned(), relation.to_owned(), kind, cx)
-        });
-
-        let page_size = self.session.read(cx).preview_limit();
-        self.tabs.push(Tab {
-            id,
-            kind: TabKind::Schema {
-                schema: schema.to_owned(),
-                relation: relation.to_owned(),
-            },
-            title: relation.to_owned(),
-            editor,
-            dirty: false,
-            last_run: None,
-            schema_view: Some(schema_view),
-            preview_state: PreviewQueryState::new(page_size),
-        });
-        self.schema_by_relation.insert(key, id);
-        self.active = Some(id);
-        self.sync_results_to_active(cx);
-        self.sync_preview_controls(cx);
-
-        tracing::info!(tab_id = id, schema, relation, "opened schema tab");
-        cx.notify();
-        id
-    }
-
     /// Close `id`, dropping its editor. Updates the active tab to a
     /// neighboring tab if `id` was active (or clears it if `id` was the last
     /// tab), and, if `id` was a live generated tab or an open schema tab,
@@ -610,7 +568,9 @@ impl TabModel {
         };
         let closed = self.tabs.remove(index);
         match &closed.kind {
-            TabKind::Generated { schema, relation } => {
+            TabKind::Generated {
+                schema, relation, ..
+            } => {
                 let key = (schema.clone(), relation.clone());
                 if self.generated_by_relation.get(&key) == Some(&id) {
                     self.generated_by_relation.remove(&key);
@@ -622,7 +582,7 @@ impl TabModel {
                     self.schema_by_relation.remove(&key);
                 }
             }
-            TabKind::Script => {}
+            TabKind::Script { .. } => {}
         }
         if self.live_owner == Some(id) {
             self.live_owner = None;
@@ -645,20 +605,54 @@ impl TabModel {
     /// Record that tab `id`'s buffer just received a manual edit. The first
     /// time this fires for a given tab, a `Generated` tab permanently
     /// converts to `Script` (dropping the generated flag and its
-    /// relation-reuse entry) and any tab's dirty flag flips on; later edits
-    /// to an already-dirty tab are no-ops, so a generated tab can never
-    /// revert even if further edits happen to recreate its original SQL
-    /// text.
+    /// relation-reuse entry), any tab's dirty flag flips on, and this
+    /// notifies immediately so the conversion (and, for a library/external
+    /// tab, the dirty marker) is visible at once. Every edit past the first
+    /// -- including one after an explicit save cleared the dirty marker on a
+    /// library/external tab -- still needs to eventually flush to disk (a
+    /// session-owned tab autosaves continuously; a library/external tab's
+    /// draft must keep tracking the live buffer), so it schedules a
+    /// debounced notify instead of firing on every keystroke: the workspace
+    /// saves the whole tab session on every `TabModel` notify, and would
+    /// otherwise re-snapshot and rewrite the entire session directory once
+    /// per keystroke.
     fn mark_edited(&mut self, id: TabId, cx: &mut Context<Self>) {
+        // Computed up front, before taking the mutable borrow below: two
+        // live tabs can share a title (e.g. two relations both named
+        // `orders` in different schemas), so the scratch file this
+        // conversion is about to assign must be disambiguated against every
+        // other currently-open scratch-backed tab's own file, never derived
+        // from `title` alone at the point a rename later needs it back.
+        let new_scratch_file = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .filter(|tab| matches!(tab.kind, TabKind::Generated { .. }))
+            .map(|tab| {
+                let used: std::collections::HashSet<String> = self
+                    .tabs
+                    .iter()
+                    .filter(|other| other.id != id && other.is_session_scratch())
+                    .filter_map(|other| {
+                        other
+                            .script_backing()
+                            .and_then(ScriptBacking::session_file)
+                            .map(|file| file.as_str().to_owned())
+                    })
+                    .collect();
+                crate::session_store::unique_script_file_name(&tab.title, &used)
+            });
+
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
-        if tab.dirty {
-            return;
-        }
+        let first_edit = !tab.dirty;
         tab.dirty = true;
 
-        if let TabKind::Generated { schema, relation } = tab.kind.clone() {
+        if let TabKind::Generated {
+            schema, relation, ..
+        } = tab.kind.clone()
+        {
             tracing::info!(
                 tab_id = id,
                 schema = %schema,
@@ -666,7 +660,16 @@ impl TabModel {
                 "generated tab converted to script on first edit"
             );
             self.generated_by_relation.remove(&(schema, relation));
-            tab.kind = TabKind::Script;
+            // The user never named this script by editing a live preview
+            // into one: it keeps the bare relation name as its title, but
+            // its sibling file is unnamed the same as a fresh query-N tab's.
+            let file_name = new_scratch_file
+                .unwrap_or_else(|| crate::session_store::script_file_name(&tab.title));
+            let file = crate::session_store::ScriptFileName::new(file_name)
+                .expect("a disambiguated scratch candidate is always a valid ScriptFileName");
+            tab.kind = TabKind::Script {
+                backing: ScriptBacking::SessionScratch { file },
+            };
 
             // `mark_edited` runs from inside this same editor's own
             // `EditListener` (see `build_editor`), i.e. while its entity is
@@ -679,54 +682,84 @@ impl TabModel {
         }
 
         self.sync_preview_controls(cx);
-        cx.notify();
+        if first_edit {
+            cx.notify();
+        } else {
+            self.schedule_debounced_edit_notify(cx);
+        }
+    }
+
+    /// Notify after [`Self::edit_debounce`] elapses, unless a later edit's
+    /// own call to this method has already superseded it -- so a burst of
+    /// keystrokes collapses into exactly one notify (and thus one
+    /// downstream autosave/draft write) after typing pauses, rather than
+    /// one per keystroke.
+    fn schedule_debounced_edit_notify(&mut self, cx: &mut Context<Self>) {
+        let generation = self.edit_debounce_generation.get() + 1;
+        self.edit_debounce_generation.set(generation);
+        let generation_cell = self.edit_debounce_generation.clone();
+        let duration = self.edit_debounce;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(duration).await;
+            if generation_cell.get() != generation {
+                return;
+            }
+            let _ = this.update(cx, |_this, cx| cx.notify());
+        })
+        .detach();
     }
 
     /// This model's entire tab state as a persistable, window-independent
     /// snapshot: every tab's kind/title and kind-specific payload, in order,
     /// plus which one is active. A `Generated` tab's SQL is never itself
-    /// part of the payload -- it is always machine-written from
-    /// `preview_state`, so only that state is captured; a `Script` tab's
-    /// text is user-authored, so its full buffer is captured instead.
+    /// part of the payload -- it is always machine-written from its own
+    /// `TabKind::Generated::preview`, so only that state is captured; a
+    /// `Script` tab's text is user-authored, so its full buffer is captured
+    /// instead.
     #[must_use]
     pub fn snapshot(&self, cx: &App) -> TabSessionSnapshot {
-        let tabs = self
+        let mut tabs: Vec<TabEntrySnapshot> = self
             .tabs
             .iter()
             .filter_map(|tab| {
-                let kind = match &tab.kind {
-                    TabKind::Script => TabEntryKind::Script {
-                        buffer_text: tab.editor.read(cx).text(),
+                let buffer_text = match &tab.kind {
+                    TabKind::Script { backing } => match backing {
+                        ScriptBacking::SessionScratch { .. }
+                        | ScriptBacking::SessionNamed { .. } => Some(tab.editor.read(cx).text()),
+                        ScriptBacking::Library { .. } | ScriptBacking::External { .. } => {
+                            let text = tab.editor.read(cx).text();
+                            tab.diverged(cx).then_some(text)
+                        }
                     },
                     // `tab.dirty` is always `false` here: `mark_edited`
                     // converts a `Generated` tab to `TabKind::Script` in the
                     // same call that would otherwise set it, so a live tab
                     // can never be both still-`Generated` and dirty.
-                    TabKind::Generated { schema, relation } => TabEntryKind::Generated {
-                        schema: schema.clone(),
-                        relation: relation.clone(),
-                        preview_state: tab.preview_state.clone(),
-                    },
+                    TabKind::Generated { .. } => None,
                     // A schema tab is a read-only view re-openable from the
                     // sidebar at any time and carries no editable buffer, so
                     // it is intentionally not persisted.
                     TabKind::Schema { .. } => return None,
                 };
                 Some(TabEntrySnapshot {
-                    kind,
+                    kind: tab.kind.clone(),
                     title: tab.title.clone(),
+                    buffer_text,
                 })
             })
             .collect();
         // Index into the persisted (non-schema) tabs, so it lines up with
         // what `restore_tabs` rebuilds; an active schema tab leaves no active
-        // index and restore falls back to the first tab.
+        // index and restore falls back to the first tab. Computed before
+        // appending carried-forward entries, which have no live tab (and
+        // thus no position) of their own.
         let active_index = self.active.and_then(|id| {
             self.tabs
                 .iter()
                 .filter(|tab| !matches!(tab.kind, TabKind::Schema { .. }))
                 .position(|tab| tab.id == id)
         });
+        tabs.extend(self.carried_forward_entries.iter().cloned());
         TabSessionSnapshot { tabs, active_index }
     }
 
@@ -743,8 +776,10 @@ impl TabModel {
     ) {
         self.tabs.clear();
         self.generated_by_relation.clear();
+        self.schema_by_relation.clear();
         self.active = None;
         self.live_owner = None;
+        self.carried_forward_entries.clear();
 
         match snapshot {
             Some(snapshot) if !snapshot.tabs.is_empty() => self.restore_tabs(snapshot, cx),
@@ -768,103 +803,37 @@ impl TabModel {
         cx.notify();
     }
 
-    /// Rebuild `self.tabs` from `snapshot`'s entries: same order, kind, and
-    /// title. A `Script` entry's buffer text is restored verbatim. A
-    /// `Generated` entry's buffer text is instead regenerated from its
-    /// persisted `preview_state` via [`Session::preview_sql_windowed`] --
-    /// the same windowed builder call a live sort/page/filter change rewrites
-    /// a tab's buffer with (see `preview_actions`) -- so a restored tab's
-    /// text and controls can never disagree. `snapshot` may come straight
-    /// from disk or, on a connection switch-back, from an in-memory cache
-    /// that was never serialized, so a `Generated` entry's row-count fields
-    /// are cleared explicitly via
-    /// [`PreviewQueryState::clear_resolved_totals`] rather than left to
-    /// `#[serde(skip)]`, keeping both restore paths identical; the next run
-    /// refetches them through the existing count path.
-    ///
-    /// Never triggers a query: [`EditorView::set_text`] does not invoke the
-    /// on-edit listener, so restoring a buffer's text neither marks a
-    /// restored tab dirty nor dispatches anything through `session`.
-    fn restore_tabs(&mut self, snapshot: &TabSessionSnapshot, cx: &mut Context<Self>) {
-        self.next_script_number = snapshot
-            .tabs
-            .iter()
-            .filter_map(|entry| parse_script_number(&entry.title))
-            .max()
-            .map_or(1, |highest| highest + 1);
-        let page_size = self.session.read(cx).preview_limit();
-
-        for entry in &snapshot.tabs {
-            let id = self.allocate_id();
-            let editor = Self::build_editor(id, cx);
-
-            let (kind, preview_state) = match &entry.kind {
-                TabEntryKind::Script { buffer_text } => {
-                    editor.update(cx, |editor, cx| editor.set_text(buffer_text, cx));
-                    (TabKind::Script, PreviewQueryState::new(page_size))
-                }
-                TabEntryKind::Generated {
-                    schema,
-                    relation,
-                    preview_state,
-                } => {
-                    let filters = preview_state.filters();
-                    let _span = tracing::info_span!(
-                        "tab_session_restore_generated",
-                        tab_id = id,
-                        schema = %schema,
-                        relation = %relation,
-                        limit = preview_state.page_size(),
-                        offset = preview_state.offset(),
-                        filtered = !filters.is_empty()
-                    )
-                    .entered();
-                    let sql = self.session.read(cx).preview_sql_windowed(
-                        schema,
-                        relation,
-                        preview_state.sort_pair(),
-                        preview_state.page_size(),
-                        preview_state.offset(),
-                        filters,
-                    );
-                    tracing::info!("regenerated a restored generated tab's buffer");
-                    editor.update(cx, |editor, cx| {
-                        editor.set_text(&sql, cx);
-                        editor.set_compact(true);
-                    });
-                    self.generated_by_relation
-                        .insert((schema.clone(), relation.clone()), id);
-                    let mut preview_state = preview_state.clone();
-                    preview_state.clear_resolved_totals();
-                    (
-                        TabKind::Generated {
-                            schema: schema.clone(),
-                            relation: relation.clone(),
-                        },
-                        preview_state,
-                    )
-                }
-            };
-
-            self.tabs.push(Tab {
-                id,
-                kind,
-                title: entry.title.clone(),
-                editor,
-                dirty: false,
-                last_run: None,
-                schema_view: None,
-                preview_state,
-            });
-        }
-
-        self.active = snapshot
-            .active_index
-            .and_then(|index| self.tabs.get(index))
-            .or_else(|| self.tabs.first())
-            .map(Tab::id);
+    /// Drop any [`Self::carried_forward_entries`] item whose external path
+    /// canonicalizes to `path`, since a live tab now exists for it again via
+    /// a fresh [`Self::open_or_focus_external`] call (the sole caller: a
+    /// [`Self::restore_tabs`] pass always starts from a freshly cleared
+    /// [`Self::carried_forward_entries`] -- see `Self::load_for_connection`
+    /// -- so it never has a stale record of its own left to retire). Without
+    /// this, a file that was briefly unreachable (an unmounted volume, say)
+    /// keeps a stale carried-forward record forever once it becomes
+    /// reachable again: the next save would then persist both the live
+    /// tab's own entry and the stale one side by side, and the save after
+    /// that would restore two tabs racing each other over the same file.
+    fn retire_carried_forward_external_entry(&mut self, path: &std::path::Path) {
+        let canonical = canonicalize_or_self(path);
+        self.carried_forward_entries.retain(|entry| {
+            !matches!(
+                &entry.kind,
+                TabKind::Script {
+                    backing: ScriptBacking::External { path, .. }
+                } if canonicalize_or_self(path) == canonical
+            )
+        });
     }
 }
 
+/// `path` canonicalized (resolving symlinks and `.`/`..` components), or
+/// `path` itself unchanged if it cannot be canonicalized (e.g. it no longer
+/// exists)
+fn canonicalize_or_self(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+mod restore;
 #[cfg(test)]
 mod tests;

@@ -12,21 +12,28 @@ use zsql_core::{
 
 use zsql_core::preview_state::PreviewQueryState;
 
-use super::{PreviewControlsChanged, ResultsChanged, ResultsSnapshot, Tab, TabKind, TabModel};
+use super::{
+    PreviewControlsChanged, ResultsChanged, ResultsSnapshot, SaveRequested, Tab, TabKind, TabModel,
+};
 use crate::session::Session;
-use crate::tab_session::{TabEntryKind, TabEntrySnapshot, TabSessionSnapshot};
+use crate::session_store::{ScriptBacking, ScriptFileName, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::ResultsView;
 use crate::ui::results::pager::PreviewAction;
 
-/// Test-only accessors: a tab's captured run, and its sort/page window (see
-/// [`Tab::preview_state`]'s field doc for when the latter is meaningful).
+/// Test-only accessors: a tab's captured run, and its sort/page window
+/// (`Some` only while `kind` is `Generated`).
 impl Tab {
     pub(crate) fn last_run_for_test(&self) -> Option<&ResultsSnapshot> {
         self.last_run.as_ref()
     }
 
     pub(crate) fn preview_state(&self) -> &zsql_core::preview_state::PreviewQueryState {
-        &self.preview_state
+        match &self.kind {
+            TabKind::Generated { preview, .. } => preview,
+            TabKind::Script { .. } | TabKind::Schema { .. } => {
+                panic!("preview_state() called on a non-Generated tab in a test")
+            }
+        }
     }
 }
 
@@ -314,13 +321,11 @@ fn opening_a_relation_creates_one_generated_tab_and_activates_it(cx: &mut TestAp
     model.read_with(cx, |model, _app| {
         assert_eq!(model.tabs().len(), 1);
         let tab = &model.tabs()[0];
-        assert_eq!(
+        assert!(matches!(
             tab.kind(),
-            &TabKind::Generated {
-                schema: "public".to_owned(),
-                relation: "orders".to_owned()
-            }
-        );
+            TabKind::Generated { schema, relation, .. }
+                if schema == "public" && relation == "orders"
+        ));
         assert_eq!(tab.title(), "orders");
         assert!(!tab.dirty());
         assert_eq!(model.active_id(), Some(tab.id()));
@@ -383,7 +388,7 @@ fn editing_a_generated_tab_converts_it_to_a_script_permanently(cx: &mut TestAppC
 
     model.read_with(cx, |model, app| {
         let tab = model.tabs().iter().find(|tab| tab.id() == id).unwrap();
-        assert_eq!(tab.kind(), &TabKind::Script);
+        assert!(matches!(tab.kind(), TabKind::Script { .. }));
         assert!(tab.dirty());
         assert_eq!(tab.title(), "orders", "conversion keeps the original title");
         assert!(!tab.editor().read(app).is_compact());
@@ -411,9 +416,8 @@ fn reopening_a_relation_whose_tab_was_edited_creates_a_new_generated_tab(cx: &mu
             .iter()
             .find(|tab| tab.id() == first_id)
             .unwrap();
-        assert_eq!(
-            first_tab.kind(),
-            &TabKind::Script,
+        assert!(
+            matches!(first_tab.kind(), TabKind::Script { .. }),
             "the old, edited tab is left untouched as a script"
         );
         let second_tab = model
@@ -421,13 +425,11 @@ fn reopening_a_relation_whose_tab_was_edited_creates_a_new_generated_tab(cx: &mu
             .iter()
             .find(|tab| tab.id() == second_id)
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             second_tab.kind(),
-            &TabKind::Generated {
-                schema: "public".to_owned(),
-                relation: "orders".to_owned()
-            }
-        );
+            TabKind::Generated { schema, relation, .. }
+                if schema == "public" && relation == "orders"
+        ));
         assert_eq!(model.active_id(), Some(second_id));
     });
 }
@@ -448,9 +450,8 @@ fn editing_back_to_the_original_generated_sql_does_not_revert_to_generated(
 
     model.read_with(cx, |model, _app| {
         let tab = model.tabs().iter().find(|tab| tab.id() == id).unwrap();
-        assert_eq!(
-            tab.kind(),
-            &TabKind::Script,
+        assert!(
+            matches!(tab.kind(), TabKind::Script { .. }),
             "recreating the original SQL text must not un-convert the tab"
         );
     });
@@ -463,7 +464,7 @@ fn new_script_tab_opens_empty_and_active_with_a_numbered_title(cx: &mut TestAppC
 
     model.read_with(cx, |model, app| {
         let tab = model.tabs().iter().find(|tab| tab.id() == id).unwrap();
-        assert_eq!(tab.kind(), &TabKind::Script);
+        assert!(matches!(tab.kind(), TabKind::Script { .. }));
         assert_eq!(tab.title(), "query-1.sql");
         assert!(!tab.dirty());
         assert_eq!(tab.editor().read(app).text(), "");
@@ -478,6 +479,45 @@ fn new_script_tab_opens_empty_and_active_with_a_numbered_title(cx: &mut TestAppC
             .find(|tab| tab.id() == second_id)
             .unwrap();
         assert_eq!(tab.title(), "query-2.sql");
+    });
+}
+
+#[gpui::test]
+fn named_open_scripts_by_file_excludes_scratch_tabs_and_includes_any_named_title(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    // Editing a generated tab converts it to a scratch-backed script whose
+    // title is the plain relation name -- the exact shape that must stay out
+    // of the named listing despite not looking like an unnamed script.
+    let converted_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| editor.insert_text_for_test("x", cx));
+
+    let named_id = model.update(cx, TabModel::new_script_tab);
+    model.update(cx, |model, cx| {
+        model.apply_renamed_title(named_id, "query-7.sql".to_owned(), cx);
+    });
+
+    model.read_with(cx, |model, _app| {
+        let converted = model
+            .tabs()
+            .iter()
+            .find(|tab| tab.id() == converted_id)
+            .unwrap();
+        assert!(
+            matches!(converted.kind(), TabKind::Script { .. }),
+            "the edit must convert it"
+        );
+        assert_eq!(
+            model.named_open_scripts_by_file(),
+            vec![("query-7.sql".to_owned(), named_id)],
+            "a scratch-backed tab stays out of the named listing regardless of how plain \
+             its title looks, while a promoted tab is listed even under a title matching \
+             the legacy unnamed pattern"
+        );
     });
 }
 
@@ -901,18 +941,22 @@ fn two_tab_snapshot() -> TabSessionSnapshot {
     TabSessionSnapshot {
         tabs: vec![
             TabEntrySnapshot {
-                kind: TabEntryKind::Generated {
+                kind: TabKind::Generated {
                     schema: "public".to_owned(),
                     relation: "orders".to_owned(),
-                    preview_state: PreviewQueryState::new(200),
+                    preview: PreviewQueryState::new(200),
                 },
                 title: "orders".to_owned(),
+                buffer_text: None,
             },
             TabEntrySnapshot {
-                kind: TabEntryKind::Script {
-                    buffer_text: "select 1;\n".to_owned(),
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionScratch {
+                        file: ScriptFileName::new("query-1.sql").unwrap(),
+                    },
                 },
                 title: "query-1.sql".to_owned(),
+                buffer_text: Some("select 1;\n".to_owned()),
             },
         ],
         active_index: Some(1),
@@ -944,10 +988,10 @@ fn snapshot_captures_every_tabs_kind_title_buffer_and_the_active_index(cx: &mut 
     assert_eq!(snapshot.tabs.len(), 2);
     assert_eq!(
         snapshot.tabs[0].kind,
-        TabEntryKind::Generated {
+        TabKind::Generated {
             schema: "public".to_owned(),
             relation: "orders".to_owned(),
-            preview_state: PreviewQueryState::new(200),
+            preview: PreviewQueryState::new(200),
         },
         "a freshly opened generated tab's captured preview state matches a \
          fresh, unsorted, unfiltered page one"
@@ -955,16 +999,159 @@ fn snapshot_captures_every_tabs_kind_title_buffer_and_the_active_index(cx: &mut 
     assert_eq!(snapshot.tabs[0].title, "orders");
     assert_eq!(
         snapshot.tabs[1].kind,
-        TabEntryKind::Script {
-            buffer_text: "select 1;".to_owned()
+        TabKind::Script {
+            backing: ScriptBacking::SessionScratch {
+                file: ScriptFileName::new("query-1.sql").unwrap(),
+            },
         }
     );
+    assert_eq!(snapshot.tabs[1].buffer_text.as_deref(), Some("select 1;"));
     assert_eq!(snapshot.tabs[1].title, "query-1.sql");
     assert_eq!(
         snapshot.active_index,
         Some(1),
         "the active tab is the script tab, at index 1"
     );
+}
+
+#[gpui::test]
+fn a_top_level_backed_tab_titled_exactly_like_an_unnamed_scripts_own_title_is_session_named(
+    cx: &mut TestAppContext,
+) {
+    // Pins the ticket's own example: a script whose title happens to look
+    // exactly like an unnamed tab's own minted title (`query-7.sql`) but
+    // whose backing lives at the session directory's top level is simply a
+    // named script -- classification comes from the tab's structural
+    // backing marker, never from a text pattern applied to `title`.
+    let model = build_model(cx);
+    let id = model.update(cx, |model, cx| {
+        model.new_script_tab_with_content("query-7.sql".to_owned(), "select 1;", cx)
+    });
+
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.script_backing_of(id),
+            Some(ScriptBacking::SessionNamed {
+                file: ScriptFileName::new("query-7.sql").unwrap()
+            })
+        );
+    });
+}
+
+#[gpui::test]
+fn restoring_a_script_entry_classifies_it_from_the_persisted_unnamed_marker_not_its_title(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    let snapshot = TabSessionSnapshot {
+        tabs: vec![
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionScratch {
+                        file: ScriptFileName::new("query-1.sql").unwrap(),
+                    },
+                },
+                title: "query-1.sql".to_owned(),
+                buffer_text: Some("select 1;".to_owned()),
+            },
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionNamed {
+                        file: ScriptFileName::new("query-7.sql").unwrap(),
+                    },
+                },
+                title: "query-7.sql".to_owned(),
+                buffer_text: Some("select 7;".to_owned()),
+            },
+        ],
+        active_index: Some(0),
+    };
+
+    model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&snapshot), cx);
+    });
+
+    model.read_with(cx, |model, _app| {
+        let unnamed_id = model.tabs()[0].id();
+        let named_id = model.tabs()[1].id();
+        assert_eq!(
+            model.script_backing_of(unnamed_id),
+            Some(ScriptBacking::SessionScratch {
+                file: ScriptFileName::new("query-1.sql").unwrap()
+            })
+        );
+        assert_eq!(
+            model.script_backing_of(named_id),
+            Some(ScriptBacking::SessionNamed {
+                file: ScriptFileName::new("query-7.sql").unwrap()
+            }),
+            "a restored query-7.sql entry marked unnamed: false must classify as named, \
+             matching its persisted location rather than its title text"
+        );
+    });
+}
+
+#[gpui::test]
+fn two_relations_sharing_a_bare_name_convert_to_distinct_session_files_under_the_same_title(
+    cx: &mut TestAppContext,
+) {
+    // `public.orders` and `archive.orders` both convert to unnamed scripts
+    // keeping the bare relation name `orders` as their shared display
+    // title -- but a rename must be able to tell them apart, so each must
+    // land on its own distinct sibling file the instant it converts, never
+    // waiting for a save round trip to discover the collision.
+    let model = build_model(cx);
+
+    let public_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    let public_editor = model.read_with(cx, |model, _app| {
+        model
+            .tabs()
+            .iter()
+            .find(|tab| tab.id() == public_id)
+            .unwrap()
+            .editor()
+            .clone()
+    });
+    public_editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("select 1;", cx);
+    });
+
+    let archive_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("archive", "orders", cx)
+    });
+    let archive_editor = model.read_with(cx, |model, _app| {
+        model
+            .tabs()
+            .iter()
+            .find(|tab| tab.id() == archive_id)
+            .unwrap()
+            .editor()
+            .clone()
+    });
+    archive_editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("select 2;", cx);
+    });
+
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tab_title_of(public_id), Some("orders"));
+        assert_eq!(model.tab_title_of(archive_id), Some("orders"));
+        let public_file = model
+            .script_backing_of(public_id)
+            .and_then(|b| b.session_file().map(|f| f.as_str().to_owned()))
+            .unwrap();
+        let archive_file = model
+            .script_backing_of(archive_id)
+            .and_then(|b| b.session_file().map(|f| f.as_str().to_owned()))
+            .unwrap();
+        assert_ne!(
+            public_file, archive_file,
+            "two same-titled unnamed tabs must never share a session file"
+        );
+        assert_eq!(public_file, "orders.sql");
+        assert_eq!(archive_file, "orders-2.sql");
+    });
 }
 
 #[gpui::test]
@@ -978,13 +1165,14 @@ fn restoring_a_snapshot_rebuilds_the_expected_tabs_order_and_active_tab(cx: &mut
 
     model.read_with(cx, |model, app| {
         assert_eq!(model.tabs().len(), 2);
-        assert_eq!(
+        assert!(matches!(
             model.tabs()[0].kind(),
-            &TabKind::Generated {
-                schema: "public".to_owned(),
-                relation: "orders".to_owned(),
-            }
-        );
+            TabKind::Generated {
+                schema,
+                relation,
+                ..
+            } if schema == "public" && relation == "orders"
+        ));
         assert_eq!(model.tabs()[0].title(), "orders");
         assert_eq!(
             model.tabs()[0].editor().read(app).text(),
@@ -992,7 +1180,7 @@ fn restoring_a_snapshot_rebuilds_the_expected_tabs_order_and_active_tab(cx: &mut
         );
         assert!(!model.tabs()[0].dirty());
 
-        assert_eq!(model.tabs()[1].kind(), &TabKind::Script);
+        assert!(matches!(model.tabs()[1].kind(), TabKind::Script { .. }));
         assert_eq!(model.tabs()[1].title(), "query-1.sql");
         assert_eq!(model.tabs()[1].editor().read(app).text(), "select 1;\n");
 
@@ -1041,10 +1229,13 @@ fn a_new_tab_after_restoring_query_1_sql_gets_a_distinct_title(cx: &mut TestAppC
     let model = build_model(cx);
     let snapshot = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script {
-                buffer_text: String::new(),
+            kind: TabKind::Script {
+                backing: ScriptBacking::SessionScratch {
+                    file: ScriptFileName::new("query-1.sql").unwrap(),
+                },
             },
             title: "query-1.sql".to_owned(),
+            buffer_text: Some(String::new()),
         }],
         active_index: Some(0),
     };
@@ -1070,10 +1261,13 @@ fn connecting_with_no_snapshot_resets_script_numbering_to_one(cx: &mut TestAppCo
     let model = build_model(cx);
     let snapshot = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script {
-                buffer_text: String::new(),
+            kind: TabKind::Script {
+                backing: ScriptBacking::SessionScratch {
+                    file: ScriptFileName::new("query-5.sql").unwrap(),
+                },
             },
             title: "query-5.sql".to_owned(),
+            buffer_text: Some(String::new()),
         }],
         active_index: Some(0),
     };
@@ -1143,7 +1337,7 @@ fn connecting_with_no_snapshot_yields_the_default_single_empty_script_tab(cx: &m
     model.read_with(cx, |model, app| {
         assert_eq!(model.tabs().len(), 1);
         let tab = &model.tabs()[0];
-        assert_eq!(tab.kind(), &TabKind::Script);
+        assert!(matches!(tab.kind(), TabKind::Script { .. }));
         assert_eq!(tab.editor().read(app).text(), "");
         assert_eq!(model.active_id(), Some(tab.id()));
     });
@@ -1169,7 +1363,7 @@ fn switching_to_a_connection_with_no_snapshot_after_one_with_tabs_replaces_them(
             1,
             "switching connections must replace, not merge with, the prior tab set"
         );
-        assert_eq!(model.tabs()[0].kind(), &TabKind::Script);
+        assert!(matches!(model.tabs()[0].kind(), TabKind::Script { .. }));
         assert_eq!(model.tabs()[0].editor().read(app).text(), "");
     });
 }
@@ -1180,10 +1374,13 @@ fn switching_between_two_connections_snapshots_swaps_the_whole_tab_set(cx: &mut 
     let snapshot_a = two_tab_snapshot();
     let snapshot_b = TabSessionSnapshot {
         tabs: vec![TabEntrySnapshot {
-            kind: TabEntryKind::Script {
-                buffer_text: "select 'b';".to_owned(),
+            kind: TabKind::Script {
+                backing: ScriptBacking::SessionNamed {
+                    file: ScriptFileName::new("b-query.sql").unwrap(),
+                },
             },
             title: "b-query.sql".to_owned(),
+            buffer_text: Some("select 'b';".to_owned()),
         }],
         active_index: Some(0),
     };
@@ -1355,7 +1552,10 @@ fn editing_a_generated_tabs_buffer_makes_further_sort_and_page_actions_inert(
 
     model.read_with(cx, |model, _app| {
         assert!(model.tab(id).unwrap().dirty());
-        assert!(matches!(model.tab(id).unwrap().kind(), TabKind::Script));
+        assert!(matches!(
+            model.tab(id).unwrap().kind(),
+            TabKind::Script { .. }
+        ));
     });
 
     let text_before = editor.read_with(cx, |editor, _app| editor.text());
@@ -1990,13 +2190,14 @@ fn editing_a_generated_tabs_buffer_makes_further_filter_actions_inert(cx: &mut T
         text_before, text_after,
         "a filter action on an edited (now Script) tab must not touch its buffer"
     );
-    assert!(
-        model.read_with(cx, |model, _app| model.tabs()[0]
-            .preview_state()
-            .filters()
-            .is_empty()),
-        "a filter action on a detached tab must not commit a filter"
-    );
+    // A converted tab is `TabKind::Script`, which carries no preview state
+    // at all -- there is structurally nothing left for a filter action to
+    // commit into, unlike the pre-refactor design where `preview_state` was
+    // carried (but ignored) on every tab regardless of kind.
+    assert!(matches!(
+        model.read_with(cx, |model, _app| model.tabs()[0].kind().clone()),
+        TabKind::Script { .. }
+    ));
     assert_eq!(
         sinks.lock().expect("sinks lock poisoned").len(),
         runs_before,
@@ -2008,7 +2209,7 @@ fn editing_a_generated_tabs_buffer_makes_further_filter_actions_inert(cx: &mut T
 
 /// A generated tab's sort, an OR-connected filter set (including an
 /// fx-classified expression value), and its page all survive a full
-/// snapshot -> JSON -> restore round trip: the regenerated buffer text
+/// snapshot -> disk -> restore round trip: the regenerated buffer text
 /// matches a direct `preview_sql_windowed` call against that exact window,
 /// and the restored `PreviewQueryState` matches the original in every field
 /// but its row counts, which a fresh restore never carries.
@@ -2059,8 +2260,15 @@ fn a_filtered_sorted_paged_generated_tab_round_trips_through_a_snapshot(cx: &mut
     );
 
     let snapshot = model.read_with(cx, TabModel::snapshot);
-    let json = serde_json::to_string(&snapshot).expect("must serialize");
-    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+    let sessions_dir = TempDir::new("snapshot-wire-roundtrip");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let parsed = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
 
     let expected_sql = session.read_with(cx, |session, _app| {
         session.preview_sql_windowed(
@@ -2116,8 +2324,15 @@ fn restoring_a_snapshot_clears_totals_and_a_rerun_refetches_them(cx: &mut TestAp
     });
 
     let snapshot = model.read_with(cx, TabModel::snapshot);
-    let json = serde_json::to_string(&snapshot).expect("must serialize");
-    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+    let sessions_dir = TempDir::new("snapshot-wire-roundtrip");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let parsed = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
 
     let restored = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
     restored.update(cx, |model, cx| {
@@ -2187,8 +2402,8 @@ fn switching_back_to_a_cached_session_clears_totals_without_a_serde_round_trip(
 }
 
 /// A script tab's buffer text -- including surrounding whitespace and
-/// non-ASCII content a user typed -- survives a snapshot/serialize/
-/// deserialize/restore round trip byte for byte.
+/// non-ASCII content a user typed -- survives a snapshot/save-to-disk/
+/// load/restore round trip byte for byte.
 #[gpui::test]
 fn a_script_tabs_buffer_text_round_trips_byte_for_byte(cx: &mut TestAppContext) {
     let model = build_model(cx);
@@ -2198,8 +2413,15 @@ fn a_script_tabs_buffer_text_round_trips_byte_for_byte(cx: &mut TestAppContext) 
     editor.update(cx, |editor, cx| editor.set_text(&text, cx));
 
     let snapshot = model.read_with(cx, TabModel::snapshot);
-    let json = serde_json::to_string(&snapshot).expect("must serialize");
-    let parsed: TabSessionSnapshot = serde_json::from_str(&json).expect("must parse back");
+    let sessions_dir = TempDir::new("snapshot-wire-roundtrip");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let parsed = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
 
     let restored = build_model(cx);
     restored.update(cx, |model, cx| {
@@ -2209,4 +2431,1289 @@ fn a_script_tabs_buffer_text_round_trips_byte_for_byte(cx: &mut TestAppContext) 
     restored.read_with(cx, |model, app| {
         assert_eq!(model.tabs()[0].editor().read(app).text(), text);
     });
+}
+
+/// A session-owned script tab -- unnamed `query-N.sql` -- never reports
+/// diverged, regardless of how many manual edits its buffer receives.
+#[gpui::test]
+fn a_session_owned_unnamed_tab_never_diverges_even_after_multiple_edits(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+
+    for text in ["select 1", "select 1, 2", "select 1, 2, 3"] {
+        editor.update(cx, |editor, cx| editor.insert_text_for_test(text, cx));
+        model.read_with(cx, |model, app| {
+            let tab = model.tab(id).unwrap();
+            assert!(
+                !tab.diverged(app),
+                "an unnamed session tab must never diverge, even after {} edits",
+                text.len()
+            );
+        });
+    }
+}
+
+/// A tab converted to library-backed reports diverged exactly when its
+/// buffer differs from the library file's last saved text: clean right
+/// after conversion, diverged once edited, clean again once a save moves
+/// the saved baseline to match.
+#[gpui::test]
+fn a_library_backed_tab_diverges_exactly_when_its_buffer_differs_from_the_saved_text(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| {
+        editor.set_text("select * from orders;", cx);
+    });
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(
+            id,
+            "orders".to_owned(),
+            "select * from orders;".to_owned(),
+            cx,
+        );
+    });
+
+    model.read_with(cx, |model, app| {
+        let tab = model.tab(id).unwrap();
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::Library { .. })
+        ));
+        assert!(
+            !tab.diverged(app),
+            "a freshly converted tab must be clean when its buffer already matches the saved text"
+        );
+    });
+
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- edited", cx);
+    });
+    model.read_with(cx, |model, app| {
+        assert!(
+            model.tab(id).unwrap().diverged(app),
+            "editing a library-backed tab's buffer must diverge it from the saved text"
+        );
+    });
+
+    let current_text = editor.read_with(cx, |editor, _app| editor.text());
+    model.update(cx, |model, cx| {
+        model.mark_backing_saved(id, current_text, cx);
+    });
+    model.read_with(cx, |model, app| {
+        assert!(
+            !model.tab(id).unwrap().diverged(app),
+            "saving back to the current buffer text must clear divergence"
+        );
+    });
+}
+
+/// A completed library rename folds back into the tab's own name and title,
+/// leaving its divergence baseline (the file's saved content) untouched.
+#[gpui::test]
+fn apply_library_rename_updates_the_name_and_title_but_not_the_saved_baseline(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| editor.set_text("select 1;", cx));
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+
+    model.update(cx, |model, cx| {
+        model.apply_library_rename(id, "top-orders", cx);
+    });
+
+    model.read_with(cx, |model, app| {
+        let tab = model.tab(id).unwrap();
+        assert_eq!(tab.library_name(), Some("top-orders"));
+        assert_eq!(tab.title(), "top-orders.sql");
+        assert!(
+            !tab.diverged(app),
+            "a rename must not touch the saved-text baseline, so a clean \
+             tab must stay clean"
+        );
+    });
+}
+
+/// `Save` on an unnamed session tab must always ask the embedding app to
+/// open the modal -- never write a file itself.
+#[gpui::test]
+fn save_on_an_unnamed_session_tab_requests_the_modal_and_writes_nothing(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let events = subscribe_save_events(&model, cx);
+
+    model.update(cx, |model, cx| model.trigger_save(id, cx));
+
+    let events: Vec<SaveRequested> = events.borrow().clone();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        SaveRequested::OpenSaveModal { as_copy: false, .. }
+    ));
+}
+
+/// `Save` on a named session tab is a silent no-op: no modal, no event.
+#[gpui::test]
+fn save_on_a_named_session_tab_emits_nothing(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    model.update(cx, |model, cx| {
+        model.apply_renamed_title(id, "top-customers.sql".to_owned(), cx);
+    });
+    let events = subscribe_save_events(&model, cx);
+
+    model.update(cx, |model, cx| model.trigger_save(id, cx));
+
+    assert!(
+        events.borrow().is_empty(),
+        "a named session tab's Save must not request anything: {:?}",
+        events.borrow()
+    );
+}
+
+/// `Save` on a library-backed tab always asks the embedding app to write
+/// the library file directly, with no modal.
+#[gpui::test]
+fn save_on_a_library_backed_tab_requests_a_direct_write(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+    let events = subscribe_save_events(&model, cx);
+
+    model.update(cx, |model, cx| model.trigger_save(id, cx));
+
+    let events: Vec<SaveRequested> = events.borrow().clone();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        SaveRequested::WriteLibraryDirect { tab_id } if tab_id == id
+    ));
+}
+
+/// `Save as` always opens the modal, regardless of the source tab's
+/// backing, and never on its own retargets anything (retargeting only
+/// ever happens once the modal is confirmed, in `ui::workspace`).
+#[gpui::test]
+fn save_as_always_opens_the_modal_regardless_of_backing(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let unnamed_id = model.update(cx, TabModel::new_script_tab);
+    let library_id = model.update(cx, TabModel::new_script_tab);
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(
+            library_id,
+            "orders".to_owned(),
+            "select 1;".to_owned(),
+            cx,
+        );
+    });
+    let events = subscribe_save_events(&model, cx);
+
+    model.update(cx, |model, cx| model.trigger_save_as(unnamed_id, cx));
+    model.update(cx, |model, cx| model.trigger_save_as(library_id, cx));
+
+    let events: Vec<SaveRequested> = events.borrow().clone();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0],
+        SaveRequested::OpenSaveModal { tab_id, as_copy: true } if tab_id == unnamed_id
+    ));
+    assert!(matches!(
+        events[1],
+        SaveRequested::OpenSaveModal { tab_id, as_copy: true } if tab_id == library_id
+    ));
+
+    model.read_with(cx, |model, _app| {
+        assert!(
+            matches!(
+                model.tab(library_id).unwrap().script_backing(),
+                Some(ScriptBacking::Library { .. })
+            ),
+            "Save as must never retarget the source tab's own backing"
+        );
+    });
+}
+
+/// A temp directory this test owns exclusively, removed on drop so tests
+/// never leak directories into the real temp dir.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "zsql-tabs-restore-test-{label}-{}-{n}",
+            std::process::id()
+        ));
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Restarting the app (`save_snapshot` then a fresh `load_snapshot`)
+/// restores a library-backed tab as library-backed, pointing at the same
+/// library file.
+#[gpui::test]
+fn restarting_restores_a_library_backed_tab_as_library_backed(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("restart-library-backed");
+    let sessions_dir = TempDir::new("restart-sessions");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    let id = model.update(cx, TabModel::new_script_tab);
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    restored.read_with(cx, |model, _app| {
+        let tab = &model.tabs()[0];
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::Library { .. })
+        ));
+        assert_eq!(tab.library_name(), Some("orders"));
+    });
+}
+
+/// On restore, a draft (if present) wins over the library file's on-disk
+/// content, and the restored tab is diverged.
+#[gpui::test]
+fn restore_with_a_draft_present_uses_the_draft_and_stays_diverged(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("restore-draft-wins");
+    let sessions_dir = TempDir::new("restore-draft-wins-sessions");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select 1;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| editor.set_text("select 1;", cx));
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- draft edit", cx);
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    restored.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.editor().read(app).text(), " -- draft editselect 1;");
+        assert!(
+            tab.diverged(app),
+            "a restored draft must leave the tab reporting diverged"
+        );
+    });
+}
+
+/// A transient read error (as opposed to the file simply not existing) on
+/// the library file at restore must never be treated as "the draft already
+/// matches the file": the tab must keep reporting diverged so a close does
+/// not prune real unsaved changes and the dirty marker does not lie clean.
+#[cfg(unix)]
+#[gpui::test]
+fn restore_with_a_draft_and_an_unreadable_library_file_stays_diverged_not_clean(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let library_dir = TempDir::new("restore-draft-unreadable-library");
+    let sessions_dir = TempDir::new("restore-draft-unreadable-library-sessions");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select 1;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| editor.set_text("select 1;", cx));
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- draft edit", cx);
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let library_file = library_dir.0.join("orders.sql");
+    let original_permissions = std::fs::metadata(&library_file)
+        .expect("must stat library file")
+        .permissions();
+    std::fs::set_permissions(&library_file, std::fs::Permissions::from_mode(0o000))
+        .expect("must revoke read permission");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        restored.read_with(cx, |model, app| {
+            let tab = &model.tabs()[0];
+            assert!(
+                tab.diverged(app),
+                "an unreadable library file at restore must never be treated as \
+                 matching an unconfirmed draft"
+            );
+        });
+    }));
+    // Restore permissions before propagating any assertion failure, so a
+    // failing assertion never leaves an unreadable temp file behind for the
+    // next run to trip over.
+    std::fs::set_permissions(&library_file, original_permissions)
+        .expect("must restore permissions");
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
+    }
+}
+
+/// On restore, with no draft present, the buffer loads from the library
+/// file itself and the tab is clean.
+#[gpui::test]
+fn restore_with_no_draft_loads_the_library_file_and_stays_clean(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("restore-no-draft");
+    let sessions_dir = TempDir::new("restore-no-draft-sessions");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select 1;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    let id = model.update(cx, TabModel::new_script_tab);
+    let editor = model.read_with(cx, |model, _app| model.tabs()[0].editor().clone());
+    editor.update(cx, |editor, cx| editor.set_text("select 1;", cx));
+    model.update(cx, |model, cx| {
+        model.convert_to_library_backed(id, "orders".to_owned(), "select 1;".to_owned(), cx);
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    restored.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.editor().read(app).text(), "select 1;");
+        assert!(
+            !tab.diverged(app),
+            "a clean restore must not report diverged"
+        );
+    });
+}
+
+/// An external-backed tab reports diverged exactly when its buffer differs
+/// from the file's last-saved text, the same rule a library-backed tab
+/// follows.
+#[gpui::test]
+fn an_external_backed_tab_diverges_exactly_when_its_buffer_differs_from_the_saved_text(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    let path = std::path::PathBuf::from("/home/t/work/migrate.sql");
+    let id = model.update(cx, |model, cx| {
+        model.new_external_tab(path.clone(), "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    let editor = model.read_with(cx, |model, _app| model.tab(id).unwrap().editor().clone());
+
+    model.read_with(cx, |model, app| {
+        let tab = model.tab(id).unwrap();
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::External { .. })
+        ));
+        assert_eq!(tab.external_path(), Some(path.as_path()));
+        assert!(
+            !tab.diverged(app),
+            "a freshly opened external tab must start clean"
+        );
+    });
+
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- edited", cx);
+    });
+    model.read_with(cx, |model, app| {
+        assert!(
+            model.tab(id).unwrap().diverged(app),
+            "editing an external-backed tab's buffer must diverge it from the saved text"
+        );
+    });
+
+    let current_text = editor.read_with(cx, |editor, _app| editor.text());
+    model.update(cx, |model, cx| {
+        model.mark_backing_saved(id, current_text, cx);
+    });
+    model.read_with(cx, |model, app| {
+        assert!(
+            !model.tab(id).unwrap().diverged(app),
+            "saving back to the current buffer text must clear divergence"
+        );
+    });
+}
+
+/// `Save` on an external-backed tab always asks the embedding app to write
+/// the file directly, with no modal.
+#[gpui::test]
+fn save_on_an_external_backed_tab_requests_a_direct_write(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let path = std::path::PathBuf::from("/home/t/work/migrate.sql");
+    let id = model.update(cx, |model, cx| {
+        model.new_external_tab(path, "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    let events = subscribe_save_events(&model, cx);
+
+    model.update(cx, |model, cx| model.trigger_save(id, cx));
+
+    let events: Vec<SaveRequested> = events.borrow().clone();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        SaveRequested::WriteExternalDirect { tab_id } if tab_id == id
+    ));
+}
+
+/// Restarting the app (`save_snapshot` then a fresh `load_snapshot`)
+/// restores an external-backed tab as external-backed, pointing at the same
+/// path, loading the file's current on-disk content.
+#[gpui::test]
+fn restarting_restores_an_external_backed_tab_as_external_backed(cx: &mut TestAppContext) {
+    let sessions_dir = TempDir::new("restart-external-sessions");
+    let external_dir = TempDir::new("restart-external-file");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    let path = external_dir.0.join("migrate.sql");
+    crate::session_store::external::save(&path, "select 1;")
+        .expect("seeding the external file must succeed");
+
+    let model = build_model(cx);
+    let id = model.update(cx, |model, cx| {
+        model.new_external_tab(path.clone(), "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    let _ = id;
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    restored.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::External { .. })
+        ));
+        assert_eq!(tab.external_path(), Some(path.as_path()));
+        assert_eq!(tab.editor().read(app).text(), "select 1;");
+        assert!(!tab.diverged(app));
+    });
+}
+
+/// On restore, a draft (if present) wins over an external file's on-disk
+/// content, and the restored tab is diverged -- even when the file itself
+/// is still perfectly readable.
+#[gpui::test]
+fn restore_with_a_draft_present_for_an_external_tab_uses_the_draft_and_stays_diverged(
+    cx: &mut TestAppContext,
+) {
+    let sessions_dir = TempDir::new("restore-external-draft-sessions");
+    let external_dir = TempDir::new("restore-external-draft-file");
+    let key = crate::session_store::ConnectionKey::Saved(uuid::Uuid::new_v4());
+    let path = external_dir.0.join("migrate.sql");
+    crate::session_store::external::save(&path, "select 1;")
+        .expect("seeding the external file must succeed");
+
+    let model = build_model(cx);
+    let id = model.update(cx, |model, cx| {
+        model.new_external_tab(path.clone(), "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    let editor = model.read_with(cx, |model, _app| model.tab(id).unwrap().editor().clone());
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- draft edit", cx);
+    });
+
+    let snapshot = model.read_with(cx, TabModel::snapshot);
+    crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .save_snapshot(&snapshot)
+        .expect("save must succeed");
+    let loaded = crate::session_store::SessionDir::new(&sessions_dir.0, key)
+        .load_snapshot()
+        .expect("load must succeed")
+        .expect("snapshot must exist");
+
+    let restored = build_model(cx);
+    restored.update(cx, |model, cx| model.load_for_connection(Some(&loaded), cx));
+
+    restored.read_with(cx, |model, app| {
+        let tab = &model.tabs()[0];
+        assert_eq!(tab.editor().read(app).text(), " -- draft editselect 1;");
+        assert!(
+            tab.diverged(app),
+            "a restored draft must leave the tab reporting diverged"
+        );
+    });
+}
+
+/// Restoring a session whose external file is missing (moved or deleted
+/// since it was last open) and has no draft to fall back to skips only that
+/// one tab, with every other tab in the snapshot restoring successfully --
+/// unlike a missing session-owned sibling script, which stays a hard error
+/// for the whole load (see `session_store::persistence`'s own
+/// `loading_a_script_tab_whose_sibling_sql_file_is_missing_returns_a_read_error`,
+/// left untouched).
+#[gpui::test]
+fn restoring_a_session_with_one_missing_external_file_skips_only_that_tab(cx: &mut TestAppContext) {
+    use crate::session_store::{ScriptFileName, TabEntrySnapshot, TabKind, TabSessionSnapshot};
+
+    let snapshot = TabSessionSnapshot {
+        tabs: vec![
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionScratch {
+                        file: ScriptFileName::new("query-1.sql").unwrap(),
+                    },
+                },
+                title: "query-1.sql".to_owned(),
+                buffer_text: Some("select 1;".to_owned()),
+            },
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::External {
+                        path: std::path::PathBuf::from(
+                            "/tmp/zsql-test-definitely-missing/gone.sql",
+                        ),
+                        saved_text: None,
+                    },
+                },
+                title: "gone.sql".to_owned(),
+                buffer_text: None,
+            },
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionScratch {
+                        file: ScriptFileName::new("query-2.sql").unwrap(),
+                    },
+                },
+                title: "query-2.sql".to_owned(),
+                buffer_text: Some("select 2;".to_owned()),
+            },
+        ],
+        active_index: Some(1),
+    };
+
+    let model = build_model(cx);
+    model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&snapshot), cx);
+    });
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs().len(),
+            2,
+            "only the tab with the missing external file must be skipped"
+        );
+        assert_eq!(model.tabs()[0].title(), "query-1.sql");
+        assert_eq!(model.tabs()[0].editor().read(app).text(), "select 1;");
+        assert_eq!(model.tabs()[1].title(), "query-2.sql");
+        assert_eq!(model.tabs()[1].editor().read(app).text(), "select 2;");
+        assert!(
+            model.active_tab().is_some(),
+            "restore must still resolve to a valid active tab despite the skipped entry"
+        );
+    });
+}
+
+/// An external entry a restore could not open (file temporarily
+/// unavailable, no draft) must not vanish from the next save's snapshot --
+/// it is carried forward verbatim until a future restore can actually open
+/// it as a live tab again.
+#[gpui::test]
+fn a_skipped_external_entry_is_carried_forward_into_the_next_snapshot(cx: &mut TestAppContext) {
+    use crate::session_store::{ScriptFileName, TabEntrySnapshot, TabKind, TabSessionSnapshot};
+
+    let skipped_entry = TabEntrySnapshot {
+        kind: TabKind::Script {
+            backing: ScriptBacking::External {
+                path: std::path::PathBuf::from("/tmp/zsql-test-definitely-missing/gone.sql"),
+                saved_text: None,
+            },
+        },
+        title: "gone.sql".to_owned(),
+        buffer_text: None,
+    };
+    let snapshot = TabSessionSnapshot {
+        tabs: vec![
+            TabEntrySnapshot {
+                kind: TabKind::Script {
+                    backing: ScriptBacking::SessionScratch {
+                        file: ScriptFileName::new("query-1.sql").unwrap(),
+                    },
+                },
+                title: "query-1.sql".to_owned(),
+                buffer_text: Some("select 1;".to_owned()),
+            },
+            skipped_entry.clone(),
+        ],
+        active_index: Some(0),
+    };
+
+    let model = build_model(cx);
+    model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&snapshot), cx);
+    });
+
+    let resaved = model.read_with(cx, TabModel::snapshot);
+
+    assert!(
+        resaved.tabs.contains(&skipped_entry),
+        "the unavailable external entry must still be present in the next snapshot, \
+         not silently dropped: {:?}",
+        resaved.tabs
+    );
+}
+
+/// Once a live tab exists again for a path a past restore carried forward
+/// (the file was temporarily unreachable), reopening that same path via
+/// `open_or_focus_external` -- the seam "Browse files..." uses -- must
+/// retire the stale carried-forward record. Without this, the next snapshot
+/// would persist both the live tab's own entry and the stale one side by
+/// side, and the save after that would restore two tabs racing each other
+/// over the same file.
+#[gpui::test]
+fn open_or_focus_external_retires_a_stale_carried_forward_entry_for_the_same_path(
+    cx: &mut TestAppContext,
+) {
+    let temp = TempDir::new("open-external-retires-carried-forward");
+    std::fs::create_dir_all(&temp.0).expect("must create temp dir");
+    let path = temp.0.join("report.sql");
+    std::fs::write(&path, "select 1;").expect("must write the external file");
+
+    let model = build_model(cx);
+    let stale_entry = TabEntrySnapshot {
+        kind: TabKind::Script {
+            backing: ScriptBacking::External {
+                path: path.clone(),
+                saved_text: None,
+            },
+        },
+        title: "report.sql".to_owned(),
+        buffer_text: None,
+    };
+    model.update(cx, |model, _cx| {
+        model.carried_forward_entries.push(stale_entry.clone());
+    });
+
+    model.update(cx, |model, cx| {
+        model.open_or_focus_external(&path, "report.sql".to_owned(), "select 1;", cx);
+    });
+
+    let resaved = model.read_with(cx, TabModel::snapshot);
+    let matching_count = resaved
+        .tabs
+        .iter()
+        .filter(|entry| matches!(&entry.kind, TabKind::Script { backing: ScriptBacking::External { path: p, .. } } if p == &path))
+        .count();
+    assert_eq!(
+        matching_count, 1,
+        "reopening the same path live must retire the stale carried-forward record, not \
+         leave a duplicate that would race the live tab on the next restore: {:?}",
+        resaved.tabs
+    );
+}
+
+/// A legacy `tabs.toml` can carry two `External` entries for the exact same
+/// path (hand-edited, or written by an older version that did not dedupe on
+/// save). Restoring both must never open two live tabs racing one inode --
+/// `restore_tabs` itself dedupes by the same canonicalized-path comparison
+/// [`TabModel::open_or_focus_external`] already uses.
+#[gpui::test]
+fn restore_tabs_dedupes_two_entries_for_the_same_external_path_into_a_single_tab(
+    cx: &mut TestAppContext,
+) {
+    let temp = TempDir::new("restore-dedupes-duplicate-external-entries");
+    std::fs::create_dir_all(&temp.0).expect("must create temp dir");
+    let path = temp.0.join("report.sql");
+    std::fs::write(&path, "select 1;").expect("must write the external file");
+
+    let duplicated_entry = TabEntrySnapshot {
+        kind: TabKind::Script {
+            backing: ScriptBacking::External {
+                path: path.clone(),
+                saved_text: None,
+            },
+        },
+        title: "report.sql".to_owned(),
+        buffer_text: None,
+    };
+    let snapshot = TabSessionSnapshot {
+        tabs: vec![duplicated_entry.clone(), duplicated_entry],
+        active_index: Some(0),
+    };
+
+    let model = build_model(cx);
+    model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&snapshot), cx);
+    });
+
+    model.read_with(cx, |model, _app| {
+        let matching_count = model
+            .tabs()
+            .iter()
+            .filter(|tab| tab.external_path() == Some(path.as_path()))
+            .count();
+        assert_eq!(
+            matching_count,
+            1,
+            "a legacy snapshot with two entries for the same path must restore exactly one \
+             live tab, not two racing the same inode: {:?}",
+            model.tabs().iter().map(Tab::title).collect::<Vec<_>>()
+        );
+    });
+
+    let resaved = model.read_with(cx, TabModel::snapshot);
+    let matching_count = resaved
+        .tabs
+        .iter()
+        .filter(|entry| matches!(&entry.kind, TabKind::Script { backing: ScriptBacking::External { path: p, .. } } if p == &path))
+        .count();
+    assert_eq!(
+        matching_count, 1,
+        "the next snapshot must carry only the one surviving entry, not both: {:?}",
+        resaved.tabs
+    );
+}
+
+/// `open_or_focus_library`'s fresh-open branch creates a new library-backed
+/// tab, loading its content from the library file.
+#[gpui::test]
+fn open_or_focus_library_opens_a_fresh_tab_for_a_name_not_already_open(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("open-or-focus-library-fresh");
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select * from orders;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+
+    let id = model
+        .update(cx, |model, cx| model.open_or_focus_library("orders", cx))
+        .expect("a valid library name must open a tab");
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(model.tabs().len(), 1);
+        let tab = model.tab(id).unwrap();
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::Library { .. })
+        ));
+        assert_eq!(tab.library_name(), Some("orders"));
+        assert_eq!(tab.editor().read(app).text(), "select * from orders;");
+        assert_eq!(model.active_id(), Some(id));
+    });
+}
+
+/// A name that is not a valid `LibraryName` (e.g. one whose stem still
+/// carries a reserved `.sql` suffix) must be refused rather than panic --
+/// see `LibraryName::new`'s own validation.
+#[gpui::test]
+fn open_or_focus_library_refuses_a_name_that_is_not_a_valid_library_name(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("open-or-focus-library-invalid-name");
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+
+    let id = model.update(cx, |model, cx| {
+        model.open_or_focus_library("report.sql", cx)
+    });
+
+    assert_eq!(id, None);
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs().len(), 0);
+    });
+}
+
+/// `open_or_focus_library` called twice for the same name must never create
+/// a second tab: the second call focuses the tab the first call opened.
+#[gpui::test]
+fn open_or_focus_library_focuses_the_existing_tab_instead_of_duplicating_it(
+    cx: &mut TestAppContext,
+) {
+    let library_dir = TempDir::new("open-or-focus-library-dedupe");
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select 1;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+    });
+    let first = model
+        .update(cx, |model, cx| model.open_or_focus_library("orders", cx))
+        .expect("a valid library name must open a tab");
+    // Open a second tab and activate it, so the dedupe path has to actively
+    // re-focus the first tab rather than trivially finding it already active.
+    model.update(cx, TabModel::new_script_tab);
+
+    let second = model
+        .update(cx, |model, cx| model.open_or_focus_library("orders", cx))
+        .expect("a valid library name must open a tab");
+
+    assert_eq!(
+        first, second,
+        "opening an already-open library name must reuse its tab id"
+    );
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs().len(),
+            2,
+            "no duplicate tab must be created for a name already open"
+        );
+        assert_eq!(model.active_id(), Some(first));
+    });
+}
+
+/// A named session script saved to disk, with no open tab for it, is still
+/// reopenable by file name -- the single place both the sidebar and the
+/// Open Script picker's "This connection" section route through for a
+/// not-currently-open row.
+#[gpui::test]
+fn open_or_focus_session_script_opens_a_fresh_tab_loading_content_from_disk(
+    cx: &mut TestAppContext,
+) {
+    let session_dir = TempDir::new("open-or-focus-session-script-fresh");
+    std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+    std::fs::write(
+        session_dir.0.join("scripts").join("top-customers.sql"),
+        "select * from customers order by revenue desc;",
+    )
+    .expect("must write the session script");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_session_dir(Some(session_dir.0.clone()));
+    });
+
+    let id = model
+        .update(cx, |model, cx| {
+            model.open_or_focus_session_script("top-customers.sql", cx)
+        })
+        .expect("the file exists and is readable, so this must open a tab");
+
+    model.read_with(cx, |model, app| {
+        let tab = model.tab(id).unwrap();
+        assert!(!matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::Library { .. })
+        ));
+        assert!(!matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::External { .. })
+        ));
+        assert_eq!(tab.title(), "top-customers.sql");
+        assert_eq!(
+            tab.editor().read(app).text(),
+            "select * from customers order by revenue desc;"
+        );
+        assert_eq!(model.active_id(), Some(id));
+    });
+}
+
+/// A second call for a file name already open as a tab must focus the
+/// existing tab rather than opening a duplicate.
+#[gpui::test]
+fn open_or_focus_session_script_focuses_the_existing_tab_instead_of_duplicating_it(
+    cx: &mut TestAppContext,
+) {
+    let session_dir = TempDir::new("open-or-focus-session-script-dedupe");
+    std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+    std::fs::write(
+        session_dir.0.join("scripts").join("top-customers.sql"),
+        "select 1;",
+    )
+    .expect("must write the session script");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_session_dir(Some(session_dir.0.clone()));
+    });
+    let first = model
+        .update(cx, |model, cx| {
+            model.open_or_focus_session_script("top-customers.sql", cx)
+        })
+        .expect("the file exists and is readable, so this must open a tab");
+    model.update(cx, TabModel::new_script_tab);
+
+    let second = model
+        .update(cx, |model, cx| {
+            model.open_or_focus_session_script("top-customers.sql", cx)
+        })
+        .expect("an already-open tab must always be found and focused");
+
+    assert_eq!(first, second);
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs().len(),
+            2,
+            "no duplicate tab must be created for a file name already open"
+        );
+        assert_eq!(model.active_id(), Some(first));
+    });
+}
+
+/// An unnamed, scratch-backed tab whose title happens to collide with a
+/// named top-level file's own name (e.g. after the user names a script
+/// "query-7", closes its tab, and a later unnamed tab mints that same
+/// title) must never be treated as that file's own open tab: opening the
+/// named file has to load it from disk into its own tab, never focus the
+/// unrelated scratch-backed buffer.
+#[gpui::test]
+fn open_or_focus_session_script_never_matches_a_scratch_backed_tab_with_the_same_title(
+    cx: &mut TestAppContext,
+) {
+    let session_dir = TempDir::new("open-or-focus-session-script-scratch-collision");
+    std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+    std::fs::write(
+        session_dir.0.join("scripts").join("query-7.sql"),
+        "select 'top-level';",
+    )
+    .expect("must write the named top-level script");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_session_dir(Some(session_dir.0.clone()));
+    });
+    let scratch_snapshot = TabSessionSnapshot {
+        tabs: vec![TabEntrySnapshot {
+            kind: TabKind::Script {
+                backing: ScriptBacking::SessionScratch {
+                    file: ScriptFileName::new("query-7.sql").unwrap(),
+                },
+            },
+            title: "query-7.sql".to_owned(),
+            buffer_text: Some("select 'scratch';".to_owned()),
+        }],
+        active_index: Some(0),
+    };
+    let scratch_id = model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&scratch_snapshot), cx);
+        model.tabs()[0].id()
+    });
+
+    let opened_id = model
+        .update(cx, |model, cx| {
+            model.open_or_focus_session_script("query-7.sql", cx)
+        })
+        .expect("the named top-level file exists and is readable");
+
+    assert_ne!(
+        opened_id, scratch_id,
+        "the scratch-backed tab must never be mistaken for the named file's own tab"
+    );
+    model.read_with(cx, |model, app| {
+        assert_eq!(
+            model.tabs().len(),
+            2,
+            "a fresh tab must be opened for the named file"
+        );
+        let opened = model.tab(opened_id).unwrap();
+        assert_eq!(
+            opened.editor().read(app).text(),
+            "select 'top-level';",
+            "the fresh tab must load the named file's own on-disk content"
+        );
+    });
+}
+
+/// `schema_by_relation` must be cleared on every connection switch, the
+/// same as `generated_by_relation` -- otherwise a schema tab opened for a
+/// relation key seen on an earlier connection resolves to a stale, already-
+/// closed `TabId` and `open_or_reuse_schema` silently no-ops forever after.
+#[gpui::test]
+fn switching_connections_clears_the_schema_relation_reuse_map(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let first_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+    });
+
+    // Standing in for a connection switch: every open tab (including the
+    // schema tab) is discarded the way `load_for_connection` always does.
+    model.update(cx, |model, cx| model.load_for_connection(None, cx));
+    model.read_with(cx, |model, _app| {
+        assert!(
+            model.tab(first_id).is_none(),
+            "the old schema tab must be gone"
+        );
+    });
+
+    let second_id = model.update(cx, |model, cx| {
+        model.open_or_reuse_schema("public", "orders", zsql_core::RelationKind::Table, cx)
+    });
+
+    assert_ne!(
+        first_id, second_id,
+        "reopening the same relation's schema after a connection switch must \
+         create a fresh tab, not resolve to the stale, already-closed id"
+    );
+    model.read_with(cx, |model, _app| {
+        assert!(model.tab(second_id).is_some());
+        assert_eq!(model.active_id(), Some(second_id));
+    });
+}
+
+/// An edit past a library-backed tab's first (e.g. one made after an
+/// explicit save already cleared the dirty marker) must still eventually
+/// notify, so its draft keeps tracking the live buffer instead of only ever
+/// persisting on a structural event (tab/connection switch, close, quit).
+#[gpui::test]
+fn an_edit_after_the_first_on_a_library_tab_still_schedules_a_notify(cx: &mut TestAppContext) {
+    let library_dir = TempDir::new("debounced-edit-notify");
+    crate::session_store::LibraryDir::at(&library_dir.0)
+        .save(
+            &crate::session_store::LibraryName::new("orders").unwrap(),
+            "select 1;",
+        )
+        .expect("seeding the library file must succeed");
+
+    let model = build_model(cx);
+    model.update(cx, |model, _cx| {
+        model.set_library_dir(Some(library_dir.0.clone()));
+        model.set_edit_debounce(std::time::Duration::from_millis(20));
+    });
+    let id = model
+        .update(cx, |model, cx| model.open_or_focus_library("orders", cx))
+        .expect("a valid library name must open a tab");
+    let editor = model.read_with(cx, |model, _app| model.tab(id).unwrap().editor().clone());
+
+    // First edit: notifies immediately (unchanged behavior).
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test("select 2;", cx);
+    });
+    cx.run_until_parked();
+    let notify_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let notify_count_for_sub = notify_count.clone();
+    cx.update(|cx| {
+        cx.observe(&model, move |_model, _cx| {
+            notify_count_for_sub.set(notify_count_for_sub.get() + 1);
+        })
+        .detach();
+    });
+
+    // Second edit past the first: must not be silently dropped.
+    editor.update(cx, |editor, cx| {
+        editor.insert_text_for_test(" -- again", cx);
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(100));
+    cx.run_until_parked();
+
+    assert!(
+        notify_count.get() > 0,
+        "an edit past the first must still eventually notify (debounced), \
+         so a library/external tab's draft keeps tracking the live buffer"
+    );
+}
+
+/// `open_or_focus_external`'s fresh-open branch creates a new
+/// external-backed tab for a path not already open.
+#[gpui::test]
+fn open_or_focus_external_opens_a_fresh_tab_for_a_path_not_already_open(cx: &mut TestAppContext) {
+    let model = build_model(cx);
+    let path = std::path::PathBuf::from("/home/t/work/migrate.sql");
+
+    let id = model.update(cx, |model, cx| {
+        model.open_or_focus_external(&path, "migrate.sql".to_owned(), "select 1;", cx)
+    });
+
+    model.read_with(cx, |model, app| {
+        assert_eq!(model.tabs().len(), 1);
+        let tab = model.tab(id).unwrap();
+        assert!(matches!(
+            tab.script_backing(),
+            Some(ScriptBacking::External { .. })
+        ));
+        assert_eq!(tab.external_path(), Some(path.as_path()));
+        assert_eq!(tab.editor().read(app).text(), "select 1;");
+        assert_eq!(model.active_id(), Some(id));
+    });
+}
+
+/// `open_or_focus_external` called twice for the same path must never
+/// create a second tab: the second call focuses the tab the first opened.
+#[gpui::test]
+fn open_or_focus_external_focuses_the_existing_tab_instead_of_duplicating_it(
+    cx: &mut TestAppContext,
+) {
+    let model = build_model(cx);
+    let path = std::path::PathBuf::from("/home/t/work/migrate.sql");
+    let first = model.update(cx, |model, cx| {
+        model.open_or_focus_external(&path, "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    // Open a second tab and activate it, so the dedupe path has to actively
+    // re-focus the first tab rather than trivially finding it already active.
+    model.update(cx, TabModel::new_script_tab);
+
+    let second = model.update(cx, |model, cx| {
+        model.open_or_focus_external(&path, "migrate.sql".to_owned(), "select 1;", cx)
+    });
+
+    assert_eq!(
+        first, second,
+        "opening an already-open external path must reuse its tab id"
+    );
+    model.read_with(cx, |model, _app| {
+        assert_eq!(
+            model.tabs().len(),
+            2,
+            "no duplicate tab must be created for a path already open"
+        );
+        assert_eq!(model.active_id(), Some(first));
+    });
+}
+
+/// A symlink to an already-open external file must focus the existing tab
+/// rather than open a duplicate racing saves against the same inode.
+#[cfg(unix)]
+#[gpui::test]
+fn open_or_focus_external_dedupes_a_symlink_to_an_already_open_path(cx: &mut TestAppContext) {
+    let dir = TempDir::new("open-or-focus-external-symlink");
+    std::fs::create_dir_all(&dir.0).expect("must create dir");
+    let real_path = dir.0.join("migrate.sql");
+    std::fs::write(&real_path, "select 1;").expect("must write");
+    let link_path = dir.0.join("migrate-link.sql");
+    std::os::unix::fs::symlink(&real_path, &link_path).expect("must create symlink");
+
+    let model = build_model(cx);
+    let first = model.update(cx, |model, cx| {
+        model.open_or_focus_external(&real_path, "migrate.sql".to_owned(), "select 1;", cx)
+    });
+    model.update(cx, TabModel::new_script_tab);
+
+    let second = model.update(cx, |model, cx| {
+        model.open_or_focus_external(&link_path, "migrate-link.sql".to_owned(), "select 1;", cx)
+    });
+
+    assert_eq!(
+        first, second,
+        "a symlink to an already-open path must resolve to the same tab"
+    );
+    model.read_with(cx, |model, _app| {
+        assert_eq!(model.tabs().len(), 2, "no duplicate tab for the same inode");
+    });
+}
+
+/// Subscribes to `model`'s [`SaveRequested`] events, returning a shared log
+/// of every event emitted after this call.
+fn subscribe_save_events(
+    model: &Entity<TabModel>,
+    cx: &mut TestAppContext,
+) -> Rc<RefCell<Vec<SaveRequested>>> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let events_for_sub = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(model, move |_model, evt: &SaveRequested, _cx| {
+            events_for_sub.borrow_mut().push(*evt);
+        })
+        .detach();
+    });
+    events
 }

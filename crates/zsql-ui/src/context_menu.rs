@@ -132,6 +132,7 @@ pub struct ContextMenuItem {
     label: String,
     style: ContextMenuStyle,
     on_click: Option<ContextMenuOnClickFn>,
+    disabled: bool,
 }
 
 impl ContextMenuItem {
@@ -147,6 +148,7 @@ impl ContextMenuItem {
             label: label.to_string(),
             style: ContextMenuStyle::default(),
             on_click: None,
+            disabled: false,
         }
     }
 
@@ -161,6 +163,16 @@ impl ContextMenuItem {
     #[must_use]
     pub fn on_click(mut self, f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_click = Some(Box::new(f));
+        self
+    }
+
+    /// Render this item dimmed and ignore any click it receives, regardless
+    /// of whether an [`Self::on_click`] handler was attached -- for an
+    /// action valid for this menu in general but not for whatever it is
+    /// currently attached to (e.g. renaming a file this app does not own).
+    #[must_use]
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
         self
     }
 
@@ -239,6 +251,7 @@ impl RenderOnce for ContextMenuItem {
     fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let theme = cx.theme();
         let selector = self.id.to_string();
+        let disabled = self.disabled;
         div()
             .id(self.id)
             .debug_selector(move || selector)
@@ -248,12 +261,21 @@ impl RenderOnce for ContextMenuItem {
             .h(self.style.item_height)
             .px(self.style.item_padding_x)
             .rounded(px(self.style.item_radius))
-            .cursor_pointer()
             .text_size(px(self.style.item_text_size))
-            .text_color(rgb(theme.colors.text_primary))
-            .hover(|el| el.bg(Colors::wash(theme.colors.accent, 0x1a)))
+            .when(disabled, |el| {
+                el.opacity(0.4)
+                    .text_color(rgb(theme.colors.text_tertiary))
+                    .cursor_not_allowed()
+            })
+            .when(!disabled, |el| {
+                el.cursor_pointer()
+                    .text_color(rgb(theme.colors.text_primary))
+                    .hover(|el| el.bg(Colors::wash(theme.colors.accent, 0x1a)))
+            })
             .child(self.label)
-            .when_some(self.on_click, |el, on_click| el.on_click(on_click))
+            .when(!disabled, |el| {
+                el.when_some(self.on_click, |el, on_click| el.on_click(on_click))
+            })
     }
 }
 

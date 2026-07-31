@@ -3,6 +3,8 @@
 //! [`zsql_core::SchemaTree`]
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use gpui::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
@@ -12,7 +14,6 @@ use gpui::{
 use zsql_core::RelationKind;
 use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
 use zsql_ui::icon::{IconName, icon};
-use zsql_ui::icon_button::icon_button_secondary;
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
 use zsql_ui::theme::{ActiveTheme, Theme};
 // Imported by name rather than as `zsql_ui::tree::...`: this module already
@@ -23,13 +24,24 @@ use zsql_ui::tree::{
     row_label, row_meta, row_shell,
 };
 
-use model::{SidebarRow, flatten_schema_tree, relation_icon_name, relation_tint};
+use model::{
+    ScriptRow, SessionScript, SidebarPane, SidebarRow, build_script_rows, flatten_schema_tree,
+    relation_icon_name, relation_tint,
+};
 
+use super::connections::UNSAVED_CONNECTION_LABEL;
+use super::open_modal::{LibraryScript, PickerTarget};
 use super::tabs::TabModel;
 use super::theme;
+use super::time_fmt;
 use crate::session::{SchemaState, Session, SessionState};
+use crate::session_store::{self, SessionDir};
 
+mod db_row;
 mod model;
+mod pane;
+mod scripts;
+mod scripts_refresh;
 
 /// What [`SidebarView::render_body`] shows in place of the tree: `None`
 /// means the tree itself should render instead.
@@ -47,6 +59,13 @@ enum SidebarPlaceholder {
     /// catalogs.
     EmptySchema,
 }
+
+/// The scripts pane's connection group label shows
+/// [`UNSAVED_CONNECTION_LABEL`] until the workspace reports the active
+/// connection's real display name via [`SidebarView::set_connection_name`]
+/// -- the same fallback the Open Script picker's own header uses when no
+/// connection is tracked as active.
+const DEFAULT_CONNECTION_NAME: &str = UNSAVED_CONNECTION_LABEL;
 
 /// The sidebar's placeholder for `state`/`schema`, in this precedence
 /// order:
@@ -101,9 +120,49 @@ pub struct SidebarView {
     scroll: Entity<ScrollableState>,
     /// The currently open relation-row context menu, if any.
     context_menu: Option<ContextMenuState>,
-    /// Whether the database-switcher dropdown (see [`Self::render_header`])
-    /// is currently open.
+    /// Whether the database row's switcher dropdown (see
+    /// [`Self::render_db_switcher_menu`]) is currently open.
     db_switcher_open: bool,
+    /// Root directory the shared library's flat pool of `.sql` files lives
+    /// under. `None` yields no library rows (the shared pool is
+    /// unavailable)
+    library_dir: Option<PathBuf>,
+    /// The active connection's session directory, for resolving a named
+    /// session script's last-modified time. `None` while no connection is
+    /// tracked (or it has no resolvable session directory).
+    session_dir: Option<PathBuf>,
+    /// The SCRIPTS/LIBRARY rows currently shown, rebuilt whenever `tabs`
+    /// changes (a script saved, renamed, closed, or the connection switched)
+    script_rows: Vec<ScriptRow>,
+    /// Which full-height pane is currently shown. In-memory only
+    active_pane: SidebarPane,
+    /// The active connection's display name, shown by the scripts pane's
+    /// "THIS CONNECTION" group label. Updated by the workspace whenever the
+    /// active connection switches
+    connection_name: String,
+    /// Scroll handle for the Scripts pane's row list, tracked by its own
+    /// scrollbar overlay the same way [`Self::tree_scroll_handle`] backs the
+    /// schema tree's.
+    scripts_scroll_handle: gpui::ScrollHandle,
+    /// The Scripts pane's scrollbar state.
+    scripts_scroll: Entity<ScrollableState>,
+    /// How often [`Self::scripts_refresh_task`] recomputes every script
+    /// row's relative-modified-time label.
+    scripts_refresh_interval: Duration,
+    /// The self-rescheduling refresh loop spawned in [`Self::new`]. Held
+    /// (not detached) so replacing it cancels the previous loop -- see
+    /// [`Self::set_scripts_refresh_interval`].
+    scripts_refresh_task: Option<gpui::Task<()>>,
+    /// Bumped by every synchronous [`Self::sync_script_rows`] call. Each
+    /// [`Self::spawn_scripts_refresh_loop`] iteration captures this value
+    /// before dispatching its background scan and compares it again once
+    /// the scan completes, dropping a result that no longer matches
+    script_rows_generation: u64,
+    /// The most recent disk listings, kept so a tabs notify (tab switch,
+    /// edit debounce) can rebuild the rows' open/active markers without
+    /// rescanning two directories on the render thread
+    cached_session_scripts: Vec<SessionScript>,
+    cached_library_scripts: Vec<LibraryScript>,
 }
 
 /// A relation row's open right-click context menu: which relation it
@@ -121,13 +180,23 @@ struct ContextMenuState {
 
 impl SidebarView {
     /// Build a sidebar over `session`, previewing clicked relations by
-    /// opening (or reusing) a generated tab in `tabs`.
+    /// opening (or reusing) a generated tab in `tabs`
     #[must_use]
-    pub fn new(session: Entity<Session>, tabs: Entity<TabModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<Session>,
+        tabs: Entity<TabModel>,
+        library_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&session, |view: &mut Self, _session, cx| {
             if view.sync_rows_if_schema_changed(cx) {
                 cx.notify();
             }
+        })
+        .detach();
+        cx.observe(&tabs, |view: &mut Self, _tabs, cx| {
+            view.rebuild_script_rows_from_cache(cx);
+            cx.notify();
         })
         .detach();
 
@@ -143,9 +212,164 @@ impl SidebarView {
             scroll: cx.new(ScrollableState::new),
             context_menu: None,
             db_switcher_open: false,
+            library_dir,
+            session_dir: None,
+            script_rows: Vec::new(),
+            active_pane: SidebarPane::default(),
+            connection_name: DEFAULT_CONNECTION_NAME.to_owned(),
+            scripts_scroll_handle: gpui::ScrollHandle::new(),
+            scripts_scroll: cx.new(ScrollableState::new),
+            scripts_refresh_interval: crate::config::SidebarConfig::default()
+                .scripts_relative_time_refresh(),
+            scripts_refresh_task: None,
+            script_rows_generation: 0,
+            cached_session_scripts: Vec::new(),
+            cached_library_scripts: Vec::new(),
         };
         view.sync_rows(cx);
+        view.sync_script_rows(cx);
+        view.spawn_scripts_refresh_loop(cx);
         view
+    }
+
+    /// Update the active connection's session directory, so a named session
+    /// script's row shows the right last-modified time
+    pub fn set_session_dir(&mut self, session_dir: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.session_dir = session_dir;
+        self.sync_script_rows(cx);
+        cx.notify();
+    }
+
+    /// Update the active connection's display name shown by the scripts
+    /// pane's "THIS CONNECTION" group label
+    pub fn set_connection_name(&mut self, connection_name: String, cx: &mut Context<Self>) {
+        self.connection_name = connection_name;
+        cx.notify();
+    }
+
+    /// Rebuild the SCRIPTS/LIBRARY rows from disk right now
+    pub fn resync_scripts(&mut self, cx: &mut Context<Self>) {
+        self.sync_script_rows(cx);
+        cx.notify();
+    }
+
+    /// The Scripts/Library rows currently shown
+    #[cfg(test)]
+    pub(crate) fn script_rows_for_test(&self) -> &[ScriptRow] {
+        &self.script_rows
+    }
+
+    /// Switch which full-height pane the sidebar shows. A no-op (no
+    /// re-render, no other state touched) when `pane` is already active.
+    #[tracing::instrument(name = "sidebar_switch_pane", skip(self, cx))]
+    fn switch_pane(&mut self, pane: SidebarPane, cx: &mut Context<Self>) {
+        if self.active_pane == pane {
+            return;
+        }
+        self.active_pane = pane;
+        // The database row and its menu only ever render in the schema
+        // pane; drop a stale open flag now rather than leaving it to
+        // silently reappear next time the schema pane comes back.
+        if pane != SidebarPane::Schema {
+            self.close_db_switcher(cx);
+        }
+        cx.notify();
+    }
+
+    /// Rebuild [`Self::script_rows`] from a disk scan of the active
+    /// connection's session directory
+    #[tracing::instrument(name = "sidebar_sync_script_rows", skip(self, cx))]
+    fn sync_script_rows(&mut self, cx: &mut Context<Self>) {
+        self.script_rows_generation += 1;
+        let tabs = self.tabs.read(cx);
+        let active_id = tabs.active_id();
+        let open_session_tabs = tabs.named_open_scripts_by_file();
+        let open_library_tabs = tabs.open_library_tabs();
+        let now = SystemTime::now();
+
+        let session_scripts: Vec<SessionScript> = self
+            .session_dir
+            .as_ref()
+            .and_then(|dir| SessionDir::at(dir).list_scripts().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| SessionScript {
+                file_name: entry.file_name,
+                relative_time: time_fmt::relative_time(now, entry.modified),
+            })
+            .collect();
+
+        let library_scripts: Vec<LibraryScript> = self
+            .library_dir
+            .as_ref()
+            .and_then(|dir| session_store::LibraryDir::at(dir).list().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| LibraryScript {
+                name: entry.name,
+                relative_time: time_fmt::relative_time(now, entry.modified),
+            })
+            .collect();
+
+        self.cached_session_scripts = session_scripts;
+        self.cached_library_scripts = library_scripts;
+        self.script_rows = build_script_rows(
+            active_id,
+            &self.cached_session_scripts,
+            &open_session_tabs,
+            &self.cached_library_scripts,
+            &open_library_tabs,
+        );
+    }
+
+    /// Rebuild [`Self::script_rows`]' open/active markers from the cached
+    /// listings, without touching disk
+    fn rebuild_script_rows_from_cache(&mut self, cx: &mut Context<Self>) {
+        self.script_rows_generation += 1;
+        let tabs = self.tabs.read(cx);
+        let active_id = tabs.active_id();
+        let open_session_tabs = tabs.named_open_scripts_by_file();
+        let open_library_tabs = tabs.open_library_tabs();
+        self.script_rows = build_script_rows(
+            active_id,
+            &self.cached_session_scripts,
+            &open_session_tabs,
+            &self.cached_library_scripts,
+            &open_library_tabs,
+        );
+    }
+
+    /// Open (or focus) the tab `target` names, and move keyboard focus onto
+    /// it
+    fn open_script_row(
+        &mut self,
+        target: PickerTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            PickerTarget::FocusTab(id) => {
+                self.tabs.update(cx, |tabs, cx| tabs.set_active(id, cx));
+            }
+            PickerTarget::OpenLibrary(name) => {
+                self.tabs
+                    .update(cx, |tabs, cx| tabs.open_or_focus_library(&name, cx));
+            }
+            PickerTarget::OpenSessionScript(file_name) => {
+                self.tabs.update(cx, |tabs, cx| {
+                    tabs.open_or_focus_session_script(&file_name, cx);
+                });
+            }
+        }
+        if let Some(handle) = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .map(|tab| tab.editor().focus_handle(cx))
+        {
+            window.focus(&handle);
+        }
+        cx.notify();
     }
 
     /// Rebuild `rows` from the session's current schema state and this
@@ -192,9 +416,8 @@ impl SidebarView {
     }
 
     /// Preview `schema.relation`: mark it selected (for row highlighting),
-    /// open (or reuse) a generated tab for it -- running the preview query
-    /// through `Session` and updating the results grid's source label --
-    /// and move keyboard focus onto that tab's editor.
+    /// open (or reuse) a generated tab for it and move keyboard focus onto
+    /// that tab's editor.
     fn preview(
         &mut self,
         schema: &str,
@@ -345,107 +568,11 @@ impl SidebarView {
             .detach();
     }
 
-    /// The "SCHEMA" header bar: the label, the database switcher (only when
-    /// the connection reports more than one selectable database), and the
-    /// refresh button.
-    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .flex_shrink_0()
-            .h(theme::SIDEBAR_HEADER_HEIGHT)
-            .px_3()
-            .border_b_1()
-            .border_color(rgb(cx.theme().colors.border_soft))
-            .child(
-                div()
-                    .text_size(px(theme::SIDEBAR_HEADER_TEXT_SIZE))
-                    .text_color(rgb(cx.theme().colors.text_tertiary))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("SCHEMA"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .children(self.render_db_switcher(cx))
-                    .child(
-                        icon_button_secondary(
-                            "sidebar-refresh-schema",
-                            window,
-                            cx,
-                            IconName::Refresh,
-                        )
-                        .on_click(cx.listener(|view, _evt, _window, cx| view.refresh_schema(cx))),
-                    ),
-            )
-    }
-
-    /// The database-switcher trigger: the current database's name plus a
-    /// chevron, opening [`Self::render_db_switcher_menu`] on click. `None`
-    /// when the active connection reports one or zero selectable databases
-    /// (a single-database backend, or a driver that reports no
-    /// switchable-database list at all -- see
-    /// [`zsql_core::Connection::list_databases`]).
-    fn render_db_switcher(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let session = self.session.read(cx);
-        if session.available_databases().len() <= 1 {
-            return None;
-        }
-        let active_theme = cx.theme();
-        let current_text = if session.state() == &SessionState::Connecting {
-            "Connecting..."
-        } else {
-            session.current_database().unwrap_or("")
-        };
-
-        Some(
-            div()
-                .relative()
-                .child(
-                    div()
-                        .id("sidebar-db-switcher-trigger")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(theme::SIDEBAR_DB_SWITCHER_GAP)
-                        .max_w(theme::SIDEBAR_DB_SWITCHER_MAX_WIDTH)
-                        .px(theme::SIDEBAR_DB_SWITCHER_PADDING_X)
-                        .py(theme::SIDEBAR_DB_SWITCHER_PADDING_Y)
-                        .rounded(px(theme::SIDEBAR_DB_SWITCHER_RADIUS))
-                        .cursor_pointer()
-                        .hover(|this| this.bg(rgb(active_theme.colors.bg_raised)))
-                        .on_click(cx.listener(|view, _evt: &ClickEvent, _window, cx| {
-                            view.toggle_db_switcher(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .text_size(px(theme::SIDEBAR_DB_SWITCHER_TEXT_SIZE))
-                                .text_color(rgb(active_theme.colors.text_secondary))
-                                .child(current_text.to_owned()),
-                        )
-                        .child(icon(
-                            IconName::ChevronDown,
-                            theme::SIDEBAR_ROW_ICON_SIZE,
-                            active_theme.colors.text_tertiary,
-                        ))
-                        .children(self.render_db_switcher_menu(cx)),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// The database-switcher's open dropdown: one item per
     /// [`Session::available_databases`] entry, the current database
-    /// highlighted. `None` when the dropdown is closed.
+    /// highlighted. `None` when the dropdown is closed. Anchored to the
+    /// database row's own top-left corner, so it drops immediately below
+    /// the row regardless of which position it renders at.
     fn render_db_switcher_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         if !self.db_switcher_open {
             return None;
@@ -456,7 +583,7 @@ impl SidebarView {
 
         let mut menu = ContextMenu::new("sidebar-db-switcher-menu")
             .anchor(gpui::Corner::TopLeft)
-            .offset(point(px(0.0), theme::SIDEBAR_HEADER_HEIGHT / 2.0))
+            .offset(point(px(0.0), px(0.0)))
             .on_close(cx.listener(|view, _event, _window, cx| {
                 view.close_db_switcher(cx);
             }));
@@ -562,16 +689,13 @@ impl SidebarView {
     /// The tree scrollbar's chrome, from the sidebar's own theme constants
     /// plus the active theme's scrollbar colors. The track paints no
     /// background.
-    fn tree_scrollbar_style(active_theme: &Theme) -> ScrollbarStyle {
-        ScrollbarStyle {
-            track_width: f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH),
-            track_color: None,
-            thumb_color: active_theme.colors.scrollbar_thumb,
-            thumb_hover_color: Some(active_theme.colors.scrollbar_thumb_hover),
-            radius: theme::SIDEBAR_SCROLLBAR_RADIUS,
-            inset: f32::from(theme::SIDEBAR_SCROLLBAR_GAP),
-            ..ScrollbarStyle::default()
-        }
+    pub(super) fn tree_scrollbar_style(active_theme: &Theme) -> ScrollbarStyle {
+        ScrollbarStyle::themed(
+            &active_theme.colors,
+            f32::from(theme::SIDEBAR_SCROLLBAR_WIDTH),
+            theme::SIDEBAR_SCROLLBAR_RADIUS,
+            f32::from(theme::SIDEBAR_SCROLLBAR_GAP),
+        )
     }
 
     /// The virtualized tree body: only rows scrolled into view are built.
@@ -810,15 +934,21 @@ fn qualified_relation_name(schema: &str, relation: &str) -> String {
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_theme = cx.theme();
-        div()
+        let mut root = div()
             .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(active_theme.colors.bg_panel))
-            .child(self.render_header(window, cx))
-            .child(self.render_body(window, cx))
-            .children(self.render_context_menu(cx))
+            .child(pane::render_pane_tabs(self, window, cx))
+            .children(db_row::render_db_row(self, cx));
+
+        root = match self.active_pane {
+            SidebarPane::Schema => root.child(self.render_body(window, cx)),
+            SidebarPane::Scripts => root.child(scripts::render_scripts_pane(self, cx)),
+        };
+
+        root.children(self.render_context_menu(cx))
     }
 }
 
@@ -969,6 +1099,7 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use gpui::AppContext as _;
@@ -978,7 +1109,10 @@ mod render_tests {
     };
     use zsql_core::{Relation, RelationKind};
 
-    use super::{SidebarPlaceholder, SidebarView, qualified_relation_name, sidebar_placeholder};
+    use super::{
+        SidebarPane, SidebarPlaceholder, SidebarView, db_row, qualified_relation_name,
+        sidebar_placeholder,
+    };
     use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
     use crate::ui::tabs::{ResultsChanged, TabModel};
@@ -1093,7 +1227,7 @@ mod render_tests {
     ) -> (gpui::Entity<SidebarView>, &mut gpui::VisualTestContext) {
         let session = cx.new(|_cx| Session::new_for_schema_test(schema));
         let tabs = build_tabs(session.clone(), cx);
-        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx))
+        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, None, cx))
     }
 
     /// Like [`build`], but over a session in `state` rather than always
@@ -1110,7 +1244,7 @@ mod render_tests {
             session
         });
         let tabs = build_tabs(session.clone(), cx);
-        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx))
+        cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, None, cx))
     }
 
     #[gpui::test]
@@ -1156,7 +1290,8 @@ mod render_tests {
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tall_schema_tree(300))));
         let tabs = build_tabs(session.clone(), cx);
-        let (sidebar, vcx) = cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, cx));
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session, tabs, None, cx));
         vcx.run_until_parked();
 
         sidebar.read_with(vcx, |view, app| {
@@ -1238,7 +1373,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         let (generation_after_build, row_count_after_build) = sidebar.update(vcx, |view, _cx| {
             (view.synced_schema_generation, view.rows.len())
@@ -1288,8 +1423,9 @@ mod render_tests {
             .detach();
         });
         let tabs_for_view = tabs.clone();
-        let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
+            SidebarView::new(session_for_view, tabs_for_view, None, cx)
+        });
 
         sidebar.update_in(vcx, |view, window, cx| {
             view.preview("public", "orders", window, cx);
@@ -1322,8 +1458,9 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let tabs_for_view = tabs.clone();
-        let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs_for_view, cx));
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
+            SidebarView::new(session_for_view, tabs_for_view, None, cx)
+        });
 
         sidebar.update(vcx, |view, cx| {
             view.view_schema("public", "orders", RelationKind::Table, cx);
@@ -1349,7 +1486,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
             view.open_context_menu(
@@ -1378,7 +1515,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
             view.open_context_menu(
@@ -1412,7 +1549,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
             view.open_context_menu(
@@ -1449,7 +1586,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
             view.open_context_menu(
@@ -1479,7 +1616,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
         vcx.run_until_parked();
 
         // Once the tree viewport is measured, a row anchor is derived from
@@ -1510,7 +1647,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         let expanded = sidebar.update(vcx, |view, _cx| view.rows.len());
         assert!(expanded > 1);
@@ -1563,7 +1700,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, SidebarView::refresh_schema);
         vcx.run_until_parked();
@@ -1592,7 +1729,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, SidebarView::refresh_schema);
         vcx.run_until_parked();
@@ -1630,20 +1767,20 @@ mod render_tests {
     }
 
     #[gpui::test]
-    fn the_database_switcher_is_hidden_with_zero_or_one_available_databases(
+    fn the_database_row_is_absent_with_zero_or_one_available_databases(
         cx: &mut gpui::TestAppContext,
     ) {
         for databases in [Vec::<&str>::new(), vec!["only_db"]] {
             let session = session_with_databases(&databases, databases.first().copied(), cx);
             let session_for_view = session.clone();
             let tabs = build_tabs(session.clone(), cx);
-            let (sidebar, vcx) =
-                cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            let (sidebar, vcx) = cx
+                .add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
             sidebar.update(vcx, |view, cx| {
                 assert!(
-                    view.render_db_switcher(cx).is_none(),
-                    "expected no database switcher with {} available database(s)",
+                    db_row::render_db_row(view, cx).is_none(),
+                    "expected no database row with {} available database(s)",
                     databases.len()
                 );
             });
@@ -1651,19 +1788,66 @@ mod render_tests {
     }
 
     #[gpui::test]
-    fn the_database_switcher_is_shown_with_more_than_one_available_database(
+    fn the_database_row_is_shown_with_more_than_one_available_database(
         cx: &mut gpui::TestAppContext,
     ) {
         let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
             assert!(
-                view.render_db_switcher(cx).is_some(),
-                "expected a database switcher with more than one available database"
+                db_row::render_db_row(view, cx).is_some(),
+                "expected a database row with more than one available database"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_database_row_stays_shown_while_a_database_switch_is_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // `select_database` moves the session synchronously into
+        // `SessionState::Connecting` (see `selecting_a_database_...` below);
+        // the row must not disappear just because a switch is in flight.
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.select_database("beta".to_owned(), cx);
+        });
+
+        session.read_with(vcx, |session, _app| {
+            assert_eq!(session.state(), &SessionState::Connecting);
+        });
+        sidebar.update(vcx, |view, cx| {
+            assert!(
+                db_row::render_db_row(view, cx).is_some(),
+                "the database row must stay visible while a switch is in flight"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_database_row_is_absent_when_the_scripts_pane_is_active_even_with_many_databases(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+
+        sidebar.update(vcx, |view, cx| {
+            view.switch_pane(SidebarPane::Scripts, cx);
+            assert!(
+                db_row::render_db_row(view, cx).is_none(),
+                "the database row is schema-pane-only, regardless of database count"
             );
         });
     }
@@ -1674,7 +1858,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.read_with(vcx, |view, _app| assert!(!view.db_switcher_open));
 
@@ -1697,7 +1881,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, SidebarView::toggle_db_switcher);
         sidebar.read_with(vcx, |view, _app| assert!(view.db_switcher_open));
@@ -1729,7 +1913,7 @@ mod render_tests {
         let session_for_view = session.clone();
         let tabs = build_tabs(session.clone(), cx);
         let (sidebar, vcx) =
-            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, cx));
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, SidebarView::toggle_db_switcher);
         // Forces a render pass with the switcher's deferred/anchored
@@ -1737,5 +1921,389 @@ mod render_tests {
         vcx.run_until_parked();
 
         sidebar.read_with(vcx, |view, _app| assert!(view.db_switcher_open));
+    }
+
+    #[gpui::test]
+    fn set_connection_name_updates_the_scripts_panes_connection_group_label_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.connection_name, "Unsaved");
+        });
+
+        sidebar.update(vcx, |view, cx| {
+            view.set_connection_name("zsql-dev".to_owned(), cx);
+        });
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.connection_name, "zsql-dev");
+        });
+    }
+
+    // -- pane switcher ----------------------------------------------
+
+    #[gpui::test]
+    fn a_new_sidebar_always_starts_on_the_schema_pane(cx: &mut gpui::TestAppContext) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.active_pane, SidebarPane::Schema);
+        });
+    }
+
+    #[gpui::test]
+    fn switching_the_pane_updates_active_pane_and_is_idempotent_once_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.active_pane, SidebarPane::Scripts);
+        });
+
+        // Switching to the pane that is already active must not panic or
+        // change anything further.
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.active_pane, SidebarPane::Scripts);
+        });
+    }
+
+    #[gpui::test]
+    fn leaving_the_schema_pane_closes_an_open_database_switcher(cx: &mut gpui::TestAppContext) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+
+        sidebar.update(vcx, super::SidebarView::toggle_db_switcher);
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.db_switcher_open);
+        });
+
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                !view.db_switcher_open,
+                "a db switcher left open must not silently reappear when the \
+                 schema pane comes back"
+            );
+        });
+    }
+
+    /// Switching panes must not reset any of the schema pane's own state --
+    /// the collapsed tree nodes and the selected relation survive a round
+    /// trip through the scripts pane and back.
+    #[gpui::test]
+    fn switching_panes_preserves_collapsed_tree_state_and_the_selected_relation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let tabs_for_view = tabs.clone();
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
+            SidebarView::new(session_for_view, tabs_for_view, None, cx)
+        });
+
+        sidebar.update_in(vcx, |view, window, cx| {
+            view.toggle_catalog("zsql", cx);
+            view.preview("public", "orders", window, cx);
+        });
+        vcx.run_until_parked();
+
+        let (collapsed_before, selected_before, rows_before) =
+            sidebar.read_with(vcx, |view, _app| {
+                (
+                    view.collapsed_catalogs.clone(),
+                    view.selected_relation.clone(),
+                    view.script_rows.clone(),
+                )
+            });
+
+        sidebar.update(vcx, |view, cx| {
+            view.switch_pane(SidebarPane::Scripts, cx);
+            view.switch_pane(SidebarPane::Schema, cx);
+        });
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.collapsed_catalogs, collapsed_before);
+            assert_eq!(view.selected_relation, selected_before);
+            assert_eq!(view.script_rows, rows_before);
+        });
+    }
+
+    #[gpui::test]
+    fn the_schema_pane_renders_without_panicking_with_the_database_row_present(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.active_pane, SidebarPane::Schema);
+        });
+        sidebar.update(vcx, |view, cx| {
+            assert!(
+                db_row::render_db_row(view, cx).is_some(),
+                "the schema pane with more than one database must show the database row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_scripts_pane_renders_without_panicking_and_hides_the_schema_tree_and_database_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session = session_with_databases(&["alpha", "beta"], Some("alpha"), cx);
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.active_pane, SidebarPane::Scripts);
+        });
+        sidebar.update(vcx, |view, cx| {
+            assert!(
+                db_row::render_db_row(view, cx).is_none(),
+                "the database row never renders while the scripts pane is active"
+            );
+        });
+    }
+
+    /// A temp directory this test owns exclusively, removed on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zsql-sidebar-test-{label}-{}-{n}",
+                std::process::id()
+            ));
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Forces the scripts pane's non-empty render path: a named session
+    /// script row (selected, since it ends as the active tab) and a library
+    /// row already open as a tab (so it renders the open-tab accent dot).
+    /// The stacked-section smoke tests above only ever reach the empty-state
+    /// branch, so neither `render_script_row` nor its open-dot element is
+    /// otherwise exercised by a render pass.
+    #[gpui::test]
+    fn the_scripts_pane_renders_a_named_session_row_and_an_open_library_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let library_dir = TempDir::new("scripts-pane-rows");
+        crate::session_store::LibraryDir::at(&library_dir.0)
+            .save(
+                &crate::session_store::LibraryName::new("revenue-report").unwrap(),
+                "select 1;",
+            )
+            .expect("seeding the library file must succeed");
+        // The scripts pane's session rows come from a disk scan, never from
+        // open tabs alone, so this named script needs a real sibling file
+        // on disk, not just an in-memory tab title.
+        let session_dir = TempDir::new("scripts-pane-rows-session");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("top-customers.sql"),
+            "select * from customers;",
+        )
+        .expect("must write the session script");
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+
+        let session_tab_id = tabs.update(cx, |tabs, cx| {
+            tabs.set_library_dir(Some(library_dir.0.clone()));
+            let id = tabs.new_script_tab(cx);
+            tabs.apply_renamed_title(id, "top-customers.sql".to_owned(), cx);
+            id
+        });
+        tabs.update(cx, |tabs, cx| {
+            tabs.open_or_focus_library("revenue-report", cx);
+        });
+        // Reactivate the session script so its row renders the selected
+        // treatment alongside the library row's open-tab dot.
+        tabs.update(cx, |tabs, cx| tabs.set_active(session_tab_id, cx));
+
+        let tabs_for_view = tabs.clone();
+        let (sidebar, vcx) = cx.add_window_view(|_window, cx| {
+            SidebarView::new(
+                session_for_view,
+                tabs_for_view,
+                Some(library_dir.0.clone()),
+                cx,
+            )
+        });
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.script_rows.len(),
+                2,
+                "expected exactly one session row and one library row"
+            );
+            let session_row = view
+                .script_rows
+                .iter()
+                .find(|row| row.kind == super::model::ScriptRowKind::Session)
+                .expect("a named session script must produce a session row");
+            assert!(
+                session_row.selected,
+                "the reactivated session tab's row must render the selected treatment"
+            );
+            let library_row = view
+                .script_rows
+                .iter()
+                .find(|row| row.kind == super::model::ScriptRowKind::Library)
+                .expect("the seeded library file must produce a library row");
+            assert!(
+                super::model::library_row_is_open(library_row),
+                "a library file open as a tab must render the open-tab accent dot"
+            );
+        });
+    }
+
+    /// A script row's relative-time label must recompute from the file's
+    /// current on-disk modified time each time the periodic refresh loop
+    /// (see `SidebarView::spawn_scripts_refresh_loop`) runs, not stay frozen
+    /// at whatever it read the first time the pane synced -- otherwise a
+    /// label like "2m" would read "2m" forever, even overnight.
+    #[gpui::test]
+    fn a_script_rows_relative_time_recomputes_on_the_periodic_refresh_not_only_at_sync_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_dir = TempDir::new("scripts-pane-relative-time-refresh");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        let script_path = session_dir.0.join("scripts").join("top-customers.sql");
+        std::fs::write(&script_path, "select * from customers;")
+            .expect("must write the session script");
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+        let refresh_interval = Duration::from_millis(20);
+        sidebar.update(vcx, |view, cx| {
+            view.set_scripts_refresh_interval(refresh_interval, cx);
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.script_rows[0].relative_time, "now",
+                "a just-written file's row must read as recently modified"
+            );
+        });
+
+        // Back-date the file on disk without going through this view at
+        // all -- standing in for real time passing between the initial sync
+        // and the periodic refresh's next scan.
+        let three_days_ago = std::time::SystemTime::now() - Duration::from_hours(3 * 24);
+        std::fs::File::open(&script_path)
+            .expect("script file must still exist")
+            .set_modified(three_days_ago)
+            .expect("must back-date the script file's modified time");
+
+        vcx.executor().advance_clock(refresh_interval * 2);
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.script_rows[0].relative_time, "3d",
+                "the periodic refresh must re-read the file's modified time from disk, \
+                 not keep showing the label computed at the original sync"
+            );
+        });
+    }
+
+    /// A synchronous resync (a script saved, renamed, closed, or the
+    /// connection switching -- anything that fires the tabs observer) that
+    /// lands while the periodic background refresh's scan is still in
+    /// flight must win: the background scan's own result, captured under
+    /// the generation the resync just superseded, must be dropped rather
+    /// than clobbering the newer synchronous rows once it completes.
+    #[gpui::test]
+    fn a_background_refresh_result_is_dropped_if_a_sync_interleaves_before_it_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_dir = TempDir::new("scripts-pane-refresh-race");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("top-customers.sql"),
+            "select 1;",
+        )
+        .expect("must write the session script");
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+        });
+        vcx.run_until_parked();
+
+        let (captured_generation, expected_rows) = sidebar.update(vcx, |view, cx| {
+            // Standing in for the periodic loop's own capture-then-dispatch
+            // step (`SidebarView::spawn_scripts_refresh_loop`): note the
+            // generation as it stands right before a background scan would
+            // have been dispatched.
+            let generation = view.script_rows_generation;
+
+            // The interleaving synchronous resync: something else (a save,
+            // a tab close, a connection switch) triggers a resync while
+            // that scan is still in flight, bumping the generation and
+            // rebuilding rows fresh from disk.
+            std::fs::write(session_dir.0.join("second.sql"), "select 2;")
+                .expect("must write a second session script");
+            view.resync_scripts(cx);
+
+            (generation, view.script_rows.clone())
+        });
+
+        // The stale scan's result finally lands, carrying whatever it read
+        // before the resync -- an empty scan stands in for a moment before
+        // "second.sql" existed at all.
+        sidebar.update(vcx, |view, cx| {
+            view.apply_background_script_rows((Vec::new(), Vec::new()), captured_generation, cx);
+        });
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.script_rows, expected_rows,
+                "a background scan captured before an interleaving sync must never overwrite \
+                 that sync's newer rows once it completes"
+            );
+        });
     }
 }

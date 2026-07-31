@@ -231,5 +231,68 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> RenderOnce for Modal<H,
     }
 }
 
+/// A small uppercase modal section label ("NAME", "WHERE IT LIVES"),
+/// optionally suffixed with contextual data
+pub fn section_label(label: &'static str, suffix: Option<String>, cx: &gpui::App) -> Div {
+    let colors = cx.theme().colors;
+    let mut header = div().flex().flex_row().items_baseline().gap_1().child(
+        div()
+            .text_size(px(10.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(rgb(colors.text_tertiary))
+            .child(label.to_uppercase()),
+    );
+    if let Some(suffix) = suffix {
+        header = header.child(
+            div()
+                .font_family(cx.theme().fonts.data.clone())
+                .text_size(px(10.0))
+                .text_color(rgb(colors.text_secondary))
+                .child(suffix),
+        );
+    }
+    header
+}
+
+/// The styled shell of a modal footer bar
+#[must_use]
+pub fn footer_bar(cx: &gpui::App) -> Div {
+    let colors = cx.theme().colors;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py(px(10.0))
+        .border_t_1()
+        .border_color(rgb(colors.border_soft))
+}
+
+/// A modal head with `title` on the left and an `esc` chip on the right,
+/// for a modal that dismisses on Escape and opts out of the default close
+/// icon (`has_close_icon(false)`).
+pub fn head_with_esc_hint(title: &'static str, cx: &gpui::App) -> Div {
+    let colors = cx.theme().colors;
+    div()
+        .flex_1()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(title)
+        .child(
+            div()
+                .font_family(cx.theme().fonts.data.clone())
+                .text_size(px(10.0))
+                .text_color(rgb(colors.text_tertiary))
+                .border_1()
+                .border_color(rgb(colors.border))
+                .rounded(px(4.0))
+                .px(px(5.0))
+                .child("esc"),
+        )
+}
+
 #[cfg(test)]
 mod tests;

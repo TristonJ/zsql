@@ -5,19 +5,23 @@
 //! "+" affordance stays fixed at the strip's trailing end, outside the
 //! scrolling region.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use gpui::{
-    ClickEvent, Context, Entity, IntoElement, Pixels, ScrollHandle, ScrollWheelEvent, Window, div,
-    point, prelude::*, px, rgb,
+    ClickEvent, Context, Entity, IntoElement, MouseButton, MouseDownEvent, Pixels, ScrollHandle,
+    ScrollWheelEvent, Window, div, point, prelude::*, px, rgb,
 };
+use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollable::{Axis, ScrollSource, ScrollableState, ScrollbarStyle, WithScrollbars};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
-use super::tabs::{Tab, TabId, TabKind, TabModel};
+use super::tabs::{Tab, TabId, TabModel};
 use super::theme as workspace_theme;
 use super::workspace::WorkspaceView;
+use crate::session_store::ScriptBacking;
+use crate::session_store::TabKind;
+use crate::session_store::backing::SaveAction;
 
 /// A tab count no real tab strip ever reaches, used to seed
 /// [`TabBarState::last_rendered_tab_count`] so its very first render is
@@ -44,6 +48,16 @@ pub(crate) struct TabBarState {
     /// Whether a retry render, scheduled because the viewport's geometry
     /// was not yet trustworthy, is already pending.
     reveal_retry_pending: Cell<bool>,
+    /// The currently open tab right-click context menu, if any.
+    context_menu: RefCell<Option<TabContextMenuState>>,
+}
+
+/// A tab's open right-click context menu: which tab it targets and the
+/// window position it should anchor to.
+#[derive(Debug, Clone, Copy)]
+struct TabContextMenuState {
+    tab_id: TabId,
+    position: gpui::Point<Pixels>,
 }
 
 impl TabBarState {
@@ -55,7 +69,20 @@ impl TabBarState {
             last_active: Cell::new(None),
             last_rendered_tab_count: Cell::new(UNMEASURED_TAB_COUNT),
             reveal_retry_pending: Cell::new(false),
+            context_menu: RefCell::new(None),
         }
+    }
+
+    /// Open the right-click context menu for `tab_id`, anchored at
+    /// `position`, replacing any menu already open.
+    pub(crate) fn open_context_menu(&self, tab_id: TabId, position: gpui::Point<Pixels>) {
+        *self.context_menu.borrow_mut() = Some(TabContextMenuState { tab_id, position });
+    }
+
+    /// Close the open tab context menu, if any. Returns whether one was
+    /// open, so a caller can decide whether a re-render is needed.
+    fn close_context_menu(&self) -> bool {
+        self.context_menu.borrow_mut().take().is_some()
     }
 
     /// Scrolls the tab at `active_index` into view if `active_id` differs
@@ -284,15 +311,136 @@ pub fn render_tab_bar(
         cx,
     );
 
-    zsql_ui::tabs::tab_bar_shell(&theme).child(scrolled).child(
-        zsql_ui::tabs::new_tab_glyph(&theme)
-            .id("workspace-new-tab")
-            .debug_selector(|| "workspace-new-tab".to_owned())
-            .cursor_pointer()
-            .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
-                view.open_new_script_tab(window, cx);
-            })),
-    )
+    zsql_ui::tabs::tab_bar_shell(&theme)
+        .child(scrolled)
+        .child(
+            zsql_ui::tabs::new_tab_glyph(&theme)
+                .id("workspace-new-tab")
+                .debug_selector(|| "workspace-new-tab".to_owned())
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _event: &ClickEvent, window, cx| {
+                    view.open_new_script_tab(window, cx);
+                })),
+        )
+        .children(render_tab_context_menu(tabs_entity, tab_bar, cx))
+}
+
+/// One action offered by a `Script` tab's right-click context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabMenuAction {
+    Save,
+    SaveAs,
+    Rename,
+    CopyToLibrary,
+    RevealInFiles,
+    Close,
+}
+
+impl TabMenuAction {
+    fn item_id(self) -> &'static str {
+        match self {
+            Self::Save => "tab-context-menu-save",
+            Self::SaveAs => "tab-context-menu-save-as",
+            Self::Rename => "tab-context-menu-rename",
+            Self::CopyToLibrary => "tab-context-menu-copy-to-library",
+            Self::RevealInFiles => "tab-context-menu-reveal-in-files",
+            Self::Close => "tab-context-menu-close",
+        }
+    }
+
+    /// The menu item's label, including its keyboard shortcut hint where one
+    /// actually exists
+    fn label(self) -> String {
+        match self {
+            Self::Save => format!("Save  {}", workspace_theme::save_shortcut_label()),
+            Self::SaveAs => format!("Save as...  {}", workspace_theme::save_as_shortcut_label()),
+            Self::Rename => "Rename...".to_owned(),
+            Self::CopyToLibrary => "Copy to library".to_owned(),
+            Self::RevealInFiles => "Reveal in files".to_owned(),
+            Self::Close => "Close".to_owned(),
+        }
+    }
+}
+
+/// The `Script` tab context menu's items, in display order
+const TAB_CONTEXT_MENU_ITEMS: [TabMenuAction; 6] = [
+    TabMenuAction::Save,
+    TabMenuAction::SaveAs,
+    TabMenuAction::Rename,
+    TabMenuAction::CopyToLibrary,
+    TabMenuAction::RevealInFiles,
+    TabMenuAction::Close,
+];
+
+/// The indices within [`TAB_CONTEXT_MENU_ITEMS`] a separator renders before:
+/// one before the file-verb group (Copy to library / Reveal in files), one
+/// before Close.
+const TAB_CONTEXT_MENU_SEPARATORS_BEFORE: [usize; 2] = [3, 5];
+
+/// Whether `action` must render disabled for a tab with `backing`
+fn action_disabled_for_backing(action: TabMenuAction, backing: Option<&ScriptBacking>) -> bool {
+    match action {
+        TabMenuAction::Save => backing.is_some_and(|b| b.save_action() == SaveAction::NoOp),
+        TabMenuAction::Rename => backing.is_some_and(|b| !b.supports_rename()),
+        TabMenuAction::SaveAs
+        | TabMenuAction::CopyToLibrary
+        | TabMenuAction::RevealInFiles
+        | TabMenuAction::Close => false,
+    }
+}
+
+/// Right-clicking a `Script` tab's context menu: [`TAB_CONTEXT_MENU_ITEMS`]
+/// in order. `None` when no tab's menu is currently open.
+fn render_tab_context_menu(
+    tabs_entity: &Entity<TabModel>,
+    tab_bar: &TabBarState,
+    cx: &mut Context<WorkspaceView>,
+) -> Option<gpui::AnyElement> {
+    let state = *tab_bar.context_menu.borrow().as_ref()?;
+    let id = state.tab_id;
+    let backing = tabs_entity.read(cx).script_backing_of(id);
+
+    let mut menu = ContextMenu::new("tab-context-menu")
+        .position(state.position)
+        .on_close(cx.listener(|view, (), _window, cx| {
+            if view.tab_bar.close_context_menu() {
+                cx.notify();
+            }
+        }));
+
+    for (index, action) in TAB_CONTEXT_MENU_ITEMS.into_iter().enumerate() {
+        if TAB_CONTEXT_MENU_SEPARATORS_BEFORE.contains(&index) {
+            menu = menu.add_separator();
+        }
+        let disabled = action_disabled_for_backing(action, backing.as_ref());
+        menu = menu.add_item(
+            ContextMenuItem::with_id(action.item_id(), action.label())
+                .disabled(disabled)
+                .on_click(cx.listener(move |view, _event, window, cx| {
+                    match action {
+                        TabMenuAction::Save => {
+                            view.tabs.update(cx, |tabs, cx| tabs.trigger_save(id, cx));
+                        }
+                        TabMenuAction::SaveAs => {
+                            view.tabs
+                                .update(cx, |tabs, cx| tabs.trigger_save_as(id, cx));
+                        }
+                        TabMenuAction::Rename => view.open_rename_modal(id, cx),
+                        TabMenuAction::CopyToLibrary => view.copy_tab_to_library(id, cx),
+                        TabMenuAction::RevealInFiles => view.reveal_tab_in_files(id, cx),
+                        TabMenuAction::Close => {
+                            view.tab_bar.close_context_menu();
+                            view.close_tab(id, window, cx);
+                            return;
+                        }
+                    }
+                    view.tab_bar.close_context_menu();
+                    cx.notify();
+                })),
+        );
+    }
+
+    Some(menu.into_any_element())
 }
 
 /// The `VisualTestContext::debug_bounds` lookup key for the tab-bar entry
@@ -321,6 +469,7 @@ fn render_tab(
     cx: &Context<WorkspaceView>,
 ) -> impl IntoElement {
     let id = tab.id();
+    let is_script = matches!(tab.kind(), TabKind::Script { .. });
     let mut shell = zsql_ui::tabs::tab_shell(active, theme)
         .id(("workspace-tab", id))
         .debug_selector(move || tab_debug_selector(id))
@@ -349,9 +498,12 @@ fn render_tab(
             }
             shell
         }
-        TabKind::Script => {
+        TabKind::Script { .. } => {
             let mut label = tab.title().to_owned();
-            if tab.dirty() {
+            // Only a diverged library- or external-backed tab ever shows
+            // the marker: a session-owned tab autosaves continuously, so it
+            // is never meaningfully "unsaved" regardless of `tab.dirty()`.
+            if tab.diverged(cx) {
                 label.push('*');
             }
             shell = shell.child(div().flex_1().min_w_0().truncate().child(label));
@@ -381,28 +533,183 @@ fn render_tab(
         }
     };
 
-    shell
-        .cursor_pointer()
-        .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+    let mut shell = shell.cursor_pointer().on_click(cx.listener(
+        move |view, _event: &ClickEvent, window, cx| {
             view.activate_tab(id, window, cx);
-        }))
-        .child(
-            zsql_ui::tabs::close_glyph(format!("close-icon-{id}"), theme)
-                .id(("workspace-tab-close", id))
-                .cursor_pointer()
-                .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    view.close_tab(id, window, cx);
-                })),
-        )
+        },
+    ));
+
+    if is_script {
+        shell = shell.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
+                view.tab_bar.open_context_menu(id, event.position);
+                cx.notify();
+            }),
+        );
+    }
+
+    shell.child(
+        zsql_ui::tabs::close_glyph(format!("close-icon-{id}"), theme)
+            .id(("workspace-tab-close", id))
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                view.close_tab(id, window, cx);
+            })),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scroll_offset_to_reveal, tab_row_min_width};
+    use super::{
+        TAB_CONTEXT_MENU_ITEMS, TAB_CONTEXT_MENU_SEPARATORS_BEFORE, TabMenuAction,
+        action_disabled_for_backing, scroll_offset_to_reveal, tab_row_min_width, workspace_theme,
+    };
+    use crate::session_store::{LibraryName, ScriptBacking, ScriptFileName};
 
     const TAB_WIDTH: f32 = 160.0;
     const VIEWPORT: f32 = 640.0;
+
+    #[test]
+    fn tab_context_menu_items_are_in_the_expected_order() {
+        assert_eq!(
+            TAB_CONTEXT_MENU_ITEMS,
+            [
+                TabMenuAction::Save,
+                TabMenuAction::SaveAs,
+                TabMenuAction::Rename,
+                TabMenuAction::CopyToLibrary,
+                TabMenuAction::RevealInFiles,
+                TabMenuAction::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_context_menu_item_ids_and_labels_carry_their_key_hints() {
+        let expected = [
+            (
+                "tab-context-menu-save",
+                format!("Save  {}", workspace_theme::save_shortcut_label()),
+            ),
+            (
+                "tab-context-menu-save-as",
+                format!("Save as...  {}", workspace_theme::save_as_shortcut_label()),
+            ),
+            ("tab-context-menu-rename", "Rename...".to_owned()),
+            (
+                "tab-context-menu-copy-to-library",
+                "Copy to library".to_owned(),
+            ),
+            (
+                "tab-context-menu-reveal-in-files",
+                "Reveal in files".to_owned(),
+            ),
+            ("tab-context-menu-close", "Close".to_owned()),
+        ];
+        let actual: Vec<(&str, String)> = TAB_CONTEXT_MENU_ITEMS
+            .map(|action| (action.item_id(), action.label()))
+            .to_vec();
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.iter().any(|(_, label)| label.contains("Ctrl+W")),
+            "Close has no bound shortcut and must never show a phantom one"
+        );
+    }
+
+    #[test]
+    fn separators_render_before_the_file_verb_group_and_before_close() {
+        assert_eq!(
+            TAB_CONTEXT_MENU_ITEMS[TAB_CONTEXT_MENU_SEPARATORS_BEFORE[0]],
+            TabMenuAction::CopyToLibrary
+        );
+        assert_eq!(
+            TAB_CONTEXT_MENU_ITEMS[TAB_CONTEXT_MENU_SEPARATORS_BEFORE[1]],
+            TabMenuAction::Close
+        );
+    }
+
+    #[test]
+    fn save_is_disabled_only_for_an_already_autosaved_named_session_tab() {
+        assert!(
+            action_disabled_for_backing(
+                TabMenuAction::Save,
+                Some(&ScriptBacking::SessionNamed {
+                    file: ScriptFileName::new("orders.sql").unwrap()
+                })
+            ),
+            "a named session tab autosaves continuously, so Save is already a no-op"
+        );
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Save,
+            Some(&ScriptBacking::SessionScratch {
+                file: ScriptFileName::new("query-1.sql").unwrap()
+            })
+        ));
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Save,
+            Some(&ScriptBacking::Library {
+                name: LibraryName::new("orders").unwrap(),
+                saved_text: None,
+            })
+        ));
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Save,
+            Some(&ScriptBacking::External {
+                path: std::path::PathBuf::from("/tmp/migrate.sql"),
+                saved_text: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn rename_is_disabled_only_for_an_external_tab() {
+        assert!(action_disabled_for_backing(
+            TabMenuAction::Rename,
+            Some(&ScriptBacking::External {
+                path: std::path::PathBuf::from("/tmp/migrate.sql"),
+                saved_text: None,
+            })
+        ));
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Rename,
+            Some(&ScriptBacking::SessionNamed {
+                file: ScriptFileName::new("orders.sql").unwrap()
+            })
+        ));
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Rename,
+            Some(&ScriptBacking::SessionScratch {
+                file: ScriptFileName::new("query-1.sql").unwrap()
+            })
+        ));
+        assert!(!action_disabled_for_backing(
+            TabMenuAction::Rename,
+            Some(&ScriptBacking::Library {
+                name: LibraryName::new("orders").unwrap(),
+                saved_text: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn every_other_action_is_always_enabled_regardless_of_backing() {
+        for action in [
+            TabMenuAction::SaveAs,
+            TabMenuAction::CopyToLibrary,
+            TabMenuAction::RevealInFiles,
+            TabMenuAction::Close,
+        ] {
+            assert!(!action_disabled_for_backing(action, None));
+            assert!(!action_disabled_for_backing(
+                action,
+                Some(&ScriptBacking::SessionNamed {
+                    file: ScriptFileName::new("orders.sql").unwrap()
+                })
+            ));
+        }
+    }
 
     #[test]
     fn a_tab_already_within_the_viewport_needs_no_scroll() {

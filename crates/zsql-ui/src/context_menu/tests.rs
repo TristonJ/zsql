@@ -9,7 +9,8 @@ use gpui::{
 use super::{ContextMenu, ContextMenuItem};
 
 /// Renders a fixed context menu ("Item A", an optional separator, "Item B",
-/// then an item with no `on_click` handler at all) anchored at a
+/// an item with no `on_click` handler at all, and a disabled item that
+/// carries an `on_click` handler it must never invoke) anchored at a
 /// caller-chosen point, recording which item was clicked and how many times
 /// `on_close` fired.
 struct MenuHost {
@@ -23,6 +24,7 @@ impl Render for MenuHost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let clicks_a = self.clicks.clone();
         let clicks_b = self.clicks.clone();
+        let clicks_disabled = self.clicks.clone();
         let closes = self.closes.clone();
         let mut menu = ContextMenu::new("menu-host")
             .position(self.position)
@@ -43,7 +45,14 @@ impl Render for MenuHost {
                     clicks_b.borrow_mut().push("Item B");
                 }),
             )
-            .add_item(ContextMenuItem::new("No Handler"));
+            .add_item(ContextMenuItem::new("No Handler"))
+            .add_item(
+                ContextMenuItem::new("Disabled Item")
+                    .on_click(move |_event, _window, _cx| {
+                        clicks_disabled.borrow_mut().push("Disabled Item");
+                    })
+                    .disabled(true),
+            );
         // A menu rendered as a bare window root (rather than nested inside a
         // larger view, as it always is in production) needs an explicit
         // full-size container so its `deferred`/`absolute` backdrop resolves
@@ -127,6 +136,28 @@ fn an_item_with_no_on_click_renders_and_can_be_clicked_without_panicking(cx: &mu
     assert!(
         clicks.borrow().is_empty(),
         "a handlerless item must not record any click"
+    );
+}
+
+#[gpui::test]
+fn a_disabled_items_on_click_never_fires_even_though_it_still_renders(cx: &mut TestAppContext) {
+    let (_host, vcx, clicks, closes) = build_menu_host(cx, anchor(), false);
+    vcx.run_until_parked();
+
+    let bounds = vcx
+        .debug_bounds("Disabled Item")
+        .expect("a disabled item must still be tagged and painted, just dimmed");
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(
+        clicks.borrow().is_empty(),
+        "a disabled item's on_click must never fire, even though one was attached"
+    );
+    assert_eq!(
+        *closes.borrow(),
+        0,
+        "clicking a disabled item must not fall through to closing the menu either"
     );
 }
 

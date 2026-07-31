@@ -84,15 +84,12 @@ impl ConnectionList {
     /// The connection list's scrollbar chrome: track/thumb thickness plus
     /// the active theme's scrollbar colors. The track paints no background.
     fn scrollbar_style(active_theme: &Theme) -> ScrollbarStyle {
-        ScrollbarStyle {
-            track_width: f32::from(theme::MODAL_LIST_SCROLLBAR_WIDTH),
-            track_color: None,
-            thumb_color: active_theme.colors.scrollbar_thumb,
-            thumb_hover_color: Some(active_theme.colors.scrollbar_thumb_hover),
-            radius: theme::MODAL_LIST_SCROLLBAR_RADIUS,
-            inset: f32::from(theme::MODAL_LIST_SCROLLBAR_GAP),
-            ..ScrollbarStyle::default()
-        }
+        ScrollbarStyle::themed(
+            &active_theme.colors,
+            f32::from(theme::MODAL_LIST_SCROLLBAR_WIDTH),
+            theme::MODAL_LIST_SCROLLBAR_RADIUS,
+            f32::from(theme::MODAL_LIST_SCROLLBAR_GAP),
+        )
     }
 
     /// Builds this list's element tree: the connection rows, scrollable

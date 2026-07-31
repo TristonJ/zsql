@@ -24,7 +24,7 @@ use crate::connections::{
 };
 use crate::drivers::detect_driver_id;
 use crate::session::{Session, SessionState, open_tunnel_and_connect, probe_connection};
-use crate::tab_session::ConnectionKey;
+use crate::session_store::ConnectionKey;
 use crate::ui::connections::form::{ConnectionForm, ConnectionFormEvent};
 use crate::ui::format::host_label;
 
@@ -39,6 +39,10 @@ pub enum ManagerView {
     /// The form view is being displayed
     Form,
 }
+
+/// The display label every view falls back to when it needs a connection
+/// name but no saved connection is active
+pub const UNSAVED_CONNECTION_LABEL: &str = "Unsaved";
 
 /// The name + URL of whichever connection the session is currently pointed
 /// at, tracked independently of [`Session`] (which only knows the connected
@@ -216,22 +220,19 @@ impl ConnectionManagerView {
     }
 
     /// The stable tab-session key for whichever connection is currently
-    /// tracked as active, if any: [`ConnectionKey::Saved`] when its
-    /// name/url match a persisted [`StoredConnection`], else
+    /// tracked as active, if any: [`ConnectionKey::Saved`] (its uuid) when
+    /// it matches a persisted [`StoredConnection`], else
     /// [`ConnectionKey::Unsaved`] for a `DATABASE_URL`/`Config`-fallback
     /// connection with no saved entry behind it.
     #[must_use]
     pub fn active_tab_session_key(&self) -> Option<ConnectionKey> {
         let active = self.active.as_ref()?;
-        let is_saved = self
-            .store
-            .connections()
-            .iter()
-            .any(|connection| Some(connection.id) == active.id);
-        Some(if is_saved {
-            ConnectionKey::Saved(active.name.clone())
-        } else {
-            ConnectionKey::Unsaved
+        let saved_id = active
+            .id
+            .filter(|id| self.store.connections().iter().any(|c| &c.id == id));
+        Some(match saved_id {
+            Some(id) => ConnectionKey::Saved(id),
+            None => ConnectionKey::Unsaved,
         })
     }
 

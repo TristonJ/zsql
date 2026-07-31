@@ -24,6 +24,27 @@ pub struct ScrollbarStyle {
     pub inset: f32,
 }
 
+impl ScrollbarStyle {
+    /// The standard theme wiring every scroll surface shares
+    #[must_use]
+    pub fn themed(
+        colors: &crate::theme::Colors,
+        track_width: f32,
+        radius: f32,
+        inset: f32,
+    ) -> Self {
+        Self {
+            track_width,
+            track_color: None,
+            thumb_color: colors.scrollbar_thumb,
+            thumb_hover_color: Some(colors.scrollbar_thumb_hover),
+            radius,
+            inset,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ScrollbarStyle {
     fn default() -> Self {
         Self {
