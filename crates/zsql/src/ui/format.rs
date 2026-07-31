@@ -197,6 +197,32 @@ pub fn row_as_json_string(row: &Row, columns: &[ColumnMeta]) -> String {
     serde_json::to_string(&row_as_json(row, columns)).unwrap_or_default()
 }
 
+/// `row`'s cells as a single line CSV string, each value serialized via [`format_value_for_clipboard`]
+#[must_use]
+pub fn row_as_csv_string(row: &Row) -> String {
+    let mut out = String::new();
+    for (i, value) in row.0.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let cell_text = format_value_for_clipboard(value);
+        // Escape any cell that contains a comma, quote, or newline
+        if cell_text.contains(&[',', '"', '\n'][..]) {
+            out.push('"');
+            for c in cell_text.chars() {
+                if c == '"' {
+                    out.push('"'); // Escape quotes by doubling them
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&cell_text);
+        }
+    }
+    out
+}
+
 /// `value`'s own JSON representation
 #[must_use]
 pub fn value_to_json(value: &Value) -> serde_json::Value {
@@ -502,6 +528,21 @@ mod tests {
         assert_eq!(
             value_to_json(&Value::Unknown(UnknownValue::None)),
             serde_json::json!("?")
+        );
+    }
+
+    #[test]
+    fn row_as_csv_string_escapes_cells_with_commas_quotes_or_newlines() {
+        let row = Row(vec![
+            Value::Text("simple".to_owned()),
+            Value::Text("with,comma".to_owned()),
+            Value::Text("with\"quote".to_owned()),
+            Value::Text("with\nnewline".to_owned()),
+        ]);
+        let csv = super::row_as_csv_string(&row);
+        assert_eq!(
+            csv,
+            "simple,\"with,comma\",\"with\"\"quote\",\"with\nnewline\""
         );
     }
 }
