@@ -47,6 +47,24 @@ impl ResultsView {
         cx.notify();
     }
 
+    /// `Copy row`: serialize every cell of the focused row via its own
+    /// [`Value`]'s display text (not its JSON representation), joined by
+    /// comma, and write it to the clipboard. A no-op while nothing is selected.
+    #[tracing::instrument(name = "results_copy_row", skip_all)]
+    pub(super) fn copy_row(&mut self, cx: &mut Context<Self>) {
+        let Some((row, _col)) = self.table_state.read(cx).focused_cell() else {
+            tracing::trace!("copy-row invoked with no results grid selection; nothing to do");
+            return;
+        };
+        let result = self.effective_result(cx);
+        let Some(row_data) = result.rows.get(row) else {
+            return;
+        };
+        let text = format::row_as_csv_string(row_data);
+        tracing::debug!(row, "copied a results grid row to the clipboard");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// `Copy row as JSON`: serialize every cell of the focused row, each via
     /// its own [`Value`]'s JSON representation (not `format_value`'s display
     /// text) keyed by column name, and write it to the clipboard. A no-op
@@ -111,6 +129,12 @@ impl ResultsView {
             .add_item(ContextMenuItem::new("Copy value").on_click(cx.listener(
                 |view, _event, window, cx| {
                     view.copy_focused_cell(&Copy, window, cx);
+                    view.close_cell_context_menu(cx);
+                },
+            )))
+            .add_item(ContextMenuItem::new("Copy row").on_click(cx.listener(
+                |view, _event, _window, cx| {
+                    view.copy_row(cx);
                     view.close_cell_context_menu(cx);
                 },
             )))
