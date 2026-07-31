@@ -8,8 +8,9 @@ use std::time::Duration;
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, canvas, div,
-    prelude::*, px, rgb,
+    prelude::*, px, rems, rgb,
 };
+use zsql_ui::button::secondary_link_button;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::theme::ActiveTheme;
 
@@ -482,20 +483,33 @@ impl WorkspaceView {
     /// affordance. The Run button is disabled -- muted fill, non-interactive
     /// -- whenever `session` holds no live connection; see
     /// [`Session::is_connected`].
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let run_shortcut = if cfg!(target_os = "macos") {
             "Cmd+Enter"
         } else {
             "Ctrl+Enter"
         };
-        let active_theme = cx.theme();
+        let active_theme = cx.theme().clone();
         let colors = active_theme.colors;
-        let can_run = self.session.read(cx).is_connected();
+        let is_connected = self.session.read(cx).is_connected();
+        let is_running = self.session.read(cx).is_running();
+        let can_run = is_connected && !is_running;
+        let can_cancel = is_connected && is_running;
         let run_button_bg = if can_run {
             colors.accent
         } else {
-            theme::run_button_disabled_bg(active_theme)
+            theme::run_button_disabled_bg(&active_theme)
         };
+
+        let cancel_button = secondary_link_button("workspace-cancel-query-button", window, cx)
+            .ml_auto()
+            .text_size(rems(0.75))
+            .child("cancel query")
+            .px_4()
+            .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+                view.session
+                    .update(cx, super::super::session::Session::cancel_query);
+            }));
 
         div()
             .flex()
@@ -514,6 +528,7 @@ impl WorkspaceView {
                     .text_color(rgb(colors.text_secondary))
                     .child("SQL"),
             )
+            .when(can_cancel, |el| el.child(cancel_button))
             .child(
                 div()
                     .id("workspace-run-query-button")
@@ -529,7 +544,7 @@ impl WorkspaceView {
                     .text_color(rgb(colors.bg_app))
                     .when(can_run, |el| {
                         el.cursor_pointer()
-                            .hover(|style| style.bg(rgb(theme::run_button_hover_bg(active_theme))))
+                            .hover(|style| style.bg(rgb(theme::run_button_hover_bg(&active_theme))))
                             .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
                                 view.run_active_tab(cx);
                             }))
@@ -543,14 +558,17 @@ impl WorkspaceView {
                     .child(
                         div()
                             .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))
-                            .child("Run"),
+                            .when(is_running, |el| el.child("Running..."))
+                            .when(!is_running, |el| el.child("Run")),
                     )
-                    .child(
-                        div()
-                            .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
-                            .text_color(theme::run_button_hint(active_theme))
-                            .child(run_shortcut),
-                    ),
+                    .when(!is_running, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(theme::RUN_BUTTON_HINT_TEXT_SIZE))
+                                .text_color(theme::run_button_hint(&active_theme))
+                                .child(run_shortcut),
+                        )
+                    }),
             )
     }
 
@@ -582,7 +600,11 @@ impl WorkspaceView {
     /// editor pane, divider, or shared results grid); for every other
     /// active tab (or none), the normal editor body, the resizable
     /// editor/results divider, and the shared results grid.
-    fn render_main_pane(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_main_pane(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         if let Some(active) = self.tabs.read(cx).active_tab()
             && let Some(schema_view) = active.schema_view()
         {
@@ -601,7 +623,7 @@ impl WorkspaceView {
         }
 
         vec![
-            self.render_header(cx).into_any_element(),
+            self.render_header(window, cx).into_any_element(),
             self.render_active_body(cx),
             div()
                 .id("editor-results-divider")
@@ -697,7 +719,7 @@ fn clamp_editor_height(
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let divider_thickness = self.layout.divider_thickness;
         let column_height = self.column_height.clone();
         let modal_open = self.connections.read(cx).is_open();
@@ -774,7 +796,7 @@ impl Render for WorkspaceView {
                                 self.tab_width,
                                 cx,
                             ))
-                            .children(self.render_main_pane(cx)),
+                            .children(self.render_main_pane(window, cx)),
                     ),
             )
             .child(self.footer.clone())

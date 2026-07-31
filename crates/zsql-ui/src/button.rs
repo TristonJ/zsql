@@ -84,6 +84,23 @@ pub fn destructive_button(
         .when(*hovered.read(cx), |b| b.bg(theme.colors.error_wash()))
 }
 
+/// A secondary button in the style of a link
+pub fn secondary_link_button(
+    id: impl Into<ElementId>,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Stateful<Div> {
+    let (btn, hovered) = button_base(id, window, cx);
+    let theme = cx.theme();
+
+    btn.border_0()
+        .text_color(rgb(theme.colors.text_secondary))
+        .when(*hovered.read(cx), |b| {
+            b.text_color(rgb(theme.colors.text_primary))
+                .font_weight(FontWeight::SEMIBOLD)
+        })
+}
+
 /// A button switch - allowing toggling between multiple options. Only one option can
 /// be selected at a time.
 #[derive(IntoElement)]

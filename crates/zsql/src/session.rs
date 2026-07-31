@@ -168,6 +168,15 @@ impl Session {
         self.connection.is_some()
     }
 
+    /// Whether a query is currently running
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.state,
+            SessionState::Running | SessionState::Truncating { .. }
+        )
+    }
+
     /// The active connection's liveliness, as tracked by the recurring
     /// probe loop, independent of [`Session::state`].
     #[must_use]
@@ -355,6 +364,17 @@ impl Session {
                 }
             }
         })
+    }
+
+    /// Abort / cancel the currently running query, if any. A no-op if there is none.
+    pub fn cancel_query(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.active_query.take() {
+            tracing::debug!("session cancelling active query");
+            handle.cancel();
+            self.query_generation += 1;
+            self.state = SessionState::Error("Query canceled".to_string());
+            cx.notify();
+        }
     }
 
     /// Snapshot the reachable schema via the active connection's
