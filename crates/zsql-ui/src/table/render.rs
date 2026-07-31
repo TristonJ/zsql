@@ -10,6 +10,7 @@ use gpui::{
 
 use crate::scrollable::restrict_wheel_to_own_axis;
 use crate::scrollable::{ScrollableState, WithScrollbars};
+use crate::table::builder::build_single_click_listener;
 use crate::theme::ActiveTheme;
 
 use super::builder::{
@@ -46,6 +47,7 @@ impl<V: Render> Table<V> {
             vertical_sizing: table_height,
             focus_on_click,
             selectable,
+            on_cell_click,
             on_cell_double_click,
             on_cell_right_click,
             column_resize,
@@ -54,6 +56,7 @@ impl<V: Render> Table<V> {
             Box::new(|_v, range, _window, _cx| range.map(|_| TableRow::new(Vec::new())).collect())
         });
 
+        let single_click_listener = build_single_click_listener(on_cell_click, &state, cx);
         let double_click_listener = build_double_click_listener(on_cell_double_click, &state, cx);
         let right_click_listener = build_right_click_listener(on_cell_right_click, &state, cx);
 
@@ -104,6 +107,7 @@ impl<V: Render> Table<V> {
             table_height,
             focus_on_click,
             selectable,
+            single_click_listener,
             double_click_listener,
             right_click_listener,
             focused_cell,
@@ -157,6 +161,7 @@ fn build_data_list<V: Render>(
     table_height: TableSizing,
     focus_on_click: Option<FocusHandle>,
     selectable: bool,
+    single_click_listener: Option<CellClickListener>,
     double_click_listener: Option<CellClickListener>,
     right_click_listener: Option<CellClickListener>,
     focused_cell: Option<(usize, usize)>,
@@ -184,6 +189,7 @@ fn build_data_list<V: Render>(
                     state: &body_tag_state,
                     focus_on_click: focus_on_click.as_ref(),
                     selectable,
+                    single_click_listener: single_click_listener.clone(),
                     double_click_listener: double_click_listener.clone(),
                     right_click_listener: right_click_listener.clone(),
                 };
@@ -340,6 +346,8 @@ struct BodyRowContext<'a> {
     /// highlight via [`Table::selectable`]. Off by default, so a table with
     /// no use for cell selection renders inert, unclickable body cells.
     selectable: bool,
+    /// Set via [`Table::on_cell_click`].
+    single_click_listener: Option<CellClickListener>,
     /// Set via [`Table::on_cell_double_click`].
     double_click_listener: Option<CellClickListener>,
     /// Set via [`Table::on_cell_right_click`].
@@ -380,6 +388,7 @@ fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_
                     row_index,
                     cell_index,
                     ctx.focus_on_click.cloned(),
+                    ctx.single_click_listener.clone(),
                     ctx.double_click_listener.clone(),
                 ),
             );

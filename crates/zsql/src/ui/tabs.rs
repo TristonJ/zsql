@@ -38,7 +38,7 @@ pub type TabId = u64;
 pub struct ResultsSnapshot {
     pub source_label: SharedString,
     pub state: SessionState,
-    pub result: ResultSet,
+    pub result: Rc<ResultSet>,
 }
 
 /// What kind of buffer a tab holds.
@@ -373,7 +373,7 @@ impl TabModel {
         cx.emit(ResultsChanged::Snapshot(ResultsSnapshot {
             source_label: label,
             state: SessionState::Connected,
-            result: ResultSet::default(),
+            result: Rc::new(ResultSet::default()),
         }));
     }
 
@@ -450,7 +450,7 @@ impl TabModel {
             ResultsSnapshot {
                 source_label: label,
                 state: session.state().clone(),
-                result: session.result().clone(),
+                result: Rc::new(session.result().clone()),
             }
         };
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {

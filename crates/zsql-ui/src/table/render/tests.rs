@@ -67,6 +67,7 @@ fn painted_body_row_cell_count(
                 state: &self.table_state,
                 focus_on_click: None,
                 selectable: false,
+                single_click_listener: None,
                 double_click_listener: None,
                 right_click_listener: None,
             };
@@ -128,6 +129,7 @@ fn build_body_row_flags_a_row_with_more_cells_than_columns(cx: &mut TestAppConte
         state: &state,
         focus_on_click: None,
         selectable: false,
+        single_click_listener: None,
         double_click_listener: None,
         right_click_listener: None,
     };

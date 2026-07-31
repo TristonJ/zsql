@@ -30,6 +30,9 @@ type CellDoubleClickHandler<V> = Rc<dyn Fn(&mut V, usize, usize, &mut Window, &m
 /// right-clicked cell's `(row, col)` and the triggering event.
 type CellRightClickHandler<V> =
     Rc<dyn Fn(&mut V, usize, usize, &MouseDownEvent, &mut Window, &mut Context<V>)>;
+/// A caller's [`Table::on_cell_click`] callback, given the clicked cell's
+/// `(row, col)`.
+type CellSingleClickHandler<V> = Rc<dyn Fn(&mut V, usize, usize, &mut Window, &mut Context<V>)>;
 /// A [`CellDoubleClickHandler`]/[`CellRightClickHandler`] once wrapped (via
 /// `Context::listener`) into a plain mouse-down handler that reads its
 /// target cell off [`TableState`] rather than closing over one -- see
@@ -53,6 +56,7 @@ pub struct Table<V: Render> {
     pub(super) vertical_sizing: TableSizing,
     pub(super) focus_on_click: Option<FocusHandle>,
     pub(super) selectable: bool,
+    pub(super) on_cell_click: Option<CellSingleClickHandler<V>>,
     pub(super) on_cell_double_click: Option<CellDoubleClickHandler<V>>,
     pub(super) on_cell_right_click: Option<CellRightClickHandler<V>>,
     pub(super) column_resize: Option<ColumnResizeConfig<V>>,
@@ -65,6 +69,32 @@ pub enum TableSizing {
     Fill,
     /// Let the table's height grow to fit all its rows, showing no vertical scrollbar.
     Fit,
+}
+
+/// Wrap `handler` (if given) into a [`CellClickListener`]: reading its
+/// target cell off `state` (already updated by the same click's own
+/// selection) rather than closing over one, so this single built-once
+/// listener can be cloned onto every selectable cell instead of
+/// monomorphizing a fresh closure per cell.
+pub(super) fn build_single_click_listener<V: Render>(
+    handler: Option<CellSingleClickHandler<V>>,
+    state: &Entity<TableState>,
+    cx: &mut Context<V>,
+) -> Option<CellClickListener> {
+    handler.map(|f| {
+        let state = state.clone();
+        let wrapped = cx.listener(
+            move |view: &mut V,
+                  _event: &MouseDownEvent,
+                  window: &mut Window,
+                  cx: &mut Context<V>| {
+                if let Some((row, col)) = state.read(cx).focused_cell() {
+                    f(view, row, col, window, cx);
+                }
+            },
+        );
+        Rc::new(wrapped) as CellClickListener
+    })
 }
 
 /// Wrap `handler` (if given) into a [`CellClickListener`]: reading its
@@ -134,6 +164,7 @@ impl<V: Render> Table<V> {
             vertical_sizing: TableSizing::Fill,
             focus_on_click: None,
             selectable: false,
+            on_cell_click: None,
             on_cell_double_click: None,
             on_cell_right_click: None,
             column_resize: None,
@@ -202,6 +233,19 @@ impl<V: Render> Table<V> {
     #[must_use]
     pub fn selectable(mut self) -> Self {
         self.selectable = true;
+        self
+    }
+
+    /// Call `f` with the just-selected cell's `(row, col)` whenever a data
+    /// cell is clicked. Has no effect unless [`Table::selectable`] is also
+    /// called. `f` runs after that click has already updated `TableState`'s
+    /// focused cell, so it always sees the cell that was actually clicked.
+    #[must_use]
+    pub fn on_cell_click(
+        mut self,
+        f: impl Fn(&mut V, usize, usize, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        self.on_cell_click = Some(Rc::new(f));
         self
     }
 
@@ -280,6 +324,7 @@ pub(super) fn select_cell_on_click(
     row_index: usize,
     cell_index: usize,
     focus_handle: Option<FocusHandle>,
+    single_click_listener: Option<CellClickListener>,
     double_click_listener: Option<CellClickListener>,
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
     let state = state.clone();
@@ -292,6 +337,15 @@ pub(super) fn select_cell_on_click(
         });
         if let Some(handle) = &focus_handle {
             window.focus(handle);
+        }
+        tracing::debug!(
+            click_count = event.click_count,
+            "selected cell ({row_index}, {cell_index}) on click"
+        );
+        if event.click_count == 1
+            && let Some(listener) = &single_click_listener
+        {
+            listener(event, window, cx);
         }
         if event.click_count >= 2
             && let Some(listener) = &double_click_listener
