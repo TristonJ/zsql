@@ -2077,6 +2077,35 @@ mod database_tests {
         run_ddl(&*conn, &format!("DROP DATABASE {SECOND_DATABASE}"));
     }
 
+    /// Install the `citext` extension, tolerating the loss of a race with a
+    /// concurrent installer: `IF NOT EXISTS` checks and inserts into
+    /// `pg_extension` non-atomically, so two tests creating the extension in
+    /// parallel can leave the loser with a `duplicate key`/`duplicate object`
+    /// error even though the extension is now installed — which is the
+    /// outcome the caller wanted, and which
+    /// [`citext_extension_is_installed`] verifies afterwards.
+    fn ensure_citext_extension(conn: &dyn zsql_core::Connection) {
+        let (tx, rx) = flume::unbounded();
+        let _handle = conn.stream_query("CREATE EXTENSION IF NOT EXISTS citext".to_owned(), tx);
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(zsql_core::QueryEvent::Done { .. })) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let message = format!("{err:?}");
+                    assert!(
+                        message.contains("pg_extension_name_index")
+                            || message.contains("duplicate object")
+                            || message.contains("42710"),
+                        "citext extension setup failed: {err:?}"
+                    );
+                    break;
+                }
+                Err(err) => panic!("citext extension setup did not complete: {err:?}"),
+            }
+        }
+    }
+
     /// Whether the `citext` extension is installed on the connected
     /// database, checked directly against `pg_extension` rather than
     /// inferred from `CREATE EXTENSION IF NOT EXISTS citext` succeeding: a
@@ -2102,7 +2131,7 @@ mod database_tests {
         let conn = live_connection();
         let table = "zsql_test_citext";
 
-        run_ddl(&*conn, "CREATE EXTENSION IF NOT EXISTS citext");
+        ensure_citext_extension(&*conn);
         assert!(
             citext_extension_is_installed(&*conn),
             "the citext extension is not installed on this postgres instance; \
@@ -2164,7 +2193,7 @@ mod database_tests {
         let conn = live_connection();
         let table = "zsql_test_citext_array";
 
-        run_ddl(&*conn, "CREATE EXTENSION IF NOT EXISTS citext");
+        ensure_citext_extension(&*conn);
         assert!(
             citext_extension_is_installed(&*conn),
             "the citext extension is not installed on this postgres instance; \
