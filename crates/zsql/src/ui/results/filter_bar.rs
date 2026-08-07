@@ -315,7 +315,7 @@ impl ResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut wrap = div().relative().child(Self::render_add_filter_control(
+        let mut wrap = div().relative().child(self.render_add_filter_control(
             interactive,
             !columns.is_empty(),
             active_theme,
@@ -336,6 +336,7 @@ impl ResultsView {
     /// The "+ filter" control: a no-op while not `interactive` or the
     /// active result has no columns to filter.
     fn render_add_filter_control(
+        &self,
         interactive: bool,
         has_column: bool,
         active_theme: &zsql_ui::theme::Theme,
@@ -343,6 +344,7 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let colors = active_theme.colors;
+        let filter_already_open = self.filter_editor.as_ref().is_some();
         let control = div()
             .id("filter-add")
             .flex()
@@ -355,15 +357,29 @@ impl ResultsView {
             .border_dashed()
             .border_color(rgb(colors.border))
             .text_color(rgb(colors.text_tertiary))
-            .child(div().text_color(rgb(colors.accent)).child("+"))
-            .child("filter");
+            .when(!filter_already_open, |el| {
+                el.child(div().text_color(rgb(colors.accent)).child("+"))
+                    .child("filter")
+            })
+            .when(filter_already_open, |el| {
+                el.child(div().text_color(rgb(colors.accent)).child("\u{2713}"))
+                    .child("apply")
+            });
 
         if interactive && has_column {
             control
                 .cursor_pointer()
                 .on_hover_state(window, cx, |el| el.text_color(rgb(colors.text_secondary)))
                 .on_click(cx.listener(|view, _event, window, cx| {
-                    view.begin_add_filter(window, cx);
+                    if view
+                        .filter_editor
+                        .as_ref()
+                        .is_some_and(|e| !e.value_field.read(cx).value().is_empty())
+                    {
+                        view.commit_filter_edit(cx);
+                    } else {
+                        view.begin_add_filter(window, cx);
+                    }
                 }))
         } else {
             control.opacity(app_theme::PAGER_DISABLED_OPACITY)
