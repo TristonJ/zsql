@@ -85,6 +85,9 @@ pub const MIN_COLUMN_WIDTH: f32 = 90.0;
 pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 /// Narrowest the leading row-number column is allowed to shrink to.
 pub const ROW_NUMBER_MIN_WIDTH: f32 = 80.0;
+/// Extra padding chars reserved in the header cells for the sort affordance
+/// & fn indicator
+pub const HEADER_EXTRA_PADDING_CHARS: usize = 4;
 
 /// Height of the sidebar's "SCHEMA" header bar.
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(34.0);

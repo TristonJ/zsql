@@ -13,6 +13,8 @@ use zsql_core::ColumnMeta;
 use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+use crate::ui::theme::HEADER_EXTRA_PADDING_CHARS;
+
 use super::pager;
 use super::{ResultsView, ValueKind, format_value, theme};
 
@@ -144,7 +146,9 @@ pub(super) fn column_width_from_parts(
     max_body_chars: usize,
     style: &zsql_ui::table::TableStyle,
 ) -> Pixels {
-    let header_chars = column.name.chars().count() + column.type_name.chars().count();
+    let header_chars =
+        column.name.chars().count() + column.type_name.chars().count() + HEADER_EXTRA_PADDING_CHARS;
+
     measure::column_width(
         header_chars,
         max_body_chars,

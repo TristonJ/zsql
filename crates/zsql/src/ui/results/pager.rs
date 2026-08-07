@@ -15,7 +15,7 @@ use crate::ui::theme as app_theme;
 
 /// The grid header's funnel marker for a column carrying an active filter,
 /// mirroring the sort arrow's own per-column marker.
-const FUNNEL_GLYPH: &str = "\u{2378}";
+const FUNNEL_GLYPH: &str = "\u{2283}";
 
 /// One pager/sort/filter interaction a live generated preview's controls
 /// can dispatch. Carried as data (rather than several separate closures) so
@@ -161,11 +161,13 @@ pub(crate) fn sortable_column_header(
                 .text_color(rgb(colors.accent))
                 .child(arrow),
         );
-    } else if controls.is_some() && is_hovered {
+    } else if controls.is_some() {
         header = header.child(
             div()
                 .text_size(px(app_theme::PAGER_TEXT_SIZE))
                 .text_color(rgb(colors.text_tertiary))
+                .opacity(0.0)
+                .when(is_hovered, |el| el.opacity(1.0))
                 .child("\u{2195}"),
         );
     }
