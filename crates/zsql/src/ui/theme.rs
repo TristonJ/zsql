@@ -291,7 +291,7 @@ pub const FILTER_FX_TAG_RADIUS: f32 = 3.0;
 
 /// Top offset of a filter bar dropdown (the operator menu or the column
 /// picker) below the control it opens from.
-pub const FILTER_MENU_TOP_OFFSET: Pixels = px(27.0);
+pub const FILTER_MENU_TOP_OFFSET: Pixels = px(4.0);
 
 /// Width of the operator menu shown while a chip is being edited.
 pub const FILTER_OP_MENU_WIDTH: Pixels = px(196.0);

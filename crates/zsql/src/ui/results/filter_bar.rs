@@ -323,7 +323,12 @@ impl ResultsView {
             cx,
         ));
         if self.filter_column_picker_open {
-            wrap = wrap.child(Self::render_column_picker(columns, active_theme, cx));
+            wrap = wrap.child(Self::render_column_picker(
+                columns,
+                active_theme,
+                window,
+                cx,
+            ));
         }
         wrap
     }
@@ -370,6 +375,7 @@ impl ResultsView {
     fn render_column_picker(
         columns: &[ColumnMeta],
         active_theme: &zsql_ui::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = active_theme.colors;
@@ -385,6 +391,19 @@ impl ResultsView {
             .block_mouse_except_scroll()
             .bg(rgb(colors.bg_overlay))
             .shadow_lg();
+
+        let overlay = div()
+            .id("filter-column-picker-overlay")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(window.viewport_size().width)
+            .h(window.viewport_size().height)
+            .block_mouse_except_scroll()
+            .on_click(cx.listener(|view, _event, _window, cx| {
+                view.filter_column_picker_open = false;
+                cx.notify();
+            }));
 
         for column in columns {
             let column = column.clone();
@@ -421,7 +440,7 @@ impl ResultsView {
             menu = menu.child(item);
         }
 
-        deferred(menu)
+        deferred(div().relative().child(overlay).child(menu))
     }
 
     /// The "clear all" control, shown only while at least one filter is
