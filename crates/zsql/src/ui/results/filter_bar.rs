@@ -7,8 +7,8 @@
 //! sort headers and pager already go inert for a detached tab.
 
 use gpui::{
-    Context, Div, Entity, Focusable, SharedString, Stateful, Window, deferred, div, prelude::*, px,
-    rgb,
+    Context, Div, Entity, Focusable, SharedString, Stateful, TextOverflow, Window, deferred, div,
+    prelude::*, px, rgb,
 };
 use zsql_core::{
     ColumnMeta, FilterCondition, FilterConditionId, FilterConnector, FilterOperator,
@@ -402,7 +402,13 @@ impl ResultsView {
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
                 .hover(|el| el.bg(colors.accent_wash()))
                 .text_color(rgb(colors.text_primary))
-                .child(column.name.clone())
+                .child(
+                    div()
+                        .max_w_full()
+                        .overflow_x_hidden()
+                        .text_overflow(TextOverflow::Truncate("…".into()))
+                        .child(column.name.clone()),
+                )
                 .child(
                     div()
                         .ml_auto()
