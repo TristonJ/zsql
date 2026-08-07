@@ -85,6 +85,9 @@ pub const MIN_COLUMN_WIDTH: f32 = 90.0;
 pub const MAX_COLUMN_WIDTH: f32 = 320.0;
 /// Narrowest the leading row-number column is allowed to shrink to.
 pub const ROW_NUMBER_MIN_WIDTH: f32 = 80.0;
+/// Extra padding chars reserved in the header cells for the sort affordance
+/// & fn indicator
+pub const HEADER_EXTRA_PADDING_CHARS: usize = 4;
 
 /// Height of the sidebar's "SCHEMA" header bar.
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(34.0);
@@ -288,7 +291,7 @@ pub const FILTER_FX_TAG_RADIUS: f32 = 3.0;
 
 /// Top offset of a filter bar dropdown (the operator menu or the column
 /// picker) below the control it opens from.
-pub const FILTER_MENU_TOP_OFFSET: Pixels = px(27.0);
+pub const FILTER_MENU_TOP_OFFSET: Pixels = px(4.0);
 
 /// Width of the operator menu shown while a chip is being edited.
 pub const FILTER_OP_MENU_WIDTH: Pixels = px(196.0);

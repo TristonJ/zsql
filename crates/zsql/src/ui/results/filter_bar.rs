@@ -7,8 +7,8 @@
 //! sort headers and pager already go inert for a detached tab.
 
 use gpui::{
-    Context, Div, Entity, Focusable, SharedString, Stateful, Window, deferred, div, prelude::*, px,
-    rgb,
+    Context, Div, Entity, Focusable, SharedString, Stateful, TextOverflow, Window, deferred, div,
+    prelude::*, px, rgb,
 };
 use zsql_core::{
     ColumnMeta, FilterCondition, FilterConditionId, FilterConnector, FilterOperator,
@@ -315,7 +315,7 @@ impl ResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut wrap = div().relative().child(Self::render_add_filter_control(
+        let mut wrap = div().relative().child(self.render_add_filter_control(
             interactive,
             !columns.is_empty(),
             active_theme,
@@ -323,7 +323,12 @@ impl ResultsView {
             cx,
         ));
         if self.filter_column_picker_open {
-            wrap = wrap.child(Self::render_column_picker(columns, active_theme, cx));
+            wrap = wrap.child(Self::render_column_picker(
+                columns,
+                active_theme,
+                window,
+                cx,
+            ));
         }
         wrap
     }
@@ -331,6 +336,7 @@ impl ResultsView {
     /// The "+ filter" control: a no-op while not `interactive` or the
     /// active result has no columns to filter.
     fn render_add_filter_control(
+        &self,
         interactive: bool,
         has_column: bool,
         active_theme: &zsql_ui::theme::Theme,
@@ -338,6 +344,7 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let colors = active_theme.colors;
+        let filter_already_open = self.filter_editor.as_ref().is_some();
         let control = div()
             .id("filter-add")
             .flex()
@@ -350,15 +357,29 @@ impl ResultsView {
             .border_dashed()
             .border_color(rgb(colors.border))
             .text_color(rgb(colors.text_tertiary))
-            .child(div().text_color(rgb(colors.accent)).child("+"))
-            .child("filter");
+            .when(!filter_already_open, |el| {
+                el.child(div().text_color(rgb(colors.accent)).child("+"))
+                    .child("filter")
+            })
+            .when(filter_already_open, |el| {
+                el.child(div().text_color(rgb(colors.accent)).child("\u{2713}"))
+                    .child("apply")
+            });
 
         if interactive && has_column {
             control
                 .cursor_pointer()
                 .on_hover_state(window, cx, |el| el.text_color(rgb(colors.text_secondary)))
                 .on_click(cx.listener(|view, _event, window, cx| {
-                    view.begin_add_filter(window, cx);
+                    if view
+                        .filter_editor
+                        .as_ref()
+                        .is_some_and(|e| !e.value_field.read(cx).value().is_empty())
+                    {
+                        view.commit_filter_edit(cx);
+                    } else {
+                        view.begin_add_filter(window, cx);
+                    }
                 }))
         } else {
             control.opacity(app_theme::PAGER_DISABLED_OPACITY)
@@ -370,6 +391,7 @@ impl ResultsView {
     fn render_column_picker(
         columns: &[ColumnMeta],
         active_theme: &zsql_ui::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = active_theme.colors;
@@ -385,6 +407,19 @@ impl ResultsView {
             .block_mouse_except_scroll()
             .bg(rgb(colors.bg_overlay))
             .shadow_lg();
+
+        let overlay = div()
+            .id("filter-column-picker-overlay")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w(window.viewport_size().width)
+            .h(window.viewport_size().height)
+            .block_mouse_except_scroll()
+            .on_click(cx.listener(|view, _event, _window, cx| {
+                view.filter_column_picker_open = false;
+                cx.notify();
+            }));
 
         for column in columns {
             let column = column.clone();
@@ -402,7 +437,13 @@ impl ResultsView {
                 .rounded(px(app_theme::FILTER_OP_MENU_ITEM_RADIUS))
                 .hover(|el| el.bg(colors.accent_wash()))
                 .text_color(rgb(colors.text_primary))
-                .child(column.name.clone())
+                .child(
+                    div()
+                        .max_w_full()
+                        .overflow_x_hidden()
+                        .text_overflow(TextOverflow::Truncate("…".into()))
+                        .child(column.name.clone()),
+                )
                 .child(
                     div()
                         .ml_auto()
@@ -415,7 +456,7 @@ impl ResultsView {
             menu = menu.child(item);
         }
 
-        deferred(menu)
+        deferred(div().relative().child(overlay).child(menu))
     }
 
     /// The "clear all" control, shown only while at least one filter is
