@@ -30,8 +30,8 @@ use futures::{StreamExt as _, pin_mut};
 use tiberius::{Client, QueryItem};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
-    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree,
-    render_where_conditions,
+    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree, append_clause_line,
+    append_where_clause, render_where_body,
 };
 
 use crate::error::{map_connect_error, map_io_connect_error, map_query_error};
@@ -265,10 +265,27 @@ impl Connection for MssqlConnection {
     /// and, since `MSSQL` has no native `ILIKE`, an `ILIKE` filter mapped to
     /// `LOWER(column) LIKE LOWER(value)`.
     fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
-        let where_clause =
-            render_where_conditions(&args.filters, crate::quoting::bracket_quote_ident, false)
-                .map(|clause| format!(" WHERE {clause}"))
-                .unwrap_or_default();
+        let multiline = args.filters.is_multiline();
+        let mut sql = if args.offset.is_some() {
+            format!(
+                "SELECT * FROM {}.{}",
+                crate::quoting::bracket_quote_ident(schema),
+                crate::quoting::bracket_quote_ident(relation)
+            )
+        } else {
+            format!(
+                "SELECT TOP ({}) * FROM {}.{}",
+                args.limit,
+                crate::quoting::bracket_quote_ident(schema),
+                crate::quoting::bracket_quote_ident(relation)
+            )
+        };
+        append_where_clause(
+            &mut sql,
+            &args.filters,
+            crate::quoting::bracket_quote_ident,
+            false,
+        );
         if let Some(offset) = args.offset {
             let order_by = args.sort.map_or_else(
                 || "(SELECT NULL)".to_owned(),
@@ -280,20 +297,14 @@ impl Connection for MssqlConnection {
                     )
                 },
             );
-            format!(
-                "SELECT * FROM {}.{}{where_clause} ORDER BY {order_by} OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY",
-                crate::quoting::bracket_quote_ident(schema),
-                crate::quoting::bracket_quote_ident(relation),
-                args.limit
-            )
-        } else {
-            format!(
-                "SELECT TOP ({}) * FROM {}.{}{where_clause}",
-                args.limit,
-                crate::quoting::bracket_quote_ident(schema),
-                crate::quoting::bracket_quote_ident(relation)
-            )
+            append_clause_line(&mut sql, multiline, &format!("ORDER BY {order_by}"));
+            append_clause_line(
+                &mut sql,
+                multiline,
+                &format!("OFFSET {offset} ROWS FETCH NEXT {} ROWS ONLY", args.limit),
+            );
         }
+        sql
     }
 
     /// This driver opens a short-lived client per operation (see the module
@@ -362,7 +373,7 @@ fn exact_count_sql(schema: &str, relation: &str, filters: &FilterState) -> Strin
         crate::quoting::bracket_quote_ident(relation)
     );
     if let Some(where_clause) =
-        render_where_conditions(filters, crate::quoting::bracket_quote_ident, false)
+        render_where_body(filters, crate::quoting::bracket_quote_ident, false, false)
     {
         sql.push_str(" WHERE ");
         sql.push_str(&where_clause);
@@ -937,6 +948,71 @@ mod tests {
             "SELECT TOP (200) * FROM [dbo].[orders] WHERE [total]]; DROP TABLE users; --] = 1"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_with_two_conditions_and_no_offset_renders_a_multiline_where_clause_after_top()
+    {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "nvarchar", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT TOP (200) * FROM [dbo].[orders]\nWHERE [status] = 'paid'\n  AND [region] = 'west'"
+        );
+    }
+
+    #[test]
+    fn preview_query_multiline_where_places_order_by_and_offset_fetch_on_their_own_lines() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "nvarchar", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(filters)
+                .sort("total_cents", SortDirection::Desc)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM [dbo].[orders]\n\
+             WHERE [status] = 'paid'\n  \
+             AND [region] = 'west'\n\
+             ORDER BY [total_cents] DESC\n\
+             OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn preview_query_multiline_where_with_no_sort_still_places_offset_fetch_on_its_own_line() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "nvarchar", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "nvarchar", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "dbo",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(filters)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM [dbo].[orders]\n\
+             WHERE [status] = 'paid'\n  \
+             AND [region] = 'west'\n\
+             ORDER BY (SELECT NULL)\n\
+             OFFSET 200 ROWS FETCH NEXT 200 ROWS ONLY"
+        );
     }
 
     #[test]

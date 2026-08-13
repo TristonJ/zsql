@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::filter::{FilterState, render_where_conditions};
+use crate::filter::{FilterState, render_where_body};
 
 /// Arguments for generating preview queries
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,43 +94,64 @@ pub fn quote_ident(ident: &str) -> String {
     out
 }
 
-/// The click-to-preview query for `relation` in `schema`. `args.filters`
-/// renders as a `WHERE` clause via [`render_where_conditions`], quoting
-/// column identifiers with [`quote_ident`] and mapping `ILIKE` natively --
-/// the same default this crate's own [`crate::driver::Connection::preview_query`]
-/// falls back to; a live driver overrides both quoting and the `ILIKE`
-/// mapping for its own dialect.
+/// Append `clause` to `sql`: on its own new line when `multiline`, otherwise
+/// inlined after a single leading space.
+pub fn append_clause_line(sql: &mut String, multiline: bool, clause: &str) {
+    sql.push(if multiline { '\n' } else { ' ' });
+    sql.push_str(clause);
+}
+
+/// Appends the `WHERE` clause including the keyword. A break precedes
+/// `WHERE` and each condition after the first starts its own indented line
+/// once `state.is_multiline()`. Does nothing when `state` has no conditions.
+pub fn append_where_clause(
+    sql: &mut String,
+    state: &FilterState,
+    quote_column: impl Fn(&str) -> String,
+    ilike_native: bool,
+) {
+    let multiline = state.is_multiline();
+    if let Some(body) = render_where_body(state, quote_column, ilike_native, multiline) {
+        append_clause_line(sql, multiline, &format!("WHERE {body}"));
+    }
+}
+
+/// The click-to-preview query for `relation` in `schema`. Identifiers are
+/// quoted with [`quote_ident`] and `ILIKE` renders natively; a live driver
+/// overrides both for its own dialect. The query renders multi-line once
+/// `args.filters` says so via [`FilterState::is_multiline`].
 #[must_use]
 pub fn default_preview_query(schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+    let multiline = args.filters.is_multiline();
     let mut sql = format!(
         "SELECT * FROM {}.{}",
         quote_ident(schema),
         quote_ident(relation)
     );
-    if let Some(where_clause) = render_where_conditions(&args.filters, quote_ident, true) {
-        let _ = write!(sql, " WHERE {where_clause}");
-    }
+    append_where_clause(&mut sql, &args.filters, quote_ident, true);
     if let Some((column, direction)) = args.sort {
-        let _ = write!(
-            sql,
-            " ORDER BY {} {}",
-            quote_ident(&column),
-            direction.as_sql()
+        append_clause_line(
+            &mut sql,
+            multiline,
+            &format!("ORDER BY {} {}", quote_ident(&column), direction.as_sql()),
         );
     }
-    let _ = write!(sql, " LIMIT {}", args.limit);
+    let mut tail = format!("LIMIT {}", args.limit);
     if let Some(offset) = args.offset
         && offset > 0
     {
-        let _ = write!(sql, " OFFSET {offset}");
+        let _ = write!(tail, " OFFSET {offset}");
     }
+    append_clause_line(&mut sql, multiline, &tail);
     sql
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewQueryArgs, SortDirection, default_preview_query, quote_ident};
-    use crate::filter::{FilterOperator, FilterState};
+    use super::{
+        PreviewQueryArgs, SortDirection, append_clause_line, default_preview_query, quote_ident,
+    };
+    use crate::filter::{FilterOperator, FilterState, render_where_body};
 
     #[test]
     fn quote_ident_wraps_a_plain_name_in_double_quotes() {
@@ -353,5 +374,160 @@ mod tests {
             sql.contains("ORDER BY \"order\" ASC"),
             "a column literally named `order` must still be quoted: {sql}"
         );
+    }
+
+    // -- multi-line WHERE clauses ---------------------------------------------
+
+    fn two_conditions() -> FilterState {
+        let mut filters = FilterState::new();
+        filters.add_condition("status", "text", FilterOperator::Eq, "paid");
+        filters.add_condition("region", "text", FilterOperator::Eq, "west");
+        filters
+    }
+
+    #[test]
+    fn default_preview_query_with_two_conditions_renders_a_multiline_where_clause() {
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(two_conditions()),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\nWHERE \"status\" = 'paid'\n  AND \"region\" = 'west'\nLIMIT 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_with_three_mixed_conditions_renders_each_on_its_own_line() {
+        let mut filters = FilterState::new();
+        filters.add_condition("status", "text", FilterOperator::Eq, "paid");
+        filters.add_condition("status", "text", FilterOperator::Eq, "pending");
+        filters.toggle_connector(0);
+        filters.add_condition("placed_at", "timestamptz", FilterOperator::Gt, "now()");
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             OR \"status\" = 'pending'\n  \
+             AND \"placed_at\" > now()\n\
+             LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_multiline_where_places_order_by_on_its_own_line() {
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(two_conditions())
+                .sort("total_cents", SortDirection::Desc),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             AND \"region\" = 'west'\n\
+             ORDER BY \"total_cents\" DESC\n\
+             LIMIT 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_multiline_where_places_limit_offset_on_its_own_line() {
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(two_conditions())
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             AND \"region\" = 'west'\n\
+             LIMIT 200 OFFSET 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_multiline_combines_sort_and_offset() {
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(two_conditions())
+                .sort("total_cents", SortDirection::Desc)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"public\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             AND \"region\" = 'west'\n\
+             ORDER BY \"total_cents\" DESC\n\
+             LIMIT 200 OFFSET 200"
+        );
+    }
+
+    #[test]
+    fn default_preview_query_multiline_output_has_no_trailing_whitespace_or_newline() {
+        let sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(two_conditions())
+                .sort("total_cents", SortDirection::Desc)
+                .offset(200),
+        );
+        assert!(!sql.ends_with('\n'), "no trailing newline: {sql:?}");
+        for line in sql.lines() {
+            assert_eq!(
+                line,
+                line.trim_end(),
+                "no trailing whitespace on any line: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_where_clause_collapses_to_the_same_tokens_as_single_line_rendering() {
+        let filters = two_conditions();
+        let single_line_body =
+            render_where_body(&filters, quote_ident, true, false).expect("has conditions");
+        let expected_single_line =
+            format!("SELECT * FROM \"public\".\"orders\" WHERE {single_line_body} LIMIT 200");
+
+        let multiline_sql = default_preview_query(
+            "public",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        let collapsed = multiline_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(collapsed, expected_single_line);
+    }
+
+    #[test]
+    fn append_clause_line_inlines_after_a_single_space_when_not_multiline() {
+        let mut sql = "SELECT 1".to_owned();
+        append_clause_line(&mut sql, false, "LIMIT 200");
+        assert_eq!(sql, "SELECT 1 LIMIT 200");
+    }
+
+    #[test]
+    fn append_clause_line_starts_a_new_line_when_multiline() {
+        let mut sql = "SELECT 1".to_owned();
+        append_clause_line(&mut sql, true, "LIMIT 200");
+        assert_eq!(sql, "SELECT 1\nLIMIT 200");
     }
 }

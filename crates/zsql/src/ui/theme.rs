@@ -293,9 +293,23 @@ pub fn text_selection_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_hover()
 }
 
-/// Height of a `Generated` tab's compact SQL strip, tall enough for one line
-/// of monospace text plus the editor's own vertical padding.
+/// Height of a `Generated` tab's compact SQL strip showing one line of
+/// monospace text plus the editor's own vertical padding.
 pub const GENERATED_STRIP_HEIGHT: Pixels = px(46.0);
+
+/// The most lines a `Generated` strip grows to fit; taller queries scroll
+/// inside the editor instead.
+pub const GENERATED_STRIP_MAX_LINES: usize = 6;
+
+/// Height of a `Generated` strip whose query spans `line_count` lines: the
+/// one-line base plus one editor line per extra line, capped at
+/// [`GENERATED_STRIP_MAX_LINES`].
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // capped at GENERATED_STRIP_MAX_LINES
+pub fn generated_strip_height(line_count: usize) -> Pixels {
+    let lines = line_count.clamp(1, GENERATED_STRIP_MAX_LINES);
+    GENERATED_STRIP_HEIGHT + px(zsql_editor::EDITOR_LINE_HEIGHT) * (lines - 1) as f32
+}
 
 /// Background tint of a `Generated` tab's compact strip: the accent color
 /// at very low opacity.
@@ -689,11 +703,29 @@ pub const MINI_STATUS_TEXT_SIZE: f32 = 9.5;
 #[cfg(test)]
 mod tests {
     use super::{
-        generated_strip_accent, generated_strip_bg, modal_row_active_bg, run_button_disabled_bg,
+        GENERATED_STRIP_HEIGHT, GENERATED_STRIP_MAX_LINES, generated_strip_accent,
+        generated_strip_bg, generated_strip_height, modal_row_active_bg, run_button_disabled_bg,
         run_button_hint, run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg,
         status_disconnected,
     };
     use zsql_ui::theme::Theme;
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // the line cap is a small count
+    fn generated_strip_height_grows_per_line_and_caps_at_the_line_limit() {
+        let line = gpui::px(zsql_editor::EDITOR_LINE_HEIGHT);
+        assert_eq!(generated_strip_height(0), GENERATED_STRIP_HEIGHT);
+        assert_eq!(generated_strip_height(1), GENERATED_STRIP_HEIGHT);
+        assert_eq!(
+            generated_strip_height(3),
+            GENERATED_STRIP_HEIGHT + line * 2.0
+        );
+        assert_eq!(
+            generated_strip_height(GENERATED_STRIP_MAX_LINES + 10),
+            GENERATED_STRIP_HEIGHT + line * (GENERATED_STRIP_MAX_LINES - 1) as f32,
+            "past the cap the strip stops growing and the editor scrolls"
+        );
+    }
 
     /// Every app-level derivation in this module must reproduce the exact
     /// ARGB value of the baked constant it replaced, the same way the

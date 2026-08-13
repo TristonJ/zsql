@@ -4,7 +4,7 @@
 //! shares. Pure and driver-agnostic, like [`crate::preview_state`] beside it
 //! -- no dialect-specific identifier quoting or `ILIKE` mapping lives here;
 //! that stays in each driver, which renders a [`FilterState`] via
-//! [`render_where_conditions`] with its own quoting and dialect choices.
+//! [`render_where_body`] with its own quoting and dialect choices.
 
 use std::fmt::Write as _;
 
@@ -311,6 +311,11 @@ impl FilterCondition {
     }
 }
 
+/// Number of committed filter conditions at or above which a generated
+/// preview query's `WHERE` clause (and the rest of the query) renders one
+/// clause per line instead of a single line.
+pub const MULTILINE_CONDITION_THRESHOLD: usize = 2;
+
 /// An ordered set of committed filter conditions plus the AND/OR connectors
 /// between adjacent ones: `connectors[i]` joins `conditions[i]` to
 /// `conditions[i + 1]`, so `connectors.len() == conditions.len() - 1`
@@ -352,6 +357,12 @@ impl FilterState {
     #[must_use]
     pub fn len(&self) -> usize {
         self.conditions.len()
+    }
+
+    /// Whether the condition count reaches [`MULTILINE_CONDITION_THRESHOLD`].
+    #[must_use]
+    pub fn is_multiline(&self) -> bool {
+        self.conditions.len() >= MULTILINE_CONDITION_THRESHOLD
     }
 
     /// Whether `column` currently carries at least one active filter, for
@@ -444,18 +455,43 @@ impl FilterState {
     }
 }
 
+/// Fixed indent for a multi-line `WHERE` clause's continuation lines: every
+/// condition after the first, once [`FilterState::is_multiline`] is true.
+const CONTINUATION_INDENT: &str = "  ";
+
+/// One condition's rendered SQL text (e.g. `"status" = 'paid'`), quoting its
+/// column via `quote_column` and mapping `ILIKE` per `ilike_native`.
+fn render_condition_sql(
+    condition: &FilterCondition,
+    quote_column: &impl Fn(&str) -> String,
+    ilike_native: bool,
+) -> String {
+    let column_sql = quote_column(condition.column());
+    let value_text = condition.rendered_value().sql_text().to_owned();
+    if condition.operator() == FilterOperator::ILike && !ilike_native {
+        format!("LOWER({column_sql}) LIKE LOWER({value_text})")
+    } else {
+        format!(
+            "{column_sql} {} {value_text}",
+            condition.operator().as_sql_symbol()
+        )
+    }
+}
+
 /// Render `state`'s conditions/connectors as a `WHERE` clause's contents
-/// (without the leading `WHERE` keyword), quoting each condition's column
-/// via `quote_column` -- always a driver's own identifier-quoting helper,
-/// never free-text interpolation -- and mapping `ILIKE` per `ilike_native`:
-/// a native `ILIKE` operator when `true` (Postgres), or
-/// `LOWER(column) LIKE LOWER(value)` when `false` (every other supported
-/// dialect). `None` when `state` holds no conditions.
+/// (without the leading `WHERE` keyword). Columns are quoted via
+/// `quote_column`, always a driver's own identifier-quoting helper, never
+/// free-text interpolation. `ILIKE` renders as a native operator when
+/// `ilike_native` is `true` (Postgres) and as `LOWER(column) LIKE
+/// LOWER(value)` on every other supported dialect. When `multiline`, each
+/// condition after the first starts its own line, indented under its
+/// connector keyword. `None` when `state` holds no conditions.
 #[must_use]
-pub fn render_where_conditions(
+pub fn render_where_body(
     state: &FilterState,
     quote_column: impl Fn(&str) -> String,
     ilike_native: bool,
+    multiline: bool,
 ) -> Option<String> {
     if state.conditions.is_empty() {
         return None;
@@ -468,19 +504,17 @@ pub fn render_where_conditions(
                 .get(index - 1)
                 .copied()
                 .unwrap_or(FilterConnector::And);
-            let _ = write!(out, " {} ", connector.as_sql());
+            if multiline {
+                let _ = write!(out, "\n{CONTINUATION_INDENT}{} ", connector.as_sql());
+            } else {
+                let _ = write!(out, " {} ", connector.as_sql());
+            }
         }
-        let column_sql = quote_column(condition.column());
-        let value_text = condition.rendered_value().sql_text().to_owned();
-        if condition.operator() == FilterOperator::ILike && !ilike_native {
-            let _ = write!(out, "LOWER({column_sql}) LIKE LOWER({value_text})");
-        } else {
-            let _ = write!(
-                out,
-                "{column_sql} {} {value_text}",
-                condition.operator().as_sql_symbol()
-            );
-        }
+        out.push_str(&render_condition_sql(
+            condition,
+            &quote_column,
+            ilike_native,
+        ));
     }
     Some(out)
 }
@@ -489,7 +523,7 @@ pub fn render_where_conditions(
 mod tests {
     use super::{
         FilterCondition, FilterConnector, FilterOperator, FilterState, FilterValueRender,
-        classify_filter_value, quote_sql_string, render_where_conditions,
+        classify_filter_value, quote_sql_string, render_where_body,
     };
 
     // -- quote_sql_string ---------------------------------------------------
@@ -920,6 +954,24 @@ mod tests {
     }
 
     #[test]
+    fn is_multiline_is_false_below_the_threshold() {
+        let mut state = FilterState::new();
+        assert!(!state.is_multiline());
+        state.add_condition("status", "text", FilterOperator::Eq, "paid");
+        assert!(!state.is_multiline());
+    }
+
+    #[test]
+    fn is_multiline_is_true_at_and_above_the_threshold() {
+        let mut state = FilterState::new();
+        state.add_condition("status", "text", FilterOperator::Eq, "paid");
+        state.add_condition("status", "text", FilterOperator::Eq, "pending");
+        assert!(state.is_multiline());
+        state.add_condition("placed_at", "timestamptz", FilterOperator::Gt, "now()");
+        assert!(state.is_multiline());
+    }
+
+    #[test]
     fn column_is_filtered_reflects_any_active_condition_on_that_column() {
         let mut state = FilterState::new();
         state.add_condition("status", "text", FilterOperator::Eq, "paid");
@@ -927,36 +979,36 @@ mod tests {
         assert!(!state.column_is_filtered("placed_at"));
     }
 
-    // -- render_where_conditions ----------------------------------------------
+    // -- render_where_body ------------------------------------------------
 
     #[test]
-    fn render_where_conditions_is_none_for_an_empty_state() {
+    fn render_where_body_is_none_for_an_empty_state() {
         let state = FilterState::new();
         assert_eq!(
-            render_where_conditions(&state, |c| format!("\"{c}\""), true),
+            render_where_body(&state, |c| format!("\"{c}\""), true, false),
             None
         );
     }
 
     #[test]
-    fn render_where_conditions_renders_a_single_condition() {
+    fn render_where_body_renders_a_single_condition() {
         let mut state = FilterState::new();
         state.add_condition("status", "text", FilterOperator::Eq, "paid");
         assert_eq!(
-            render_where_conditions(&state, |c| format!("\"{c}\""), true),
+            render_where_body(&state, |c| format!("\"{c}\""), true, false),
             Some("\"status\" = 'paid'".to_owned())
         );
     }
 
     #[test]
-    fn render_where_conditions_joins_multiple_with_their_own_connectors() {
+    fn render_where_body_joins_multiple_with_their_own_connectors() {
         let mut state = FilterState::new();
         state.add_condition("status", "text", FilterOperator::Eq, "paid");
         state.add_condition("status", "text", FilterOperator::Eq, "pending");
         state.toggle_connector(0);
         state.add_condition("placed_at", "timestamptz", FilterOperator::Gt, "now()");
         assert_eq!(
-            render_where_conditions(&state, |c| format!("\"{c}\""), true),
+            render_where_body(&state, |c| format!("\"{c}\""), true, false),
             Some(
                 "\"status\" = 'paid' OR \"status\" = 'pending' AND \"placed_at\" > now()"
                     .to_owned()
@@ -965,27 +1017,27 @@ mod tests {
     }
 
     #[test]
-    fn render_where_conditions_uses_native_ilike_when_requested() {
+    fn render_where_body_uses_native_ilike_when_requested() {
         let mut state = FilterState::new();
         state.add_condition("name", "text", FilterOperator::ILike, "smith%");
         assert_eq!(
-            render_where_conditions(&state, |c| format!("\"{c}\""), true),
+            render_where_body(&state, |c| format!("\"{c}\""), true, false),
             Some("\"name\" ILIKE 'smith%'".to_owned())
         );
     }
 
     #[test]
-    fn render_where_conditions_maps_ilike_to_lower_like_lower_when_not_native() {
+    fn render_where_body_maps_ilike_to_lower_like_lower_when_not_native() {
         let mut state = FilterState::new();
         state.add_condition("name", "text", FilterOperator::ILike, "smith%");
         assert_eq!(
-            render_where_conditions(&state, |c| format!("`{c}`"), false),
+            render_where_body(&state, |c| format!("`{c}`"), false, false),
             Some("LOWER(`name`) LIKE LOWER('smith%')".to_owned())
         );
     }
 
     #[test]
-    fn render_where_conditions_renders_each_comparison_operator_symbol() {
+    fn render_where_body_renders_each_comparison_operator_symbol() {
         for (operator, symbol) in [
             (FilterOperator::Lt, "<"),
             (FilterOperator::Le, "<="),
@@ -994,7 +1046,7 @@ mod tests {
             let mut state = FilterState::new();
             state.add_condition("total_cents", "int4", operator, "5000");
             assert_eq!(
-                render_where_conditions(&state, |c| format!("\"{c}\""), true),
+                render_where_body(&state, |c| format!("\"{c}\""), true, false),
                 Some(format!("\"total_cents\" {symbol} 5000")),
                 "operator {operator:?} must emit its SQL symbol verbatim"
             );
@@ -1002,15 +1054,15 @@ mod tests {
     }
 
     #[test]
-    fn render_where_conditions_renders_a_case_sensitive_like_pattern() {
+    fn render_where_body_renders_a_case_sensitive_like_pattern() {
         let mut state = FilterState::new();
         state.add_condition("name", "text", FilterOperator::Like, "Smith%");
         assert_eq!(
-            render_where_conditions(&state, |c| format!("\"{c}\""), true),
+            render_where_body(&state, |c| format!("\"{c}\""), true, false),
             Some("\"name\" LIKE 'Smith%'".to_owned())
         );
         assert_eq!(
-            render_where_conditions(&state, |c| format!("`{c}`"), false),
+            render_where_body(&state, |c| format!("`{c}`"), false, false),
             Some("`name` LIKE 'Smith%'".to_owned()),
             "plain LIKE is case-sensitive everywhere, so no LOWER() wrapping on any dialect"
         );
@@ -1036,10 +1088,35 @@ mod tests {
     }
 
     #[test]
-    fn render_where_conditions_quotes_the_column_via_the_given_quoting_fn() {
+    fn render_where_body_indents_every_condition_after_the_first_when_multiline() {
+        let mut state = FilterState::new();
+        state.add_condition("status", "text", FilterOperator::Eq, "paid");
+        state.add_condition("status", "text", FilterOperator::Eq, "pending");
+        state.toggle_connector(0);
+        state.add_condition("placed_at", "timestamptz", FilterOperator::Gt, "now()");
+        assert_eq!(
+            render_where_body(&state, |c| format!("\"{c}\""), true, true),
+            Some(
+                "\"status\" = 'paid'\n  OR \"status\" = 'pending'\n  AND \"placed_at\" > now()"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn render_where_body_is_none_for_an_empty_state_when_multiline() {
+        let state = FilterState::new();
+        assert_eq!(
+            render_where_body(&state, |c| format!("\"{c}\""), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn render_where_body_quotes_the_column_via_the_given_quoting_fn() {
         let mut state = FilterState::new();
         state.add_condition("weird\"col", "text", FilterOperator::Eq, "x");
-        let rendered = render_where_conditions(&state, crate::sql::quote_ident, true);
+        let rendered = render_where_body(&state, crate::sql::quote_ident, true, false);
         assert_eq!(rendered, Some("\"weird\"\"col\" = 'x'".to_owned()));
     }
 

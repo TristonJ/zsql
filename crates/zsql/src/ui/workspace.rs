@@ -681,7 +681,8 @@ impl WorkspaceView {
         };
 
         if active.is_generated() {
-            Self::render_generated_strip(active, active_theme).into_any_element()
+            let line_count = active.editor().read(cx).line_count();
+            Self::render_generated_strip(active, line_count, active_theme).into_any_element()
         } else {
             div()
                 .flex_shrink_0()
@@ -743,14 +744,18 @@ impl WorkspaceView {
     }
 
     /// The strip a live `Generated` tab renders instead of the full editor.
-    fn render_generated_strip(tab: &Tab, active_theme: &zsql_ui::theme::Theme) -> impl IntoElement {
+    fn render_generated_strip(
+        tab: &Tab,
+        line_count: usize,
+        active_theme: &zsql_ui::theme::Theme,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
             .items_center()
             .flex_shrink_0()
             .w_full()
-            .h(theme::GENERATED_STRIP_HEIGHT)
+            .h(theme::generated_strip_height(line_count))
             .bg(theme::generated_strip_bg(active_theme))
             .border_color(rgb(theme::generated_strip_accent(active_theme)))
             .child(

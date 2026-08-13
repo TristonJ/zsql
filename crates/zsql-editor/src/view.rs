@@ -220,6 +220,12 @@ impl EditorView {
         self.buffer.text()
     }
 
+    /// The buffer's current line count, always at least 1.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.buffer.lines().len().max(1)
+    }
+
     /// Install the listener invoked after every manual text edit, replacing
     /// any previously-installed listener.
     pub fn set_on_edit(&mut self, listener: EditListener) {
