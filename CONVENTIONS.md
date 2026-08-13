@@ -47,4 +47,13 @@ being added can live on it's own and is not tightly coupled to the other crates.
   invariant, a non-obvious behavior.
 - Source is ASCII-only (standard 7-bit): use `-` not an em-dash, straight quotes, `->` not an
   arrow. No non-ASCII characters in code, comments, or identifiers.
+- Write comments in natural English sentences. Never use `--` as a pseudo em-dash; restructure
+  the sentence (a comma, a colon, or two sentences) instead.
+- Public API docs describe behavior in the API's own terms, not input or framework conventions:
+  say "when `extend` is true", not "on shift-click"; never explain what a parameter means "in
+  gpui" or any other framework.
+- Do not grow a type by extending its `impl` block from a sibling file. When a file needs
+  splitting, extract real units: a gpui view's render helpers become dedicated
+  `#[derive(IntoElement)]` component structs with `RenderOnce` (see `zsql-ui`'s `ContextMenu`),
+  and non-render logic moves to a type that owns it.
 - Prefer `thiserror` for typed errors in libraries, `anyhow` at the app edges.
