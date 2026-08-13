@@ -40,10 +40,28 @@ pub type QueryRunner = Box<dyn Fn(String, &mut Context<EditorView>)>;
 /// anything about tabs, relations, or sessions.
 pub type EditListener = Box<dyn Fn(&mut Context<EditorView>)>;
 
+/// Invoked on `SaveScript` (`secondary-s`) or `SaveScriptAs`
+/// (`shift-secondary-s`). The same seam pattern as [`QueryRunner`]: the
+/// embedding app decides what "save" means for a given tab (open a modal,
+/// write a file, or nothing at all), keeping this crate free of any
+/// session, file-store, or tab type.
+pub type SaveRequester = Box<dyn Fn(&mut Context<EditorView>)>;
+
+/// Invoked on `OpenScript` (`secondary-o`) or `BrowseScriptFiles`
+/// (`shift-secondary-o`). The same seam pattern as [`SaveRequester`]: the
+/// embedding app decides what "open" means (a picker, a native file dialog,
+/// or nothing at all), keeping this crate free of any session, file-store,
+/// or tab type.
+pub type OpenRequester = Box<dyn Fn(&mut Context<EditorView>)>;
+
 actions!(
     zsql_editor,
     [
         RunQuery,
+        SaveScript,
+        SaveScriptAs,
+        OpenScript,
+        BrowseScriptFiles,
         MoveLeft,
         MoveRight,
         MoveUp,
@@ -106,6 +124,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-v", Paste, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
+        KeyBinding::new("secondary-s", SaveScript, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-secondary-s", SaveScriptAs, Some(KEY_CONTEXT)),
+        KeyBinding::new("secondary-o", OpenScript, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-secondary-o", BrowseScriptFiles, Some(KEY_CONTEXT)),
         KeyBinding::new("secondary-z", Undo, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-secondary-z", Redo, Some(KEY_CONTEXT)),
         // Ctrl-Y is a common redo shortcut in its own right, distinct from
@@ -126,6 +148,16 @@ pub struct EditorView {
     run_query: QueryRunner,
     /// Invoked after every manual text edit; see [`EditListener`].
     on_edit: Option<EditListener>,
+    /// Invoked on `SaveScript`; see [`SaveRequester`]. `None` until the
+    /// embedding app installs one via [`EditorView::set_save_requester`], in
+    /// which case the action is simply a no-op.
+    save: Option<SaveRequester>,
+    /// Invoked on `SaveScriptAs`; see [`SaveRequester`].
+    save_as: Option<SaveRequester>,
+    /// Invoked on `OpenScript`; see [`OpenRequester`].
+    open: Option<OpenRequester>,
+    /// Invoked on `BrowseScriptFiles`; see [`OpenRequester`].
+    browse: Option<OpenRequester>,
     /// Whether this editor renders as a compact, single-line strip -- no
     /// line-number gutter -- instead of the full multi-line pane.
     compact: bool,
@@ -159,6 +191,10 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             run_query,
             on_edit: None,
+            save: None,
+            save_as: None,
+            open: None,
+            browse: None,
             compact: false,
             marked_range: None,
             is_selecting: false,
@@ -188,6 +224,30 @@ impl EditorView {
     /// any previously-installed listener.
     pub fn set_on_edit(&mut self, listener: EditListener) {
         self.on_edit = Some(listener);
+    }
+
+    /// Install the seam `SaveScript` (`secondary-s`) invokes, replacing any
+    /// previously-installed one.
+    pub fn set_save_requester(&mut self, requester: SaveRequester) {
+        self.save = Some(requester);
+    }
+
+    /// Install the seam `SaveScriptAs` (`shift-secondary-s`) invokes,
+    /// replacing any previously-installed one.
+    pub fn set_save_as_requester(&mut self, requester: SaveRequester) {
+        self.save_as = Some(requester);
+    }
+
+    /// Install the seam `OpenScript` (`secondary-o`) invokes, replacing any
+    /// previously-installed one.
+    pub fn set_open_requester(&mut self, requester: OpenRequester) {
+        self.open = Some(requester);
+    }
+
+    /// Install the seam `BrowseScriptFiles` (`shift-secondary-o`) invokes,
+    /// replacing any previously-installed one.
+    pub fn set_browse_requester(&mut self, requester: OpenRequester) {
+        self.browse = Some(requester);
     }
 
     /// Whether this editor currently renders in its compact, single-line
@@ -440,6 +500,35 @@ impl EditorView {
         (self.run_query)(sql, cx);
     }
 
+    fn save_script(&mut self, _: &SaveScript, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(save) = self.save.as_ref() {
+            save(cx);
+        }
+    }
+
+    fn save_script_as(&mut self, _: &SaveScriptAs, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(save_as) = self.save_as.as_ref() {
+            save_as(cx);
+        }
+    }
+
+    fn open_script(&mut self, _: &OpenScript, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = self.open.as_ref() {
+            open(cx);
+        }
+    }
+
+    fn browse_script_files(
+        &mut self,
+        _: &BrowseScriptFiles,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(browse) = self.browse.as_ref() {
+            browse(cx);
+        }
+    }
+
     // -- mouse -----------------------------------------------------------
 
     fn on_mouse_down(
@@ -616,6 +705,10 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::save_script))
+            .on_action(cx.listener(Self::save_script_as))
+            .on_action(cx.listener(Self::open_script))
+            .on_action(cx.listener(Self::browse_script_files))
             .child(
                 div()
                     .id("sql-editor-code")

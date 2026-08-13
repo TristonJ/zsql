@@ -104,6 +104,10 @@ pub const SIDEBAR_ROW_ICON_SIZE: Pixels = px(13.0);
 /// Size of a relation row's kind icon (table/view/matview/partitioned).
 pub const SIDEBAR_RELATION_ICON_SIZE: Pixels = px(12.0);
 
+/// Left padding for a script/library row: the tree's top-level (catalog-row)
+/// indent, since a script row has no nesting hierarchy of its own.
+pub const SIDEBAR_SCRIPT_ROW_INDENT: f32 = SIDEBAR_INDENT_L0;
+
 /// Width of the sidebar tree's scrollbar track and thumb.
 pub const SIDEBAR_SCROLLBAR_WIDTH: Pixels = px(8.0);
 /// Corner radius of the sidebar scrollbar thumb.
@@ -111,23 +115,104 @@ pub const SIDEBAR_SCROLLBAR_RADIUS: f32 = 4.0;
 /// Distance between the sidebar scrollbar track and the tree's right edge.
 pub const SIDEBAR_SCROLLBAR_GAP: Pixels = px(4.0);
 
-/// Text size of the "SCHEMA" header label.
+/// Text size of the "SCHEMA"/"SCRIPTS" pane tab labels and their trailing
+/// mono count.
 pub const SIDEBAR_HEADER_TEXT_SIZE: f32 = 10.5;
 
-/// Widest the sidebar header's database-switcher trigger is allowed to
-/// grow to before its label truncates.
-pub const SIDEBAR_DB_SWITCHER_MAX_WIDTH: Pixels = px(150.0);
-/// Text size of the database-switcher trigger's current-database label and
-/// its dropdown menu items.
-pub const SIDEBAR_DB_SWITCHER_TEXT_SIZE: f32 = 11.0;
-/// Horizontal padding inside the database-switcher trigger.
-pub const SIDEBAR_DB_SWITCHER_PADDING_X: Pixels = px(6.0);
-/// Vertical padding inside the database-switcher trigger.
-pub const SIDEBAR_DB_SWITCHER_PADDING_Y: Pixels = px(3.0);
-/// Corner radius of the database-switcher trigger.
-pub const SIDEBAR_DB_SWITCHER_RADIUS: f32 = 5.0;
-/// Gap between the database-switcher trigger's label and its chevron.
-pub const SIDEBAR_DB_SWITCHER_GAP: Pixels = px(4.0);
+// ---- sidebar pane switcher (the "SCHEMA"/"SCRIPTS" tabs in the header) --
+
+/// Horizontal padding inside a pane tab, and the pane switcher's trailing
+/// tail's own right padding (matching the tabs' own edge inset).
+pub const SIDEBAR_PANE_TAB_PADDING_X: Pixels = px(14.0);
+/// Horizontal gap between a pane tab's label and its trailing count.
+pub const SIDEBAR_PANE_TAB_GAP: Pixels = px(7.0);
+
+// ---- sidebar database row (its own full-width row under the pane tabs) -
+
+/// Height of the sidebar's database row.
+pub const SIDEBAR_DB_ROW_HEIGHT: Pixels = px(30.0);
+/// Horizontal padding inside the database row.
+pub const SIDEBAR_DB_ROW_PADDING_X: Pixels = px(14.0);
+/// Horizontal gap between the database row's eyebrow label, current
+/// database name, and trailing chevron.
+pub const SIDEBAR_DB_ROW_GAP: Pixels = px(8.0);
+/// Text size of the database row's "DB" eyebrow label.
+pub const SIDEBAR_DB_ROW_EYEBROW_TEXT_SIZE: f32 = 9.0;
+/// Text size of the database row's current-database name.
+pub const SIDEBAR_DB_ROW_NAME_TEXT_SIZE: f32 = 11.5;
+/// Size of the database row's trailing chevron glyph.
+pub const SIDEBAR_DB_ROW_CHEVRON_ICON_SIZE: Pixels = px(9.0);
+
+// ---- scripts pane: group labels and the library open-dot ----------------
+
+/// Height of a scripts-pane group label ("This connection - name" /
+/// "Library").
+pub const SIDEBAR_SCRIPT_GROUP_HEIGHT: Pixels = px(24.0);
+/// Top margin above a scripts-pane group label, separating it from
+/// whatever renders above it.
+pub const SIDEBAR_SCRIPT_GROUP_MARGIN_TOP: Pixels = px(8.0);
+/// Horizontal padding inside a scripts-pane group label.
+pub const SIDEBAR_SCRIPT_GROUP_PADDING_X: Pixels = px(14.0);
+/// Text size of a scripts-pane group label.
+pub const SIDEBAR_SCRIPT_GROUP_TEXT_SIZE: f32 = 9.0;
+/// Horizontal gap between a group label and its trailing connection-name
+/// suffix.
+pub const SIDEBAR_SCRIPT_GROUP_SUFFIX_GAP: Pixels = px(5.0);
+/// Diameter of the accent dot marking a library script currently open as a
+/// tab on this connection.
+pub const SIDEBAR_LIBRARY_OPEN_DOT_SIZE: Pixels = px(5.0);
+/// Horizontal gap before a library row's open-dot.
+pub const SIDEBAR_LIBRARY_OPEN_DOT_GAP: Pixels = px(6.0);
+
+// ---- scripts pane: empty connection-group invitation ---------------------
+
+/// Horizontal margin around the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_MARGIN_X: Pixels = px(14.0);
+/// Top margin above the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_MARGIN_TOP: Pixels = px(10.0);
+/// Bottom margin below the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_MARGIN_BOTTOM: Pixels = px(4.0);
+/// Horizontal padding inside the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_PADDING_X: Pixels = px(12.0);
+/// Vertical padding inside the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_PADDING_Y: Pixels = px(16.0);
+/// Corner radius of the empty-state invitation block.
+pub const SIDEBAR_SCRIPTS_EMPTY_RADIUS: f32 = 8.0;
+/// Vertical gap between the empty-state block's two lines.
+pub const SIDEBAR_SCRIPTS_EMPTY_GAP: Pixels = px(6.0);
+/// Text size of the empty-state block's first line.
+pub const SIDEBAR_SCRIPTS_EMPTY_TITLE_TEXT_SIZE: f32 = 12.0;
+/// Text size of the empty-state block's second line.
+pub const SIDEBAR_SCRIPTS_EMPTY_DETAIL_TEXT_SIZE: f32 = 11.0;
+/// Horizontal gap between the empty-state block's shortcut chip and the
+/// rest of its second line.
+pub const SIDEBAR_SCRIPTS_EMPTY_KBD_GAP: Pixels = px(4.0);
+/// Text size of the empty-state block's shortcut chip.
+pub const SIDEBAR_SCRIPTS_EMPTY_KBD_TEXT_SIZE: f32 = 10.0;
+/// Horizontal padding inside the empty-state block's shortcut chip.
+pub const SIDEBAR_SCRIPTS_EMPTY_KBD_PADDING_X: Pixels = px(4.0);
+/// Corner radius of the empty-state block's shortcut chip.
+pub const SIDEBAR_SCRIPTS_EMPTY_KBD_RADIUS: f32 = 4.0;
+
+/// The platform's save shortcut label
+#[must_use]
+pub const fn save_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+S"
+    } else {
+        "Ctrl+S"
+    }
+}
+
+/// Platform-specific save-as shortcut label
+#[must_use]
+pub const fn save_as_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+Shift+S"
+    } else {
+        "Ctrl+Shift+S"
+    }
+}
 
 /// Background tint for the selected relation row: the accent color at low
 /// opacity.
@@ -332,6 +417,9 @@ pub const MODAL_LIST_SCROLLBAR_RADIUS: f32 = 4.0;
 pub const MODAL_LIST_SCROLLBAR_GAP: Pixels = px(4.0);
 /// Corner radius of a connection-list row.
 pub const MODAL_ROW_RADIUS: f32 = 7.0;
+/// Tallest the Open Script picker's row list may grow before it scrolls
+/// rather than pushing the modal's footer off screen.
+pub const OPEN_MODAL_ROWS_MAX_HEIGHT: Pixels = px(360.0);
 /// Background tint marking the currently-connected row in the modal list.
 #[must_use]
 pub fn modal_row_active_bg(theme: &Theme) -> gpui::Rgba {

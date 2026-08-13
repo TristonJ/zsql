@@ -7,16 +7,17 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Task, Window, canvas, div,
-    prelude::*, px, rems, rgb,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render, Task, Window,
+    canvas, div, prelude::*, px, rems, rgb,
 };
 use zsql_ui::button::secondary_link_button;
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::theme::ActiveTheme;
 
 use super::appearance::AppearanceModalView;
-use super::connections::ConnectionManagerView;
+use super::connections::{ConnectionManagerView, UNSAVED_CONNECTION_LABEL};
 use super::footer::ConnectionFooterView;
+use super::open_modal::OpenModalView;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use super::tab_bar;
@@ -25,8 +26,45 @@ use super::theme;
 use crate::config::{LayoutConfig, ValuePanelConfig};
 use crate::connections::ConnectionStore;
 use crate::session::Session;
-use crate::tab_session::{self, TabSessionStore};
+use crate::session_store::{self, SessionStore};
 use crate::ui::tabs::{PreviewControlsChanged, ResultsChanged};
+pub use startup::WorkspaceStartup;
+
+/// The platform open-file dialog function "Browse files..." invokes
+pub type OpenFilesPrompt = Box<dyn Fn(&mut App) -> Task<Option<Vec<PathBuf>>>>;
+/// The platform save-file dialog function "Somewhere else..." invokes
+pub type SaveFilePrompt =
+    Box<dyn Fn(&mut App, &std::path::Path, Option<&str>) -> Task<Option<PathBuf>>>;
+
+/// The default [`OpenFilesPrompt`]: `gpui`'s own native path-prompt API
+/// (`App::prompt_for_paths`, backed by the platform's real open-file
+/// dialog).
+fn default_open_files_prompt(cx: &mut App) -> Task<Option<Vec<PathBuf>>> {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: None,
+    });
+    cx.spawn(async move |_cx| match receiver.await {
+        Ok(Ok(Some(paths))) => Some(paths),
+        _ => None,
+    })
+}
+
+/// The default [`SaveFilePrompt`]: `App::prompt_for_new_path`, gpui's own
+/// native save-file dialog. See [`default_open_files_prompt`].
+fn default_save_file_prompt(
+    cx: &mut App,
+    directory: &std::path::Path,
+    suggested_name: Option<&str>,
+) -> Task<Option<PathBuf>> {
+    let receiver = cx.prompt_for_new_path(directory, suggested_name);
+    cx.spawn(async move |_cx| match receiver.await {
+        Ok(Ok(Some(path))) => Some(path),
+        _ => None,
+    })
+}
 
 /// Which pane boundary a divider drag is currently resizing, and the pane
 /// size/pointer position it started from. Tracking the drag's origin (not
@@ -56,7 +94,7 @@ pub struct WorkspaceView {
     appearance: Entity<AppearanceModalView>,
     footer: Entity<ConnectionFooterView>,
     sidebar: Entity<SidebarView>,
-    tabs: Entity<TabModel>,
+    pub(crate) tabs: Entity<TabModel>,
     results: Entity<ResultsView>,
     layout: LayoutConfig,
     sidebar_width: Pixels,
@@ -70,34 +108,36 @@ pub struct WorkspaceView {
     column_height: Rc<Cell<Pixels>>,
     /// The tab-session persistence state machine: where the store lives on
     /// disk, which key `tabs` currently holds state for, the save/load race
-    /// protection described on [`TabSessionStore`], and the per-key cache of
+    /// protection described on [`SessionStore`], and the per-key cache of
     /// the latest dispatched-for-save snapshot.
-    tab_session_store: TabSessionStore,
+    session_store: SessionStore,
     /// The tab strip's horizontal scroll state; see [`tab_bar::TabBarState`].
-    tab_bar: tab_bar::TabBarState,
+    pub(crate) tab_bar: tab_bar::TabBarState,
     /// Width every tab-bar entry renders at; see [`LayoutConfig::tab_width`].
     tab_width: Pixels,
-}
-
-/// The persisted, path-shaped settings [`WorkspaceView::new`] otherwise
-/// could not accept as separate parameters without tripping the
-/// too-many-arguments lint: where per-connection tab sessions live, and
-/// where the Appearance modal starts from.
-pub struct WorkspaceStartup {
-    /// Where per-connection tab sessions are read from and saved to
-    /// (typically [`crate::config::Config::tab_sessions_path`]). `None`
-    /// disables tab-session persistence entirely.
-    pub tab_sessions_path: Option<PathBuf>,
-    /// The theme name the Appearance modal starts with its matching card
-    /// checked/active (typically `cfg.theme.name`).
-    pub active_theme_name: String,
-    /// Where the Appearance modal discovers user theme files (typically
-    /// [`crate::config::Config::themes_dir`]).
-    pub themes_dir: Option<PathBuf>,
-    /// Where the Appearance modal persists a selected theme name (typically
-    /// [`crate::config::Config::default_path`]). `None` disables persistence
-    /// for the session.
-    pub config_path: Option<PathBuf>,
+    /// Root directory the shared library lives under; see
+    /// [`WorkspaceStartup::library_root`].
+    library_dir: Option<PathBuf>,
+    /// The Save Script / Save as / Rename modal.
+    pub(crate) save_modal: Entity<crate::ui::save_modal::SaveModalView>,
+    /// The Open Script picker.
+    pub(crate) open_modal: Entity<OpenModalView>,
+    /// The platform open-file dialog seam; see [`OpenFilesPrompt`].
+    open_files_prompt: OpenFilesPrompt,
+    /// The platform save-file dialog seam; see [`SaveFilePrompt`].
+    save_file_prompt: SaveFilePrompt,
+    /// How long the footer's post-save confirmation stays visible.
+    save_confirmation_duration: Duration,
+    /// Invalidates a pending save-confirmation clear timer once a newer
+    /// confirmation (or an unrelated footer update) supersedes it, so two
+    /// saves in quick succession cannot have the first one's timer clear
+    /// the second's message early.
+    save_confirmation_generation: Rc<Cell<u64>>,
+    /// Set when the save or open modal is dismissed without confirming
+    /// (Escape, the close icon, or Cancel), consumed by the next `render`
+    pub(crate) refocus_editor_on_next_render: bool,
+    /// Set while a "Browse files..." native dialog is open
+    pub(crate) browse_dialog_in_flight: Rc<Cell<bool>>,
 }
 
 impl WorkspaceView {
@@ -127,38 +167,53 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Self {
         let WorkspaceStartup {
-            tab_sessions_path,
+            sessions_root,
+            library_root,
             active_theme_name,
             themes_dir,
             config_path,
+            save_confirmation_duration,
+            edit_debounce,
+            scripts_relative_time_refresh,
         } = startup;
         let header_session = session.clone();
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         results.update(cx, |results, cx| {
             results.configure_value_panel(cx, &layout, value_panel);
         });
-        let tabs = cx.new(|cx| TabModel::new(session.clone(), cx));
+        let session_store = SessionStore::new(sessions_root);
+        let tabs = Self::build_tabs(
+            &session,
+            library_root.clone(),
+            edit_debounce,
+            session_store.claim_factory(),
+            cx,
+        );
+        let save_modal = cx.new(crate::ui::save_modal::SaveModalView::new);
+        let open_modal = cx.new(OpenModalView::new);
 
-        let sidebar = cx.new(|cx| SidebarView::new(session.clone(), tabs.clone(), cx));
-        let connections = cx.new(|cx| {
-            ConnectionManagerView::new(
-                session.clone(),
-                connection_store,
-                probe_timeout,
-                batch_size,
-                cx,
-            )
-        });
-        results.update(cx, |results, _cx| {
-            results.set_connections_modal(connections.clone());
-        });
-        let appearance =
-            cx.new(|cx| AppearanceModalView::new(active_theme_name, themes_dir, config_path, cx));
-        let footer = cx.new(|cx| {
-            ConnectionFooterView::new(session, connections.clone(), appearance.clone(), cx)
-        });
+        let sidebar = Self::build_sidebar(
+            &session,
+            &tabs,
+            library_root.clone(),
+            scripts_relative_time_refresh,
+            cx,
+        );
+        let (connections, appearance, footer) = Self::build_connection_chrome(
+            session,
+            &results,
+            connection_store,
+            probe_timeout,
+            batch_size,
+            active_theme_name,
+            themes_dir,
+            config_path,
+            cx,
+        );
 
         Self::subscribe_to_tab_events(&tabs, &results, &footer, cx);
+        Self::subscribe_to_save_events(&tabs, &save_modal, cx);
+        Self::subscribe_to_open_events(&tabs, &open_modal, cx);
 
         // Every workspace opens with one empty script tab so the editor
         // pane is never blank
@@ -171,45 +226,7 @@ impl WorkspaceView {
         let tab_width = layout.tab_width;
         let tab_bar_state = tab_bar::TabBarState::new(cx);
 
-        // Opening/closing the modal (or switching its list/add-form panel)
-        // lives entirely inside `connections`' own state; this workspace
-        // must still re-render to mount or unmount that entity as the modal
-        // overlay child below. A change to which connection is tracked as
-        // active additionally swaps the tab session (see
-        // `Self::handle_active_connection_changed`).
-        cx.observe(&connections, |this, connections, cx| {
-            let new_active = connections.read(cx).active().cloned();
-            if this
-                .tab_session_store
-                .active_connection_changed(new_active.as_ref())
-            {
-                this.handle_active_connection_changed(cx);
-            }
-            cx.notify();
-        })
-        .detach();
-        // Opening/closing the Appearance modal (or selecting a card while it
-        // stays open) lives entirely inside `appearance`'s own state; this
-        // workspace must still re-render to mount or unmount that entity as
-        // the modal overlay child below.
-        cx.observe(&appearance, |_this, _appearance, cx| {
-            cx.notify();
-        })
-        .detach();
-        // Opening, reusing, converting, closing, or switching a tab lives
-        // entirely inside `tabs`' own state; this workspace must still
-        // re-render the tab bar and the active tab's body whenever any of
-        // that changes, and persist the active connection's tab session so
-        // the change survives a reconnect or restart.
-        cx.observe(&tabs, |this, _tabs, cx| {
-            if this.tab_session_store.take_suppressed() {
-                cx.notify();
-                return;
-            }
-            this.save_active_tab_session(cx);
-            cx.notify();
-        })
-        .detach();
+        Self::subscribe_to_connection_and_tab_changes(&connections, &appearance, &tabs, cx);
 
         Self {
             session: header_session,
@@ -224,9 +241,18 @@ impl WorkspaceView {
             editor_height,
             drag: None,
             column_height: Rc::new(Cell::new(Pixels::ZERO)),
-            tab_session_store: TabSessionStore::new(tab_sessions_path),
+            session_store,
             tab_bar: tab_bar_state,
             tab_width,
+            library_dir: library_root,
+            save_modal,
+            open_modal,
+            open_files_prompt: Box::new(default_open_files_prompt),
+            save_file_prompt: Box::new(default_save_file_prompt),
+            save_confirmation_duration,
+            save_confirmation_generation: Rc::new(Cell::new(0)),
+            refocus_editor_on_next_render: false,
+            browse_dialog_in_flight: Rc::new(Cell::new(false)),
         }
     }
 
@@ -270,6 +296,56 @@ impl WorkspaceView {
         .detach();
     }
 
+    fn subscribe_to_connection_and_tab_changes(
+        connections: &Entity<ConnectionManagerView>,
+        appearance: &Entity<AppearanceModalView>,
+        tabs: &Entity<TabModel>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.observe(connections, |this, connections, cx| {
+            let new_active = connections.read(cx).active().cloned();
+            if this
+                .session_store
+                .active_connection_changed(new_active.as_ref())
+            {
+                this.handle_active_connection_changed(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.observe(appearance, |_this, _appearance, cx| {
+            cx.notify();
+        })
+        .detach();
+        cx.observe(tabs, |this, _tabs, cx| {
+            if this.session_store.take_suppressed() {
+                cx.notify();
+                return;
+            }
+            this.save_active_tab_session(cx);
+            cx.notify();
+        })
+        .detach();
+    }
+
+    fn subscribe_to_save_events(
+        tabs: &Entity<TabModel>,
+        save_modal: &Entity<crate::ui::save_modal::SaveModalView>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe(tabs, |this, _tabs, evt: &super::tabs::SaveRequested, cx| {
+            this.handle_save_requested(evt, cx);
+        })
+        .detach();
+        cx.subscribe(
+            save_modal,
+            |this, _modal, evt: &crate::ui::save_modal::SaveModalEvent, cx| {
+                this.handle_save_modal_event(evt, cx);
+            },
+        )
+        .detach();
+    }
+
     /// The active tab's editor focus handle, so the app can focus it on
     /// startup or after a tab switch. `None` when every tab has been closed,
     /// or when the active tab is a read-only Schema tab, whose editor is
@@ -309,10 +385,22 @@ impl WorkspaceView {
                 connections.active().cloned(),
             )
         };
-        let snapshot = self.tab_session_store.begin_switch(new_key, new_active);
+        let connection_name = new_active.as_ref().map_or_else(
+            || UNSAVED_CONNECTION_LABEL.to_owned(),
+            |active| active.name.clone(),
+        );
+        let snapshot = self.session_store.begin_switch(new_key, new_active);
 
         self.tabs.update(cx, |tabs, cx| {
-            tabs.load_for_connection(snapshot.as_ref(), cx);
+            tabs.load_for_connection(snapshot.as_deref(), cx);
+        });
+        let session_dir = self.session_store.active_session_dir();
+        self.tabs.update(cx, |tabs, _cx| {
+            tabs.set_session_dir(session_dir.clone());
+        });
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_session_dir(session_dir, cx);
+            sidebar.set_connection_name(connection_name, cx);
         });
     }
 
@@ -351,14 +439,23 @@ impl WorkspaceView {
     /// completion (app quit) can await it, while a caller that only wants to
     /// fire-and-forget (a tab change) can detach it.
     fn dispatch_tab_session_save(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
-        if !self.tab_session_store.can_persist() {
+        if !self.session_store.can_persist() {
             return None;
         }
         let snapshot = self.tabs.read(cx).snapshot(cx);
-        let (path, key, snapshot) = self.tab_session_store.dispatch_save(snapshot)?;
-        Some(cx.background_spawn(async move {
-            if let Err(err) = tab_session::save_snapshot(&path, &key, &snapshot) {
+        let (path, key, snapshot, claim) = self.session_store.dispatch_save(snapshot)?;
+        Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    session_store::SessionDir::new(&path, key)
+                        .save_snapshot_if_current(&snapshot, claim)
+                })
+                .await;
+            if let Err(err) = result {
                 tracing::warn!(error = %err, "failed to save tab session");
+                let _ = this.update(cx, |this, cx| {
+                    this.show_save_error("Failed to save tab session", cx);
+                });
             }
         }))
     }
@@ -720,6 +817,9 @@ fn clamp_editor_height(
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.refocus_editor_on_next_render) {
+            self.focus_active_editor(window, cx);
+        }
         let divider_thickness = self.layout.divider_thickness;
         let column_height = self.column_height.clone();
         let modal_open = self.connections.read(cx).is_open();
@@ -802,8 +902,36 @@ impl Render for WorkspaceView {
             .child(self.footer.clone())
             .when(modal_open, |el| el.child(self.connections.clone()))
             .when(appearance_open, |el| el.child(self.appearance.clone()))
+            .when(self.save_modal.read(cx).is_open(), |el| {
+                el.child(self.save_modal.clone())
+            })
+            .when(self.open_modal.read(cx).is_open(), |el| {
+                el.child(self.open_modal.clone())
+            })
     }
 }
+
+/// Test-only accessors/injection points for this view's own tests and for
+/// `ui::workspace::tests`' end-to-end keybinding coverage.
+#[cfg(test)]
+impl WorkspaceView {
+    /// Replace the "Browse files..." seam with `prompt`, so a test can fake
+    /// the picked paths without invoking the real platform dialog (which
+    /// `gpui`'s test platform does not implement and would panic on).
+    pub(crate) fn set_open_files_prompt_for_test(&mut self, prompt: OpenFilesPrompt) {
+        self.open_files_prompt = prompt;
+    }
+
+    /// Replace the "Somewhere else..." save-file seam with `prompt`, for the
+    /// same reason as [`Self::set_open_files_prompt_for_test`].
+    pub(crate) fn set_save_file_prompt_for_test(&mut self, prompt: SaveFilePrompt) {
+        self.save_file_prompt = prompt;
+    }
+}
+
+mod open_flow;
+mod save_flow;
+mod startup;
 
 #[cfg(test)]
 mod tests;

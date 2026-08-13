@@ -16,17 +16,30 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// File name of the persisted connection store, under `APP_CONFIG_DIR_NAME`.
 /// See [`crate::connections::ConnectionStore`].
 const CONNECTIONS_FILE_NAME: &str = "connections.toml";
-/// File name of the persisted per-connection tab-session store, under
-/// `APP_CONFIG_DIR_NAME`. See [`crate::tab_session`].
+/// File name of the legacy, pre-migration per-connection tab-session store,
+/// under `APP_CONFIG_DIR_NAME`. See [`crate::session_store::migration`].
 const TAB_SESSIONS_FILE_NAME: &str = "tab_sessions.json";
 /// Directory name under `APP_CONFIG_DIR_NAME` that holds user theme files,
 /// one JSON file per theme named after [`ThemeConfig::name`]. See
 /// [`crate::theme_resolve`].
 const THEMES_DIR_NAME: &str = "themes";
+/// Directory name under the OS data dir that holds every zsql session
+/// directory: `dirs::data_dir().join(APP_DATA_DIR_NAME)`.
+const APP_DATA_DIR_NAME: &str = "zsql";
+/// Directory name under `APP_DATA_DIR_NAME` that holds one subdirectory per
+/// connection's tab session. See [`crate::session_store`].
+const SESSIONS_DIR_NAME: &str = "sessions";
+/// Directory name under `APP_DATA_DIR_NAME` that holds the shared library's
+/// flat pool of `.sql` files. See [`crate::session_store::library`].
+const LIBRARY_DIR_NAME: &str = "library";
 
 /// The standard SSH port, used to fill in a connection form's SSH tunnel
 /// port when left empty.
 pub const DEFAULT_SSH_TUNNEL_PORT: u16 = 22;
+
+/// Fallback tab title for a file opened via Browse whose path carries no
+/// usable file name.
+pub const UNTITLED_SCRIPT_NAME: &str = "untitled.sql";
 
 /// Top-level application config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,6 +55,94 @@ pub struct Config {
     pub layout: LayoutConfig,
     /// Thresholds and layout tunables for the results grid's value panel.
     pub value_panel: ValuePanelConfig,
+    /// Timing for transient status-bar messages.
+    pub status: StatusConfig,
+    /// Timing for autosave/draft persistence.
+    pub autosave: AutosaveConfig,
+    /// Timing for the sidebar's own periodic housekeeping.
+    pub sidebar: SidebarConfig,
+}
+
+/// Timing for autosave/draft persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutosaveConfig {
+    /// Debounce interval, in milliseconds, between an edit and the notify
+    /// it schedules.
+    pub edit_debounce_ms: u64,
+}
+
+const DEFAULT_EDIT_DEBOUNCE_MS: u64 = 400;
+
+impl Default for AutosaveConfig {
+    fn default() -> Self {
+        Self {
+            edit_debounce_ms: DEFAULT_EDIT_DEBOUNCE_MS,
+        }
+    }
+}
+
+impl AutosaveConfig {
+    /// [`Self::edit_debounce_ms`] as a [`Duration`].
+    #[must_use]
+    pub fn edit_debounce(&self) -> Duration {
+        Duration::from_millis(self.edit_debounce_ms)
+    }
+}
+
+/// Timing for transient status-bar messages, e.g. the "saved <file>"
+/// confirmation shown after an explicit script save.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatusConfig {
+    /// How long the post-save confirmation stays visible before clearing
+    /// itself, in milliseconds.
+    pub save_confirmation_duration_ms: u64,
+}
+
+const DEFAULT_SAVE_CONFIRMATION_DURATION_MS: u64 = 2_500;
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            save_confirmation_duration_ms: DEFAULT_SAVE_CONFIRMATION_DURATION_MS,
+        }
+    }
+}
+
+impl StatusConfig {
+    /// [`Self::save_confirmation_duration_ms`] as a [`Duration`].
+    #[must_use]
+    pub fn save_confirmation_duration(&self) -> Duration {
+        Duration::from_millis(self.save_confirmation_duration_ms)
+    }
+}
+
+/// Timing for the sidebar's own periodic housekeeping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SidebarConfig {
+    /// How often the Scripts pane recomputes every row's relative-modified-
+    /// time label ("2m", "3h", ...), in milliseconds
+    pub scripts_relative_time_refresh_ms: u64,
+}
+
+const DEFAULT_SCRIPTS_RELATIVE_TIME_REFRESH_MS: u64 = 30_000;
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            scripts_relative_time_refresh_ms: DEFAULT_SCRIPTS_RELATIVE_TIME_REFRESH_MS,
+        }
+    }
+}
+
+impl SidebarConfig {
+    /// [`Self::scripts_relative_time_refresh_ms`] as a [`Duration`].
+    #[must_use]
+    pub fn scripts_relative_time_refresh(&self) -> Duration {
+        Duration::from_millis(self.scripts_relative_time_refresh_ms)
+    }
 }
 
 /// Font settings
@@ -279,21 +380,42 @@ impl Config {
         dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(CONNECTIONS_FILE_NAME))
     }
 
-    /// Path to the persisted tab-session store
+    /// Path to the legacy, pre-migration tab-session store
     /// (`$XDG_CONFIG_HOME/zsql/tab_sessions.json`), if resolvable. Lives
     /// alongside [`Config::default_path`], under the same app config
-    /// directory.
+    /// directory. Superseded by [`Config::sessions_dir`]; this path is only
+    /// ever consulted by the one-time migration in
+    /// [`crate::session_store::migration`].
     #[must_use]
     pub fn tab_sessions_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(TAB_SESSIONS_FILE_NAME))
     }
 
+    /// Directory holding every connection's tab-session subdirectory
+    /// (`$XDG_DATA_HOME/zsql/sessions/`), if resolvable
+    #[must_use]
+    pub fn sessions_dir() -> Option<PathBuf> {
+        dirs::data_dir().map(|d| d.join(APP_DATA_DIR_NAME).join(SESSIONS_DIR_NAME))
+    }
+
+    /// Directory holding the shared library's flat pool of `.sql` files
+    /// (`$XDG_DATA_HOME/zsql/library/`), if resolvable
+    #[must_use]
+    pub fn library_dir() -> Option<PathBuf> {
+        dirs::data_dir().map(|d| d.join(APP_DATA_DIR_NAME).join(LIBRARY_DIR_NAME))
+    }
+
     /// Directory holding user theme files
-    /// (`$XDG_CONFIG_HOME/zsql/themes/`), if resolvable. Lives alongside
-    /// [`Config::default_path`], under the same app config directory.
+    /// (`$XDG_CONFIG_HOME/zsql/themes/`), if resolvable
     #[must_use]
     pub fn themes_dir() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join(APP_CONFIG_DIR_NAME).join(THEMES_DIR_NAME))
+    }
+
+    /// The "Somewhere else..." save dialog's default starting directory
+    #[must_use]
+    pub fn default_export_dir() -> Option<PathBuf> {
+        dirs::document_dir().or_else(dirs::home_dir)
     }
 
     /// Load config from `path`, falling back to defaults if it does not exist.
@@ -344,6 +466,99 @@ mod tests {
     use std::time::Duration;
 
     use super::Config;
+
+    #[test]
+    fn sessions_dir_ends_in_zsql_sessions_when_resolvable() {
+        let Some(path) = Config::sessions_dir() else {
+            return;
+        };
+        assert!(path.ends_with("zsql/sessions"));
+    }
+
+    #[test]
+    fn sessions_dir_lives_under_the_data_dir_not_the_config_dir() {
+        let (Some(sessions_dir), Some(config_dir)) = (Config::sessions_dir(), dirs::config_dir())
+        else {
+            return;
+        };
+        if let Some(data_dir) = dirs::data_dir() {
+            assert!(sessions_dir.starts_with(&data_dir));
+        }
+        if data_dir_differs_from_config_dir(&config_dir) {
+            assert!(!sessions_dir.starts_with(&config_dir));
+        }
+    }
+
+    /// Some platforms (notably plain XDG setups without `XDG_DATA_HOME` set)
+    /// can resolve the same directory for both roots; the "not under the
+    /// config dir" assertion only makes sense when they actually differ.
+    fn data_dir_differs_from_config_dir(config_dir: &std::path::Path) -> bool {
+        dirs::data_dir().is_some_and(|data_dir| data_dir != config_dir)
+    }
+
+    #[test]
+    fn library_dir_ends_in_zsql_library_when_resolvable() {
+        let Some(path) = Config::library_dir() else {
+            return;
+        };
+        assert!(path.ends_with("zsql/library"));
+    }
+
+    #[test]
+    fn library_dir_lives_under_the_data_dir_not_the_config_dir() {
+        let (Some(library_dir), Some(config_dir)) = (Config::library_dir(), dirs::config_dir())
+        else {
+            return;
+        };
+        if let Some(data_dir) = dirs::data_dir() {
+            assert!(library_dir.starts_with(&data_dir));
+        }
+        if data_dir_differs_from_config_dir(&config_dir) {
+            assert!(!library_dir.starts_with(&config_dir));
+        }
+    }
+
+    #[test]
+    fn library_dir_is_a_sibling_of_sessions_dir() {
+        let (Some(library_dir), Some(sessions_dir)) =
+            (Config::library_dir(), Config::sessions_dir())
+        else {
+            return;
+        };
+        assert_eq!(library_dir.parent(), sessions_dir.parent());
+    }
+
+    #[test]
+    fn save_confirmation_duration_defaults_to_a_positive_span() {
+        let cfg = Config::default();
+        assert!(cfg.status.save_confirmation_duration_ms > 0);
+        assert_eq!(
+            cfg.status.save_confirmation_duration(),
+            Duration::from_millis(cfg.status.save_confirmation_duration_ms)
+        );
+    }
+
+    #[test]
+    fn status_config_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.status.save_confirmation_duration_ms = 9_001;
+
+        let text = toml::to_string(&cfg).expect("config must serialize to toml");
+        let parsed: Config = toml::from_str(&text).expect("config must parse back from toml");
+
+        assert_eq!(parsed.status.save_confirmation_duration_ms, 9_001);
+    }
+
+    #[test]
+    fn status_section_is_optional_in_toml_and_falls_back_to_defaults() {
+        let parsed: Config =
+            toml::from_str("[connection]\ndefault_url = \"postgres://localhost/db\"\n")
+                .expect("config without a [status] section must still parse");
+        assert_eq!(
+            parsed.status.save_confirmation_duration_ms,
+            Config::default().status.save_confirmation_duration_ms
+        );
+    }
 
     #[test]
     fn liveness_defaults_are_positive_and_the_timeout_is_shorter_than_the_interval() {

@@ -3,7 +3,9 @@
 //! connection (or invites connecting one). Clicking it opens the
 //! [`ConnectionManagerView`] modal.
 
-use gpui::{ClickEvent, Context, Entity, FontWeight, Render, Window, div, prelude::*, px, rgb};
+use gpui::{
+    ClickEvent, Context, Entity, FontWeight, Render, SharedString, Window, div, prelude::*, px, rgb,
+};
 use zsql_core::{RowCount, group_thousands};
 use zsql_ui::grid::{self, status_dot_outline};
 use zsql_ui::theme::{ActiveTheme, Theme};
@@ -93,6 +95,16 @@ pub struct ConnectionFooterView {
     result_snapshot: Option<ResultsSnapshot>,
     /// The row count to display in the footer
     row_count: Option<RowCount>,
+    /// The transient save confirmation or error shown after an explicit or
+    /// automatic script save, if one is currently visible
+    save_confirmation: Option<SaveStatus>,
+}
+
+/// The footer's transient post-save message
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaveStatus {
+    Saved(SharedString),
+    Error(SharedString),
 }
 
 impl ConnectionFooterView {
@@ -117,7 +129,51 @@ impl ConnectionFooterView {
             appearance_modal,
             result_snapshot: None,
             row_count: None,
+            save_confirmation: None,
         }
+    }
+
+    /// Show the transient "saved <file>" confirmation, replacing any
+    /// currently shown. The caller is responsible for clearing it again
+    /// (see [`Self::clear_saved_confirmation`]) after its own timer.
+    pub fn show_saved_confirmation(&mut self, file_name: &str, cx: &mut Context<Self>) {
+        self.save_confirmation = Some(SaveStatus::Saved(SharedString::from(format!(
+            "saved {file_name}"
+        ))));
+        cx.notify();
+    }
+
+    /// Show a transient save-failure message, replacing any currently
+    /// shown. The caller is responsible for clearing it again (see
+    /// [`Self::clear_saved_confirmation`]) after its own timer
+    pub fn show_save_error(&mut self, reason: &str, cx: &mut Context<Self>) {
+        self.save_confirmation = Some(SaveStatus::Error(SharedString::from(reason.to_owned())));
+        cx.notify();
+    }
+
+    /// Clear the transient save confirmation or error, if one is showing. A
+    /// no-op otherwise
+    pub fn clear_saved_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.save_confirmation.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The save confirmation text currently shown, if any (success or
+    /// error, indistinguishable to this accessor). Test-only: the render
+    /// path reads `self.save_confirmation` directly.
+    #[cfg(test)]
+    pub(crate) fn save_confirmation_for_test(&self) -> Option<String> {
+        match self.save_confirmation.as_ref()? {
+            SaveStatus::Saved(text) | SaveStatus::Error(text) => Some(text.to_string()),
+        }
+    }
+
+    /// Whether the currently shown transient message (if any) is an error
+    /// rather than a success. Test-only.
+    #[cfg(test)]
+    pub(crate) fn save_error_showing_for_test(&self) -> bool {
+        matches!(self.save_confirmation, Some(SaveStatus::Error(_)))
     }
 
     /// Force the footer to render a certain result rather than reading from the
@@ -236,6 +292,33 @@ impl ConnectionFooterView {
         }
     }
 
+    /// The transient "saved <file>" confirmation with the accent check
+    /// glyph, shown between the query result summary and the appearance
+    /// trigger. `None` while nothing was just saved
+    fn render_save_confirmation(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let status = self.save_confirmation.clone()?;
+        let colors = cx.theme().colors;
+        let (glyph, text, color) = match status {
+            SaveStatus::Saved(text) => ("\u{2713}", text, colors.accent),
+            SaveStatus::Error(text) => ("\u{2717}", text, colors.status_error),
+        };
+        Some(
+            div()
+                .id("connection-footer-save-confirmation")
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .font_family(&cx.theme().fonts.data)
+                .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
+                .text_color(rgb(color))
+                .child(glyph)
+                .child(text),
+        )
+    }
+
     fn render_appearance_trigger(
         &self,
         _window: &mut Window,
@@ -329,6 +412,7 @@ impl Render for ConnectionFooterView {
                     .child(self.render_connection_status(window, cx))
                     .child(self.render_current_query_result(window, cx)),
             )
+            .children(self.render_save_confirmation(cx))
             .child(self.render_appearance_trigger(window, cx))
     }
 }

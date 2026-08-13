@@ -21,8 +21,6 @@ pub const ROW_TEXT_SIZE: f32 = 12.5;
 pub const DISCLOSURE_WIDTH: f32 = 10.0;
 /// Text size of a row's trailing count affordance.
 pub const META_TEXT_SIZE: f32 = 10.0;
-/// Text size of a row's kind label.
-pub const KIND_TEXT_SIZE: f32 = 9.0;
 
 /// Shared chrome for a tree row: height, indent, gap, monospace text.
 #[must_use]
@@ -91,20 +89,7 @@ pub fn row_meta(text: impl Into<SharedString>, theme: &Theme) -> Div {
         .child(text.into())
 }
 
-/// A row's kind label (e.g. table/view/matview/partitioned).
-#[must_use]
-pub fn row_kind(text: impl Into<SharedString>, theme: &Theme) -> Div {
-    div()
-        .flex_shrink_0()
-        .ml_auto()
-        .pl_2()
-        .text_size(px(KIND_TEXT_SIZE))
-        .text_color(rgb(theme.colors.text_tertiary))
-        .font_family(&theme.fonts.data)
-        .child(text.into())
-}
-
-/// A row's trailing count, following [`row_kind`] in normal flow.
+/// A row's trailing count, following the label in normal flow.
 #[must_use]
 pub fn row_count(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
@@ -119,8 +104,8 @@ pub fn row_count(text: impl Into<SharedString>, theme: &Theme) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        Theme, disclosure_glyph, disclosure_icon_name, disclosure_spacer, row_count, row_kind,
-        row_label, row_meta, row_shell,
+        Theme, disclosure_glyph, disclosure_icon_name, disclosure_spacer, row_count, row_label,
+        row_meta, row_shell,
     };
     use crate::icon::IconName;
 
@@ -140,11 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn label_meta_kind_and_count_helpers_build_for_text() {
+    fn label_meta_and_count_helpers_build_for_text() {
         let theme = Theme::default();
         let _label = row_label("orders");
         let _meta = row_meta("4 cols", &theme);
-        let _kind = row_kind("table", &theme);
         let _count = row_count("4 cols", &theme);
     }
 }

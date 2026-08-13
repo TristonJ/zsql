@@ -1,9 +1,5 @@
 //! Routes a sort/pager/filter click ([`PreviewAction`]) to the active tab's
-//! [`PreviewQueryState`] and, when that actually changes the window, reruns
-//! the tab via the exact same windowed SQL builder that rewrites its
-//! buffer -- so the executed query and the displayed buffer text can never
-//! diverge. A no-op whenever the active tab is not a live, unedited
-//! generated preview.
+//! [`PreviewQueryState`]
 
 use gpui::Context;
 use zsql_core::preview_state::PreviewQueryState;
@@ -12,9 +8,7 @@ use super::{PreviewControlsChanged, TabKind, TabModel};
 use crate::ui::results::pager::{PreviewAction, PreviewControls};
 
 impl TabModel {
-    /// Route `action` to whichever tab is currently active, per
-    /// [`PreviewAction`]'s own variants. The single body every control
-    /// [`TabModel::preview_dispatch`] reaches ultimately calls into.
+    /// Route `action` to whichever tab is currently active
     pub(super) fn dispatch_preview_action(
         &mut self,
         action: PreviewAction,
@@ -171,14 +165,7 @@ impl TabModel {
     /// Apply `mutate` to the active tab's [`PreviewQueryState`] (only while
     /// it is a live, unedited generated preview), and, only when `mutate`
     /// reports it actually changed the window (e.g. `prev_page` at page 1
-    /// returns `false`), re-run the tab's query via the exact same windowed
-    /// builder call used to rewrite its buffer -- so buffer text and
-    /// executed SQL can never diverge, and a pager control already at its
-    /// boundary is a true no-op rather than an redundant identical rerun.
-    /// `refetch_count` is forwarded to
-    /// [`crate::session::Session::preview_relation_windowed`]: `true` for a
-    /// filter change, which alters which rows exist at all, `false` for a
-    /// sort/page change, which does not.
+    /// returns `false`)
     fn rerun_active_generated_tab(
         &mut self,
         cx: &mut Context<Self>,
@@ -193,10 +180,13 @@ impl TabModel {
             .iter_mut()
             .find(|tab| tab.id == id)
             .is_some_and(|tab| {
-                if tab.dirty || !matches!(tab.kind, TabKind::Generated { .. }) {
+                if tab.dirty {
                     return false;
                 }
-                mutate(&mut tab.preview_state)
+                let TabKind::Generated { preview, .. } = &mut tab.kind else {
+                    return false;
+                };
+                mutate(preview)
             });
         if !changed {
             return;
@@ -205,16 +195,20 @@ impl TabModel {
         let Some(tab) = self.tab(id) else {
             return;
         };
-        let TabKind::Generated { schema, relation } = tab.kind.clone() else {
+        let TabKind::Generated {
+            schema,
+            relation,
+            preview,
+        } = tab.kind.clone()
+        else {
             return;
         };
-        let sort = tab
-            .preview_state
+        let sort = preview
             .sort_pair()
             .map(|(column, direction)| (column.to_owned(), direction));
-        let limit = tab.preview_state.page_size();
-        let offset = tab.preview_state.offset();
-        let filters = tab.preview_state.filters().clone();
+        let limit = preview.page_size();
+        let offset = preview.offset();
+        let filters = preview.filters().clone();
         let editor = tab.editor.clone();
 
         let _span = tracing::info_span!(
@@ -254,20 +248,17 @@ impl TabModel {
         self.sync_preview_controls(cx);
     }
 
-    /// Rebuild `results`'s [`PreviewControls`] from the active tab: `Some`
-    /// while it is a live, unedited generated preview, else `None`, which
-    /// is what renders the grid's sort headers and the results bar's pager
-    /// inert without hiding the grid itself.
+    /// Rebuild `results`'s [`PreviewControls`] from the active tab
     pub(super) fn sync_preview_controls(&self, cx: &mut Context<Self>) {
         let controls = self.active.and_then(|id| self.tab(id)).and_then(|tab| {
-            let TabKind::Generated { .. } = tab.kind else {
-                return None;
-            };
             if tab.dirty {
                 return None;
             }
+            let TabKind::Generated { preview, .. } = &tab.kind else {
+                return None;
+            };
             Some(PreviewControls {
-                state: tab.preview_state.clone(),
+                state: preview.clone(),
                 dispatch: self.preview_dispatch.clone(),
             })
         });

@@ -13,4 +13,7 @@ mod view;
 pub use buffer::{Position, Selection, TextBuffer};
 pub use highlighter::{HighlightKind, Highlighter, PlainHighlighter, SqlHighlighter, StyleSpan};
 pub use theme::syntax_color;
-pub use view::{EditListener, EditorView, KEY_CONTEXT, QueryRunner, RunQuery, init};
+pub use view::{
+    EditListener, EditorView, KEY_CONTEXT, QueryRunner, RunQuery, SaveRequester, SaveScript,
+    SaveScriptAs, init,
+};
