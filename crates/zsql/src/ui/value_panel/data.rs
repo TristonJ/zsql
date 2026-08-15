@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use zsql_core::{ColumnMeta, Value};
+use zsql_ui::selectable_text::SelectableTextState;
 
 use crate::config::ValuePanelConfig;
 use crate::ui::format::ValueKind;
@@ -490,6 +491,10 @@ pub struct ValuePanelState {
     timestamp_mode: TimestampMode,
     tree_selected: Vec<PathSegment>,
     tree_expanded: HashSet<Vec<PathSegment>>,
+    /// Mouse selection over the currently displayed body's plain text.
+    /// Cleared whenever that text could change from under it, so a stale
+    /// byte-offset selection never mismatches newly displayed text.
+    text_selection: SelectableTextState,
 }
 
 impl ValuePanelState {
@@ -529,6 +534,7 @@ impl ValuePanelState {
             return;
         }
         self.content = content;
+        self.text_selection.clear();
     }
 
     pub fn pin(&mut self) {
@@ -554,6 +560,7 @@ impl ValuePanelState {
 
     pub fn set_json_mode(&mut self, mode: JsonMode) {
         self.json_mode = mode;
+        self.text_selection.clear();
     }
 
     #[must_use]
@@ -563,6 +570,7 @@ impl ValuePanelState {
 
     pub fn set_bytes_mode(&mut self, mode: BytesMode) {
         self.bytes_mode = mode;
+        self.text_selection.clear();
     }
 
     #[must_use]
@@ -572,6 +580,21 @@ impl ValuePanelState {
 
     pub fn set_timestamp_mode(&mut self, mode: TimestampMode) {
         self.timestamp_mode = mode;
+        self.text_selection.clear();
+    }
+
+    /// The current mouse selection over the displayed body's plain text.
+    #[must_use]
+    pub fn text_selection(&self) -> &SelectableTextState {
+        &self.text_selection
+    }
+
+    pub fn text_selection_mut(&mut self) -> &mut SelectableTextState {
+        &mut self.text_selection
+    }
+
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection.clear();
     }
 
     #[must_use]
@@ -1133,6 +1156,44 @@ mod tests {
         assert!(!panel.is_pinned());
         panel.set_content(Some(content(0)));
         assert_eq!(panel.content().map(|c| c.id), Some(0));
+    }
+
+    // ---- text selection clearing on content/mode changes ---------------
+
+    #[test]
+    fn set_content_clears_a_prior_text_selection() {
+        let mut panel = ValuePanelState::new();
+        panel.set_content(Some(content(0)));
+        panel.text_selection_mut().begin(0, false);
+        assert!(panel.text_selection_mut().extend_while_dragging(3));
+        assert!(panel.text_selection().range().is_some());
+
+        panel.set_content(Some(content(1)));
+        assert_eq!(
+            panel.text_selection().range(),
+            None,
+            "a new cell must clear any selection made against the old one's text"
+        );
+    }
+
+    #[test]
+    fn mode_switches_each_clear_a_prior_text_selection() {
+        let mut panel = ValuePanelState::new();
+
+        panel.text_selection_mut().begin(0, false);
+        assert!(panel.text_selection_mut().extend_while_dragging(2));
+        panel.set_json_mode(JsonMode::Raw);
+        assert_eq!(panel.text_selection().range(), None);
+
+        panel.text_selection_mut().begin(0, false);
+        assert!(panel.text_selection_mut().extend_while_dragging(2));
+        panel.set_bytes_mode(BytesMode::Base64);
+        assert_eq!(panel.text_selection().range(), None);
+
+        panel.text_selection_mut().begin(0, false);
+        assert!(panel.text_selection_mut().extend_while_dragging(2));
+        panel.set_timestamp_mode(TimestampMode::Utc);
+        assert_eq!(panel.text_selection().range(), None);
     }
 
     // ---- panel mode + tree state accessors ---------------------------

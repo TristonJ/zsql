@@ -1,10 +1,13 @@
+use std::ops::Range;
+
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, KeyBinding, Render,
-    Stateful, Window, actions, div, prelude::*, px, rgb,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, KeyBinding, MouseButton,
+    MouseUpEvent, Render, Stateful, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, Value};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+use super::body::{MonoBody, NullBody, OversizedJsonBody, TextBody};
 use super::data::{
     self, BytesMode, JsonLoad, JsonMode, RendererKind, TimestampMode, ValuePanelState,
 };
@@ -24,7 +27,7 @@ pub const VALUE_PANEL_KEY_CONTEXT: &str = "ValuePanel";
 #[derive(Debug, Clone)]
 pub(super) struct ValuePanelJsonCache {
     id: usize,
-    text: String,
+    pub(super) text: String,
     /// Read by `json_tree`'s keyboard navigation to reach the parsed tree
     /// without re-parsing on every keypress.
     pub(super) load: JsonLoad,
@@ -45,8 +48,7 @@ pub struct ValuePanel {
     /// The parent focus handle, so we can return focus when the panel is
     /// explicitly closed.
     parent_focus_handle: FocusHandle,
-    /// Configuration options for the value panel
-    config: ValuePanelConfig,
+    pub(super) config: ValuePanelConfig,
 }
 
 actions!(
@@ -115,6 +117,22 @@ impl Render for ValuePanel {
             .on_action(cx.listener(Self::copy_tree_node_path))
             .on_action(cx.listener(Self::close_panel_from_panel))
             .on_action(cx.listener(Self::focus_parent_from_panel))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
+                    if view.state.text_selection_mut().end_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
+                    if view.state.text_selection_mut().end_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .flex_shrink_0()
@@ -144,6 +162,7 @@ impl ValuePanel {
     /// Set the configuration for the panel
     pub fn set_config(&mut self, config: ValuePanelConfig) {
         self.config = config;
+        self.state.clear_text_selection();
     }
 
     /// Toggle the visibility of the panel
@@ -264,6 +283,9 @@ impl ValuePanel {
     ) -> Div {
         let active_theme = cx.theme();
         let renderer = data::renderer_for(value, &column.type_name);
+        let selection = self.state.text_selection().range();
+        let body_text = self.current_body_text();
+        let text = body_text.as_deref().unwrap_or_default();
 
         let mut root = div()
             .flex()
@@ -276,68 +298,43 @@ impl ValuePanel {
             RendererKind::Json => {
                 root = root
                     .child(self.render_json_subbar(active_theme, cx))
-                    .child(self.render_json_body(active_theme, cx))
+                    .child(self.render_json_body(text, active_theme, selection, cx))
                     .child(self.render_json_footer(active_theme, cx));
             }
             RendererKind::Text => {
-                let text = match value {
-                    Value::Text(text) | Value::Uuid(text) => text.clone(),
-                    _ => String::new(),
-                };
+                let label = format!("Raw - {} chars", text.chars().count());
                 root = root
-                    .child(Self::render_static_subbar(
-                        format!("Raw - {} chars", text.chars().count()).as_str(),
-                        active_theme,
-                    ))
-                    .child(Self::render_text_body(&text, active_theme));
+                    .child(Self::render_static_subbar(&label, active_theme))
+                    .child(TextBody::new(cx.entity(), text, selection));
             }
             RendererKind::Bytes => {
-                let bytes = match value {
-                    Value::Bytes(bytes) => bytes.clone(),
-                    _ => Vec::new(),
-                };
                 root = root
                     .child(self.render_bytes_subbar(active_theme, cx))
-                    .child(Self::render_bytes_body(
-                        &bytes,
-                        self.state.bytes_mode(),
-                        self.config.hex_bytes_per_row,
-                        active_theme,
-                    ));
+                    .child(MonoBody::new(cx.entity(), text, selection).scrollable());
             }
             RendererKind::Number => {
-                let text = data::number_raw_text(value).unwrap_or_default();
                 root = root
                     .child(Self::render_static_subbar(
                         "Raw - full precision",
                         active_theme,
                     ))
-                    .child(Self::render_mono_body(&text, active_theme));
+                    .child(MonoBody::new(cx.entity(), text, selection));
             }
             RendererKind::Timestamp => {
                 root = root
                     .child(self.render_timestamp_subbar(active_theme, cx))
-                    .child(Self::render_timestamp_body(
-                        value,
-                        self.state.timestamp_mode(),
-                        active_theme,
-                    ));
+                    .child(MonoBody::new(cx.entity(), text, selection));
             }
             RendererKind::Bool => {
-                let text = match value {
-                    Value::Bool(b) => b.to_string(),
-                    _ => String::new(),
-                };
-                root = root.child(Self::render_mono_body(&text, active_theme));
+                root = root.child(MonoBody::new(cx.entity(), text, selection));
             }
             RendererKind::Null => {
-                root = root.child(Self::render_null_body(active_theme));
+                root = root.child(NullBody);
             }
             RendererKind::Unknown { type_name } => {
-                let text = format_value(value).text;
                 root = root
                     .child(Self::render_static_subbar(&type_name, active_theme))
-                    .child(Self::render_mono_body(&text, active_theme));
+                    .child(MonoBody::new(cx.entity(), text, selection));
             }
         }
         root
@@ -408,6 +405,7 @@ impl ValuePanel {
         let colors = active_theme.colors;
         let mut btn = div()
             .id(label)
+            .debug_selector(move || format!("value-panel-mode-button-{label}"))
             .px_2()
             .h(theme::VALUE_PANEL_BUTTON_HEIGHT)
             .flex()
@@ -491,28 +489,28 @@ impl ValuePanel {
         bar
     }
 
-    fn render_json_body(&self, active_theme: &Theme, cx: &Context<Self>) -> AnyElement {
+    fn render_json_body(
+        &self,
+        text: &str,
+        active_theme: &Theme,
+        selection: Option<Range<usize>>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let Some(cache) = self.json.as_ref() else {
             return div().flex_1().min_h_0().into_any_element();
         };
         match &cache.load {
-            JsonLoad::Invalid(_) => {
-                Self::render_scroll_mono_body(&cache.text, active_theme).into_any_element()
-            }
-            JsonLoad::Oversized {
-                preview,
-                total_bytes,
-            } => Self::render_oversized_json_body(preview, *total_bytes, active_theme, cx)
+            JsonLoad::Invalid(_) => MonoBody::new(cx.entity(), text, selection)
+                .scrollable()
                 .into_any_element(),
+            JsonLoad::Oversized { total_bytes, .. } => {
+                OversizedJsonBody::new(cx.entity(), text, *total_bytes, selection)
+                    .into_any_element()
+            }
             JsonLoad::Parsed(node) => match self.state.json_mode() {
-                JsonMode::Raw => {
-                    Self::render_scroll_mono_body(&cache.text, active_theme).into_any_element()
-                }
-                JsonMode::Pretty => {
-                    let pretty = serde_json::to_string_pretty(&data::json_node_to_serde(node))
-                        .unwrap_or_default();
-                    Self::render_scroll_mono_body(&pretty, active_theme).into_any_element()
-                }
+                JsonMode::Raw | JsonMode::Pretty => MonoBody::new(cx.entity(), text, selection)
+                    .scrollable()
+                    .into_any_element(),
                 JsonMode::Tree => self
                     .render_json_tree(node, active_theme, cx)
                     .into_any_element(),
@@ -520,55 +518,56 @@ impl ValuePanel {
         }
     }
 
-    fn render_oversized_json_body(
-        preview: &str,
-        total_bytes: usize,
-        active_theme: &Theme,
-        cx: &Context<Self>,
-    ) -> Div {
-        let colors = active_theme.colors;
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .gap_2()
-            .p(theme::VALUE_PANEL_PADDING_X)
-            .child(
-                div()
-                    .text_size(px(theme::VALUE_PANEL_LABEL_TEXT_SIZE))
-                    .text_color(rgb(colors.text_tertiary))
-                    .child(format!(
-                        "{total_bytes} bytes -- past the eager-parse threshold; showing the \
-                             first {} bytes",
-                        preview.len()
-                    )),
-            )
-            .child(
-                Self::mono_text(preview, active_theme)
-                    .id("value-panel-oversized-preview")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll(),
-            )
-            .child(
-                div()
-                    .id("value-panel-load-full")
-                    .cursor_pointer()
-                    .flex_shrink_0()
-                    .px_2()
-                    .h(theme::VALUE_PANEL_BUTTON_HEIGHT)
-                    .flex()
-                    .items_center()
-                    .rounded(px(theme::VALUE_PANEL_BUTTON_RADIUS))
-                    .bg(theme::sidebar_selected_bg(active_theme))
-                    .text_color(rgb(colors.accent))
-                    .text_size(px(theme::VALUE_PANEL_LABEL_TEXT_SIZE))
-                    .child("Load full value")
-                    .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
-                        view.load_full_json_value(cx);
-                    })),
-            )
+    /// The panel's currently displayed body text, or `None` for JSON Tree
+    /// mode and any state with no flat text body (`Null`, or no content).
+    pub(super) fn current_body_text(&self) -> Option<String> {
+        let content = self.state.content()?;
+        let renderer = data::renderer_for(&content.value, &content.column.type_name);
+        match renderer {
+            RendererKind::Json => {
+                let cache = self.json.as_ref()?;
+                match &cache.load {
+                    JsonLoad::Invalid(_) => Some(cache.text.clone()),
+                    JsonLoad::Oversized { preview, .. } => Some(preview.clone()),
+                    JsonLoad::Parsed(node) => match self.state.json_mode() {
+                        JsonMode::Raw => Some(cache.text.clone()),
+                        JsonMode::Pretty => {
+                            serde_json::to_string_pretty(&data::json_node_to_serde(node)).ok()
+                        }
+                        JsonMode::Tree => None,
+                    },
+                }
+            }
+            RendererKind::Text => match &content.value {
+                Value::Text(text) | Value::Uuid(text) => Some(text.clone()),
+                _ => None,
+            },
+            RendererKind::Bytes => {
+                let bytes = match &content.value {
+                    Value::Bytes(bytes) => bytes.as_slice(),
+                    _ => &[],
+                };
+                Some(match self.state.bytes_mode() {
+                    BytesMode::Hex => data::format_hex_dump(bytes, self.config.hex_bytes_per_row),
+                    BytesMode::Base64 => format::base64_encode(bytes),
+                })
+            }
+            RendererKind::Number => data::number_raw_text(&content.value),
+            RendererKind::Timestamp => {
+                let raw = data::timestamp_raw_text(&content.value)?;
+                Some(match self.state.timestamp_mode() {
+                    TimestampMode::Raw => raw.to_owned(),
+                    TimestampMode::Utc => data::timestamp_utc_text(raw)
+                        .unwrap_or_else(|| format!("{raw} (could not be parsed as a timestamp)")),
+                })
+            }
+            RendererKind::Bool => match &content.value {
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            },
+            RendererKind::Null => None,
+            RendererKind::Unknown { .. } => Some(format_value(&content.value).text),
+        }
     }
 
     fn render_json_footer(&self, active_theme: &Theme, cx: &Context<Self>) -> Div {
@@ -620,20 +619,6 @@ impl ValuePanel {
         bar
     }
 
-    fn render_text_body(text: &str, active_theme: &Theme) -> Stateful<Div> {
-        let colors = active_theme.colors;
-        div()
-            .id("value-panel-text-body")
-            .flex_1()
-            .min_h_0()
-            .p(theme::VALUE_PANEL_PADDING_X)
-            .overflow_y_scroll()
-            .text_size(px(theme::VALUE_PANEL_TEXT_SIZE))
-            .text_color(rgb(colors.text_primary))
-            .font_family(&active_theme.fonts.data)
-            .child(text.to_owned())
-    }
-
     fn render_bytes_subbar(&self, active_theme: &Theme, cx: &Context<Self>) -> Div {
         let colors = active_theme.colors;
         let current_mode = self.state.bytes_mode();
@@ -665,19 +650,6 @@ impl ValuePanel {
             ));
         }
         bar
-    }
-
-    fn render_bytes_body(
-        bytes: &[u8],
-        mode: BytesMode,
-        bytes_per_row: usize,
-        active_theme: &Theme,
-    ) -> Stateful<Div> {
-        let text = match mode {
-            BytesMode::Hex => data::format_hex_dump(bytes, bytes_per_row),
-            BytesMode::Base64 => format::base64_encode(bytes),
-        };
-        Self::render_scroll_mono_body(&text, active_theme)
     }
 
     fn render_timestamp_subbar(&self, active_theme: &Theme, cx: &Context<Self>) -> Div {
@@ -713,57 +685,12 @@ impl ValuePanel {
         bar
     }
 
-    fn render_timestamp_body(value: &Value, mode: TimestampMode, active_theme: &Theme) -> Div {
-        let Some(raw) = data::timestamp_raw_text(value) else {
-            return Self::render_mono_body("", active_theme);
-        };
-        let text = match mode {
-            TimestampMode::Raw => raw.to_owned(),
-            TimestampMode::Utc => data::timestamp_utc_text(raw)
-                .unwrap_or_else(|| format!("{raw} (could not be parsed as a timestamp)")),
-        };
-        Self::render_mono_body(&text, active_theme)
-    }
-
-    fn render_null_body(active_theme: &Theme) -> Div {
-        let colors = active_theme.colors;
-        div()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .items_center()
-            .justify_center()
-            .text_color(rgb(colors.value_null))
-            .child("NULL")
-    }
-
-    fn mono_text(text: &str, active_theme: &Theme) -> Div {
-        div()
-            .font_family(&active_theme.fonts.data)
-            .text_size(px(theme::VALUE_PANEL_TEXT_SIZE))
-            .text_color(rgb(active_theme.colors.text_primary))
-            .child(text.to_owned())
-    }
-
-    fn render_mono_body(text: &str, active_theme: &Theme) -> Div {
-        Self::mono_text(text, active_theme)
-            .flex_1()
-            .min_h_0()
-            .p(theme::VALUE_PANEL_PADDING_X)
-    }
-
-    fn render_scroll_mono_body(text: &str, active_theme: &Theme) -> Stateful<Div> {
-        Self::render_mono_body(text, active_theme)
-            .id("value-panel-scroll-body")
-            .overflow_y_scroll()
-    }
-
     /// The "Load full value" action on an oversized JSON preview: parses the
     /// complete source text on a background executor (never on the render
     /// path), then updates the cache once it finishes. A no-op unless the
     /// panel is currently showing an [`JsonLoad::Oversized`] value.
     #[tracing::instrument(name = "results_value_panel_load_full_json", skip_all)]
-    fn load_full_json_value(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn load_full_json_value(&mut self, cx: &mut Context<Self>) {
         let Some(cache) = &self.json else {
             return;
         };
@@ -789,6 +716,7 @@ impl ValuePanel {
                         .map(|c| c.text.clone())
                         .unwrap_or_default();
                     this.json = Some(ValuePanelJsonCache { id, text, load });
+                    this.state.clear_text_selection();
                     cx.notify();
                 }
             })
@@ -797,12 +725,11 @@ impl ValuePanel {
         .detach();
     }
 
-    /// Cmd/Ctrl-C while the panel has focus: copy the selected tree node's
-    /// own value (its JSON text) when a JSON tree is showing, else fall back
-    /// to the panel's own target cell -- the same text `Copy value`/
-    /// `copy_focused_cell` would copy -- so Cmd/Ctrl-C always copies
-    /// something while the panel is focused, regardless of which renderer
-    /// (or an unparsed json/jsonb cell) it is currently showing.
+    /// Cmd/Ctrl-C while the panel has focus: copy an active text selection's
+    /// exact substring when one exists, else the selected tree node's own
+    /// value (its JSON text) when a JSON tree is showing, else the panel's
+    /// whole formatted target cell. Something is always copied, regardless
+    /// of which renderer the panel is currently showing.
     #[tracing::instrument(name = "results_value_panel_copy_tree_node_value", skip_all)]
     fn copy_tree_node_value(
         &mut self,
@@ -810,6 +737,15 @@ impl ValuePanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(range) = self.state.text_selection().range()
+            && let Some(body_text) = self.current_body_text()
+            && let Some(selected) = body_text.get(range)
+        {
+            tracing::debug!("copied the value panel's active text selection to the clipboard");
+            cx.write_to_clipboard(ClipboardItem::new_string(selected.to_owned()));
+            return;
+        }
+
         if let Some(JsonLoad::Parsed(root)) = self.json.as_ref().map(|c| &c.load)
             && let Some(node) = data::node_at_path(root, self.state.selected_tree_path())
         {
@@ -877,6 +813,8 @@ mod tests {
         ValuePanel, ValuePanelContent,
     };
     use crate::config::ValuePanelConfig;
+    use crate::ui::format;
+    use crate::ui::theme;
     use crate::ui::value_panel::data::{self, PathSegment};
 
     fn json_content(id: usize, text: &str) -> ValuePanelContent {
@@ -926,6 +864,11 @@ mod tests {
                 matches!(p.json_load_for_test(), Some(JsonLoad::Oversized { .. })),
                 "a value past the configured threshold must open Oversized"
             );
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(3);
         });
 
         panel.update(cx, ValuePanel::load_full_json_value);
@@ -935,6 +878,11 @@ mod tests {
             assert!(
                 matches!(p.json_load_for_test(), Some(JsonLoad::Parsed(_))),
                 "Load full value must upgrade the cache from Oversized to Parsed"
+            );
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "upgrading the cache must clear a selection made against the oversized preview"
             );
         });
     }
@@ -970,9 +918,16 @@ mod tests {
     fn panel_window(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<ValuePanel>, &mut gpui::VisualTestContext) {
+        panel_window_with_config(cx, ValuePanelConfig::default())
+    }
+
+    fn panel_window_with_config(
+        cx: &mut gpui::TestAppContext,
+        config: ValuePanelConfig,
+    ) -> (gpui::Entity<ValuePanel>, &mut gpui::VisualTestContext) {
         cx.add_window_view(|window, cx| {
             let parent = cx.focus_handle();
-            let panel = ValuePanel::new(parent, ValuePanelConfig::default(), cx);
+            let panel = ValuePanel::new(parent, config, cx);
             window.focus(panel.focus_handle());
             panel
         })
@@ -1081,6 +1036,395 @@ mod tests {
         assert_eq!(copied_path.as_deref(), Some("$.items[0].sku"));
     }
 
+    // -- Text-body mouse selection and its interaction with copy -----------
+
+    /// The pixel point that hit-tests back to `text`'s byte `offset`, shaped
+    /// with the same font/size/padding a value-panel body renders with --
+    /// lets a test drive `simulate_event` with real, shape-derived
+    /// coordinates against a body painted at `bounds` (from
+    /// [`gpui::VisualTestContext::debug_bounds`]) instead of guessed pixel
+    /// offsets.
+    fn click_point_for_offset(
+        vcx: &mut gpui::VisualTestContext,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        text: &str,
+        offset: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        let font_size = gpui::px(theme::VALUE_PANEL_TEXT_SIZE);
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(zsql_ui::theme::Theme::default().fonts.data),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = vcx.update(|window, _cx| {
+            window
+                .text_system()
+                .layout_line(text, font_size, &[run], None)
+        });
+        let padding = theme::VALUE_PANEL_PADDING_X;
+        gpui::point(
+            bounds.origin.x + padding + line.x_for_index(offset),
+            bounds.origin.y + padding + gpui::px(4.0),
+        )
+    }
+
+    /// Simulate a click-and-drag over a value-panel body's rendered text
+    /// from byte `from` to byte `to`, through the panel's real mouse
+    /// listeners (not a direct [`data::ValuePanelState`] mutation), ending
+    /// the drag with a mouse-up as a real drag would.
+    fn simulate_drag_over_body(
+        vcx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+        text: &str,
+        from: usize,
+        to: usize,
+    ) {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .expect("the body must be painted before it can be dragged over");
+        let down_point = click_point_for_offset(vcx, bounds, text, from);
+        let drag_point = click_point_for_offset(vcx, bounds, text, to);
+
+        vcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: down_point,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.simulate_event(gpui::MouseMoveEvent {
+            position: drag_point,
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::default(),
+        });
+        vcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: drag_point,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_over_text_sets_a_selection_spanning_the_dragged_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let text = "hello world";
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(0, Value::Text(text.to_owned()), "text")));
+        });
+        vcx.run_until_parked();
+
+        simulate_drag_over_body(vcx, "value-panel-text-body", text, 0, 5);
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                Some(0..5),
+                "a real click-and-drag over the rendered text must select exactly the dragged \
+                 byte range through the panel's own mouse listeners"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn shift_click_extends_the_selection_from_its_original_anchor(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        let text = "hello world";
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(0, Value::Text(text.to_owned()), "text")));
+        });
+        vcx.run_until_parked();
+
+        simulate_drag_over_body(vcx, "value-panel-text-body", text, 0, 5);
+
+        let bounds = vcx
+            .debug_bounds("value-panel-text-body")
+            .expect("the body must still be painted");
+        let shift_point = click_point_for_offset(vcx, bounds, text, 9);
+        vcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: shift_point,
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..gpui::Modifiers::default()
+            },
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                Some(0..9),
+                "a real shift-click must extend the selection from its original anchor, not the \
+                 last cursor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copy_with_an_active_selection_copies_only_the_selected_text(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Text("hello world".to_owned()),
+                "text",
+            )));
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(5);
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some("hello"),
+            "Cmd/Ctrl-C with an active selection must copy exactly the selected substring"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_with_no_selection_still_copies_the_whole_cell_value(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Text("hello world".to_owned()),
+                "text",
+            )));
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some("hello world"),
+            "Cmd/Ctrl-C with no selection must fall back to the whole cell value, unchanged"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_with_selection_copies_the_selected_substring_of_a_bytes_hex_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Bytes(vec![0x00, 0x41, 0xff, 0x10, 0xab, 0xcd]),
+                "bytea",
+            )));
+        });
+        vcx.run_until_parked();
+
+        let text = panel
+            .read_with(vcx, |p, _cx| p.current_body_text())
+            .expect("a Bytes cell must have hex-dump body text");
+        assert!(
+            text.len() >= 8,
+            "the hex dump must be long enough to select a sub-range from"
+        );
+
+        panel.update(vcx, |p, cx| {
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(8);
+            cx.notify();
+        });
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(&text[0..8]),
+            "Cmd/Ctrl-C with a selection over a Bytes hex body must copy exactly the same \
+             substring the body renders"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_with_selection_copies_the_selected_substring_of_a_json_pretty_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, r#"{"items":[{"sku":"A1"}]}"#)));
+            p.state_mut_for_test().set_json_mode(data::JsonMode::Pretty);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let text = panel
+            .read_with(vcx, |p, _cx| p.current_body_text())
+            .expect("Pretty mode must have body text");
+        assert!(
+            text.len() >= 6,
+            "the pretty-printed document must be long enough to select a sub-range from"
+        );
+
+        panel.update(vcx, |p, cx| {
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(6);
+            cx.notify();
+        });
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(&text[0..6]),
+            "Cmd/Ctrl-C with a selection over a JSON Pretty body must copy exactly the same \
+             substring the body renders"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_with_selection_copies_the_selected_substring_of_an_oversized_json_preview(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let oversized = format!(r#"{{"padding":"{}"}}"#, "x".repeat(100));
+        let (panel, vcx) = panel_window_with_config(
+            cx,
+            ValuePanelConfig {
+                json_eager_parse_threshold_bytes: 16,
+                json_oversized_preview_bytes: 8,
+                ..ValuePanelConfig::default()
+            },
+        );
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, &oversized)));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(
+                matches!(p.json_load_for_test(), Some(JsonLoad::Oversized { .. })),
+                "a value past the configured threshold must open Oversized"
+            );
+        });
+
+        let text = panel
+            .read_with(vcx, |p, _cx| p.current_body_text())
+            .expect("an Oversized cell must have preview body text");
+        assert!(
+            text.len() >= 4,
+            "the preview must be long enough to select a sub-range from"
+        );
+
+        panel.update(vcx, |p, cx| {
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(4);
+            cx.notify();
+        });
+
+        vcx.dispatch_action(CopyTreeNodeValue);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(&text[0..4]),
+            "Cmd/Ctrl-C with a selection over an oversized-JSON preview must copy exactly the \
+             same substring the preview renders"
+        );
+    }
+
+    #[gpui::test]
+    fn set_config_clears_a_prior_text_selection(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Text("hello world".to_owned()),
+                "text",
+            )));
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(5);
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(p.state_for_test().text_selection().range().is_some());
+        });
+
+        panel.update(vcx, |p, _cx| {
+            p.set_config(ValuePanelConfig {
+                hex_bytes_per_row: 32,
+                ..ValuePanelConfig::default()
+            });
+        });
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "changing the panel's config must clear a selection made against the previous \
+                 body text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_cell_clears_a_prior_text_selection(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Text("hello world".to_owned()),
+                "text",
+            )));
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(5);
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(p.state_for_test().text_selection().range().is_some());
+        });
+
+        panel.update(vcx, |p, _cx| {
+            p.update_content(Some(content(1, Value::Text("goodbye".to_owned()), "text")));
+        });
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "a new cell must clear a selection made against the previous cell's text"
+            );
+        });
+    }
+
     /// A JSON cell's panel renders in every mode without panicking, covering
     /// the JSON tree/pretty/raw paths and the invalid-JSON fallback path
     /// together in one render smoke test.
@@ -1173,6 +1517,313 @@ mod tests {
             assert!(
                 p.state_for_test().is_open(),
                 "the panel must stay open across every non-JSON cell it renders"
+            );
+        });
+    }
+
+    // -- current_body_text: every renderer/mode combination -----------------
+
+    #[gpui::test]
+    fn current_body_text_for_invalid_json_returns_the_raw_source_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let raw = "not json";
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, raw)));
+        });
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert!(matches!(p.json_load_for_test(), Some(JsonLoad::Invalid(_))));
+            assert_eq!(
+                p.current_body_text().as_deref(),
+                Some(raw),
+                "invalid JSON must show its exact raw source, not an empty or reformatted body"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_json_raw_mode_returns_the_raw_source_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let raw = r#"{"v":1}"#;
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, raw)));
+            p.state_mut_for_test().set_json_mode(data::JsonMode::Raw);
+        });
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(p.current_body_text().as_deref(), Some(raw));
+        });
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_bytes_base64_mode_returns_the_base64_encoding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let bytes = vec![0x00, 0x41, 0xff, 0x10, 0xab, 0xcd];
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(0, Value::Bytes(bytes.clone()), "bytea")));
+            p.state_mut_for_test()
+                .set_bytes_mode(data::BytesMode::Base64);
+        });
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.current_body_text().as_deref(),
+                Some(format::base64_encode(&bytes).as_str())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_number_values_returns_their_raw_text(cx: &mut gpui::TestAppContext) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+        });
+
+        for (id, value, expected) in [
+            (0usize, Value::Int(42), "42"),
+            (1, Value::Float(1.5), "1.5"),
+            (2, Value::Numeric("3.140".to_owned()), "3.140"),
+        ] {
+            panel.update(vcx, |p, _cx| {
+                p.update_content(Some(content(id, value, "numeric")));
+            });
+            vcx.run_until_parked();
+            panel.read_with(vcx, |p, _cx| {
+                assert_eq!(p.current_body_text().as_deref(), Some(expected));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_timestamp_modes_returns_raw_and_utc_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let raw = "2026-07-14T09:12:31+02:00";
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Timestamp(raw.to_owned()),
+                "timestamptz",
+            )));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.current_body_text().as_deref(),
+                Some(raw),
+                "Raw mode must show the driver's exact text"
+            );
+        });
+
+        panel.update(vcx, |p, _cx| {
+            p.state_mut_for_test()
+                .set_timestamp_mode(data::TimestampMode::Utc);
+        });
+        panel.read_with(vcx, |p, _cx| {
+            let expected = data::timestamp_utc_text(raw).expect("a well-formed offset must parse");
+            assert_eq!(p.current_body_text(), Some(expected));
+        });
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_an_unparseable_raw_timestamp_falls_back_to_a_could_not_be_parsed_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        let raw = "not a timestamp";
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Timestamp(raw.to_owned()),
+                "timestamptz",
+            )));
+            p.state_mut_for_test()
+                .set_timestamp_mode(data::TimestampMode::Utc);
+        });
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.current_body_text().as_deref(),
+                Some("not a timestamp (could not be parsed as a timestamp)")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn current_body_text_for_bool_and_unknown_values_returns_their_formatted_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(0, Value::Bool(true), "bool")));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(p.current_body_text().as_deref(), Some("true"));
+        });
+
+        let unknown = Value::Unknown(UnknownValue::Text("(1,2)".to_owned()));
+        panel.update(vcx, |p, _cx| {
+            p.update_content(Some(content(1, unknown.clone(), "point")));
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.current_body_text(),
+                Some(format::format_value(&unknown).text)
+            );
+        });
+    }
+
+    // -- mode switches clear a prior text selection, through the panel's
+    // own subbar buttons rather than a direct state mutation -------------
+
+    #[gpui::test]
+    fn switching_json_mode_via_the_subbar_button_clears_a_prior_text_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(json_content(0, r#"{"v":1}"#)));
+            p.state_mut_for_test().set_json_mode(data::JsonMode::Pretty);
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(3);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(p.state_for_test().text_selection().range().is_some());
+        });
+
+        let bounds = vcx
+            .debug_bounds("value-panel-mode-button-Raw")
+            .expect("the JSON subbar's Raw button must be painted");
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().json_mode(),
+                data::JsonMode::Raw,
+                "the click must have actually switched the JSON mode"
+            );
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "clicking a JSON subbar mode button must clear a selection made against the \
+                 previous mode's text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn switching_bytes_mode_via_the_subbar_button_clears_a_prior_text_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Bytes(vec![0x00, 0x41, 0xff, 0x10]),
+                "bytea",
+            )));
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(3);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(p.state_for_test().text_selection().range().is_some());
+        });
+
+        let bounds = vcx
+            .debug_bounds("value-panel-mode-button-Base64")
+            .expect("the Bytes subbar's Base64 button must be painted");
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().bytes_mode(),
+                data::BytesMode::Base64,
+                "the click must have actually switched the Bytes mode"
+            );
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "clicking the Bytes subbar's Base64 button must clear a selection made against \
+                 the previous mode's text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn switching_timestamp_mode_via_the_subbar_button_clears_a_prior_text_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, vcx) = panel_window(cx);
+        panel.update(vcx, |p, cx| {
+            p.open(cx);
+            p.update_content(Some(content(
+                0,
+                Value::Timestamp("2026-07-14T09:12:31+02:00".to_owned()),
+                "timestamptz",
+            )));
+            p.state_mut_for_test().text_selection_mut().begin(0, false);
+            let _ = p
+                .state_mut_for_test()
+                .text_selection_mut()
+                .extend_while_dragging(3);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        panel.read_with(vcx, |p, _cx| {
+            assert!(p.state_for_test().text_selection().range().is_some());
+        });
+
+        let bounds = vcx
+            .debug_bounds("value-panel-mode-button-UTC")
+            .expect("the Timestamp subbar's UTC button must be painted");
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        panel.read_with(vcx, |p, _cx| {
+            assert_eq!(
+                p.state_for_test().timestamp_mode(),
+                data::TimestampMode::Utc,
+                "the click must have actually switched the Timestamp mode"
+            );
+            assert_eq!(
+                p.state_for_test().text_selection().range(),
+                None,
+                "clicking the Timestamp subbar's UTC button must clear a selection made against \
+                 the previous mode's text"
             );
         });
     }

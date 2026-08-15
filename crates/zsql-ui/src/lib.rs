@@ -9,6 +9,7 @@ pub mod icon_button;
 pub mod modal;
 pub mod scrollable;
 pub mod scrollbar;
+pub mod selectable_text;
 pub mod table;
 pub mod tabs;
 pub mod text_field;
