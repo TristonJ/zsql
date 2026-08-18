@@ -15,8 +15,8 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Executor as _, Row as _, SqlSafeStr as _, Statement as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
-    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree, quote_ident,
-    render_where_conditions,
+    QueryEvent, QueryHandle, RelationSchema, RowBatch, RowCount, SchemaTree, append_clause_line,
+    append_where_clause, quote_ident, render_where_body,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{POOL_ACQUIRE_TIMEOUT, build_pool, liveness_check_or_skip_if_busy};
@@ -154,29 +154,28 @@ impl Connection for SqliteConnectionImpl {
     /// (double-quoted identifiers) except for `ILIKE`, which `SQLite` has no
     /// native support for and so maps to `LOWER(column) LIKE LOWER(value)`.
     fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        let multiline = args.filters.is_multiline();
         let mut sql = format!(
             "SELECT * FROM {}.{}",
             quote_ident(schema),
             quote_ident(relation)
         );
-        if let Some(where_clause) = render_where_conditions(&args.filters, quote_ident, false) {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clause);
-        }
+        append_where_clause(&mut sql, &args.filters, quote_ident, false);
         if let Some((column, direction)) = args.sort {
-            sql.push_str(" ORDER BY ");
-            sql.push_str(&quote_ident(&column));
-            sql.push(' ');
-            sql.push_str(direction.as_sql());
+            append_clause_line(
+                &mut sql,
+                multiline,
+                &format!("ORDER BY {} {}", quote_ident(&column), direction.as_sql()),
+            );
         }
-        sql.push_str(" LIMIT ");
-        sql.push_str(&args.limit.to_string());
+        let mut tail = format!("LIMIT {}", args.limit);
         if let Some(offset) = args.offset
             && offset > 0
         {
-            sql.push_str(" OFFSET ");
-            sql.push_str(&offset.to_string());
+            tail.push_str(" OFFSET ");
+            tail.push_str(&offset.to_string());
         }
+        append_clause_line(&mut sql, multiline, &tail);
         sql
     }
 
@@ -200,7 +199,7 @@ fn count_sql(schema: &str, relation: &str, filters: &FilterState) -> String {
         quote_ident(schema),
         quote_ident(relation)
     );
-    if let Some(where_clause) = render_where_conditions(filters, quote_ident, false) {
+    if let Some(where_clause) = render_where_body(filters, quote_ident, false, false) {
         sql.push_str(" WHERE ");
         sql.push_str(&where_clause);
     }
@@ -622,6 +621,51 @@ mod tests {
             "SELECT * FROM \"main\".\"orders\" WHERE \"total\"\"; DROP TABLE users; --\" = 1 LIMIT 200"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_with_two_conditions_renders_a_multiline_where_clause() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "TEXT", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "TEXT", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"main\".\"orders\"\nWHERE \"status\" = 'paid'\n  AND \"region\" = 'west'\nLIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_multiline_where_combines_with_sort_and_offset() {
+        let driver = SqliteDriver;
+        let cfg = ConnConfig::from_url("sqlite::memory:").unwrap();
+        let conn = block_on(driver.connect(&cfg)).expect("connect should succeed");
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "TEXT", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "TEXT", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "main",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(filters)
+                .sort("total_cents", zsql_core::SortDirection::Desc)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"main\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             AND \"region\" = 'west'\n\
+             ORDER BY \"total_cents\" DESC\n\
+             LIMIT 200 OFFSET 200"
+        );
     }
 
     #[test]

@@ -12,7 +12,8 @@ use sqlx::mysql::MySqlPool;
 use sqlx::{AssertSqlSafe, MySql, Row as _};
 use zsql_core::{
     BatchSink, ConnConfig, Connection, CoreError, Driver, FilterState, PreviewQueryArgs,
-    QueryHandle, RelationSchema, RowCount, SchemaTree, render_where_conditions,
+    QueryHandle, RelationSchema, RowCount, SchemaTree, append_clause_line, append_where_clause,
+    render_where_body,
 };
 use zsql_sqlx::error::map_sqlx_query_error;
 use zsql_sqlx::pool::{
@@ -202,30 +203,31 @@ impl Connection for MySqlConnection {
     /// and, since `MySQL`/`MariaDB` have no native `ILIKE`, an `ILIKE`
     /// filter mapped to `LOWER(column) LIKE LOWER(value)`.
     fn preview_query(&self, schema: &str, relation: &str, args: PreviewQueryArgs) -> String {
+        let multiline = args.filters.is_multiline();
         let mut sql = format!(
             "SELECT * FROM {}.{}",
             backtick_quote_ident(schema),
             backtick_quote_ident(relation)
         );
-        if let Some(where_clause) =
-            render_where_conditions(&args.filters, backtick_quote_ident, false)
-        {
-            let _ = write!(sql, " WHERE {where_clause}");
-        }
+        append_where_clause(&mut sql, &args.filters, backtick_quote_ident, false);
         if let Some((column, direction)) = args.sort {
-            let _ = write!(
-                sql,
-                " ORDER BY {} {}",
-                backtick_quote_ident(&column),
-                direction.as_sql()
+            append_clause_line(
+                &mut sql,
+                multiline,
+                &format!(
+                    "ORDER BY {} {}",
+                    backtick_quote_ident(&column),
+                    direction.as_sql()
+                ),
             );
         }
-        let _ = write!(sql, " LIMIT {}", args.limit);
+        let mut tail = format!("LIMIT {}", args.limit);
         if let Some(offset) = args.offset
             && offset > 0
         {
-            let _ = write!(sql, " OFFSET {offset}");
+            let _ = write!(tail, " OFFSET {offset}");
         }
+        append_clause_line(&mut sql, multiline, &tail);
         sql
     }
 
@@ -274,7 +276,7 @@ fn exact_count_sql(schema: &str, relation: &str, filters: &FilterState) -> Strin
         backtick_quote_ident(schema),
         backtick_quote_ident(relation)
     );
-    if let Some(where_clause) = render_where_conditions(filters, backtick_quote_ident, false) {
+    if let Some(where_clause) = render_where_body(filters, backtick_quote_ident, false, false) {
         let _ = write!(sql, " WHERE {where_clause}");
     }
     sql
@@ -574,6 +576,47 @@ mod tests {
             "SELECT * FROM `zsql`.`orders` WHERE `total``; DROP TABLE users; --` = 1 LIMIT 200"
         );
         assert_eq!(sql.matches("DROP TABLE").count(), 1);
+    }
+
+    #[test]
+    fn preview_query_with_two_conditions_renders_a_multiline_where_clause() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "text", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "zsql",
+            "orders",
+            PreviewQueryArgs::from_limit(200).filters(filters),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM `zsql`.`orders`\nWHERE `status` = 'paid'\n  AND `region` = 'west'\nLIMIT 200"
+        );
+    }
+
+    #[test]
+    fn preview_query_multiline_where_combines_with_sort_and_offset() {
+        let conn = connection_for_test();
+        let mut filters = zsql_core::FilterState::new();
+        filters.add_condition("status", "text", zsql_core::FilterOperator::Eq, "paid");
+        filters.add_condition("region", "text", zsql_core::FilterOperator::Eq, "west");
+        let sql = conn.preview_query(
+            "zsql",
+            "orders",
+            PreviewQueryArgs::from_limit(200)
+                .filters(filters)
+                .sort("total_cents", SortDirection::Desc)
+                .offset(200),
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM `zsql`.`orders`\n\
+             WHERE `status` = 'paid'\n  \
+             AND `region` = 'west'\n\
+             ORDER BY `total_cents` DESC\n\
+             LIMIT 200 OFFSET 200"
+        );
     }
 
     #[test]

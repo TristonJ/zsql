@@ -2032,8 +2032,10 @@ fn multiple_filters_combine_with_their_own_and_or_connectors_in_chip_order(
     model.read_with(cx, |model, app| {
         assert_eq!(
             model.tabs()[0].editor().read(app).text(),
-            "SELECT * FROM \"public\".\"orders\" WHERE \"status\" = 'paid' OR \"status\" = \
-             'pending' LIMIT 200"
+            "SELECT * FROM \"public\".\"orders\"\n\
+             WHERE \"status\" = 'paid'\n  \
+             OR \"status\" = 'pending'\n\
+             LIMIT 200"
         );
     });
 
