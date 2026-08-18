@@ -2,7 +2,9 @@
 //! handles both of its panes share, and the [`ScrollableState`] composing
 //! them into scrollbars.
 
-use gpui::{AppContext as _, Context, Entity, Pixels, ScrollHandle, UniformListScrollHandle};
+use gpui::{
+    AppContext as _, Context, Entity, Pixels, ScrollHandle, ScrollStrategy, UniformListScrollHandle,
+};
 
 use super::resize::ColumnResizeDrag;
 use crate::scrollable::ScrollableState;
@@ -64,6 +66,14 @@ impl TableState {
     /// itself notify -- see [`TableState::set_focused_cell`].
     pub fn clear_focused_cell(&mut self) {
         self.focused_cell = None;
+    }
+
+    /// Scroll `row` into view within this table's data pane, leaving the
+    /// horizontal scroll position untouched. A no-op while `row` is already
+    /// fully visible.
+    pub fn scroll_row_into_view(&self, row: usize) {
+        self.row_scroll_handle
+            .scroll_to_item(row, ScrollStrategy::Top);
     }
 
     /// Begin a column resize drag: `column`'s width is `start_width` and the
@@ -148,6 +158,15 @@ mod tests {
         state.update(cx, |state, _cx| state.clear_focused_cell());
         state.read_with(cx, |state, _app| {
             assert_eq!(state.focused_cell(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_row_into_view_requests_that_row_as_the_new_scroll_top(cx: &mut TestAppContext) {
+        let state = cx.new(TableState::new);
+        state.read_with(cx, |state, _app| state.scroll_row_into_view(42));
+        state.read_with(cx, |state, _app| {
+            assert_eq!(state.row_scroll_handle.logical_scroll_top_index(), 42);
         });
     }
 }

@@ -2366,3 +2366,464 @@ fn render_filter_bar_does_not_panic_across_every_editing_state(cx: &mut gpui::Te
     view.update(vcx, |view, cx| view.set_preview_controls(None, cx));
     vcx.run_until_parked();
 }
+
+mod quick_find_tests {
+    use gpui::{AppContext as _, Focusable as _};
+    use zsql_core::{ColumnMeta, ResultSet, Row, Value};
+
+    use super::{ResultsView, SessionState, ViewMode};
+    use crate::session::Session;
+    use crate::ui::results::quick_find::QuickFindHighlight;
+    use crate::ui::results::{OpenQuickFind, QuickFindNext, QuickFindPrev};
+
+    fn column(name: &str, type_name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: true,
+        }
+    }
+
+    /// Two columns, three rows: `refund`/`paid` on row 0, `refunded`/`PAID`
+    /// on row 1, `a refund` on row 2, giving enough matching cells across
+    /// rows and columns to exercise ordering, wraparound, and
+    /// case-sensitivity.
+    fn refunds_result() -> ResultSet {
+        ResultSet {
+            columns: vec![column("note", "text"), column("status", "text")],
+            rows: vec![
+                Row(vec![
+                    Value::Text("refund".to_owned()),
+                    Value::Text("paid".to_owned()),
+                ]),
+                Row(vec![
+                    Value::Text("refunded".to_owned()),
+                    Value::Text("PAID".to_owned()),
+                ]),
+                Row(vec![
+                    Value::Text("a refund".to_owned()),
+                    Value::Text("shipped".to_owned()),
+                ]),
+            ],
+            affected: None,
+            notices: Vec::new(),
+        }
+    }
+
+    fn view_with_refunds(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            super::super::init(cx);
+            zsql_ui::text_field::init(cx);
+        });
+        let state = SessionState::Results(std::time::Duration::from_millis(1));
+        let session = cx.new(|_cx| Session::new_for_render_test(state, refunds_result()));
+        cx.add_window_view(|window, cx| {
+            let view = ResultsView::new(session, "public.orders", cx);
+            window.focus(&view.focus_handle(cx));
+            view
+        })
+    }
+
+    #[gpui::test]
+    fn secondary_f_opens_the_bar_with_its_input_focused(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert!(view.quick_find_is_open_for_test());
+        });
+        let input_focus = view
+            .read_with(vcx, |view, cx| {
+                view.quick_find_input_focus_handle_for_test(cx)
+            })
+            .expect("the bar must be open");
+        vcx.update(|window, _cx| {
+            assert!(
+                input_focus.is_focused(window),
+                "opening the bar must move window focus into its query input"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn typing_filters_live_and_updates_the_match_counter(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("r e f u n d");
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_match_count_for_test(),
+                Some(3),
+                "\"refund\" case-insensitively matches all three note cells"
+            );
+            assert_eq!(view.quick_find_current_number_for_test(), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_query_has_no_matches_and_shows_zero_of_zero(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_match_count_for_test(), Some(0));
+            assert_eq!(view.quick_find_current_number_for_test(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn enter_and_shift_enter_navigate_matches_with_wraparound(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("r e f u n d");
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(1));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(2));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(3));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_current_number_for_test(),
+                Some(1),
+                "Enter from the last match must wrap to the first"
+            );
+        });
+
+        vcx.simulate_keystrokes("shift-enter");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_current_number_for_test(),
+                Some(3),
+                "Shift+Enter from the first match must wrap to the last"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn up_and_down_keys_navigate_matches_while_the_input_has_focus(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("r e f u n d");
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("down");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(2));
+        });
+
+        vcx.simulate_keystrokes("up");
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn quick_find_next_and_prev_actions_navigate_with_wraparound(cx: &mut gpui::TestAppContext) {
+        // Exercises the same handler the bar's next/previous buttons invoke
+        // on click.
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_quick_find_query_for_test("refund", cx);
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(QuickFindNext);
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(2));
+        });
+
+        vcx.dispatch_action(QuickFindPrev);
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_current_number_for_test(), Some(1));
+        });
+
+        vcx.dispatch_action(QuickFindPrev);
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_current_number_for_test(),
+                Some(3),
+                "previous from the first match must wrap to the last"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn toggling_case_sensitivity_changes_the_match_results(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_quick_find_query_for_test("PAID", cx);
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_case_sensitive_for_test(),
+                Some(false),
+                "case-sensitivity starts off"
+            );
+            assert_eq!(
+                view.quick_find_match_count_for_test(),
+                Some(2),
+                "case-insensitively \"PAID\" matches both \"paid\" and \"PAID\""
+            );
+        });
+
+        view.update(vcx, |view, cx| {
+            view.toggle_quick_find_case_for_test(cx);
+        });
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_case_sensitive_for_test(), Some(true));
+            assert_eq!(
+                view.quick_find_match_count_for_test(),
+                Some(1),
+                "case-sensitive \"PAID\" only matches the literal \"PAID\" cell"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn esc_closes_the_bar_clears_highlights_and_restores_grid_focus(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_quick_find_query_for_test("refund", cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_ne!(view.quick_find_highlight(0, 0), QuickFindHighlight::None);
+        });
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert!(
+                !view.quick_find_is_open_for_test(),
+                "Esc must close the bar"
+            );
+            assert_eq!(
+                view.quick_find_highlight(0, 0),
+                QuickFindHighlight::None,
+                "closing must clear every highlight"
+            );
+            assert_eq!(
+                view.table_state.read(app).focused_cell(),
+                Some((0, 0)),
+                "the last current match's cell stays the grid's focused cell, so find doubles \
+                 as jump-to"
+            );
+        });
+        let grid_focus = view.read_with(vcx, ResultsView::focus_handle);
+        vcx.update(|window, _cx| {
+            assert!(
+                grid_focus.is_focused(window),
+                "closing must return window focus to the grid"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_query_run_closes_the_bar(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert!(view.quick_find_is_open_for_test());
+        });
+
+        view.update(vcx, |view, cx| {
+            view.show_live("public.orders", cx);
+        });
+
+        view.read_with(vcx, |view, _app| {
+            assert!(
+                !view.quick_find_is_open_for_test(),
+                "a fresh result must close a stale quick-find bar rather than leaving it open \
+                 over replaced rows"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_f_does_not_reopen_an_already_open_bar_but_refocuses_its_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_quick_find_query_for_test("refund", cx);
+        });
+        vcx.run_until_parked();
+
+        // Move focus away from the input, then reopen: the same session must
+        // be reused (the query survives) and focus must return to the input.
+        let grid_focus = view.read_with(vcx, ResultsView::focus_handle);
+        vcx.update(|window, _cx| window.focus(&grid_focus));
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_match_count_for_test(),
+                Some(3),
+                "reopening while already open must not clear the in-progress query"
+            );
+        });
+        let input_focus = view
+            .read_with(vcx, |view, cx| {
+                view.quick_find_input_focus_handle_for_test(cx)
+            })
+            .expect("the bar must be open");
+        vcx.update(|window, _cx| assert!(input_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn quick_find_closed_leaves_ordinary_grid_navigation_and_copy_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::ui::results::{CellDown, CellRight, Copy};
+
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+
+        // The first arrow press with nothing selected lands on (0, 0), then
+        // CellRight steps to (0, 1): ordinary grid navigation, unaffected by
+        // quick-find ever having existed.
+        vcx.dispatch_action(CellDown);
+        vcx.dispatch_action(CellRight);
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.table_state.read(app).focused_cell(), Some((0, 1)));
+            assert!(!view.quick_find_is_open_for_test());
+        });
+
+        vcx.dispatch_action(Copy);
+        let copied = vcx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("paid"));
+    }
+
+    #[gpui::test]
+    fn opening_the_bar_switches_out_of_the_text_view_so_highlights_are_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_view_mode_for_test(ViewMode::Text, cx);
+        });
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.view_mode_for_test(), ViewMode::Text);
+        });
+
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.view_mode_for_test(),
+                ViewMode::Grid,
+                "opening quick-find must switch to the grid so its highlights are visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sync_dimensions_recomputes_matches_when_the_loaded_rows_change(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, vcx) = view_with_refunds(cx);
+        vcx.run_until_parked();
+        vcx.dispatch_action(OpenQuickFind);
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.set_quick_find_query_for_test("refund", cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(view.quick_find_match_count_for_test(), Some(3));
+            assert_eq!(view.quick_find_current_number_for_test(), Some(1));
+        });
+
+        let session = view.read_with(vcx, |view, _app| view.session.clone());
+        session.update(vcx, |session, _cx| {
+            session.set_result_for_test(ResultSet {
+                columns: vec![column("note", "text"), column("status", "text")],
+                rows: vec![
+                    Row(vec![
+                        Value::Text("refund".to_owned()),
+                        Value::Text("paid".to_owned()),
+                    ]),
+                    Row(vec![
+                        Value::Text("refunded".to_owned()),
+                        Value::Text("PAID".to_owned()),
+                    ]),
+                ],
+                affected: None,
+                notices: Vec::new(),
+            });
+        });
+        // `Session::set_result_for_test` bypasses `cx.notify()`, so the view
+        // is synced explicitly here rather than relying on the observer.
+        view.update(vcx, ResultsView::sync_dimensions);
+
+        view.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.quick_find_match_count_for_test(),
+                Some(2),
+                "the row-3 match must drop once its row is no longer loaded"
+            );
+            assert_eq!(
+                view.quick_find_current_number_for_test(),
+                Some(1),
+                "the current match survives a sync that still contains its cell"
+            );
+        });
+    }
+}
