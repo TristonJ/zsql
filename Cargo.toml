@@ -15,7 +15,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 # UI (verified published: gpui 0.2.2). Pinned exact given pre-1.0 churn.
