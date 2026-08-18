@@ -474,15 +474,9 @@ mod tests {
     /// channel back from the crate's own background runtime.
     fn block_on_without_a_tokio_runtime<F: std::future::Future>(fut: F) -> F::Output {
         use std::pin::pin;
-        use std::task::{Context, Poll, Wake, Waker};
+        use std::task::{Context, Poll, Waker};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: Arc<Self>) {}
-        }
-
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = pin!(fut);
         loop {
             match fut.as_mut().poll(&mut cx) {
