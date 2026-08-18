@@ -1,4 +1,6 @@
 # ZSQL
+[![CI](https://github.com/TristonJ/zsql/actions/workflows/ci.yml/badge.svg)](https://github.com/TristonJ/zsql/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/TristonJ/zsql/branch/main/graph/badge.svg)](https://codecov.io/gh/TristonJ/zsql) [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](https://github.com/TristonJ/zsql/blob/main/LICENSE)
+
 A lightweight developer-first SQL editor.
 
 ## Screenshots
