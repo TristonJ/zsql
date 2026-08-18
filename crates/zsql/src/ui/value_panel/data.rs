@@ -500,7 +500,9 @@ pub struct ValuePanelState {
 impl ValuePanelState {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut state = Self::default();
+        state.reset_tree();
+        state
     }
 
     #[must_use]
@@ -606,13 +608,12 @@ impl ValuePanelState {
         self.tree_selected = path;
     }
 
-    /// Reset the tree's selection/expansion, e.g. once the panel starts
-    /// showing a different value: a stale selection or expand-set from a
-    /// previous document would otherwise point at nodes the new one may not
-    /// have.
+    /// Reset the tree to its initial state: no selection, and only the root
+    /// expanded, so a fresh document immediately shows its first level.
     pub fn reset_tree(&mut self) {
         self.tree_selected.clear();
         self.tree_expanded.clear();
+        self.tree_expanded.insert(Vec::new());
     }
 
     #[must_use]
@@ -1229,5 +1230,36 @@ mod tests {
         panel.reset_tree();
         assert!(!panel.is_tree_node_expanded(&path));
         assert_eq!(panel.selected_tree_path(), &[] as &[PathSegment]);
+    }
+
+    #[test]
+    fn a_fresh_or_reset_tree_starts_with_the_root_expanded() {
+        let mut panel = ValuePanelState::new();
+        assert!(
+            panel.is_tree_node_expanded(&[]),
+            "a fresh tree must show its first level without a click"
+        );
+
+        panel.toggle_tree_node(&[]);
+        assert!(!panel.is_tree_node_expanded(&[]));
+        panel.reset_tree();
+        assert!(
+            panel.is_tree_node_expanded(&[]),
+            "resetting for a new document must re-expand the root"
+        );
+    }
+
+    #[test]
+    fn a_fresh_tree_lists_the_root_and_its_first_level_as_visible_rows() {
+        let panel = ValuePanelState::new();
+        let root = parse_json(r#"{"a": 1, "b": {"c": 2}}"#).unwrap();
+        let rows = visible_tree_rows(&root, panel.tree_expanded());
+
+        let depths: Vec<usize> = rows.iter().map(|row| row.depth).collect();
+        assert_eq!(
+            depths,
+            vec![0, 1, 1],
+            "the root and exactly its first level must be visible"
+        );
     }
 }
