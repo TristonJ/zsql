@@ -19,17 +19,10 @@ mod ui;
 
 use config::Config;
 use connections::ConnectionStore;
-use gpui::{
-    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
-};
+use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*};
 use session::{Session, SessionState};
 use ui::workspace::{WorkspaceStartup, WorkspaceView};
 use zsql_ui::theme::{Theme, get_builtin_fonts};
-
-/// Default window size for the workspace.
-const WINDOW_WIDTH: f32 = 1180.0;
-/// Default window size for the workspace.
-const WINDOW_HEIGHT: f32 = 760.0;
 
 /// The window title shown by the OS (taskbar, window list, title bar).
 const APP_TITLE: &str = "zsql";
@@ -164,10 +157,10 @@ fn main() -> anyhow::Result<()> {
             ui::save_modal::init(cx);
             ui::open_modal::init(cx);
 
-            let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+            let bounds = Bounds::maximized(None, cx);
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(WindowBounds::Maximized(bounds)),
                     titlebar: Some(TitlebarOptions {
                         title: Some(APP_TITLE.into()),
                         ..Default::default()
