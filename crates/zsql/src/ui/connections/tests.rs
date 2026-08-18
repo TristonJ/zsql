@@ -1488,6 +1488,13 @@ async fn run_test_with_an_unreachable_ssh_host_reports_an_ssh_layer_failure(
         });
         let user_field = form.read(cx).ssh_user_field.clone();
         user_field.update(cx, |field, cx| field.set_value("nobody", cx));
+        // Password auth keeps the test independent of an ambient ssh-agent;
+        // with agent auth, an agentless environment fails before dialing.
+        form.update(cx, |form, cx| {
+            form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+        });
+        let password_field = form.read(cx).ssh_password_field.clone();
+        password_field.update(cx, |field, cx| field.set_value("test-password", cx));
     });
 
     let task = manager.update(vcx, |view, cx| {
@@ -1534,6 +1541,13 @@ async fn connect_unsaved_does_not_silently_ignore_the_forms_ssh_section(cx: &mut
         });
         let user_field = form.read(cx).ssh_user_field.clone();
         user_field.update(cx, |field, cx| field.set_value("nobody", cx));
+        // Password auth keeps the test independent of an ambient ssh-agent;
+        // with agent auth, an agentless environment fails before dialing.
+        form.update(cx, |form, cx| {
+            form.set_ssh_auth_kind(SshAuthKind::Password, cx);
+        });
+        let password_field = form.read(cx).ssh_password_field.clone();
+        password_field.update(cx, |field, cx| field.set_value("test-password", cx));
     });
 
     let task = manager.update(vcx, |view, cx| {
