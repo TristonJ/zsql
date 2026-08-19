@@ -15,8 +15,8 @@ jobs:
 
     strategy:
       matrix:
-        # TODO: Mac/Windows builds
-        os: [ubuntu-latest]
+        # TODO: Windows builds
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
 
     steps:
       - name: Verify Tag
