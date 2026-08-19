@@ -8,6 +8,8 @@ use zsql_ui::tree::{row_meta, row_shell};
 use zsql_ui::utils::OnHoverState;
 
 use super::SidebarView;
+use super::filter::{self, MatchRange};
+use super::find;
 use super::model::{ScriptRow, ScriptRowKind, library_row_is_open, scripts_pane_shows_empty_state};
 use crate::ui::tabs::TabModel;
 use crate::ui::theme;
@@ -25,6 +27,12 @@ pub(super) fn render_scripts_pane(
     window: &mut Window,
     cx: &mut Context<SidebarView>,
 ) -> Div {
+    let query = find::current_query(view, cx);
+    let trimmed = query.trim();
+    if !trimmed.is_empty() {
+        return render_filtered_scripts_pane(view, trimmed, window, cx);
+    }
+
     let session_rows: Vec<(usize, &ScriptRow)> = view
         .script_rows
         .iter()
@@ -57,7 +65,7 @@ pub(super) fn render_scripts_pane(
         pane.children(
             session_rows
                 .into_iter()
-                .map(|(index, row)| render_script_row(index, row, cx)),
+                .map(|(index, row)| render_script_row(index, row, None, cx)),
         )
     };
 
@@ -68,8 +76,58 @@ pub(super) fn render_scripts_pane(
         pane.children(
             library_rows
                 .into_iter()
-                .map(|(index, row)| render_script_row(index, row, cx)),
+                .map(|(index, row)| render_script_row(index, row, None, cx)),
         )
+    };
+
+    view.scripts_scroll.update(cx, |scroll, _cx| {
+        scroll.vertical(Axis::measured(ScrollSource::Container(
+            view.scripts_scroll_handle.clone(),
+        )));
+    });
+    let scroll_area = pane.with_scrollbars(
+        &view.scripts_scroll,
+        SidebarView::tree_scrollbar_style(cx.theme()),
+        cx,
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(scroll_area)
+        .child(render_scripts_footer(window, cx))
+}
+
+/// The Scripts pane under a live filter: every row whose label matches the
+/// query, amber-washed, or a small empty state with zero matches. The
+/// footer stays pinned exactly as it does unfiltered.
+fn render_filtered_scripts_pane(
+    view: &SidebarView,
+    query: &str,
+    window: &mut Window,
+    cx: &mut Context<SidebarView>,
+) -> Div {
+    let matches = filter::filter_script_rows(&view.script_rows, query);
+
+    let mut pane = div()
+        .id("sidebar-scripts-pane")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .track_scroll(&view.scripts_scroll_handle)
+        .py(px(theme::SIDEBAR_TREE_PADDING_Y));
+
+    pane = if matches.is_empty() {
+        pane.child(find::render_filter_empty_state(query, cx))
+    } else {
+        pane.children(matches.iter().map(|found| {
+            let row = &view.script_rows[found.index];
+            render_script_row(found.index, row, Some(&found.label_match), cx)
+        }))
     };
 
     view.scripts_scroll.update(cx, |scroll, _cx| {
@@ -246,8 +304,15 @@ fn render_empty_state(cx: &Context<SidebarView>) -> Div {
         )
 }
 
-/// One script/library row
-fn render_script_row(index: usize, row: &ScriptRow, cx: &Context<SidebarView>) -> Stateful<Div> {
+/// One script/library row. `label_match`, when rendered under a live
+/// filter, washes that byte range of the label in the shared quick-find
+/// amber.
+fn render_script_row(
+    index: usize,
+    row: &ScriptRow,
+    label_match: Option<&MatchRange>,
+    cx: &Context<SidebarView>,
+) -> Stateful<Div> {
     let active_theme = cx.theme();
     let target = row.target.clone();
     let mut shell = row_shell(theme::SIDEBAR_SCRIPT_ROW_INDENT, active_theme)
@@ -273,7 +338,11 @@ fn render_script_row(index: usize, row: &ScriptRow, cx: &Context<SidebarView>) -
         .items_center()
         .flex_1()
         .min_w_0()
-        .child(div().min_w_0().truncate().child(row.label.clone()));
+        .child(find::highlighted_row_label_fixed(
+            &row.label,
+            label_match,
+            active_theme,
+        ));
     if library_row_is_open(row) {
         label_group = label_group.child(
             div()

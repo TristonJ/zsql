@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    ClickEvent, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, Stateful, UniformListScrollHandle, Window, div, point, prelude::*, px,
-    rgb, uniform_list,
+    App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
+    MouseDownEvent, Pixels, Render, Stateful, UniformListScrollHandle, Window, actions, div, point,
+    prelude::*, px, rgb, uniform_list,
 };
 use zsql_core::RelationKind;
 use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
@@ -37,11 +37,38 @@ use super::time_fmt;
 use crate::session::{SchemaState, Session, SessionState};
 use crate::session_store::{self, SessionDir};
 
+mod context_menu;
 mod db_row;
+mod filter;
+mod find;
 mod model;
 mod pane;
 mod scripts;
 mod scripts_refresh;
+
+/// The key context the sidebar's own key bindings are scoped to.
+pub const KEY_CONTEXT: &str = "Sidebar";
+
+actions!(zsql_sidebar, [OpenFind, CloseFind]);
+
+/// The context predicate the sidebar's open-find binding matches against:
+/// the sidebar's own context, but never while keyboard focus sits inside a
+/// text field (the find row's own input renders within this context).
+const BINDING_CONTEXT: &str = "Sidebar && !TextField";
+
+/// The keystroke that opens the sidebar's find row, shared with
+/// [`crate::ui::workspace`]'s hover-based routing so the two paths can
+/// never diverge.
+pub(crate) const OPEN_FIND_KEYSTROKE: &str = "secondary-f";
+
+/// Register the sidebar's key bindings. Call once at startup, before any
+/// window that hosts a [`SidebarView`] is opened.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(OPEN_FIND_KEYSTROKE, OpenFind, Some(BINDING_CONTEXT)),
+        KeyBinding::new("escape", CloseFind, Some(find::KEY_CONTEXT)),
+    ]);
+}
 
 /// What [`SidebarView::render_body`] shows in place of the tree: `None`
 /// means the tree itself should render instead.
@@ -119,7 +146,7 @@ pub struct SidebarView {
     /// The tree's scrollbar state.
     scroll: Entity<ScrollableState>,
     /// The currently open relation-row context menu, if any.
-    context_menu: Option<ContextMenuState>,
+    context_menu: Option<context_menu::ContextMenuState>,
     /// Whether the database row's switcher dropdown (see
     /// [`Self::render_db_switcher_menu`]) is currently open.
     db_switcher_open: bool,
@@ -163,19 +190,18 @@ pub struct SidebarView {
     /// rescanning two directories on the render thread
     cached_session_scripts: Vec<SessionScript>,
     cached_library_scripts: Vec<LibraryScript>,
-}
-
-/// A relation row's open right-click context menu: which relation it
-/// targets, the flattened index of its triggering row (so the menu can
-/// anchor to that row's right edge), and the triggering click position used
-/// as a fallback anchor before the tree viewport has been measured.
-#[derive(Debug, Clone)]
-struct ContextMenuState {
-    schema: String,
-    relation: String,
-    kind: RelationKind,
-    row_index: usize,
-    fallback_position: Point<Pixels>,
+    /// The open quick-find session, if any. `None` shows the database row
+    /// (schema pane) or nothing (scripts pane) in its slot instead.
+    find: Option<find::SidebarFind>,
+    /// The expand/collapse choices captured just before the live query went
+    /// non-empty, restored exactly once it clears.
+    pre_filter_collapse: Option<filter::CollapseSnapshot>,
+    /// Whether the pointer currently sits over the sidebar, for Ctrl+F's
+    /// hover-based routing against the results grid's own quick find.
+    pointer_hovering: bool,
+    /// This view's own focus target, so a tab or a click can move keyboard
+    /// focus onto the sidebar and its find input registers as within it.
+    focus_handle: FocusHandle,
 }
 
 impl SidebarView {
@@ -225,6 +251,10 @@ impl SidebarView {
             script_rows_generation: 0,
             cached_session_scripts: Vec::new(),
             cached_library_scripts: Vec::new(),
+            find: None,
+            pre_filter_collapse: None,
+            pointer_hovering: false,
+            focus_handle: cx.focus_handle(),
         };
         view.sync_rows(cx);
         view.sync_script_rows(cx);
@@ -259,6 +289,12 @@ impl SidebarView {
         &self.script_rows
     }
 
+    /// Whether the quick-find row is currently open.
+    #[cfg(test)]
+    pub(crate) fn find_is_open_for_test(&self) -> bool {
+        self.find.is_some()
+    }
+
     /// Switch which full-height pane the sidebar shows. A no-op (no
     /// re-render, no other state touched) when `pane` is already active.
     #[tracing::instrument(name = "sidebar_switch_pane", skip(self, cx))]
@@ -273,6 +309,7 @@ impl SidebarView {
         if pane != SidebarPane::Schema {
             self.close_db_switcher(cx);
         }
+        find::sync_placeholder_for_pane(self, pane, cx);
         cx.notify();
     }
 
@@ -458,71 +495,6 @@ impl SidebarView {
         cx.notify();
     }
 
-    /// Open the right-click context menu for `schema.relation`, anchored to
-    /// the right edge of its `row_index` row. `fallback_position` (window
-    /// coordinates, from the triggering mouse event) anchors the menu until
-    /// the tree viewport has been measured.
-    fn open_context_menu(
-        &mut self,
-        schema: String,
-        relation: String,
-        kind: RelationKind,
-        row_index: usize,
-        fallback_position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        self.context_menu = Some(ContextMenuState {
-            schema,
-            relation,
-            kind,
-            row_index,
-            fallback_position,
-        });
-        cx.notify();
-    }
-
-    /// Where to anchor the context menu for the relation row at `row_index`:
-    /// the top of that row at the tree viewport's right edge, in window
-    /// coordinates. `None` before the tree viewport has been measured, when
-    /// the row's on-screen position cannot yet be derived.
-    #[allow(clippy::cast_precision_loss)]
-    fn relation_row_anchor(&self, row_index: usize) -> Option<Point<Pixels>> {
-        let bounds = self.tree_scroll_handle.0.borrow().base_handle.bounds();
-        if bounds.size.height == Pixels::ZERO {
-            return None;
-        }
-        let right_edge_x = bounds.origin.x + bounds.size.width;
-        let row_top_y = bounds.origin.y + ROW_HEIGHT * row_index as f32 - self.tree_scroll_offset();
-        Some(point(right_edge_x, row_top_y))
-    }
-
-    /// Close the open context menu, if any.
-    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
-        if self.context_menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Write the open context menu's relation's bare name to the system
-    /// clipboard, then close the menu. A no-op if no menu is open.
-    fn copy_name(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = &self.context_menu {
-            cx.write_to_clipboard(ClipboardItem::new_string(menu.relation.clone()));
-        }
-        self.close_context_menu(cx);
-    }
-
-    /// Write the open context menu's relation's qualified `schema.relation`
-    /// name to the system clipboard, then close the menu. A no-op if no
-    /// menu is open.
-    fn copy_qualified_name(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = &self.context_menu {
-            let qualified = qualified_relation_name(&menu.schema, &menu.relation);
-            cx.write_to_clipboard(ClipboardItem::new_string(qualified));
-        }
-        self.close_context_menu(cx);
-    }
-
     /// The tree's current downward scroll offset (zero at the top).
     /// `ScrollHandle::offset` is negative-down, matching `EditorView`'s
     /// scroll handle convention, so this negates it back to a
@@ -539,6 +511,25 @@ impl SidebarView {
         if self.session.read(cx).is_connected() {
             self.session.update(cx, Session::introspect).detach();
         }
+    }
+
+    /// [`OpenFind`]'s handler: open the quick-find row and focus its input,
+    /// or refocus it if already open.
+    #[tracing::instrument(name = "sidebar_open_find", skip_all)]
+    pub(crate) fn open_find(&mut self, _: &OpenFind, window: &mut Window, cx: &mut Context<Self>) {
+        find::open(self, window, cx);
+    }
+
+    /// [`CloseFind`]'s handler: close the find row and restore the
+    /// collapse state captured before filtering began.
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        find::close(self, window, cx);
+    }
+
+    /// Whether the pointer currently sits over the sidebar, for Ctrl+F's
+    /// hover-based routing between this view and the results grid.
+    pub(crate) fn is_pointer_hovering(&self) -> bool {
+        self.pointer_hovering
     }
 
     /// Open (or close, if already open) the database-switcher dropdown.
@@ -651,6 +642,16 @@ impl SidebarView {
             .into_any_element(),
             None => self.render_tree(window, cx).into_any_element(),
         }
+    }
+
+    /// The schema pane's body, routed through the live find filter when a
+    /// session is open with a non-empty query.
+    fn render_schema_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        find::render_schema_body(self, window, cx)
     }
 
     /// A centered title + detail message shown in place of the tree for any
@@ -800,13 +801,16 @@ impl SidebarView {
                 name,
                 kind,
                 column_count,
-            } => self.render_relation_row(ix, schema, name, *kind, *column_count, cx),
+            } => self.render_relation_row(ix, schema, name, *kind, *column_count, None, cx),
         }
     }
 
     /// A relation row: left-click previews it, right-click opens its
     /// context menu, and a currently-selected relation gets a teal left
-    /// border and tinted background.
+    /// border and tinted background. `label_match`, when the row is
+    /// rendered under a live filter, washes that byte range of the label
+    /// in the shared quick-find amber.
+    #[allow(clippy::too_many_arguments)]
     fn render_relation_row(
         &self,
         ix: usize,
@@ -814,6 +818,7 @@ impl SidebarView {
         name: &str,
         kind: RelationKind,
         column_count: usize,
+        label_match: Option<&filter::MatchRange>,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let active_theme = cx.theme();
@@ -836,7 +841,8 @@ impl SidebarView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
-                    view.open_context_menu(
+                    context_menu::open(
+                        view,
                         schema_for_menu.clone(),
                         name_for_menu.clone(),
                         kind,
@@ -847,7 +853,7 @@ impl SidebarView {
                 }),
             )
             .child(disclosure_spacer())
-            .child(row_label(name.to_owned()))
+            .child(find::highlighted_row_label(name, label_match, active_theme))
             .child(icon(
                 relation_icon_name(kind),
                 theme::SIDEBAR_RELATION_ICON_SIZE,
@@ -867,88 +873,39 @@ impl SidebarView {
     }
 }
 
-impl SidebarView {
-    /// The right-click context menu overlay: `Preview Data`, `View Schema`,
-    /// a separator, then `Copy Name`/`Copy Qualified Name`, anchored to the
-    /// right edge of its triggering relation row. A full-window backdrop
-    /// behind it absorbs off-menu clicks so closing the menu never doubles
-    /// as activating whatever sits beneath it. Renders nothing when no menu
-    /// is open.
-    fn render_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let menu = self.context_menu.clone()?;
-        let schema = menu.schema.clone();
-        let relation = menu.relation.clone();
-        let kind = menu.kind;
-        let anchor = self
-            .relation_row_anchor(menu.row_index)
-            .unwrap_or(menu.fallback_position);
-
-        let preview_schema = schema.clone();
-        let preview_relation = relation.clone();
-        let view_schema_schema = schema.clone();
-        let view_schema_relation = relation.clone();
-
-        let menu = ContextMenu::new("sidebar-context-menu")
-            .position(anchor)
-            .on_close(cx.listener(|view, _event, _window, cx| {
-                view.close_context_menu(cx);
-            }))
-            .add_item(ContextMenuItem::new("Preview Data").on_click(cx.listener(
-                move |view, _event, window, cx| {
-                    view.preview(&preview_schema, &preview_relation, window, cx);
-                    view.close_context_menu(cx);
-                },
-            )))
-            .add_item(ContextMenuItem::new("View Schema").on_click(cx.listener(
-                move |view, _event, _window, cx| {
-                    view.view_schema(&view_schema_schema, &view_schema_relation, kind, cx);
-                    view.close_context_menu(cx);
-                },
-            )))
-            .add_separator()
-            .add_item(ContextMenuItem::new("Copy Name").on_click(cx.listener(
-                |view, _event, _window, cx| {
-                    view.copy_name(cx);
-                    view.close_context_menu(cx);
-                },
-            )))
-            .add_item(
-                ContextMenuItem::new("Copy Qualified Name").on_click(cx.listener(
-                    |view, _event, _window, cx| {
-                        view.copy_qualified_name(cx);
-                        view.close_context_menu(cx);
-                    },
-                )),
-            );
-
-        Some(menu.into_any_element())
+impl Focusable for SidebarView {
+    fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
     }
-}
-
-/// `schema.relation`, the text `Copy Qualified Name` writes to the
-/// clipboard.
-fn qualified_relation_name(schema: &str, relation: &str) -> String {
-    format!("{schema}.{relation}")
 }
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_theme = cx.theme();
         let mut root = div()
+            .id("sidebar-root")
+            .debug_selector(|| "sidebar-root".to_owned())
             .relative()
             .flex()
             .flex_col()
             .size_full()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::close_find))
+            .on_hover(cx.listener(|view, hovered: &bool, _window, _cx| {
+                view.pointer_hovering = *hovered;
+            }))
             .bg(rgb(active_theme.colors.bg_panel))
             .child(pane::render_pane_tabs(self, window, cx))
-            .children(db_row::render_db_row(self, cx));
+            .children(find::render_top_slot(self, cx));
 
         root = match self.active_pane {
-            SidebarPane::Schema => root.child(self.render_body(window, cx)),
+            SidebarPane::Schema => root.child(self.render_schema_pane(window, cx)),
             SidebarPane::Scripts => root.child(scripts::render_scripts_pane(self, window, cx)),
         };
 
-        root.children(self.render_context_menu(cx))
+        root.children(context_menu::render(self, cx))
     }
 }
 
@@ -1112,7 +1069,7 @@ mod render_tests {
     use zsql_ui::scrollable::vertical_thumb_debug_selector;
 
     use super::{
-        SidebarPane, SidebarPlaceholder, SidebarView, db_row, qualified_relation_name,
+        SidebarPane, SidebarPlaceholder, SidebarView, context_menu, db_row, filter, find,
         sidebar_placeholder,
     };
     use crate::session::{SchemaState, Session, SessionState};
@@ -1491,7 +1448,8 @@ mod render_tests {
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
-            view.open_context_menu(
+            context_menu::open(
+                view,
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
@@ -1504,7 +1462,7 @@ mod render_tests {
             assert!(view.context_menu.is_some());
         });
 
-        sidebar.update(vcx, SidebarView::close_context_menu);
+        sidebar.update(vcx, context_menu::close);
         sidebar.read_with(vcx, |view, _app| {
             assert!(view.context_menu.is_none());
         });
@@ -1520,7 +1478,8 @@ mod render_tests {
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
-            view.open_context_menu(
+            context_menu::open(
+                view,
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
@@ -1528,7 +1487,7 @@ mod render_tests {
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
-            view.copy_name(cx);
+            context_menu::copy_name(view, cx);
         });
 
         let copied =
@@ -1554,7 +1513,8 @@ mod render_tests {
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
-            view.open_context_menu(
+            context_menu::open(
+                view,
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
@@ -1562,7 +1522,7 @@ mod render_tests {
                 gpui::point(gpui::px(10.0), gpui::px(20.0)),
                 cx,
             );
-            view.copy_qualified_name(cx);
+            context_menu::copy_qualified_name(view, cx);
         });
 
         let copied =
@@ -1578,7 +1538,10 @@ mod render_tests {
 
     #[test]
     fn qualified_relation_name_joins_schema_and_relation_with_a_dot() {
-        assert_eq!(qualified_relation_name("public", "orders"), "public.orders");
+        assert_eq!(
+            context_menu::qualified_relation_name("public", "orders"),
+            "public.orders"
+        );
     }
 
     #[gpui::test]
@@ -1591,7 +1554,8 @@ mod render_tests {
             cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
 
         sidebar.update(vcx, |view, cx| {
-            view.open_context_menu(
+            context_menu::open(
+                view,
                 "public".to_owned(),
                 "orders".to_owned(),
                 RelationKind::Table,
@@ -1625,11 +1589,9 @@ mod render_tests {
         // the row's laid-out geometry (its top at the viewport's right edge),
         // and successive rows anchor lower than their predecessors.
         sidebar.read_with(vcx, |view, _app| {
-            let first = view
-                .relation_row_anchor(0)
+            let first = context_menu::relation_row_anchor(view, 0)
                 .expect("a measured tree yields a row anchor");
-            let second = view
-                .relation_row_anchor(1)
+            let second = context_menu::relation_row_anchor(view, 1)
                 .expect("a measured tree yields a row anchor");
             assert!(
                 second.y > first.y,
@@ -2465,5 +2427,389 @@ mod render_tests {
             vec![OpenRequested::BrowseFiles],
             "clicking the footer must emit exactly the BrowseFiles request"
         );
+    }
+
+    // -- quick find -------------------------------------------------
+
+    /// Like [`build`], but registers the sidebar's own key bindings first,
+    /// so `vcx.simulate_keystrokes` actually dispatches through the real
+    /// keymap instead of only through direct method calls.
+    fn build_with_find_init(
+        cx: &mut gpui::TestAppContext,
+        schema: SchemaState,
+    ) -> (gpui::Entity<SidebarView>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            super::init(cx);
+            zsql_ui::text_field::init(cx);
+        });
+        build(cx, schema)
+    }
+
+    #[gpui::test]
+    fn secondary_f_opens_the_find_row_with_its_input_focused_when_the_sidebar_has_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        let focus_handle = sidebar.read_with(vcx, |view, _app| view.focus_handle.clone());
+        vcx.update(|window, _cx| window.focus(&focus_handle));
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.find.is_some(), "Ctrl+F must open the find row");
+        });
+        let input_focus = sidebar
+            .read_with(vcx, find::input_focus_handle_for_test)
+            .expect("the find row must be open");
+        vcx.update(|window, _cx| {
+            assert!(
+                input_focus.is_focused(window),
+                "opening the find row must move window focus into its query input"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn typing_a_query_captures_and_auto_expands_a_previously_collapsed_matching_schema(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| view.toggle_schema("zsql", "public", cx));
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.collapsed_schemas
+                    .contains(&("zsql".to_owned(), "public".to_owned())),
+                "the schema must start collapsed for this test to prove anything"
+            );
+        });
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.pre_filter_collapse.is_some(),
+                "the pre-filter collapse state must be captured on the first keystroke"
+            );
+            assert!(
+                !view
+                    .collapsed_schemas
+                    .contains(&("zsql".to_owned(), "public".to_owned())),
+                "a schema holding a match must auto-expand while filtering"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn esc_closes_the_row_and_restores_the_exact_pre_filter_collapse_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| view.toggle_schema("zsql", "public", cx));
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(view.find.is_none(), "Esc must close the find row");
+            assert!(
+                view.pre_filter_collapse.is_none(),
+                "the snapshot must be consumed once restored"
+            );
+            assert!(
+                view.collapsed_schemas
+                    .contains(&("zsql".to_owned(), "public".to_owned())),
+                "the user's own collapse choice from before filtering must be restored exactly"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn emptying_the_query_restores_collapse_state_without_closing_the_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| view.toggle_schema("zsql", "public", cx));
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        for _ in 0.."orders".len() {
+            vcx.simulate_keystrokes("backspace");
+        }
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.find.is_some(),
+                "emptying the query must not close the row, only Esc does"
+            );
+            assert!(
+                view.pre_filter_collapse.is_none(),
+                "the snapshot must be consumed once the query empties back out"
+            );
+            assert!(
+                view.collapsed_schemas
+                    .contains(&("zsql".to_owned(), "public".to_owned())),
+                "the pre-filter collapse state must be restored once the query empties"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn enter_opens_the_first_visible_match(cx: &mut gpui::TestAppContext) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        let tabs = sidebar.read_with(vcx, |view, _app| view.tabs.clone());
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.selected_relation,
+                Some(("public".to_owned(), "orders".to_owned())),
+                "Enter must open the first visible match, the same as clicking it"
+            );
+        });
+        tabs.read_with(vcx, |tabs, _app| {
+            assert_eq!(
+                tabs.tabs().len(),
+                1,
+                "Enter must open exactly one generated tab"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn enter_with_zero_visible_matches_is_a_no_op(cx: &mut gpui::TestAppContext) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("z z z z z");
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(view.selected_relation, None);
+        });
+    }
+
+    #[gpui::test]
+    fn filtered_relation_rows_remain_interactive_for_preview_and_context_menu(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        sidebar.update_in(vcx, |view, window, cx| {
+            view.preview("public", "orders", window, cx);
+        });
+        sidebar.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.selected_relation,
+                Some(("public".to_owned(), "orders".to_owned())),
+                "a filtered relation row's click handler must still preview normally"
+            );
+        });
+
+        sidebar.update(vcx, |view, cx| {
+            context_menu::open(
+                view,
+                "public".to_owned(),
+                "orders".to_owned(),
+                RelationKind::Table,
+                0,
+                gpui::point(gpui::px(10.0), gpui::px(20.0)),
+                cx,
+            );
+        });
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                view.context_menu.is_some(),
+                "a filtered relation row's context menu must still open normally"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_query_matching_nothing_renders_the_empty_state_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("z z z z z");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, cx| {
+            let tree = match view.session.read(cx).schema() {
+                SchemaState::Ready(tree) => tree.clone(),
+                other => panic!("expected a Ready schema, got {other:?}"),
+            };
+            assert!(
+                filter::flatten_schema_tree_filtered(&tree, "zzzzz").is_empty(),
+                "this test's fixture must reach the zero-match empty state"
+            );
+        });
+        assert!(
+            vcx.debug_bounds("sidebar-filter-empty").is_some(),
+            "a zero-match query must render the empty-state element, not a blank pane"
+        );
+    }
+
+    #[gpui::test]
+    fn the_scripts_pane_is_filtered_by_the_same_find_row(cx: &mut gpui::TestAppContext) {
+        let session_dir = TempDir::new("sidebar-find-scripts-pane");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("top-customers.sql"),
+            "select 1;",
+        )
+        .expect("must write a session script");
+        std::fs::write(
+            session_dir.0.join("scripts").join("cohort-debug.sql"),
+            "select 2;",
+        )
+        .expect("must write a session script");
+
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("t o p");
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            let matches = filter::filter_script_rows(&view.script_rows, "top");
+            assert_eq!(matches.len(), 1);
+            assert_eq!(
+                view.script_rows[matches[0].index].label,
+                "top-customers.sql"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn enter_opens_the_first_visible_match_in_the_scripts_pane(cx: &mut gpui::TestAppContext) {
+        let session_dir = TempDir::new("sidebar-find-scripts-enter");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("top-customers.sql"),
+            "select 1;",
+        )
+        .expect("must write a session script");
+        std::fs::write(
+            session_dir.0.join("scripts").join("cohort-debug.sql"),
+            "select 2;",
+        )
+        .expect("must write a session script");
+
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        let tabs = sidebar.read_with(vcx, |view, _app| view.tabs.clone());
+        // `TabModel`'s own session directory (distinct from the sidebar's,
+        // which only drives the scripts pane's disk scan) is what
+        // `open_or_focus_session_script` reads the file from.
+        tabs.update(vcx, |tabs, _cx| {
+            tabs.set_session_dir(Some(session_dir.0.clone()));
+        });
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("t o p");
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+
+        tabs.read_with(vcx, |tabs, _app| {
+            assert_eq!(
+                tabs.active_tab().map(crate::ui::tabs::Tab::title),
+                Some("top-customers.sql"),
+                "Enter must activate the first visible matching script"
+            );
+        });
+    }
+
+    /// Switching panes with a filter active must reapply the same query to
+    /// the newly active pane's own rows, rather than clearing the filter or
+    /// leaving it stuck showing the old pane's stale matches.
+    #[gpui::test]
+    fn switching_panes_while_filtered_reapplies_the_same_query_to_the_new_panes_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_dir = TempDir::new("sidebar-find-pane-switch");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("orders-report.sql"),
+            "select 1;",
+        )
+        .expect("must write a session script");
+
+        let (sidebar, vcx) = build_with_find_init(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.update_in(vcx, find::open);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, cx| {
+            assert!(
+                view.find.is_some(),
+                "switching panes must not close an active filter"
+            );
+            let query = find::current_query(view, cx);
+            assert_eq!(query, "orders");
+            let matches = filter::filter_script_rows(&view.script_rows, &query);
+            assert_eq!(
+                matches.len(),
+                1,
+                "the same query must re-filter the new pane's own rows"
+            );
+            assert_eq!(
+                view.script_rows[matches[0].index].label,
+                "orders-report.sql"
+            );
+        });
     }
 }
