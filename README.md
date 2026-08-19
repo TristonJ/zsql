@@ -19,13 +19,14 @@ A lightweight developer-first SQL editor.
 </details>
 
 ## Features
-- Lightweight - built with Zed's [gpui](https://docs.rs/gpui/latest/gpui/)
+- Lightweight (around ~40mb installed) - built with Zed's [gpui](https://docs.rs/gpui/latest/gpui/)
 - Multi-database support
 - Simple query generation (with filters, pagination, and sorting)
 - Simple schema exploration (table & column metadata)
 - Custom SQL scripts with syntax highlighting
 - Detailed value viewer (JSON, hex, etc.)
 - Multiple theme & custom theme support
+- SQL script library per-connection
 
 ## Database Support
 - PostgreSQL
@@ -34,9 +35,72 @@ A lightweight developer-first SQL editor.
 - Microsoft SQL Server
 
 ## Installing
-For now, you must clone the repo and use cargo to install the binary:
+
+Depending on your platform, there are a few ways to install ZSQL.
+
+### AppImage
+
+On Linux, you can download the latest AppImage from the [releases](
+https://github.com/TristonJ/zsql/releases) page. The AppImage is a portable
+Linux application that can be run without installation.
+
+### Debian Package
+
+On debian-based distributions (e.g. Ubuntu), you can download the latest deb
+package from the [releases](https://github.com/TristonJ/zsql/releases) page.
+
+### Arch Linux
+
+On Arch Linux based distributions, there is currently a PKGBUILD available on
+the [releases](https://github.com/TristonJ/zsql/releases) page. To install from
+that PKGBUILD:
+
+```sh
+# Download the PKGBUILD & the tarball
+curl -LO https://github.com/TristonJ/zsql/releases/download/v0.1.0/zsql-0.1.0-x86_64.tar.gz
+curl -LO https://github.com/TristonJ/zsql/releases/download/v0.1.0/PKGBUILD
+
+# Run makepkg to build the package
+makepkg -si
+```
+
+> Note: AUR distribution coming soon.
+
+### MacOS
+
+On MacOS, you can download the latest `.dmg` from the [releases](
+https://github.com/TristonJ/zsql/releases) page for your architecture (Intel or Apple Silicon).
+
+Because there is _currently_ no developer certificate registered with Apple, you may get a
+"app is damanged" warning when trying to open the app. To bypass this, you can execute
+the following command in your terminal after installation:
+```sh
+sudo xattr -rd com.apple.quarantine /path/to/zsql.app
+```
+
+### From Source
+
+Installing the binary from source is simple if you have Rust + Cargo installed:
 ```sh
 cargo install --path crates/zsql
+```
+
+## Configuration
+
+There are a number of configuration options available, including fonts, UI positioning,
+query limits, etc. These are stored in your platform-specific configuration directory.
+On Linux, this is typically `~/.config/zsql/config.toml`. On MacOS, this is typically
+`~/Library/Application Support/zsql/config.toml`.
+
+To see the full list of configuration options, see the `Config` struct in
+`./crates/zsql/src/config.rs`. For example, to set the theme and fonts:
+```toml
+[theme]
+name = "zsql-dark"
+
+[theme.fonts]
+data = "JetBrains Mono"
+ui = "IBM Plex Sans"
 ```
 
 ## Building
