@@ -266,6 +266,9 @@ impl WorkspaceView {
         cx.subscribe(tabs, move |_v, _tabs, evt: &ResultsChanged, cx| {
             changed_results.update(cx, |results, cx| match evt {
                 ResultsChanged::Live(label) => results.show_live(label, cx),
+                ResultsChanged::LiveWindowChanged(label) => {
+                    results.show_live_window(label, cx);
+                }
                 ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
             });
         })
@@ -280,7 +283,9 @@ impl WorkspaceView {
         let changed_footer = footer.clone();
         cx.subscribe(tabs, move |_v, _tabs, evt: &ResultsChanged, cx| {
             changed_footer.update(cx, |footer, cx| match evt {
-                ResultsChanged::Live(_) => footer.set_result_snapshot(None, cx),
+                ResultsChanged::Live(_) | ResultsChanged::LiveWindowChanged(_) => {
+                    footer.set_result_snapshot(None, cx);
+                }
                 ResultsChanged::Snapshot(snap) => {
                     footer.set_result_snapshot(Some(snap.clone()), cx);
                 }

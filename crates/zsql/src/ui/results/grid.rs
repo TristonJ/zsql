@@ -8,9 +8,12 @@
 
 use std::ops::Range;
 
-use gpui::{Context, Div, Pixels, Window, div, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, Context, Div, Pixels, StrikethroughStyle, Window, div, prelude::*, px, rgb,
+};
 use zsql_core::ColumnMeta;
-use zsql_ui::table::{Gutter, RowNumberStyle, Table, TableColumn, TableRow, measure};
+use zsql_ui::grid::CELL_PADDING_X;
+use zsql_ui::table::{Gutter, Table, TableColumn, TableRow, measure};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use crate::ui::theme::HEADER_EXTRA_PADDING_CHARS;
@@ -34,10 +37,7 @@ impl ResultsView {
             .style(Self::table_style(&active_theme))
             .columns(columns)
             .row_count(row_count)
-            .gutter(Gutter::RowNumbers(RowNumberStyle {
-                char_width: theme::CELL_CHAR_WIDTH,
-                min_width: theme::ROW_NUMBER_MIN_WIDTH,
-            }))
+            .gutter(Self::row_number_gutter(row_count, &active_theme))
             .rows(Self::render_data_row_cells)
             .selectable()
             .focus_on_cell_click(self.focus_handle.clone())
@@ -47,6 +47,56 @@ impl ResultsView {
             })
             .resizable_columns(px(theme::MIN_COLUMN_WIDTH), Self::resize_column)
             .render(cx)
+    }
+
+    /// The row-number gutter. A `Gutter::Custom` (rather than the built-in
+    /// `RowNumbers`) since only this view knows which rows are staged.
+    fn row_number_gutter(row_count: usize, active_theme: &Theme) -> Gutter<Self> {
+        let style = Self::table_style(active_theme);
+        let width = measure::row_number_column_width(
+            row_count,
+            &style,
+            theme::CELL_CHAR_WIDTH,
+            theme::ROW_NUMBER_MIN_WIDTH,
+        );
+        let header = div()
+            .flex_1()
+            .flex()
+            .justify_end()
+            .text_color(rgb(style.row_number_color))
+            .child("#")
+            .into_any_element();
+        Gutter::Custom {
+            width,
+            header,
+            render: Box::new(Self::render_row_number_cells),
+        }
+    }
+
+    /// Batch renderer for [`ResultsView::row_number_gutter`]'s body cells.
+    fn render_row_number_cells(
+        &mut self,
+        range: std::ops::Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let active_theme = cx.theme().clone();
+        let colors = active_theme.colors;
+        range
+            .map(|ix| {
+                let staged = self.staged_id_for_row(cx, ix).is_some();
+                let mut cell = div().flex_1().flex().justify_end().px(px(CELL_PADDING_X));
+                cell = if staged {
+                    cell.bg(theme::staged_delete_wash(&active_theme))
+                        .text_color(rgb(colors.status_error))
+                        .child(format!("- {}", ix + 1))
+                } else {
+                    cell.text_color(rgb(colors.text_tertiary))
+                        .child((ix + 1).to_string())
+                };
+                cell.into_any_element()
+            })
+            .collect()
     }
 
     /// [`zsql_ui::table::Table::resizable_columns`]'s live-resize callback:
@@ -76,7 +126,10 @@ impl ResultsView {
     /// measured width can never drift from the padding it is actually
     /// rendered with.
     pub(super) fn table_style(active_theme: &Theme) -> zsql_ui::table::TableStyle {
-        zsql_ui::table::TableStyle::themed(active_theme)
+        zsql_ui::table::TableStyle {
+            gutter_cell_padding_x: px(0.0), // we use internal padding to make sure bg colors work
+            ..zsql_ui::table::TableStyle::themed(active_theme)
+        }
     }
 
     /// The data pane's columns: each column's cached width plus its header
@@ -110,6 +163,7 @@ impl ResultsView {
 
         range
             .map(|ix| {
+                let staged = self.staged_id_for_row(cx, ix).is_some();
                 let cells = rows
                     .get(ix)
                     .map(|row| {
@@ -129,22 +183,40 @@ impl ResultsView {
                                     .overflow_y_hidden()
                                     .text_color(rgb(formatted.kind.color(active_theme)))
                                     .when(is_null, gpui::prelude::Styled::italic);
-                                cell = match highlight {
-                                    QuickFindHighlight::Current => cell
-                                        .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
-                                        .bg(theme::quick_find_current_match_bg(active_theme))
-                                        .text_color(rgb(active_theme.colors.accent_contrast)),
-                                    QuickFindHighlight::Match => cell
-                                        .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
-                                        .bg(theme::quick_find_match_bg(active_theme)),
-                                    QuickFindHighlight::None => cell,
-                                };
+                                if staged {
+                                    cell = cell.text_color(rgb(active_theme.colors.text_tertiary));
+                                    // Set directly: line_through() leaves the
+                                    // strike at the text color, and gpui's
+                                    // text_decoration_color styles only
+                                    // underlines.
+                                    cell.text_style()
+                                        .get_or_insert_with(Default::default)
+                                        .strikethrough = Some(StrikethroughStyle {
+                                        thickness: px(1.0),
+                                        color: Some(rgb(active_theme.colors.status_error).into()),
+                                    });
+                                } else {
+                                    cell = match highlight {
+                                        QuickFindHighlight::Current => cell
+                                            .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
+                                            .bg(theme::quick_find_current_match_bg(active_theme))
+                                            .text_color(rgb(active_theme.colors.accent_contrast)),
+                                        QuickFindHighlight::Match => cell
+                                            .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
+                                            .bg(theme::quick_find_match_bg(active_theme)),
+                                        QuickFindHighlight::None => cell,
+                                    };
+                                }
                                 cell.child(formatted.text).into_any_element()
                             })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                TableRow::new(cells)
+                let mut table_row = TableRow::new(cells);
+                if staged {
+                    table_row = table_row.background(theme::staged_delete_wash(active_theme));
+                }
+                table_row
             })
             .collect()
     }

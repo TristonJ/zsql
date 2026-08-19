@@ -45,6 +45,8 @@ impl Default for TableBorders {
 pub struct TableStyle {
     /// Horizontal padding inside every cell.
     pub cell_padding_x: Pixels,
+    /// Horizontal padding inside the gutter cells
+    pub gutter_cell_padding_x: Pixels,
     /// Height of the header row.
     pub header_height: Pixels,
     /// Height of each body row.
@@ -85,6 +87,7 @@ impl TableStyle {
     pub fn themed(theme: &Theme) -> Self {
         Self {
             cell_padding_x: px(grid::CELL_PADDING_X),
+            gutter_cell_padding_x: px(grid::CELL_PADDING_X),
             header_height: DEFAULT_HEADER_HEIGHT,
             row_height: DEFAULT_ROW_HEIGHT,
             borders: TableBorders::default(),

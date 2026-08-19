@@ -16,6 +16,7 @@ mod accumulate;
 mod connect;
 mod probe;
 mod state;
+mod transaction;
 mod tunnel;
 
 use tunnel::TunnelHandle;

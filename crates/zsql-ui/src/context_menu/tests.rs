@@ -25,6 +25,7 @@ impl Render for MenuHost {
         let clicks_a = self.clicks.clone();
         let clicks_b = self.clicks.clone();
         let clicks_disabled = self.clicks.clone();
+        let clicks_danger = self.clicks.clone();
         let closes = self.closes.clone();
         let mut menu = ContextMenu::new("menu-host")
             .position(self.position)
@@ -52,7 +53,17 @@ impl Render for MenuHost {
                         clicks_disabled.borrow_mut().push("Disabled Item");
                     })
                     .disabled(true),
-            );
+            )
+            .add_item(
+                ContextMenuItem::new("Hinted Item")
+                    .disabled(true)
+                    .hint("needs a primary key"),
+            )
+            .add_item(ContextMenuItem::new("Danger Item").danger(true).on_click(
+                move |_event, _window, _cx| {
+                    clicks_danger.borrow_mut().push("Danger Item");
+                },
+            ));
         // A menu rendered as a bare window root (rather than nested inside a
         // larger view, as it always is in production) needs an explicit
         // full-size container so its `deferred`/`absolute` backdrop resolves
@@ -189,6 +200,35 @@ fn right_mouse_down_outside_the_menu_invokes_on_close(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     assert_eq!(*closes.borrow(), 1);
+}
+
+#[gpui::test]
+fn a_hint_renders_alongside_a_disabled_items_label(cx: &mut TestAppContext) {
+    let (_host, vcx, _clicks, _closes) = build_menu_host(cx, anchor(), false);
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds("Hinted Item").is_some(),
+        "an item carrying a hint must still render and be tagged"
+    );
+    assert!(
+        vcx.debug_bounds("Hinted Item-hint").is_some(),
+        "the hint text itself must render as its own tagged element"
+    );
+}
+
+#[gpui::test]
+fn a_danger_item_renders_and_its_click_handler_fires(cx: &mut TestAppContext) {
+    let (_host, vcx, clicks, _closes) = build_menu_host(cx, anchor(), false);
+    vcx.run_until_parked();
+
+    let bounds = vcx
+        .debug_bounds("Danger Item")
+        .expect("a danger-styled item must still render and be tagged");
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert_eq!(*clicks.borrow(), vec!["Danger Item"]);
 }
 
 #[gpui::test]

@@ -109,11 +109,7 @@ impl ResultsView {
         cx.write_to_clipboard(ClipboardItem::new_string(name));
     }
 
-    /// The right-click cell context menu overlay: `View value`, `Copy
-    /// value`, `Copy row as JSON`, a separator, then `Copy column name`,
-    /// anchored at the triggering click. A full-window backdrop behind it
-    /// absorbs off-menu clicks, mirroring the sidebar's relation-row context
-    /// menu. Renders nothing when no menu is open.
+    /// The right-click cell context menu overlay.
     pub(super) fn render_cell_context_menu(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let menu_state = self.cell_context_menu.as_ref()?;
         let menu = ContextMenu::new("results-cell-context-menu")
@@ -154,8 +150,43 @@ impl ResultsView {
                         view.close_cell_context_menu(cx);
                     },
                 )),
-            );
+            )
+            .add_separator()
+            .add_item(self.render_delete_or_restore_item(cx));
 
         Some(menu.into_any_element())
+    }
+
+    /// The menu's trailing `Delete row`/`Restore row` item.
+    fn render_delete_or_restore_item(&self, cx: &Context<Self>) -> ContextMenuItem {
+        if let Some(hint) = self.staging_unavailable_hint(cx) {
+            return ContextMenuItem::new("Delete row").disabled(true).hint(hint);
+        }
+
+        let row = self
+            .table_state
+            .read(cx)
+            .focused_cell()
+            .map(|(row, _col)| row);
+        let staged_id = row.and_then(|row| self.staged_id_for_row(cx, row));
+
+        match staged_id {
+            Some(_) => ContextMenuItem::new("Restore row").on_click(cx.listener(
+                move |view, _event, _window, cx| {
+                    if let Some(row) = row {
+                        view.stage_or_restore_row(row, cx);
+                    }
+                    view.close_cell_context_menu(cx);
+                },
+            )),
+            None => ContextMenuItem::new("Delete row")
+                .danger(true)
+                .on_click(cx.listener(move |view, _event, _window, cx| {
+                    if let Some(row) = row {
+                        view.stage_or_restore_row(row, cx);
+                    }
+                    view.close_cell_context_menu(cx);
+                })),
+        }
     }
 }

@@ -1,18 +1,29 @@
 //! A batch-rendered body row's cell content, as the caller's `rows`
 //! callback returns it to [`super::Table`].
 
-use gpui::AnyElement;
+use gpui::{AnyElement, Rgba};
 
 /// One body row's cells, in column order.
 pub struct TableRow {
     pub cells: Vec<AnyElement>,
+    pub background: Option<Rgba>,
 }
 
 impl TableRow {
     /// A row built from `cells`, one per data column, in column order.
     #[must_use]
     pub fn new(cells: Vec<AnyElement>) -> Self {
-        Self { cells }
+        Self {
+            cells,
+            background: None,
+        }
+    }
+
+    /// Paint the whole row, cell padding included, with `background`.
+    #[must_use]
+    pub fn background(mut self, background: Rgba) -> Self {
+        self.background = Some(background);
+        self
     }
 }
 

@@ -6,7 +6,6 @@ use gpui::{
     MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ResultSet, group_thousands};
-use zsql_ui::quick_find_bar::{QuickFindBar, QuickFindBarEvent};
 use zsql_ui::table::TableState;
 use zsql_ui::theme::{ActiveTheme, Theme};
 
@@ -26,9 +25,13 @@ mod cell_menu;
 mod empty_state;
 pub(crate) mod filter_bar;
 mod grid;
+mod ledger;
 pub(crate) mod pager;
 mod panel_host;
 mod quick_find;
+mod snapshot;
+mod staging;
+mod staging_bar;
 mod text_view;
 mod toolbar;
 
@@ -53,6 +56,7 @@ actions!(
         QuickFindNext,
         QuickFindPrev,
         QuickFindClose,
+        ApplyStagedChanges,
     ]
 );
 
@@ -64,7 +68,9 @@ const BINDING_CONTEXT: &str = "ResultsGrid && !TextField";
 
 /// Register the results grid's and value panel's key bindings. Call once at
 /// startup, before any window that hosts a [`ResultsView`] is opened.
-pub fn init(cx: &mut App) {
+/// `apply_staged_keybinding` is the staged-changes queue's Apply chord (from
+/// [`crate::config::StagingConfig::apply_keybinding`]).
+pub fn init(cx: &mut App, apply_staged_keybinding: &str) {
     cx.bind_keys([
         KeyBinding::new("secondary-c", Copy, Some(BINDING_CONTEXT)),
         KeyBinding::new("up", CellUp, Some(BINDING_CONTEXT)),
@@ -77,6 +83,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-[", PrevPage, Some(BINDING_CONTEXT)),
         KeyBinding::new("ctrl-]", NextPage, Some(BINDING_CONTEXT)),
         KeyBinding::new("secondary-f", OpenQuickFind, Some(BINDING_CONTEXT)),
+        KeyBinding::new(
+            apply_staged_keybinding,
+            ApplyStagedChanges,
+            Some(BINDING_CONTEXT),
+        ),
         // Bound on the bar's own context (an ancestor of its query input's
         // `TextField` context) rather than `BINDING_CONTEXT`, so these fire
         // while the bar's input has focus. Plain Enter is not bound here: the
@@ -182,6 +193,12 @@ pub struct ResultsView {
     /// switch and query rerun (see [`ResultsView::reset_for_new_result`]) so
     /// it never lingers over a replaced result set.
     quick_find: Option<quick_find::ResultsQuickFind>,
+    /// Pending row deletes, staged from the cell context menu but not yet
+    /// applied. Cleared on every tab switch and fresh query run (see
+    /// [`ResultsView::show_live`]/[`ResultsView::show_snapshot`]), but not
+    /// on a same-relation window change (see
+    /// [`ResultsView::show_live_window`]).
+    staging: Entity<staging::StagingState>,
 }
 
 /// A results grid cell's open right-click context menu: the triggering
@@ -206,6 +223,9 @@ impl ResultsView {
     ) -> Self {
         cx.observe(&session, |view: &mut Self, _session, cx| {
             view.sync_dimensions(cx);
+            // Cheap when nothing changed; picks up the relation-schema
+            // fetch a preview activated before the session had connected.
+            view.sync_relation_schema(cx);
             cx.notify();
         })
         .detach();
@@ -214,6 +234,21 @@ impl ResultsView {
         let value_panel =
             cx.new(|cx| ValuePanel::new(focus_handle.clone(), ValuePanelConfig::default(), cx));
         let text_view = cx.new(TextView::new);
+
+        let staging = cx.new(|_cx| staging::StagingState::new(session.clone()));
+        cx.observe(&staging, |_view, _staging, cx| cx.notify())
+            .detach();
+        cx.subscribe(
+            &staging,
+            |view: &mut Self, _staging, _event: &staging::StagedChangesApplied, cx| {
+                // The database changed underneath the grid; rerun the active
+                // preview so it reflects the new state.
+                if let Some(preview) = &view.preview {
+                    (preview.dispatch.clone())(pager::PreviewAction::Reload, cx);
+                }
+            },
+        )
+        .detach();
 
         let mut view = Self {
             session,
@@ -245,6 +280,7 @@ impl ResultsView {
             filter_editor: None,
             filter_column_picker_open: false,
             quick_find: None,
+            staging,
         };
         view.sync_dimensions(cx);
         view
@@ -288,6 +324,7 @@ impl ResultsView {
         self.preview = preview;
         self.filter_editor = None;
         self.filter_column_picker_open = false;
+        self.sync_relation_schema(cx);
         cx.notify();
     }
 
@@ -316,68 +353,6 @@ impl ResultsView {
     fn next_page(&mut self, _action: &NextPage, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(preview) = &self.preview {
             (preview.dispatch.clone())(pager::PreviewAction::NextPage, cx);
-        }
-    }
-
-    /// Follow `session`'s state/result live under `source_label`, e.g. for
-    /// the tab that `session` is currently running a query for. Every
-    /// render reads straight off `session` until the next
-    /// [`ResultsView::show_snapshot`] or `show_live` call.
-    pub fn show_live(&mut self, source_label: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.source_label = source_label.into();
-        self.frozen = None;
-        self.reset_for_new_result(cx);
-        self.sync_dimensions(cx);
-        cx.notify();
-    }
-
-    /// Freeze the grid to `snapshot` instead of following `session` live,
-    /// e.g. when switching to a tab that is not the one `session` is
-    /// currently running a query for.
-    pub fn show_snapshot(&mut self, snapshot: ResultsSnapshot, cx: &mut Context<Self>) {
-        self.source_label = snapshot.source_label.clone();
-        self.frozen = Some(snapshot);
-        self.reset_for_new_result(cx);
-        self.sync_dimensions(cx);
-        cx.notify();
-    }
-
-    /// Clear every piece of state derived from the previous result, right
-    /// before a new result becomes current: the incrementally-folded
-    /// column-width cache (so the next `sync_dimensions` call recomputes
-    /// widths from the new result's own columns/rows rather than folding
-    /// onto stale per-column maxima), and the Text view's default/wrap/
-    /// selection/scroll position, so nothing carries forward onto a
-    /// different result.
-    fn reset_for_new_result(&mut self, cx: &mut Context<Self>) {
-        self.column_widths = Vec::new();
-        self.column_width_overrides = Vec::new();
-        self.column_max_body_chars = Vec::new();
-        self.folded_row_count = 0;
-        self.view_mode = ViewMode::Grid;
-        self.view_mode_defaulted = false;
-        self.filter_editor = None;
-        self.filter_column_picker_open = false;
-        self.quick_find = None;
-        self.text_view.update(cx, |tv, _c| tv.reset());
-    }
-
-    /// The result set this view currently renders: `session`'s live result
-    /// while [`ResultsView::frozen`] is `None`, else the frozen snapshot's.
-    fn effective_result<'a>(&'a self, cx: &'a App) -> &'a ResultSet {
-        match &self.frozen {
-            Some(snapshot) => &snapshot.result,
-            None => self.session.read(cx).result(),
-        }
-    }
-
-    /// The lifecycle state this view currently renders: `session`'s live
-    /// state while [`ResultsView::frozen`] is `None`, else the frozen
-    /// snapshot's.
-    fn effective_state<'a>(&'a self, cx: &'a App) -> &'a SessionState {
-        match &self.frozen {
-            Some(snapshot) => &snapshot.state,
-            None => self.session.read(cx).state(),
         }
     }
 
@@ -759,171 +734,6 @@ impl ResultsView {
     }
 }
 
-// ---- quick find -----------------------------------------------------------
-
-impl ResultsView {
-    /// This cell's quick-find highlight, `None` while the bar is closed or
-    /// the cell has no match.
-    fn quick_find_highlight(&self, row: usize, col: usize) -> quick_find::QuickFindHighlight {
-        self.quick_find
-            .as_ref()
-            .map_or(quick_find::QuickFindHighlight::None, |state| {
-                state.highlight(row, col)
-            })
-    }
-
-    /// [`OpenQuickFind`]'s handler: open the bar over the results grid, or
-    /// refocus its input if already open. Switches to the Grid view first
-    /// if the Text document view is active, so the highlights the bar
-    /// drives are actually visible.
-    #[tracing::instrument(name = "results_open_quick_find", skip_all)]
-    fn open_quick_find(&mut self, _: &OpenQuickFind, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(state) = &self.quick_find {
-            state.bar().read(cx).focus_input(window, cx);
-            return;
-        }
-        self.set_view_mode(ViewMode::Grid, cx);
-        let state = quick_find::ResultsQuickFind::open(window, cx);
-        state.bar().read(cx).focus_input(window, cx);
-        self.quick_find = Some(state);
-        tracing::debug!("opened the results quick-find bar");
-        cx.notify();
-    }
-
-    /// [`QuickFindClose`]'s handler: closes the bar and clears every
-    /// highlight, leaving the grid's own focused cell (the last current
-    /// match, if any) untouched, so quick-find doubles as jump-to.
-    fn quick_find_close(
-        &mut self,
-        _: &QuickFindClose,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.quick_find.take().is_none() {
-            return;
-        }
-        window.focus(&self.focus_handle);
-        tracing::debug!("closed the results quick-find bar");
-        cx.notify();
-    }
-
-    fn quick_find_next(&mut self, _: &QuickFindNext, _window: &mut Window, cx: &mut Context<Self>) {
-        self.quick_find_step(true, cx);
-    }
-
-    fn quick_find_prev(&mut self, _: &QuickFindPrev, _window: &mut Window, cx: &mut Context<Self>) {
-        self.quick_find_step(false, cx);
-    }
-
-    /// The single reaction point for everything the bar asks for, whether
-    /// requested by one of its buttons or by typing in its input.
-    fn handle_quick_find_event(
-        &mut self,
-        _bar: &Entity<QuickFindBar>,
-        event: &QuickFindBarEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            QuickFindBarEvent::QueryChanged(query) => self.set_quick_find_query(query.clone(), cx),
-            QuickFindBarEvent::StepRequested { forward } => self.quick_find_step(*forward, cx),
-            QuickFindBarEvent::CaseToggleRequested => self.toggle_quick_find_case(cx),
-            QuickFindBarEvent::DismissRequested => {
-                self.quick_find_close(&QuickFindClose, window, cx);
-            }
-        }
-    }
-
-    /// Step the current match forward (`forward`) or backward, wrapping at
-    /// either end, and move the grid's focus/scroll to it.
-    fn quick_find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let landed = {
-            let Some(state) = &mut self.quick_find else {
-                return;
-            };
-            let landed = state.step(forward);
-            state.push_status(cx);
-            landed
-        };
-        if let Some((row, col)) = landed {
-            self.focus_quick_find_match(row, col, cx);
-        }
-        cx.notify();
-    }
-
-    /// Recompute matches for `query` against the currently loaded rows and
-    /// jump to the new current match, if any.
-    fn set_quick_find_query(&mut self, query: String, cx: &mut Context<Self>) {
-        let Some(mut state) = self.quick_find.take() else {
-            return;
-        };
-        let landed = state.set_query(query, self.effective_result(cx));
-        state.push_status(cx);
-        self.quick_find = Some(state);
-        if let Some((row, col)) = landed {
-            self.focus_quick_find_match(row, col, cx);
-        }
-        cx.notify();
-    }
-
-    /// Toggle case-sensitive matching and recompute the current query
-    /// against it.
-    fn toggle_quick_find_case(&mut self, cx: &mut Context<Self>) {
-        let Some(mut state) = self.quick_find.take() else {
-            return;
-        };
-        let landed = state.toggle_case(self.effective_result(cx));
-        state.push_status(cx);
-        self.quick_find = Some(state);
-        if let Some((row, col)) = landed {
-            self.focus_quick_find_match(row, col, cx);
-        }
-        cx.notify();
-    }
-
-    /// Recompute the open bar's matches against the currently loaded rows,
-    /// keeping the current match on the same cell where it is still one.
-    /// Call this after a page swap or more rows streaming in. A no-op while
-    /// the bar is closed.
-    fn sync_quick_find_matches(&mut self, cx: &mut Context<Self>) {
-        let Some(mut state) = self.quick_find.take() else {
-            return;
-        };
-        state.sync(self.effective_result(cx));
-        state.push_status(cx);
-        self.quick_find = Some(state);
-    }
-
-    /// Move the grid's focused cell to `(row, col)` and scroll its row into
-    /// view, so keyboard cell navigation continues from a quick-find match.
-    fn focus_quick_find_match(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
-        self.table_state.update(cx, |state, cx| {
-            state.set_focused_cell(row, col);
-            cx.notify();
-        });
-        self.table_state.read(cx).scroll_row_into_view(row);
-    }
-
-    /// The floating quick-find overlay over the grid's top-right, wrapping
-    /// the bar with this view's key context and action handlers. `None`
-    /// while the bar is closed.
-    fn render_quick_find_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let state = self.quick_find.as_ref()?;
-        Some(
-            div()
-                .key_context(quick_find::KEY_CONTEXT)
-                .absolute()
-                .top(theme::QUICK_FIND_BAR_TOP_OFFSET)
-                .right(theme::QUICK_FIND_BAR_RIGHT_OFFSET)
-                .on_action(cx.listener(Self::quick_find_next))
-                .on_action(cx.listener(Self::quick_find_prev))
-                .on_action(cx.listener(Self::quick_find_close))
-                .child(state.bar().clone())
-                .into_any_element(),
-        )
-    }
-}
-
 #[cfg(test)]
 impl ResultsView {
     pub(crate) fn quick_find_is_open_for_test(&self) -> bool {
@@ -999,6 +809,7 @@ impl Render for ResultsView {
             .on_action(cx.listener(Self::prev_page))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::open_quick_find))
+            .on_action(cx.listener(Self::apply_staged_changes_action))
             .on_mouse_move(cx.listener(Self::value_panel_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
@@ -1011,6 +822,7 @@ impl Render for ResultsView {
             .child(self.render_body(window, cx))
             .children(self.render_quick_find_overlay(cx))
             .children(self.render_cell_context_menu(cx))
+            .child(self.staging.clone())
     }
 }
 

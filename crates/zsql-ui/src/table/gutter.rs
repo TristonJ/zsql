@@ -82,7 +82,7 @@ pub(super) fn gutter_cell_shell(width: Pixels, style: &TableStyle) -> Div {
         .items_center()
         .w(width)
         .h(style.row_height)
-        .px(style.cell_padding_x)
+        .px(style.gutter_cell_padding_x)
         .bg(rgb(style.gutter_bg));
     if style.borders.row {
         cell = cell.border_b_1().border_color(rgb(style.row_border));

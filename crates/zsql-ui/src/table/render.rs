@@ -359,6 +359,9 @@ struct BodyRowContext<'a> {
 fn build_body_row_cells(row: TableRow, row_index: usize, ctx: &BodyRowContext<'_>) -> Div {
     let style = ctx.style;
     let mut row_div = div().flex().flex_row().items_center().h(style.row_height);
+    if let Some(background) = row.background {
+        row_div = row_div.bg(background);
+    }
     if ctx.fill_width {
         // Mirror the header row: fill the pane so growable cells have slack,
         // but never shrink below the summed column width, so a narrow pane

@@ -12,6 +12,7 @@ mod session;
 mod session_store;
 #[cfg(all(test, feature = "ssh-integration-tests"))]
 mod ssh_live_tests;
+mod staging;
 #[cfg(test)]
 mod test_support;
 mod theme_resolve;
@@ -152,7 +153,7 @@ fn main() -> anyhow::Result<()> {
 
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
-            ui::results::init(cx);
+            ui::results::init(cx, &cfg.staging.apply_keybinding);
             ui::schema_view::init(cx);
             ui::save_modal::init(cx);
             ui::open_modal::init(cx);

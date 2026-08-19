@@ -133,6 +133,12 @@ pub struct ContextMenuItem {
     style: ContextMenuStyle,
     on_click: Option<ContextMenuOnClickFn>,
     disabled: bool,
+    /// A short inline note shown right-aligned after the label, e.g. why a
+    /// disabled item is unavailable.
+    hint: Option<SharedString>,
+    /// Whether the label paints in [`Colors::status_error`] rather than the
+    /// usual primary text color, for a destructive action.
+    danger: bool,
 }
 
 impl ContextMenuItem {
@@ -149,6 +155,8 @@ impl ContextMenuItem {
             style: ContextMenuStyle::default(),
             on_click: None,
             disabled: false,
+            hint: None,
+            danger: false,
         }
     }
 
@@ -173,6 +181,22 @@ impl ContextMenuItem {
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Show `hint` right-aligned after the label, e.g. why the item is
+    /// disabled.
+    #[must_use]
+    pub fn hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// Paint the label as a destructive action's color rather than the
+    /// usual primary text color.
+    #[must_use]
+    pub fn danger(mut self, danger: bool) -> Self {
+        self.danger = danger;
         self
     }
 
@@ -251,13 +275,16 @@ impl RenderOnce for ContextMenuItem {
     fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let theme = cx.theme();
         let selector = self.id.to_string();
+        let hint_selector = format!("{selector}-hint");
         let disabled = self.disabled;
+        let danger = self.danger;
         div()
             .id(self.id)
             .debug_selector(move || selector)
             .flex()
             .flex_row()
             .items_center()
+            .gap(px(8.0))
             .h(self.style.item_height)
             .px(self.style.item_padding_x)
             .rounded(px(self.style.item_radius))
@@ -267,12 +294,27 @@ impl RenderOnce for ContextMenuItem {
                     .text_color(rgb(theme.colors.text_tertiary))
                     .cursor_not_allowed()
             })
-            .when(!disabled, |el| {
+            .when(!disabled && danger, |el| {
+                el.cursor_pointer()
+                    .text_color(rgb(theme.colors.status_error))
+                    .hover(|el| el.bg(theme.colors.error_wash()))
+            })
+            .when(!disabled && !danger, |el| {
                 el.cursor_pointer()
                     .text_color(rgb(theme.colors.text_primary))
                     .hover(|el| el.bg(Colors::wash(theme.colors.accent, 0x1a)))
             })
-            .child(self.label)
+            .child(div().flex_1().child(self.label))
+            .when_some(self.hint, |el, hint| {
+                el.child(
+                    div()
+                        .debug_selector(move || hint_selector)
+                        .flex_shrink_0()
+                        .text_size(px(self.style.item_text_size * 0.8))
+                        .text_color(rgb(theme.colors.text_tertiary))
+                        .child(hint),
+                )
+            })
             .when(!disabled, |el| {
                 el.when_some(self.on_click, |el, on_click| el.on_click(on_click))
             })
