@@ -434,6 +434,31 @@ pub const FILTER_OP_MENU_ITEM_RADIUS: f32 = 4.0;
 /// item's trailing pattern hint (where present) lines up in a column.
 pub const FILTER_OP_MENU_SYMBOL_WIDTH: Pixels = px(38.0);
 
+// ---- results pane: quick-find bar ---------------------------------------
+
+/// Top offset of the quick-find bar, floating over the grid's top-right
+/// below the results header bar.
+pub const QUICK_FIND_BAR_TOP_OFFSET: Pixels = px(40.0);
+/// Right offset of the quick-find bar from the results pane's edge.
+pub const QUICK_FIND_BAR_RIGHT_OFFSET: Pixels = px(14.0);
+/// Corner radius painted behind a quick-find match cell's content.
+pub const QUICK_FIND_MATCH_RADIUS: f32 = 2.0;
+
+/// Background wash for a quick-find match: the amber value/warn hue at low
+/// opacity, distinct from the current match's teal.
+#[must_use]
+pub fn quick_find_match_bg(theme: &Theme) -> gpui::Rgba {
+    Colors::wash(theme.colors.status_warn, 0x2e)
+}
+
+/// Background wash for the current quick-find match: a stronger accent wash
+/// than the grid's own focused-cell selection, so the two stay visually
+/// distinct even when the current match is also the focused cell.
+#[must_use]
+pub fn quick_find_current_match_bg(theme: &Theme) -> gpui::Rgba {
+    theme.colors.accent_wash_hover()
+}
+
 /// Horizontal padding around the generated strip's trailing "generated" tag
 /// and hint text.
 pub const GENERATED_STRIP_TRAILING_PADDING_X: f32 = 14.0;
@@ -730,9 +755,9 @@ pub const MINI_STATUS_TEXT_SIZE: f32 = 9.5;
 mod tests {
     use super::{
         GENERATED_STRIP_HEIGHT, GENERATED_STRIP_MAX_LINES, generated_strip_accent,
-        generated_strip_bg, generated_strip_height, modal_row_active_bg, run_button_disabled_bg,
-        run_button_hint, run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg,
-        status_disconnected,
+        generated_strip_bg, generated_strip_height, modal_row_active_bg,
+        quick_find_current_match_bg, quick_find_match_bg, run_button_disabled_bg, run_button_hint,
+        run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, status_disconnected,
     };
     use zsql_ui::theme::Theme;
 
@@ -786,5 +811,26 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(run_button_disabled_bg(&theme), theme.colors.accent_dim());
         assert_ne!(run_button_disabled_bg(&theme), theme.colors.accent);
+    }
+
+    /// The quick-find match and current-match washes must draw from the
+    /// amber and teal roles respectively, and stay visually distinct from
+    /// each other and from the grid's own plain selection wash.
+    #[test]
+    fn quick_find_washes_are_amber_for_a_match_and_a_stronger_teal_for_the_current_one() {
+        let theme = Theme::default();
+        assert_eq!(
+            quick_find_match_bg(&theme),
+            zsql_ui::theme::Colors::wash(theme.colors.status_warn, 0x2e)
+        );
+        assert_eq!(
+            quick_find_current_match_bg(&theme),
+            theme.colors.accent_wash_hover()
+        );
+        assert_ne!(
+            quick_find_current_match_bg(&theme),
+            theme.colors.accent_wash(),
+            "the current match's wash must differ from the grid's own focused-cell selection wash"
+        );
     }
 }

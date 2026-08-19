@@ -16,6 +16,7 @@ use zsql_ui::theme::{ActiveTheme, Theme};
 use crate::ui::theme::HEADER_EXTRA_PADDING_CHARS;
 
 use super::pager;
+use super::quick_find::QuickFindHighlight;
 use super::{ResultsView, ValueKind, format_value, theme};
 
 impl ResultsView {
@@ -114,10 +115,12 @@ impl ResultsView {
                     .map(|row| {
                         row.0
                             .iter()
-                            .map(|value| {
+                            .enumerate()
+                            .map(|(col, value)| {
                                 let formatted = format_value(value);
                                 let is_null = formatted.kind == ValueKind::Null;
-                                div()
+                                let highlight = self.quick_find_highlight(ix, col);
+                                let mut cell = div()
                                     .flex()
                                     .flex_col()
                                     .justify_start()
@@ -125,9 +128,18 @@ impl ResultsView {
                                     .h_full()
                                     .overflow_y_hidden()
                                     .text_color(rgb(formatted.kind.color(active_theme)))
-                                    .when(is_null, gpui::prelude::Styled::italic)
-                                    .child(formatted.text)
-                                    .into_any_element()
+                                    .when(is_null, gpui::prelude::Styled::italic);
+                                cell = match highlight {
+                                    QuickFindHighlight::Current => cell
+                                        .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
+                                        .bg(theme::quick_find_current_match_bg(active_theme))
+                                        .text_color(rgb(active_theme.colors.accent_contrast)),
+                                    QuickFindHighlight::Match => cell
+                                        .rounded(px(theme::QUICK_FIND_MATCH_RADIUS))
+                                        .bg(theme::quick_find_match_bg(active_theme)),
+                                    QuickFindHighlight::None => cell,
+                                };
+                                cell.child(formatted.text).into_any_element()
                             })
                             .collect::<Vec<_>>()
                     })

@@ -7,6 +7,8 @@ pub mod grid;
 pub mod icon;
 pub mod icon_button;
 pub mod modal;
+pub mod quick_find;
+pub mod quick_find_bar;
 pub mod scrollable;
 pub mod scrollbar;
 pub mod selectable_text;
