@@ -9,7 +9,7 @@ publish = false
 # The only crate in the workspace allowed to depend on tokio/russh. Both are
 # kept private: no tokio or russh type appears in this crate's public API, so
 # the rest of the (deliberately tokio-free) workspace never sees them.
-russh = "=0.62.4"
+russh = "=0.62.5"
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "net",
