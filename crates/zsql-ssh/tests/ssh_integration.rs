@@ -49,15 +49,9 @@ fn remote_target() -> (String, u16) {
 /// be drivable from any executor, and polling it manually here proves that.
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::pin::pin;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
-    struct NoopWaker;
-    impl Wake for NoopWaker {
-        fn wake(self: std::sync::Arc<Self>) {}
-    }
-
-    let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut fut = pin!(fut);
     loop {
         match fut.as_mut().poll(&mut cx) {
