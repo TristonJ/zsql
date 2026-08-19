@@ -2453,6 +2453,66 @@ mod save_flow_tests {
         });
     }
 
+    /// Clicking the scripts pane's pinned "Open external file..." footer
+    /// must go straight to the Browse files flow, exactly like driving
+    /// `shift-secondary-o` does above.
+    #[gpui::test]
+    fn clicking_the_scripts_pane_footer_triggers_the_browse_files_flow_directly(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            zsql_editor::init(cx);
+            zsql_ui::text_field::init(cx);
+            crate::ui::open_modal::init(cx);
+        });
+        let session = session_for_test(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test("scripts-footer-click"),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup::default(),
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        let invoked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let invoked_for_prompt = invoked.clone();
+        workspace.update(vcx, |workspace, _cx| {
+            workspace.set_open_files_prompt_for_test(Box::new(move |_cx| {
+                invoked_for_prompt.set(true);
+                gpui::Task::ready(None)
+            }));
+        });
+
+        let scripts_tab_bounds = vcx
+            .debug_bounds("sidebar-pane-tab-scripts")
+            .expect("the scripts pane tab must be painted");
+        vcx.simulate_click(scripts_tab_bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        let footer_bounds = vcx
+            .debug_bounds("sidebar-scripts-open-external")
+            .expect("the footer must be painted once the scripts pane is active");
+        vcx.simulate_click(footer_bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        assert!(
+            invoked.get(),
+            "clicking the footer must invoke the Browse files seam directly"
+        );
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                !workspace.open_modal.read(cx).is_open(),
+                "Browse files must never show the picker modal itself"
+            );
+        });
+    }
+
     /// Triggering `shift-secondary-o` twice before the first native dialog
     /// resolves must invoke the (here, faked) prompt seam only once.
     #[gpui::test]

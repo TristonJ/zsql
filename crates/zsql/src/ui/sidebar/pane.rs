@@ -83,6 +83,7 @@ fn render_pane_tab(
 ) -> Stateful<Div> {
     let mut tab = div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .relative()
         .flex()
         .flex_row()
