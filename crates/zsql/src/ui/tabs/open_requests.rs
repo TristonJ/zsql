@@ -17,19 +17,17 @@ pub enum OpenRequested {
 impl EventEmitter<OpenRequested> for TabModel {}
 
 impl TabModel {
-    // Taking self matches the shape `Entity::update` expects, letting the
-    // editor's open/browse requesters pass the method itself rather than a
-    // wrapping closure.
+    // Taking self matches the shape `Entity::update` expects, so callers
+    // can pass the method itself rather than a wrapping closure.
     #[allow(clippy::unused_self)]
     pub(super) fn request_open(&mut self, cx: &mut Context<Self>) {
         cx.emit(OpenRequested::OpenPicker);
     }
 
-    // Taking self matches the shape `Entity::update` expects, letting the
-    // editor's open/browse requesters pass the method itself rather than a
-    // wrapping closure.
+    // Taking self matches the shape `Entity::update` expects, so callers
+    // can pass the method itself rather than a wrapping closure.
     #[allow(clippy::unused_self)]
-    pub(super) fn request_browse(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_browse(&mut self, cx: &mut Context<Self>) {
         cx.emit(OpenRequested::BrowseFiles);
     }
 }

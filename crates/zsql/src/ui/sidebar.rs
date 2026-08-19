@@ -945,7 +945,7 @@ impl Render for SidebarView {
 
         root = match self.active_pane {
             SidebarPane::Schema => root.child(self.render_body(window, cx)),
-            SidebarPane::Scripts => root.child(scripts::render_scripts_pane(self, cx)),
+            SidebarPane::Scripts => root.child(scripts::render_scripts_pane(self, window, cx)),
         };
 
         root.children(self.render_context_menu(cx))
@@ -1109,13 +1109,15 @@ mod render_tests {
     };
     use zsql_core::{Relation, RelationKind};
 
+    use zsql_ui::scrollable::vertical_thumb_debug_selector;
+
     use super::{
         SidebarPane, SidebarPlaceholder, SidebarView, db_row, qualified_relation_name,
         sidebar_placeholder,
     };
     use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
-    use crate::ui::tabs::{ResultsChanged, TabModel};
+    use crate::ui::tabs::{OpenRequested, ResultsChanged, TabModel};
 
     /// A `Connection` double whose `introspect` hands back a fixed,
     /// distinctively-named tree, so a test can tell a fresh introspection
@@ -2305,5 +2307,163 @@ mod render_tests {
                  that sync's newer rows once it completes"
             );
         });
+    }
+
+    /// The footer must render even when the scripts pane shows the
+    /// empty-connection-group state, since it starts a flow unrelated to
+    /// whether any scripts exist yet.
+    #[gpui::test]
+    fn the_scripts_pane_footer_is_present_in_the_empty_state(cx: &mut gpui::TestAppContext) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                super::model::scripts_pane_shows_empty_state(&view.script_rows),
+                "this test's fixture must reach the empty-scripts state"
+            );
+        });
+        assert!(
+            vcx.debug_bounds("sidebar-scripts-open-external").is_some(),
+            "the open-external-file footer must render in the empty-scripts state"
+        );
+    }
+
+    /// The footer must render alongside a populated script list too.
+    #[gpui::test]
+    fn the_scripts_pane_footer_is_present_with_populated_scripts(cx: &mut gpui::TestAppContext) {
+        let session_dir = TempDir::new("scripts-pane-footer-populated");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        std::fs::write(
+            session_dir.0.join("scripts").join("top-customers.sql"),
+            "select * from customers;",
+        )
+        .expect("must write the session script");
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        sidebar.read_with(vcx, |view, _app| {
+            assert!(
+                !super::model::scripts_pane_shows_empty_state(&view.script_rows),
+                "this test's fixture must reach the populated-scripts state"
+            );
+        });
+        assert!(
+            vcx.debug_bounds("sidebar-scripts-open-external").is_some(),
+            "the open-external-file footer must render alongside a populated script list"
+        );
+    }
+
+    /// The footer is a structural sibling of the scrollable rows, not one of
+    /// them, so scrolling an overflowing list must never move, hide, or
+    /// clip it.
+    #[gpui::test]
+    fn the_scripts_pane_footer_stays_put_while_an_overflowing_list_scrolls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let session_dir = TempDir::new("scripts-pane-footer-overflow");
+        std::fs::create_dir_all(session_dir.0.join("scripts")).expect("must create scripts dir");
+        for i in 0..80 {
+            std::fs::write(
+                session_dir
+                    .0
+                    .join("scripts")
+                    .join(format!("script-{i:03}.sql")),
+                format!("select {i};"),
+            )
+            .expect("must write a session script");
+        }
+
+        let session =
+            cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(sample_schema_tree())));
+        let session_for_view = session.clone();
+        let tabs = build_tabs(session.clone(), cx);
+        let (sidebar, vcx) =
+            cx.add_window_view(|_window, cx| SidebarView::new(session_for_view, tabs, None, cx));
+        sidebar.update(vcx, |view, cx| {
+            view.set_session_dir(Some(session_dir.0.clone()), cx);
+            view.switch_pane(SidebarPane::Scripts, cx);
+        });
+        vcx.run_until_parked();
+
+        let scroll = sidebar.read_with(vcx, |view, _app| view.scripts_scroll.clone());
+        let thumb_selector = vertical_thumb_debug_selector(&scroll);
+        let thumb_bounds_before = vcx.debug_bounds(thumb_selector).expect(
+            "this test's fixture must overflow the pane's viewport enough to show a \
+             scrollbar thumb, or the scroll below would prove nothing",
+        );
+        let footer_bounds_before = vcx
+            .debug_bounds("sidebar-scripts-open-external")
+            .expect("the footer must be painted before scrolling");
+
+        sidebar.update(vcx, |view, cx| {
+            view.scripts_scroll_handle
+                .set_offset(gpui::point(gpui::px(0.0), gpui::px(-3000.0)));
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        let thumb_bounds_after = vcx
+            .debug_bounds(thumb_selector)
+            .expect("the scrollbar thumb must still be painted after scrolling");
+        assert_ne!(
+            thumb_bounds_before, thumb_bounds_after,
+            "the scroll offset change must actually reach the paint pipeline, or the \
+             footer assertion below would prove nothing"
+        );
+
+        let footer_bounds_after = vcx
+            .debug_bounds("sidebar-scripts-open-external")
+            .expect("the footer must still be painted after scrolling");
+        assert_eq!(
+            footer_bounds_before, footer_bounds_after,
+            "the footer must stay a structural sibling of the scrolled rows, unmoved by \
+             scrolling to any position or list length"
+        );
+    }
+
+    /// Clicking the footer must raise the exact event Ctrl+Shift+O raises on
+    /// the same tabs model, not a parallel path into the file dialog.
+    #[gpui::test]
+    fn clicking_the_footer_emits_the_same_browse_files_event_as_ctrl_shift_o(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sidebar, vcx) = build(cx, SchemaState::Ready(sample_schema_tree()));
+        let tabs = sidebar.read_with(vcx, |view, _app| view.tabs.clone());
+
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let events_for_sub = events.clone();
+        vcx.update(|_window, cx| {
+            cx.subscribe(&tabs, move |_tabs, evt: &OpenRequested, _cx| {
+                events_for_sub.borrow_mut().push(*evt);
+            })
+            .detach();
+        });
+
+        sidebar.update(vcx, |view, cx| view.switch_pane(SidebarPane::Scripts, cx));
+        vcx.run_until_parked();
+
+        let bounds = vcx
+            .debug_bounds("sidebar-scripts-open-external")
+            .expect("the footer must be painted before it can be clicked");
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+
+        assert_eq!(
+            *events.borrow(),
+            vec![OpenRequested::BrowseFiles],
+            "clicking the footer must emit exactly the BrowseFiles request"
+        );
     }
 }

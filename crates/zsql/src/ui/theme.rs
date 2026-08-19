@@ -164,6 +164,30 @@ pub const SIDEBAR_LIBRARY_OPEN_DOT_SIZE: Pixels = px(5.0);
 /// Horizontal gap before a library row's open-dot.
 pub const SIDEBAR_LIBRARY_OPEN_DOT_GAP: Pixels = px(6.0);
 
+// ---- scripts pane: pinned "open external file" footer -------------------
+
+/// Fully transparent. For borders that reserve their space until a hover
+/// state paints them, so hovering never shifts layout.
+pub const COLOR_TRANSPARENT: u32 = 0x0000_0000;
+/// Height of the scripts pane's pinned open-external-file footer.
+pub const SIDEBAR_SCRIPTS_FOOTER_HEIGHT: Pixels = px(40.0);
+/// Horizontal padding inside the footer, around its button row.
+pub const SIDEBAR_SCRIPTS_FOOTER_PADDING_X: Pixels = px(7.0);
+/// Height of the footer's button row.
+pub const SIDEBAR_SCRIPTS_FOOTER_ROW_HEIGHT: Pixels = px(28.0);
+/// Corner radius of the footer's button row.
+pub const SIDEBAR_SCRIPTS_FOOTER_ROW_RADIUS: f32 = 6.0;
+/// Gap between the button row's icon, label, and shortcut chip.
+pub const SIDEBAR_SCRIPTS_FOOTER_GAP: Pixels = px(7.0);
+/// Size of the button row's leading icon.
+pub const SIDEBAR_SCRIPTS_FOOTER_ICON_SIZE: Pixels = px(13.0);
+/// Text size of the footer row's trailing shortcut chip.
+pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE: f32 = 10.0;
+/// Horizontal padding inside the shortcut chip.
+pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_PADDING_X: Pixels = px(3.0);
+/// Corner radius of the shortcut chip.
+pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_RADIUS: f32 = 4.0;
+
 // ---- scripts pane: empty connection-group invitation ---------------------
 
 /// Horizontal margin around the empty-state invitation block.

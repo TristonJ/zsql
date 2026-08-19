@@ -1,12 +1,15 @@
 //! Render logic for the sidebar's Scripts pane
 
-use gpui::{ClickEvent, Context, Div, Stateful, div, prelude::*, px, rgb};
+use gpui::{ClickEvent, Context, Div, Stateful, Window, div, prelude::*, px, rgb, rgba};
+use zsql_ui::icon::{IconName, icon};
 use zsql_ui::scrollable::{Axis, ScrollSource, WithScrollbars};
 use zsql_ui::theme::ActiveTheme;
 use zsql_ui::tree::{row_meta, row_shell};
+use zsql_ui::utils::OnHoverState;
 
 use super::SidebarView;
 use super::model::{ScriptRow, ScriptRowKind, library_row_is_open, scripts_pane_shows_empty_state};
+use crate::ui::tabs::TabModel;
 use crate::ui::theme;
 
 /// The glyph every script row leads with
@@ -17,7 +20,11 @@ const GROUP_LABEL_SEPARATOR: &str = "\u{b7}";
 /// The Scripts pane - a "This connection" group, then a "Library" group,
 /// filling the sidebar's full remaining height below the pane tabs/database
 /// row
-pub(super) fn render_scripts_pane(view: &SidebarView, cx: &mut Context<SidebarView>) -> Div {
+pub(super) fn render_scripts_pane(
+    view: &SidebarView,
+    window: &mut Window,
+    cx: &mut Context<SidebarView>,
+) -> Div {
     let session_rows: Vec<(usize, &ScriptRow)> = view
         .script_rows
         .iter()
@@ -70,14 +77,78 @@ pub(super) fn render_scripts_pane(view: &SidebarView, cx: &mut Context<SidebarVi
             view.scripts_scroll_handle.clone(),
         )));
     });
-    pane.with_scrollbars(
+    let scroll_area = pane.with_scrollbars(
         &view.scripts_scroll,
         SidebarView::tree_scrollbar_style(cx.theme()),
         cx,
-    )
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(scroll_area)
+        .child(render_scripts_footer(window, cx))
 }
 
-/// The Scripts pane's scrollbar chrome, matching the schema tree's own.
+/// The pane's pinned footer: a full-width button row, outside the
+/// scrollable list, that starts the platform open-file dialog.
+fn render_scripts_footer(window: &mut Window, cx: &mut Context<SidebarView>) -> Div {
+    let colors = cx.theme().colors;
+    let data_font = cx.theme().fonts.data.clone();
+    let row = div()
+        .id("sidebar-scripts-open-external")
+        .debug_selector(|| "sidebar-scripts-open-external".to_owned())
+        .flex_1()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(theme::SIDEBAR_SCRIPTS_FOOTER_GAP)
+        .h(theme::SIDEBAR_SCRIPTS_FOOTER_ROW_HEIGHT)
+        .px(theme::SIDEBAR_SCRIPTS_FOOTER_PADDING_X)
+        .rounded(px(theme::SIDEBAR_SCRIPTS_FOOTER_ROW_RADIUS))
+        .border_1()
+        .border_color(rgba(theme::COLOR_TRANSPARENT))
+        .cursor_pointer()
+        .text_color(rgb(colors.text_secondary))
+        .hover(|el| {
+            el.bg(rgb(colors.bg_raised))
+                .border_color(rgb(colors.border))
+        })
+        .on_hover_state(window, cx, |el| el.text_color(rgb(colors.text_primary)))
+        .on_click(cx.listener(|view, _event: &ClickEvent, _window, cx| {
+            view.tabs.update(cx, TabModel::request_browse);
+        }))
+        .child(icon(
+            IconName::FolderOpen,
+            theme::SIDEBAR_SCRIPTS_FOOTER_ICON_SIZE,
+            colors.text_tertiary,
+        ))
+        .child(div().flex_1().child("Open external file..."))
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_family(&data_font)
+                .text_size(px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE))
+                .text_color(rgb(colors.text_tertiary))
+                .px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_PADDING_X)
+                .rounded(px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_RADIUS))
+                .border_1()
+                .border_color(rgb(colors.border))
+                .child("Ctrl+Shift+O"),
+        );
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .h(theme::SIDEBAR_SCRIPTS_FOOTER_HEIGHT)
+        .px(theme::SIDEBAR_SCRIPTS_FOOTER_PADDING_X)
+        .border_t_1()
+        .border_color(rgb(colors.border_soft))
+        .child(row)
+}
+
 /// The Library group's own empty-state line
 fn render_library_empty_state(cx: &Context<SidebarView>) -> Div {
     div()
