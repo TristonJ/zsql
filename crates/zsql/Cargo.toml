@@ -1,6 +1,6 @@
 [package]
 name = "zsql"
-version = "0.0.0"
+version = "0.1.1"
 description = "A fast, lightweight desktop SQL editor."
 edition.workspace = true
 license.workspace = true
@@ -83,7 +83,7 @@ driver-integration-tests = []
 [package.metadata.packager]
 before-packaging-command = "cargo build --release"
 product-name = "zsql"
-version = "0.1.0"
+version = "0.1.1"
 identifier = "com.tristonj.zsql"
 out-dir = "../../target/package"
 description = "A lightweight, developer-focused SQL editor"
