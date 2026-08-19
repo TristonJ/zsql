@@ -1,9 +1,13 @@
 //! The results grid: a virtualized table view over a `Session`'s current
 //! [`SessionState`] and accumulated result set
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
-    MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    KeyBinding, MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*,
+    px, rgb,
 };
 use zsql_core::{ResultSet, group_thousands};
 use zsql_ui::table::TableState;
@@ -21,7 +25,9 @@ use crate::ui::results::pager::PreviewControls;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
+mod cell_edit;
 mod cell_menu;
+mod edit_popover;
 mod empty_state;
 pub(crate) mod filter_bar;
 mod grid;
@@ -57,6 +63,8 @@ actions!(
         QuickFindPrev,
         QuickFindClose,
         ApplyStagedChanges,
+        EditCell,
+        CancelCellEdit,
     ]
 );
 
@@ -88,6 +96,8 @@ pub fn init(cx: &mut App, apply_staged_keybinding: &str) {
             ApplyStagedChanges,
             Some(BINDING_CONTEXT),
         ),
+        KeyBinding::new("f2", EditCell, Some(BINDING_CONTEXT)),
+        KeyBinding::new("escape", CancelCellEdit, Some(cell_edit::KEY_CONTEXT)),
         // Bound on the bar's own context (an ancestor of its query input's
         // `TextField` context) rather than `BINDING_CONTEXT`, so these fire
         // while the bar's input has focus. Plain Enter is not bound here: the
@@ -113,6 +123,7 @@ pub(crate) enum ViewMode {
 }
 
 /// A virtualized results grid, driven by a `Session` entity.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ResultsView {
     session: Entity<Session>,
     source_label: SharedString,
@@ -199,6 +210,22 @@ pub struct ResultsView {
     /// on a same-relation window change (see
     /// [`ResultsView::show_live_window`]).
     staging: Entity<staging::StagingState>,
+    /// The cell edit popover, as its own entity. Closed on every tab switch
+    /// and query rerun alongside the staged queue (see
+    /// [`ResultsView::set_preview_controls`] and
+    /// [`ResultsView::reset_for_new_result`]).
+    cell_editor: Entity<cell_edit::CellEditor>,
+    /// Set whenever the cell edit popover closes (staged or cancelled) from
+    /// a path with no `Window` access (the popover input's own Enter-to-
+    /// submit event). Consumed by the next render, which does have one, to
+    /// return keyboard focus to the grid.
+    pending_grid_refocus: bool,
+    /// The results grid's currently focused body cell's own painted window
+    /// bounds, as of the last completed frame. Recorded by a zero-size probe
+    /// in [`grid`] so the cell edit popover can anchor to the exact cell it
+    /// edits; `None` before that cell has ever painted (e.g. a test that
+    /// opens the popover without a real render pass).
+    focused_cell_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// A results grid cell's open right-click context menu: the triggering
@@ -234,6 +261,17 @@ impl ResultsView {
         let value_panel =
             cx.new(|cx| ValuePanel::new(focus_handle.clone(), ValuePanelConfig::default(), cx));
         let text_view = cx.new(TextView::new);
+
+        let cell_editor = cx.new(|_cx| cell_edit::CellEditor::new());
+        cx.observe(&cell_editor, |_view, _editor, cx| cx.notify())
+            .detach();
+        cx.subscribe(
+            &cell_editor,
+            |view: &mut Self, _editor, event: &cell_edit::CellEditorEvent, cx| {
+                view.handle_cell_editor_event(event, cx);
+            },
+        )
+        .detach();
 
         let staging = cx.new(|_cx| staging::StagingState::new(session.clone()));
         cx.observe(&staging, |_view, _staging, cx| cx.notify())
@@ -281,6 +319,9 @@ impl ResultsView {
             filter_column_picker_open: false,
             quick_find: None,
             staging,
+            cell_editor,
+            pending_grid_refocus: false,
+            focused_cell_bounds: Rc::new(Cell::new(None)),
         };
         view.sync_dimensions(cx);
         view
@@ -324,6 +365,7 @@ impl ResultsView {
         self.preview = preview;
         self.filter_editor = None;
         self.filter_column_picker_open = false;
+        self.cell_editor.update(cx, cell_edit::CellEditor::close);
         self.sync_relation_schema(cx);
         cx.notify();
     }
@@ -792,6 +834,10 @@ impl Render for ResultsView {
         self.text_view.update(cx, |text_view, cx| {
             text_view.update_document(self.effective_result(cx))
         });
+        if self.pending_grid_refocus {
+            self.pending_grid_refocus = false;
+            window.focus(&self.focus_handle);
+        }
 
         div()
             .id("results-grid-pane")
@@ -810,6 +856,7 @@ impl Render for ResultsView {
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::open_quick_find))
             .on_action(cx.listener(Self::apply_staged_changes_action))
+            .on_action(cx.listener(Self::edit_focused_cell))
             .on_mouse_move(cx.listener(Self::value_panel_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_value_panel_drag))
@@ -822,6 +869,7 @@ impl Render for ResultsView {
             .child(self.render_body(window, cx))
             .children(self.render_quick_find_overlay(cx))
             .children(self.render_cell_context_menu(cx))
+            .child(self.cell_editor.clone())
             .child(self.staging.clone())
     }
 }

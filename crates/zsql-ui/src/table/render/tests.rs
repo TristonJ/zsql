@@ -334,7 +334,7 @@ impl Render for Harness {
             table = table.selectable();
         }
         if let Some(log) = self.double_click_log.clone() {
-            table = table.on_cell_double_click(move |_this, row, col, _window, _cx| {
+            table = table.on_cell_double_click(move |_this, row, col, _event, _window, _cx| {
                 log.borrow_mut().push((row, col));
             });
         }

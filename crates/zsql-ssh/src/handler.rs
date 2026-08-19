@@ -41,26 +41,28 @@ impl ClientHandler {
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKey,
-    ) -> Result<bool, Self::Error> {
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         let span = tracing::info_span!("ssh_check_server_key", host = %self.host, port = self.port);
         let _enter = span.enter();
 
-        match host_key::decide(&self.host_key, &self.host, self.port, server_public_key) {
-            Ok(()) => {
-                tracing::info!("ssh host key accepted");
-                Ok(true)
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "ssh host key rejected");
-                if let Ok(mut slot) = self.host_key_error.lock() {
-                    *slot = Some(err);
+        let accepted =
+            match host_key::decide(&self.host_key, &self.host, self.port, server_public_key) {
+                Ok(()) => {
+                    tracing::info!("ssh host key accepted");
+                    Ok(true)
                 }
-                Ok(false)
-            }
-        }
+                Err(err) => {
+                    tracing::warn!(error = %err, "ssh host key rejected");
+                    if let Ok(mut slot) = self.host_key_error.lock() {
+                        *slot = Some(err);
+                    }
+                    Ok(false)
+                }
+            };
+        std::future::ready(accepted)
     }
 }
 

@@ -95,6 +95,9 @@ pub enum TextFieldEvent {
 /// keyboard editing, clipboard, and IME support. Owns only primitives --
 /// strings, byte offsets, colors, and pixel sizes -- so it has no reason to
 /// know about any app, driver, or session type.
+// Every bool here is an independent flag (mask display, edit rejection,
+// drag-selection latch, focus cache), not a hidden state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TextFieldState {
     model: FieldModel,
     placeholder: SharedString,
@@ -108,6 +111,12 @@ pub struct TextFieldState {
     /// (e.g. a password) rather than as itself. Editing, selection, and
     /// clipboard all still operate on the real content underneath.
     masked: bool,
+    /// Whether the field rejects edits: typing, deletion, cut, and paste are
+    /// ignored, the caret never paints, and the content dims, while the
+    /// field stays focusable so Enter/Escape bindings scoped to it (or an
+    /// ancestor) keep firing. Programmatic [`TextFieldState::set_value`]
+    /// still works.
+    disabled: bool,
     blink: BlinkState,
     /// Whether the field held focus as of the most recent render. The blink
     /// loop reads this to skip ticking (and repainting) an unfocused field,
@@ -178,6 +187,7 @@ impl TextFieldState {
             marked_range: None,
             is_selecting: false,
             masked: false,
+            disabled: false,
             blink: BlinkState::new(),
             focused: false,
             last_line: None,
@@ -234,6 +244,17 @@ impl TextFieldState {
     #[must_use]
     pub fn is_masked(&self) -> bool {
         self.masked
+    }
+
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Reject or accept edits; see [`TextFieldState::disabled`].
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        self.disabled = disabled;
+        cx.notify();
     }
 
     /// Show ([`MASK_GLYPH`] repeated) or reveal this field's content, e.g. a
@@ -330,11 +351,17 @@ impl TextFieldState {
     // -- editing actions -----------------------------------------------
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         self.model.backspace();
         self.note_keystroke(cx);
     }
 
     fn delete_forward(&mut self, _: &DeleteForward, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         self.model.delete_forward();
         self.note_keystroke(cx);
     }
@@ -364,6 +391,9 @@ impl TextFieldState {
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.model.has_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.model.selected_text().to_owned(),
@@ -374,6 +404,9 @@ impl TextFieldState {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.model.insert_text(&text);
         }
@@ -389,6 +422,11 @@ impl TextFieldState {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        // A disabled field still takes focus (so Enter/Escape bindings
+        // scoped to it keep firing) but never starts a caret or selection.
+        if self.disabled {
+            return;
+        }
         self.is_selecting = true;
         if let Some(offset) = self.byte_offset_for_point(event.position) {
             if event.modifiers.shift {
@@ -548,10 +586,20 @@ impl Render for TextFieldState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focused = self.focus_handle.is_focused(window);
         let colors = cx.theme().colors;
-        let border_color = if self.focused {
+        let border_color = if self.focused && !self.disabled {
             colors.accent
         } else {
             colors.border
+        };
+        let text_color = if self.disabled {
+            colors.text_tertiary
+        } else {
+            colors.text_primary
+        };
+        let cursor_style = if self.disabled {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::IBeam
         };
 
         div()
@@ -562,7 +610,7 @@ impl Render for TextFieldState {
             .id(("text-field", cx.entity_id()))
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
-            .cursor(CursorStyle::IBeam)
+            .cursor(cursor_style)
             .flex()
             .items_center()
             .w_full()
@@ -582,7 +630,7 @@ impl Render for TextFieldState {
             .border_color(rgb(border_color))
             .bg(rgb(colors.bg_app))
             .text_size(self.style.text_size)
-            .text_color(rgb(colors.text_primary))
+            .text_color(rgb(text_color))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_home))
@@ -651,6 +699,9 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         text_input::replace_text_in_range(self, range_utf16, new_text);
         self.note_keystroke(cx);
     }
@@ -663,6 +714,9 @@ impl EntityInputHandler for TextFieldState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         text_input::replace_and_mark_text_in_range(
             self,
             range_utf16,
@@ -778,6 +832,7 @@ impl Element for TextFieldContentElement {
         let content = field.model.text().to_owned();
         let showing_placeholder = should_show_placeholder(&content);
         let masked = field.masked;
+        let disabled = field.disabled;
         let placeholder = field.placeholder.clone();
         let marked_range = field.marked_range.clone();
         let focused = field.focus_handle.is_focused(window);
@@ -848,7 +903,7 @@ impl Element for TextFieldContentElement {
             field.last_followed_cursor = Some(cursor_offset);
         });
 
-        let cursor = (focused && blink_visible).then(|| {
+        let cursor = (focused && blink_visible && !disabled).then(|| {
             text_input::caret_quad(
                 bounds,
                 caret_x - scroll_offset,

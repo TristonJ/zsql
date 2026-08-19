@@ -5,11 +5,11 @@ use gpui::{AnyElement, App, Context, Entity, EventEmitter, Render, Window, div, 
 use zsql_core::schema_detail::RelationSchema;
 use zsql_editor::{Highlighter as _, SqlHighlighter, StyleSpan};
 
-use super::ledger::{LedgerLine, StagedLedger};
+use super::ledger::{LedgerLine, LedgerLineKind, StagedLedger};
 use super::staging_bar::StagingBar;
 use super::{ApplyStagedChanges, ResultsView};
 use crate::session::Session;
-use crate::staging::{RowIdentity, StagedChangeId, StagedChangeQueue};
+use crate::staging::{RowIdentity, StagedChange, StagedChangeId, StagedChangeQueue, UpdateValue};
 
 /// Fetch state of the active relation's [`RelationSchema`].
 enum RelationSchemaFetch {
@@ -81,12 +81,37 @@ impl StagingState {
         self.queue.is_empty()
     }
 
-    /// The id of the queued change targeting `identity`, if any.
-    pub fn find_staged(&self, identity: &RowIdentity) -> Option<StagedChangeId> {
+    /// The id of the queued delete targeting `identity`, if any.
+    pub fn find_staged_delete(&self, identity: &RowIdentity) -> Option<StagedChangeId> {
         if self.queue.is_empty() {
             return None;
         }
-        self.queue.find_staged(identity)
+        self.queue.find_staged_delete(identity)
+    }
+
+    /// The new value of the queued update targeting `identity`.`column`, if
+    /// any.
+    pub fn staged_update_value(&self, identity: &RowIdentity, column: &str) -> Option<UpdateValue> {
+        self.queue.staged_update_value(identity, column).cloned()
+    }
+
+    /// Whether `identity` carries at least one staged cell edit.
+    pub fn row_has_staged_update(&self, identity: &RowIdentity) -> bool {
+        self.queue.entries().iter().any(|entry| {
+            matches!(entry.change, StagedChange::Update { .. }) && entry.change.target() == identity
+        })
+    }
+
+    /// The number of staged cell edits and staged deletes currently queued,
+    /// counted independently for the staging bar's summary.
+    fn staged_change_counts(&self) -> (usize, usize) {
+        self.queue
+            .entries()
+            .iter()
+            .fold((0, 0), |(edits, deletes), entry| match &entry.change {
+                StagedChange::Delete { .. } => (edits, deletes + 1),
+                StagedChange::Update { .. } => (edits + 1, deletes),
+            })
     }
 
     /// Whether an Apply is currently in flight, blocking queue mutation.
@@ -107,7 +132,7 @@ impl StagingState {
             tracing::trace!("stage/restore requested while an apply is in flight; ignored");
             return;
         }
-        if let Some(id) = self.queue.find_staged(&identity) {
+        if let Some(id) = self.queue.find_staged_delete(&identity) {
             self.queue.unstage(id);
             tracing::info!(row = source_row, "restored a staged row delete");
         } else {
@@ -120,6 +145,33 @@ impl StagingState {
         }
         self.settle_after_mutation();
         cx.notify();
+    }
+
+    /// Stage `identity`.`column` to `value` (read from `source_row`),
+    /// creating or replacing that cell's entry. Returns whether the edit was
+    /// actually staged: a row already staged for delete rejects it.
+    pub fn stage_update(
+        &mut self,
+        source_row: usize,
+        identity: RowIdentity,
+        column: String,
+        value: UpdateValue,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let staged = self
+            .queue
+            .stage_update(source_row, identity, column, value)
+            .is_some();
+        if staged {
+            self.apply_state = ApplyState::Idle;
+            tracing::info!(
+                row = source_row,
+                staged_count = self.queue.len(),
+                "staged a cell edit"
+            );
+            cx.notify();
+        }
+        staged
     }
 
     /// The ledger's per-line unstage control. A no-op while an Apply is in
@@ -309,6 +361,10 @@ impl StagingState {
                 let spans: Vec<StyleSpan> = self.highlighter.spans_for_line(0).to_vec();
                 LedgerLine {
                     id: entry.id,
+                    kind: match entry.change {
+                        StagedChange::Delete { .. } => LedgerLineKind::Delete,
+                        StagedChange::Update { .. } => LedgerLineKind::Update,
+                    },
                     source_row: entry.source_row,
                     sql,
                     spans,
@@ -332,18 +388,19 @@ impl StagingState {
             _ => None,
         };
         Some(
-            StagingBar::new(self.queue.len(), self.ledger_open)
-                .retrying(retrying)
-                .applying(self.applying())
-                .general_error(general_error)
-                .on_toggle_ledger(
-                    cx.listener(|staging, _event, _window, cx| staging.toggle_ledger(cx)),
-                )
-                .on_discard_all(cx.listener(|staging, _event, _window, cx| {
-                    staging.discard_all(cx);
-                }))
-                .on_apply(cx.listener(|staging, _event, _window, cx| staging.apply(cx)))
-                .into_any_element(),
+            {
+                let (edit_count, delete_count) = self.staged_change_counts();
+                StagingBar::new(edit_count, delete_count, self.ledger_open)
+            }
+            .retrying(retrying)
+            .applying(self.applying())
+            .general_error(general_error)
+            .on_toggle_ledger(cx.listener(|staging, _event, _window, cx| staging.toggle_ledger(cx)))
+            .on_discard_all(cx.listener(|staging, _event, _window, cx| {
+                staging.discard_all(cx);
+            }))
+            .on_apply(cx.listener(|staging, _event, _window, cx| staging.apply(cx)))
+            .into_any_element(),
         )
     }
 
@@ -417,13 +474,46 @@ impl ResultsView {
         )
     }
 
-    /// The id of `row`'s staged change, if it is currently staged.
+    /// The id of `row`'s staged delete, if it is currently staged for
+    /// deletion. `None` for a row that carries only staged cell edits, or no
+    /// staged change at all.
     pub(super) fn staged_id_for_row(&self, cx: &App, row: usize) -> Option<StagedChangeId> {
         if self.staging.read(cx).is_empty() {
             return None;
         }
         let identity = self.row_identity_for(cx, row)?;
-        self.staging.read(cx).find_staged(&identity)
+        self.staging.read(cx).find_staged_delete(&identity)
+    }
+
+    /// The staged new value for `row`'s `col` cell, if that exact cell
+    /// carries a staged edit.
+    pub(super) fn staged_update_for_cell(
+        &self,
+        cx: &App,
+        row: usize,
+        col: usize,
+    ) -> Option<UpdateValue> {
+        if self.staging.read(cx).is_empty() {
+            return None;
+        }
+        let identity = self.row_identity_for(cx, row)?;
+        let column = self.effective_result(cx).columns.get(col)?;
+        self.staging
+            .read(cx)
+            .staged_update_value(&identity, &column.name)
+    }
+
+    /// Whether `row` carries at least one staged cell edit, for the
+    /// row-number gutter's plus-minus marker.
+    pub(super) fn row_has_staged_update(&self, cx: &App, row: usize) -> bool {
+        let staging = self.staging.read(cx);
+        if staging.is_empty() {
+            return false;
+        }
+        let Some(identity) = self.row_identity_for(cx, row) else {
+            return false;
+        };
+        staging.row_has_staged_update(&identity)
     }
 
     /// The cell menu's `Delete row`/`Restore row` click: stage `row`'s
@@ -503,5 +593,50 @@ impl ResultsView {
 
     pub(crate) fn apply_is_retrying_for_test(&self, cx: &App) -> bool {
         matches!(self.staging.read(cx).apply_state, ApplyState::Failed { .. })
+    }
+
+    pub(crate) fn unstage_entry_for_test(&mut self, id: StagedChangeId, cx: &mut Context<Self>) {
+        self.staging
+            .update(cx, |staging, cx| staging.unstage(id, cx));
+    }
+
+    pub(crate) fn row_has_staged_update_for_test(&self, cx: &App, row: usize) -> bool {
+        self.row_has_staged_update(cx, row)
+    }
+
+    pub(crate) fn staged_statements_for_test(&self, cx: &App) -> Vec<String> {
+        self.staging.read(cx).queue.statements()
+    }
+
+    pub(crate) fn staged_entry_ids_for_test(&self, cx: &App) -> Vec<StagedChangeId> {
+        self.staging
+            .read(cx)
+            .queue
+            .entries()
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// Every staged entry's kind ("update"/"delete"), in FIFO staging order.
+    pub(crate) fn staged_entry_kinds_for_test(&self, cx: &App) -> Vec<&'static str> {
+        self.staging
+            .read(cx)
+            .queue
+            .entries()
+            .iter()
+            .map(|entry| match entry.change {
+                StagedChange::Delete { .. } => "delete",
+                StagedChange::Update { .. } => "update",
+            })
+            .collect()
+    }
+
+    pub(crate) fn staged_edit_count_for_test(&self, cx: &App) -> usize {
+        self.staging.read(cx).staged_change_counts().0
+    }
+
+    pub(crate) fn staged_delete_count_for_test(&self, cx: &App) -> usize {
+        self.staging.read(cx).staged_change_counts().1
     }
 }

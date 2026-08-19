@@ -1,6 +1,4 @@
-//! The staged-changes model behind results-grid row deletes: a driver- and
-//! UI-agnostic queue of pending edits, keyed by a row's primary key rather
-//! than its position on screen, plus pure DELETE statement generation.
+//! The staged-changes model behind results-grid row changes.
 
 use zsql_core::filter::quote_sql_string;
 use zsql_core::schema_detail::RelationSchema;
@@ -30,11 +28,30 @@ pub struct RowIdentity {
     pub pk: Vec<PkColumnValue>,
 }
 
+/// How a staged cell edit's new value renders into generated SQL text,
+/// mirroring [`zsql_core::filter::FilterValueRender`]'s classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateValue {
+    /// Already rendered per [`zsql_core::filter::render_literal_value`]:
+    /// either a single-quoted, escaped string or a bare numeric literal.
+    Literal(String),
+    /// Raw SQL, embedded unquoted (e.g. `now()`).
+    Expression(String),
+    Null,
+}
+
 /// One kind of pending change against a relation, targeting one row by its
 /// [`RowIdentity`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum StagedChange {
-    Delete { target: RowIdentity },
+    Delete {
+        target: RowIdentity,
+    },
+    Update {
+        target: RowIdentity,
+        column: String,
+        new_value: UpdateValue,
+    },
 }
 
 impl StagedChange {
@@ -42,7 +59,7 @@ impl StagedChange {
     #[must_use]
     pub fn target(&self) -> &RowIdentity {
         match self {
-            StagedChange::Delete { target } => target,
+            StagedChange::Delete { target } | StagedChange::Update { target, .. } => target,
         }
     }
 }
@@ -100,13 +117,67 @@ impl StagedChangeQueue {
         id
     }
 
-    /// The id of the queued change targeting `target`, if any.
+    /// The id of the queued delete targeting `target`, if any.
     #[must_use]
-    pub fn find_staged(&self, target: &RowIdentity) -> Option<StagedChangeId> {
+    pub fn find_staged_delete(&self, target: &RowIdentity) -> Option<StagedChangeId> {
         self.entries
             .iter()
-            .find(|entry| entry.change.target() == target)
+            .find(
+                |entry| matches!(&entry.change, StagedChange::Delete { target: t } if t == target),
+            )
             .map(|entry| entry.id)
+    }
+
+    /// The new value of the queued update targeting `target`'s `column`, if
+    /// any.
+    #[must_use]
+    pub fn staged_update_value(&self, target: &RowIdentity, column: &str) -> Option<&UpdateValue> {
+        self.entries.iter().find_map(|entry| match &entry.change {
+            StagedChange::Update {
+                target: t,
+                column: c,
+                new_value,
+            } if t == target && c == column => Some(new_value),
+            _ => None,
+        })
+    }
+
+    /// Stage `target`.`column` to `value`, read from `source_row`. Rejected
+    /// (returns `None`, queue left untouched) while `target` already carries
+    /// a staged delete: a row queued for deletion cannot also take a cell
+    /// edit. When `target`.`column` is already staged for update, replaces
+    /// that entry's value in place, keeping its id and FIFO position;
+    /// otherwise appends a fresh entry at the end of the queue.
+    pub fn stage_update(
+        &mut self,
+        source_row: usize,
+        target: RowIdentity,
+        column: String,
+        value: UpdateValue,
+    ) -> Option<StagedChangeId> {
+        if self.find_staged_delete(&target).is_some() {
+            return None;
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            matches!(&entry.change, StagedChange::Update { target: t, column: c, .. } if *t == target && *c == column)
+        }) {
+            if let StagedChange::Update { new_value, .. } = &mut entry.change {
+                *new_value = value;
+            }
+            return Some(entry.id);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.entries.push(StagedChangeEntry {
+            id,
+            source_row,
+            change: StagedChange::Update {
+                target,
+                column,
+                new_value: value,
+            },
+        });
+        Some(id)
     }
 
     /// Remove the entry with `id`. Returns whether an entry was actually
@@ -138,6 +209,11 @@ impl StagedChangeQueue {
 pub fn statement_sql(change: &StagedChange) -> String {
     match change {
         StagedChange::Delete { target } => delete_statement_sql(target),
+        StagedChange::Update {
+            target,
+            column,
+            new_value,
+        } => update_statement_sql(target, column, new_value),
     }
 }
 
@@ -152,20 +228,62 @@ fn delete_statement_sql(target: &RowIdentity) -> String {
         quote_ident(&target.schema),
         quote_ident(&target.relation)
     );
-    for (index, pk) in target.pk.iter().enumerate() {
+    push_pk_where_sql(&mut sql, &target.pk);
+    sql.push(';');
+    sql
+}
+
+/// `UPDATE "schema"."relation" SET "column" = <new_value> WHERE ...`,
+/// targeting `target`'s primary key exactly like [`delete_statement_sql`]
+/// (sharing [`push_pk_where_sql`], so a composite PK's `WHERE` clause can
+/// never diverge between the two statement kinds).
+fn update_statement_sql(target: &RowIdentity, column: &str, new_value: &UpdateValue) -> String {
+    let mut sql = format!(
+        "UPDATE {}.{} {} WHERE ",
+        quote_ident(&target.schema),
+        quote_ident(&target.relation),
+        update_set_fragment_sql(column, new_value)
+    );
+    push_pk_where_sql(&mut sql, &target.pk);
+    sql.push(';');
+    sql
+}
+
+/// An update's `SET "column" = <new_value>` fragment alone, without the
+/// statement around it.
+#[must_use]
+pub fn update_set_fragment_sql(column: &str, new_value: &UpdateValue) -> String {
+    format!(
+        "SET {} = {}",
+        quote_ident(column),
+        update_value_sql(new_value)
+    )
+}
+
+/// `new_value` as SQL text: `NULL` bare for the null mode, raw text for an
+/// expression, or `new_value`'s already-rendered literal.
+fn update_value_sql(new_value: &UpdateValue) -> String {
+    match new_value {
+        UpdateValue::Null => "NULL".to_owned(),
+        UpdateValue::Expression(text) | UpdateValue::Literal(text) => text.clone(),
+    }
+}
+
+/// Appends `pk`'s columns, AND-joined in `pk`'s own order, as a `WHERE`
+/// clause's body (no leading `WHERE` keyword).
+fn push_pk_where_sql(sql: &mut String, pk: &[PkColumnValue]) {
+    for (index, pk_column) in pk.iter().enumerate() {
         if index > 0 {
             sql.push_str(" AND ");
         }
-        sql.push_str(&quote_ident(&pk.column));
-        if matches!(pk.value, Value::Null) {
+        sql.push_str(&quote_ident(&pk_column.column));
+        if matches!(pk_column.value, Value::Null) {
             sql.push_str(" IS NULL");
         } else {
             sql.push_str(" = ");
-            sql.push_str(&pk_literal(pk));
+            sql.push_str(&pk_literal(pk_column));
         }
     }
-    sql.push(';');
-    sql
 }
 
 /// `pk`'s value as a SQL literal: a bare numeric literal for an
@@ -181,6 +299,33 @@ fn pk_literal(pk: &PkColumnValue) -> String {
         text
     } else {
         quote_sql_string(&text)
+    }
+}
+
+/// Reverse of [`quote_sql_string`]: strips a literal's surrounding quotes
+/// and un-doubles embedded ones, recovering the raw text before quoting.
+/// Text with no surrounding quotes (a bare numeric literal) passes through
+/// unchanged.
+#[must_use]
+pub fn unquote_sql_string(text: &str) -> String {
+    match text
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        Some(inner) => inner.replace("''", "'"),
+        None => text.to_owned(),
+    }
+}
+
+/// `new_value`'s plain display text for the results grid cell it is staged
+/// against: unquoted for a literal, raw for an expression, `NULL` for the
+/// null mode.
+#[must_use]
+pub fn update_value_display_text(new_value: &UpdateValue) -> String {
+    match new_value {
+        UpdateValue::Null => "NULL".to_owned(),
+        UpdateValue::Expression(text) => text.clone(),
+        UpdateValue::Literal(text) => unquote_sql_string(text),
     }
 }
 
@@ -239,8 +384,9 @@ mod tests {
     use zsql_core::schema_detail::ColumnDetail;
 
     use super::{
-        PkColumnValue, RowIdentity, StagedChange, StagedChangeQueue, has_usable_primary_key,
-        row_identity, statement_sql,
+        PkColumnValue, RowIdentity, StagedChange, StagedChangeQueue, UpdateValue,
+        has_usable_primary_key, row_identity, statement_sql, unquote_sql_string,
+        update_set_fragment_sql, update_value_display_text,
     };
 
     fn pk_column(name: &str, type_name: &str) -> ColumnDetail {
@@ -308,12 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn find_staged_locates_the_entry_matching_a_row_identity() {
+    fn find_staged_delete_locates_the_entry_matching_a_row_identity() {
         let mut queue = StagedChangeQueue::new();
         let target = identity(int_pk(7));
         let id = queue.stage_delete(0, target.clone());
-        assert_eq!(queue.find_staged(&target), Some(id));
-        assert_eq!(queue.find_staged(&identity(int_pk(8))), None);
+        assert_eq!(queue.find_staged_delete(&target), Some(id));
+        assert_eq!(queue.find_staged_delete(&identity(int_pk(8))), None);
     }
 
     #[test]
@@ -489,6 +635,317 @@ mod tests {
             sql,
             "DELETE FROM \"public\".\"orders\" WHERE \"tenant_id\" = 9 AND \"user_id\" = 4;"
         );
+    }
+
+    // -- StagedChangeQueue::stage_update ---------------------------------
+
+    #[test]
+    fn stage_update_appends_an_entry_and_assigns_a_unique_id() {
+        let mut queue = StagedChangeQueue::new();
+        let id = queue
+            .stage_update(
+                0,
+                identity(int_pk(1)),
+                "status".to_owned(),
+                UpdateValue::Literal("'shipped'".to_owned()),
+            )
+            .expect("staging an update against an unstaged row must succeed");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.entries()[0].id, id);
+    }
+
+    #[test]
+    fn staging_the_same_cell_twice_replaces_the_value_in_place_at_the_same_id_and_position() {
+        let mut queue = StagedChangeQueue::new();
+        queue.stage_delete(9, identity(int_pk(2)));
+        let target = identity(int_pk(1));
+        let first = queue
+            .stage_update(
+                0,
+                target.clone(),
+                "status".to_owned(),
+                UpdateValue::Literal("'shipped'".to_owned()),
+            )
+            .expect("first stage must succeed");
+        let second = queue
+            .stage_update(
+                0,
+                target.clone(),
+                "status".to_owned(),
+                UpdateValue::Literal("'refunded'".to_owned()),
+            )
+            .expect("restaging the same cell must succeed");
+
+        assert_eq!(first, second, "restaging the same cell must keep its id");
+        assert_eq!(
+            queue.len(),
+            2,
+            "restaging the same cell must not append a new entry"
+        );
+        assert_eq!(
+            queue.entries()[0].change,
+            StagedChange::Delete {
+                target: identity(int_pk(2))
+            },
+            "restaging a different cell must not disturb an unrelated entry's FIFO position"
+        );
+        assert_eq!(
+            queue.staged_update_value(&target, "status"),
+            Some(&UpdateValue::Literal("'refunded'".to_owned())),
+            "the replaced entry must carry the newest value"
+        );
+    }
+
+    #[test]
+    fn staging_two_different_columns_on_the_same_row_appends_two_entries() {
+        let mut queue = StagedChangeQueue::new();
+        let target = identity(int_pk(1));
+        queue
+            .stage_update(
+                0,
+                target.clone(),
+                "status".to_owned(),
+                UpdateValue::Literal("'shipped'".to_owned()),
+            )
+            .expect("staging the first column must succeed");
+        queue
+            .stage_update(
+                0,
+                target,
+                "total_cents".to_owned(),
+                UpdateValue::Literal("9000".to_owned()),
+            )
+            .expect("staging a different column on the same row must succeed");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn stage_update_is_rejected_while_the_target_row_carries_a_staged_delete() {
+        let mut queue = StagedChangeQueue::new();
+        let target = identity(int_pk(1));
+        queue.stage_delete(0, target.clone());
+
+        let result = queue.stage_update(
+            0,
+            target,
+            "status".to_owned(),
+            UpdateValue::Literal("'shipped'".to_owned()),
+        );
+
+        assert_eq!(
+            result, None,
+            "a row staged for delete must not also accept a staged edit"
+        );
+        assert_eq!(
+            queue.len(),
+            1,
+            "a rejected stage_update must leave the queue exactly as it was"
+        );
+    }
+
+    #[test]
+    fn stage_update_succeeds_again_once_the_blocking_delete_is_unstaged() {
+        let mut queue = StagedChangeQueue::new();
+        let target = identity(int_pk(1));
+        let delete_id = queue.stage_delete(0, target.clone());
+        queue.unstage(delete_id);
+
+        let result = queue.stage_update(
+            0,
+            target,
+            "status".to_owned(),
+            UpdateValue::Literal("'shipped'".to_owned()),
+        );
+
+        assert!(
+            result.is_some(),
+            "unstaging the delete must make the row eligible for edits again"
+        );
+    }
+
+    #[test]
+    fn find_staged_delete_never_matches_a_staged_update_on_the_same_row() {
+        let mut queue = StagedChangeQueue::new();
+        let target = identity(int_pk(1));
+        queue
+            .stage_update(
+                0,
+                target.clone(),
+                "status".to_owned(),
+                UpdateValue::Literal("'shipped'".to_owned()),
+            )
+            .expect("staging the update must succeed");
+
+        assert_eq!(
+            queue.find_staged_delete(&target),
+            None,
+            "find_staged_delete must never match a staged update against the same row"
+        );
+    }
+
+    // -- UPDATE statement generation --------------------------------------
+
+    #[test]
+    fn update_statement_renders_a_literal_value_quoted() {
+        let change = StagedChange::Update {
+            target: identity(int_pk(2)),
+            column: "status".to_owned(),
+            new_value: UpdateValue::Literal("'shipped'".to_owned()),
+        };
+        assert_eq!(
+            statement_sql(&change),
+            "UPDATE \"public\".\"orders\" SET \"status\" = 'shipped' WHERE \"id\" = 2;"
+        );
+    }
+
+    #[test]
+    fn update_statement_renders_a_bare_numeric_literal_value_unquoted() {
+        let change = StagedChange::Update {
+            target: identity(int_pk(2)),
+            column: "total_cents".to_owned(),
+            new_value: UpdateValue::Literal("9000".to_owned()),
+        };
+        assert_eq!(
+            statement_sql(&change),
+            "UPDATE \"public\".\"orders\" SET \"total_cents\" = 9000 WHERE \"id\" = 2;"
+        );
+    }
+
+    #[test]
+    fn update_statement_renders_an_expression_value_raw_and_unquoted() {
+        let change = StagedChange::Update {
+            target: identity(int_pk(8)),
+            column: "placed_at".to_owned(),
+            new_value: UpdateValue::Expression("now()".to_owned()),
+        };
+        assert_eq!(
+            statement_sql(&change),
+            "UPDATE \"public\".\"orders\" SET \"placed_at\" = now() WHERE \"id\" = 8;"
+        );
+    }
+
+    #[test]
+    fn update_statement_renders_null_mode_as_bare_null_not_the_string_null() {
+        let change = StagedChange::Update {
+            target: identity(int_pk(4)),
+            column: "metadata".to_owned(),
+            new_value: UpdateValue::Null,
+        };
+        let sql = statement_sql(&change);
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"orders\" SET \"metadata\" = NULL WHERE \"id\" = 4;"
+        );
+        assert!(
+            !sql.contains("'NULL'"),
+            "NULL mode must never render as the quoted string 'NULL'"
+        );
+    }
+
+    #[test]
+    fn update_statement_joins_a_composite_primary_key_with_and_in_column_order() {
+        let target = identity(vec![
+            PkColumnValue {
+                column: "tenant_id".to_owned(),
+                type_name: "int8".to_owned(),
+                value: zsql_core::Value::Int(9),
+            },
+            PkColumnValue {
+                column: "user_id".to_owned(),
+                type_name: "int8".to_owned(),
+                value: zsql_core::Value::Int(4),
+            },
+        ]);
+        let change = StagedChange::Update {
+            target,
+            column: "status".to_owned(),
+            new_value: UpdateValue::Literal("'shipped'".to_owned()),
+        };
+        assert_eq!(
+            statement_sql(&change),
+            "UPDATE \"public\".\"orders\" SET \"status\" = 'shipped' \
+             WHERE \"tenant_id\" = 9 AND \"user_id\" = 4;"
+        );
+    }
+
+    #[test]
+    fn update_statement_quotes_identifiers_that_need_escaping() {
+        let target = RowIdentity {
+            schema: "we\"ird".to_owned(),
+            relation: "orders".to_owned(),
+            pk: int_pk(1),
+        };
+        let change = StagedChange::Update {
+            target,
+            column: "we\"ird col".to_owned(),
+            new_value: UpdateValue::Literal("'x'".to_owned()),
+        };
+        let sql = statement_sql(&change);
+        assert!(sql.starts_with("UPDATE \"we\"\"ird\".\"orders\" SET \"we\"\"ird col\""));
+    }
+
+    #[test]
+    fn update_set_fragment_sql_renders_the_same_text_the_full_statement_embeds() {
+        let fragment =
+            update_set_fragment_sql("status", &UpdateValue::Literal("'shipped'".to_owned()));
+        assert_eq!(fragment, "SET \"status\" = 'shipped'");
+
+        let change = StagedChange::Update {
+            target: identity(int_pk(2)),
+            column: "status".to_owned(),
+            new_value: UpdateValue::Literal("'shipped'".to_owned()),
+        };
+        assert!(statement_sql(&change).contains(&fragment));
+    }
+
+    // -- unquote_sql_string / update_value_display_text --------------------
+
+    #[test]
+    fn unquote_sql_string_strips_quotes_and_undoubles_an_embedded_quote() {
+        assert_eq!(unquote_sql_string("'it''s'"), "it's");
+    }
+
+    #[test]
+    fn unquote_sql_string_passes_a_bare_numeric_literal_through_unchanged() {
+        assert_eq!(unquote_sql_string("9000"), "9000");
+    }
+
+    #[test]
+    fn unquote_sql_string_reverses_quote_sql_string_for_arbitrary_text() {
+        let raw = "shipped-with-a-note";
+        assert_eq!(
+            unquote_sql_string(&zsql_core::filter::quote_sql_string(raw)),
+            raw
+        );
+    }
+
+    #[test]
+    fn update_value_display_text_unquotes_a_literal() {
+        assert_eq!(
+            update_value_display_text(&UpdateValue::Literal("'shipped'".to_owned())),
+            "shipped"
+        );
+    }
+
+    #[test]
+    fn update_value_display_text_leaves_a_bare_numeric_literal_bare() {
+        assert_eq!(
+            update_value_display_text(&UpdateValue::Literal("9000".to_owned())),
+            "9000"
+        );
+    }
+
+    #[test]
+    fn update_value_display_text_shows_an_expression_raw() {
+        assert_eq!(
+            update_value_display_text(&UpdateValue::Expression("now()".to_owned())),
+            "now()"
+        );
+    }
+
+    #[test]
+    fn update_value_display_text_shows_null_mode_as_the_word_null() {
+        assert_eq!(update_value_display_text(&UpdateValue::Null), "NULL");
     }
 
     // -- has_usable_primary_key ---------------------------------------------

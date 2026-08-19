@@ -76,11 +76,14 @@ pub trait CancelHandle<DB: Database>: Send + 'static {
 pub struct NoServerSideCancel;
 
 impl<DB: Database> CancelHandle<DB> for NoServerSideCancel {
-    async fn cancel(self, _cancel_pool: &sqlx::Pool<DB>) -> Result<(), sqlx::Error> {
+    fn cancel(
+        self,
+        _cancel_pool: &sqlx::Pool<DB>,
+    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send {
         tracing::info!(
             "server-side cancel requested, but backend has no server-side cancel mechanism; query will only be cancelled cooperatively"
         );
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 

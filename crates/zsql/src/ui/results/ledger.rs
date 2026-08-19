@@ -9,16 +9,23 @@ use gpui::{
     App, ClickEvent, Div, HighlightStyle, RenderOnce, StyledText, Window, div, prelude::*, px, rgb,
 };
 use zsql_editor::{StyleSpan, syntax_color};
-use zsql_ui::theme::{ActiveTheme, Theme};
+use zsql_ui::theme::{ActiveTheme, Colors, Theme};
 
 use crate::staging::StagedChangeId;
 use crate::ui::theme;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LedgerLineKind {
+    Delete,
+    Update,
+}
 
 /// One ledger row's data: the statement it will run (with its highlight
 /// spans), where it was staged from, and the database's own error text if it
 /// was the statement that failed the most recent Apply.
 pub(super) struct LedgerLine {
     pub id: StagedChangeId,
+    pub kind: LedgerLineKind,
     pub source_row: usize,
     pub sql: String,
     pub spans: Vec<StyleSpan>,
@@ -85,6 +92,16 @@ fn render_statement(sql: String, spans: &[StyleSpan], theme: &Theme) -> Div {
         .child(StyledText::new(sql).with_highlights(highlights))
 }
 
+impl LedgerLineKind {
+    /// A ledger line's gutter mark glyph and color.
+    fn mark(self, colors: Colors) -> (&'static str, u32) {
+        match self {
+            LedgerLineKind::Delete => ("-", colors.status_error),
+            LedgerLineKind::Update => ("\u{b1}", colors.status_warn),
+        }
+    }
+}
+
 fn render_line(
     line: LedgerLine,
     theme: &Theme,
@@ -93,6 +110,7 @@ fn render_line(
 ) -> Div {
     let id = line.id;
     let colors = theme.colors;
+    let (mark, mark_color) = line.kind.mark(colors);
 
     let row = div()
         .debug_selector(move || format!("ledger-line-{id}"))
@@ -102,8 +120,6 @@ fn render_line(
         .h(theme::LEDGER_ROW_HEIGHT)
         .font_family(data_font)
         .text_size(px(theme::LEDGER_TEXT_SIZE))
-        .border_b_1()
-        .border_color(rgb(colors.border_soft))
         .child(
             div()
                 .flex_shrink_0()
@@ -111,8 +127,8 @@ fn render_line(
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(colors.status_error))
-                .child("-"),
+                .text_color(rgb(mark_color))
+                .child(mark),
         )
         .child(render_statement(line.sql, &line.spans, theme).px_3())
         .child(
@@ -145,16 +161,22 @@ fn render_line(
         });
 
     match line.error {
-        Some(message) => div().flex().flex_col().child(row).child(
-            div()
-                .debug_selector(move || format!("ledger-error-{id}"))
-                .px_3()
-                .pb_1()
-                .text_size(px(theme::LEDGER_META_TEXT_SIZE))
-                .text_color(rgb(colors.status_error))
-                .child(message),
-        ),
-        None => row,
+        Some(message) => div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(colors.border_soft))
+            .child(row)
+            .child(
+                div()
+                    .debug_selector(move || format!("ledger-error-{id}"))
+                    .px_3()
+                    .pb_1()
+                    .text_size(px(theme::LEDGER_META_TEXT_SIZE))
+                    .text_color(rgb(colors.status_error))
+                    .child(message),
+            ),
+        None => row.border_b_1().border_color(rgb(colors.border_soft)),
     }
 }
 

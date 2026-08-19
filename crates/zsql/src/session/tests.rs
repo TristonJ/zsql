@@ -141,6 +141,22 @@ impl Session {
         session
     }
 
+    /// Build a session already connected to `connection`, holding `result`
+    /// as its accumulated result set and reporting `state`: for a test
+    /// that needs both a live connection (e.g. for a staged-changes
+    /// relation-schema fetch) and an actually-painted results grid, which
+    /// [`Session::new_for_query_test`] alone (fixed at `Connected`, with an
+    /// empty result set) cannot provide.
+    pub(crate) fn new_for_query_test_with_result(
+        connection: Arc<dyn Connection>,
+        state: SessionState,
+        result: ResultSet,
+    ) -> Self {
+        let mut session = Self::new_for_render_test(state, result);
+        session.connection = Some(connection);
+        session
+    }
+
     /// Build a session already connected to `connection` at `url`, idle,
     /// with no result set -- for [`Session::switch_database`] tests, which
     /// derive their new connect URL from `Session`'s own `current_url`.
