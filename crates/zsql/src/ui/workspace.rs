@@ -6,9 +6,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Render, Task, Window,
-    canvas, div, prelude::*, px, rems, rgb,
+    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent,
+    KeybindingKeystroke, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Render, Task, Window, canvas, div, prelude::*, px, rems, rgb,
 };
 use zsql_ui::button::secondary_link_button;
 use zsql_ui::icon::{IconName, icon};
@@ -820,6 +820,42 @@ fn clamp_editor_height(
     (current + delta).clamp(min_editor_height, max_editor_height)
 }
 
+impl WorkspaceView {
+    /// Routes Ctrl+F to the sidebar's own find row when the pointer sits
+    /// over the sidebar and the sidebar does not already have keyboard
+    /// focus (that case dispatches through the sidebar's own key binding
+    /// normally). Pre-empts whatever the currently focused view's own
+    /// binding would otherwise do, including the results grid's quick
+    /// find, so a hover always wins over an unrelated focus elsewhere.
+    fn route_find_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sidebar_focused = self
+            .sidebar
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let sidebar_hovered = self.sidebar.read(cx).is_pointer_hovering();
+        if sidebar_focused || !sidebar_hovered {
+            return;
+        }
+        let target = KeybindingKeystroke::from_keystroke(
+            Keystroke::parse(super::sidebar::OPEN_FIND_KEYSTROKE)
+                .expect("the sidebar's open-find keystroke must parse"),
+        );
+        if !event.keystroke.should_match(&target) {
+            return;
+        }
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_find(&super::sidebar::OpenFind, window, cx);
+        });
+        cx.stop_propagation();
+    }
+}
+
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.refocus_editor_on_next_render) {
@@ -838,6 +874,7 @@ impl Render for WorkspaceView {
             .flex()
             .flex_col()
             .size_full()
+            .capture_key_down(cx.listener(Self::route_find_key))
             .bg(rgb(colors.bg_app))
             .font_family(&cx.theme().fonts.ui)
             .child(

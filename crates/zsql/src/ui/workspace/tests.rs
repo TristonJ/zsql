@@ -4297,3 +4297,133 @@ mod save_flow_tests {
         );
     }
 }
+
+/// Ctrl+F's routing between the sidebar's own find row and the results
+/// grid's quick find: hover over the sidebar wins regardless of where
+/// keyboard focus sits, and the results grid's own binding is otherwise
+/// untouched.
+mod find_routing_tests {
+    use std::time::Duration;
+
+    use gpui::{AppContext as _, Focusable, Modifiers, TestAppContext};
+    use zsql_core::{Catalog, Relation, RelationKind, SchemaNs, SchemaTree};
+
+    use super::{WorkspaceStartup, WorkspaceView};
+    use crate::config::{LayoutConfig, ValuePanelConfig};
+    use crate::connections::ConnectionStore;
+    use crate::session::{SchemaState, Session};
+
+    fn empty_store_for_test() -> ConnectionStore {
+        let path = std::env::temp_dir().join(format!(
+            "zsql-workspace-find-routing-test-{}.toml",
+            std::process::id()
+        ));
+        ConnectionStore::load(&path).expect("loading a nonexistent path must succeed empty")
+    }
+
+    fn sample_schema_session(cx: &mut TestAppContext) -> gpui::Entity<Session> {
+        let tree = SchemaTree {
+            catalogs: vec![Catalog {
+                name: "zsql".to_owned(),
+                schemas: vec![SchemaNs {
+                    name: "public".to_owned(),
+                    tables: vec![Relation {
+                        name: "orders".to_owned(),
+                        kind: RelationKind::Table,
+                        columns: vec![],
+                    }],
+                }],
+            }],
+        };
+        cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(tree)))
+    }
+
+    fn build(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<WorkspaceView>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            zsql_editor::init(cx);
+            zsql_ui::text_field::init(cx);
+            crate::ui::results::init(cx);
+            crate::ui::sidebar::init(cx);
+        });
+        let session = sample_schema_session(cx);
+        cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup::default(),
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn ctrl_f_over_the_hovered_sidebar_opens_its_find_row_even_without_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, vcx) = build(cx);
+        vcx.run_until_parked();
+
+        // Focus the editor, not the sidebar: this stands in for the
+        // ordinary case where the user is mid-query and moves the mouse
+        // over the sidebar to search it without clicking into it first.
+        let editor_focus = workspace
+            .read_with(vcx, WorkspaceView::editor_focus_handle)
+            .expect("a workspace always opens with an active editor");
+        vcx.update(|window, _cx| window.focus(&editor_focus));
+        vcx.run_until_parked();
+
+        let sidebar_bounds = vcx
+            .debug_bounds("sidebar-root")
+            .expect("the sidebar must be painted");
+        vcx.simulate_mouse_move(sidebar_bounds.center(), None, Modifiers::default());
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace.sidebar.read(cx).find_is_open_for_test(),
+                "hovering the sidebar must route Ctrl+F to its own find row"
+            );
+            assert!(
+                !workspace.results.read(cx).quick_find_is_open_for_test(),
+                "the results grid's quick find must not open while the sidebar is hovered"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_f_with_the_sidebar_neither_focused_nor_hovered_still_opens_the_results_quick_find(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, vcx) = build(cx);
+        vcx.run_until_parked();
+
+        let results_focus = workspace.read_with(vcx, |workspace, cx| {
+            workspace.results.read(cx).focus_handle(cx)
+        });
+        vcx.update(|window, _cx| window.focus(&results_focus));
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace.results.read(cx).quick_find_is_open_for_test(),
+                "Ctrl+F with the results grid focused must still open its own quick find"
+            );
+            assert!(
+                !workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the sidebar's find row must not have opened"
+            );
+        });
+    }
+}
