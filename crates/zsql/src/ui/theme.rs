@@ -7,7 +7,7 @@
 //! `zsql_ui::theme`, `zsql_ui::grid`, `zsql_ui::tree`, and
 //! `zsql_ui::scrollbar`.
 
-use gpui::{Pixels, px};
+use gpui::{Pixels, Rems, px};
 use zsql_ui::theme::{Colors, Theme};
 
 /// Status-bar "disconnected" indicator: the liveliness probe reports the
@@ -181,8 +181,10 @@ pub const SIDEBAR_SCRIPTS_FOOTER_ROW_RADIUS: f32 = 6.0;
 pub const SIDEBAR_SCRIPTS_FOOTER_GAP: Pixels = px(7.0);
 /// Size of the button row's leading icon.
 pub const SIDEBAR_SCRIPTS_FOOTER_ICON_SIZE: Pixels = px(13.0);
+/// Text size of the footer row's label.
+pub const SIDEBAR_SCRIPTS_FOOTER_LABEL_TEXT_SIZE: Rems = Rems(0.8);
 /// Text size of the footer row's trailing shortcut chip.
-pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE: f32 = 10.0;
+pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE: Rems = Rems(0.625);
 /// Horizontal padding inside the shortcut chip.
 pub const SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_PADDING_X: Pixels = px(3.0);
 /// Corner radius of the shortcut chip.

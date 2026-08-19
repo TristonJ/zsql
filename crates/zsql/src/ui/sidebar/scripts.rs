@@ -125,12 +125,17 @@ fn render_scripts_footer(window: &mut Window, cx: &mut Context<SidebarView>) -> 
             theme::SIDEBAR_SCRIPTS_FOOTER_ICON_SIZE,
             colors.text_tertiary,
         ))
-        .child(div().flex_1().child("Open external file..."))
+        .child(
+            div()
+                .text_size(theme::SIDEBAR_SCRIPTS_FOOTER_LABEL_TEXT_SIZE)
+                .flex_1()
+                .child("Open external file..."),
+        )
         .child(
             div()
                 .flex_shrink_0()
                 .font_family(&data_font)
-                .text_size(px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE))
+                .text_size(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_TEXT_SIZE)
                 .text_color(rgb(colors.text_tertiary))
                 .px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_PADDING_X)
                 .rounded(px(theme::SIDEBAR_SCRIPTS_FOOTER_SHORTCUT_RADIUS))
