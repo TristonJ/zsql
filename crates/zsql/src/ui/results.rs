@@ -6,8 +6,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    KeyBinding, MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*,
-    px, rgb,
+    MouseButton, Pixels, Point, Render, SharedString, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ResultSet, group_thousands};
 use zsql_ui::table::TableState;
@@ -25,6 +24,7 @@ use crate::ui::results::pager::PreviewControls;
 use crate::ui::results::text_view::TextView;
 use crate::ui::value_panel::{self, ValuePanel};
 
+mod bindings;
 mod cell_edit;
 mod cell_menu;
 mod edit_popover;
@@ -40,6 +40,8 @@ mod staging;
 mod staging_bar;
 mod text_view;
 mod toolbar;
+
+pub(crate) use bindings::ResultsBindings;
 
 /// The key context the results grid's own key bindings are scoped to, so
 /// they only fire while the grid is focused.
@@ -74,41 +76,87 @@ actions!(
 /// like `space` must insert text there rather than drive the grid).
 const BINDING_CONTEXT: &str = "ResultsGrid && !TextField";
 
-/// Register the results grid's and value panel's key bindings. Call once at
-/// startup, before any window that hosts a [`ResultsView`] is opened.
-/// `apply_staged_keybinding` is the staged-changes queue's Apply chord (from
-/// [`crate::config::StagingConfig::apply_keybinding`]).
-pub fn init(cx: &mut App, apply_staged_keybinding: &str) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-c", Copy, Some(BINDING_CONTEXT)),
-        KeyBinding::new("up", CellUp, Some(BINDING_CONTEXT)),
-        KeyBinding::new("down", CellDown, Some(BINDING_CONTEXT)),
-        KeyBinding::new("left", CellLeft, Some(BINDING_CONTEXT)),
-        KeyBinding::new("right", CellRight, Some(BINDING_CONTEXT)),
-        KeyBinding::new("space", ToggleValuePanel, Some(BINDING_CONTEXT)),
-        KeyBinding::new("escape", CloseValuePanel, Some(BINDING_CONTEXT)),
-        KeyBinding::new("tab", FocusValuePanel, Some(BINDING_CONTEXT)),
-        KeyBinding::new("ctrl-[", PrevPage, Some(BINDING_CONTEXT)),
-        KeyBinding::new("ctrl-]", NextPage, Some(BINDING_CONTEXT)),
-        KeyBinding::new("secondary-f", OpenQuickFind, Some(BINDING_CONTEXT)),
-        KeyBinding::new(
-            apply_staged_keybinding,
-            ApplyStagedChanges,
-            Some(BINDING_CONTEXT),
-        ),
-        KeyBinding::new("f2", EditCell, Some(BINDING_CONTEXT)),
-        KeyBinding::new("escape", CancelCellEdit, Some(cell_edit::KEY_CONTEXT)),
-        // Bound on the bar's own context (an ancestor of its query input's
-        // `TextField` context) rather than `BINDING_CONTEXT`, so these fire
-        // while the bar's input has focus. Plain Enter is not bound here: the
-        // input's own `TextField` context claims it first and this view
-        // reacts to the resulting `TextFieldEvent::Submit` instead.
-        KeyBinding::new("shift-enter", QuickFindPrev, Some(quick_find::KEY_CONTEXT)),
-        KeyBinding::new("up", QuickFindPrev, Some(quick_find::KEY_CONTEXT)),
-        KeyBinding::new("down", QuickFindNext, Some(quick_find::KEY_CONTEXT)),
-        KeyBinding::new("escape", QuickFindClose, Some(quick_find::KEY_CONTEXT)),
-    ]);
-    value_panel::init(cx);
+/// Register the results grid's, quick-find row's, cell-edit popover's, and
+/// value panel's key bindings from `bindings`/`value_panel_bindings`. Call
+/// once at startup, before any window that hosts a [`ResultsView`] is
+/// opened.
+pub fn init(
+    cx: &mut App,
+    bindings: &ResultsBindings,
+    value_panel_bindings: &value_panel::ValuePanelBindings,
+) {
+    let mut keys = Vec::new();
+    crate::keybindings::bind_all(&mut keys, &bindings.copy, &Copy, BINDING_CONTEXT);
+    crate::keybindings::bind_all(&mut keys, &bindings.cell_up, &CellUp, BINDING_CONTEXT);
+    crate::keybindings::bind_all(&mut keys, &bindings.cell_down, &CellDown, BINDING_CONTEXT);
+    crate::keybindings::bind_all(&mut keys, &bindings.cell_left, &CellLeft, BINDING_CONTEXT);
+    crate::keybindings::bind_all(&mut keys, &bindings.cell_right, &CellRight, BINDING_CONTEXT);
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.toggle_value_panel,
+        &ToggleValuePanel,
+        BINDING_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.close_value_panel,
+        &CloseValuePanel,
+        BINDING_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.focus_value_panel,
+        &FocusValuePanel,
+        BINDING_CONTEXT,
+    );
+    crate::keybindings::bind_all(&mut keys, &bindings.prev_page, &PrevPage, BINDING_CONTEXT);
+    crate::keybindings::bind_all(&mut keys, &bindings.next_page, &NextPage, BINDING_CONTEXT);
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.open_quick_find,
+        &OpenQuickFind,
+        BINDING_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.apply_staged,
+        &ApplyStagedChanges,
+        BINDING_CONTEXT,
+    );
+    crate::keybindings::bind_all(&mut keys, &bindings.edit_cell, &EditCell, BINDING_CONTEXT);
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.cancel_cell_edit,
+        &CancelCellEdit,
+        cell_edit::KEY_CONTEXT,
+    );
+    // Bound on the bar's own context (an ancestor of its query input's
+    // `TextField` context) rather than `BINDING_CONTEXT`, so these fire
+    // while the bar's input has focus. Plain Enter is not bound here: the
+    // input's own `TextField` context claims it first and this view reacts
+    // to the resulting `TextFieldEvent::Submit` instead.
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.quick_find_prev,
+        &QuickFindPrev,
+        quick_find::KEY_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.quick_find_next,
+        &QuickFindNext,
+        quick_find::KEY_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.quick_find_close,
+        &QuickFindClose,
+        quick_find::KEY_CONTEXT,
+    );
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "zsql results keybindings registered");
+    value_panel::init(cx, value_panel_bindings);
 }
 
 /// Which layout the results pane renders a result with: the virtualized grid

@@ -1,12 +1,13 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, KeyBinding, MouseButton,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, MouseButton,
     MouseUpEvent, Render, Stateful, Window, actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{ColumnMeta, Value};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+use super::ValuePanelBindings;
 use super::body::{MonoBody, NullBody, OversizedJsonBody, TextBody};
 use super::data::{
     self, BytesMode, JsonLoad, JsonMode, RendererKind, TimestampMode, ValuePanelState,
@@ -65,27 +66,63 @@ actions!(
     ]
 );
 
-/// Register the results grid's and value panel's key bindings. Call once at
+/// Register the value panel's key bindings from `bindings`. Call once at
 /// startup, before any window that hosts a [`ValuePanel`] is opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", TreeUp, Some(VALUE_PANEL_KEY_CONTEXT)),
-        KeyBinding::new("down", TreeDown, Some(VALUE_PANEL_KEY_CONTEXT)),
-        KeyBinding::new("left", TreeCollapse, Some(VALUE_PANEL_KEY_CONTEXT)),
-        KeyBinding::new("right", TreeExpand, Some(VALUE_PANEL_KEY_CONTEXT)),
-        KeyBinding::new(
-            "secondary-c",
-            CopyTreeNodeValue,
-            Some(VALUE_PANEL_KEY_CONTEXT),
-        ),
-        KeyBinding::new(
-            "shift-secondary-c",
-            CopyTreeNodePath,
-            Some(VALUE_PANEL_KEY_CONTEXT),
-        ),
-        KeyBinding::new("escape", ClosePanelFromPanel, Some(VALUE_PANEL_KEY_CONTEXT)),
-        KeyBinding::new("tab", FocusGridFromPanel, Some(VALUE_PANEL_KEY_CONTEXT)),
-    ]);
+pub fn init(cx: &mut App, bindings: &ValuePanelBindings) {
+    use crate::keybindings::bind_all;
+
+    let mut keys = Vec::new();
+    bind_all(
+        &mut keys,
+        &bindings.tree_up,
+        &TreeUp,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.tree_down,
+        &TreeDown,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.tree_collapse,
+        &TreeCollapse,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.tree_expand,
+        &TreeExpand,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.copy_tree_node_value,
+        &CopyTreeNodeValue,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.copy_tree_node_path,
+        &CopyTreeNodePath,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.close_panel_from_panel,
+        &ClosePanelFromPanel,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    bind_all(
+        &mut keys,
+        &bindings.focus_grid_from_panel,
+        &FocusGridFromPanel,
+        VALUE_PANEL_KEY_CONTEXT,
+    );
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "value panel keybindings registered");
 }
 
 impl Render for ValuePanel {

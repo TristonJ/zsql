@@ -8,6 +8,8 @@ use gpui::{Pixels, px};
 use serde::{Deserialize, Serialize};
 use zsql_ui::theme::{DEFAULT_FONT_DATA, DEFAULT_FONT_UI};
 
+use crate::keybindings::KeybindingsConfig;
+
 /// Directory name under the OS config dir that holds every zsql config/data
 /// file: `dirs::config_dir().join(APP_CONFIG_DIR_NAME)`.
 const APP_CONFIG_DIR_NAME: &str = "zsql";
@@ -42,7 +44,7 @@ pub const DEFAULT_SSH_TUNNEL_PORT: u16 = 22;
 pub const UNTITLED_SCRIPT_NAME: &str = "untitled.sql";
 
 /// Top-level application config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Theme/appearance settings: the active theme name and data/UI fonts.
@@ -64,10 +66,14 @@ pub struct Config {
     /// The results grid's staged-changes queue: the keybinding that applies
     /// it.
     pub staging: StagingConfig,
+    /// Overrides for the keyboard shortcuts every registration site binds by
+    /// default.
+    #[serde(skip_serializing_if = "crate::keybindings::config::is_default")]
+    pub keybindings: KeybindingsConfig,
 }
 
 /// Timing for autosave/draft persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutosaveConfig {
     /// Debounce interval, in milliseconds, between an edit and the notify
@@ -95,7 +101,7 @@ impl AutosaveConfig {
 
 /// Timing for transient status-bar messages, e.g. the "saved <file>"
 /// confirmation shown after an explicit script save.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatusConfig {
     /// How long the post-save confirmation stays visible before clearing
@@ -122,7 +128,7 @@ impl StatusConfig {
 }
 
 /// Timing for the sidebar's own periodic housekeeping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     /// How often the Scripts pane recomputes every row's relative-modified-
@@ -149,7 +155,7 @@ impl SidebarConfig {
 }
 
 /// The results grid's staged-changes queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StagingConfig {
     /// The key chord that applies the staged-changes queue, in `gpui`
@@ -168,7 +174,7 @@ impl Default for StagingConfig {
 }
 
 /// Font settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FontConfig {
     /// The font used in code blocks, values, tables, etc.
     pub data: String,
@@ -177,7 +183,7 @@ pub struct FontConfig {
 }
 
 /// Appearance settings: the active theme name and data/UI fonts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Named theme (e.g. `dark`).
@@ -187,7 +193,7 @@ pub struct ThemeConfig {
 }
 
 /// Query execution limits and defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryConfig {
     /// Rows accumulated per streamed batch before pushing to the UI. Threaded
@@ -209,7 +215,7 @@ pub struct QueryConfig {
 
 /// Timing for the recurring connection liveliness probe that runs once a
 /// [`crate::session::Session`] is connected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LivenessConfig {
     /// How often the liveliness probe fires, in milliseconds, while a
@@ -224,7 +230,7 @@ pub struct LivenessConfig {
 /// Sizing bounds for the workspace's resizable panes: the schema sidebar,
 /// the SQL editor, and the results grid. The divider between two panes lets
 /// the user drag past the default size but never past `min`/`max`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutConfig {
     /// Sidebar width when the workspace first opens.
@@ -251,7 +257,7 @@ pub struct LayoutConfig {
     pub tab_width: Pixels,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // All three fields end in `_width` because they describe the same
 // dimension (default/min/max), matching `LayoutConfig`'s own naming.
 #[allow(clippy::struct_field_names)]
@@ -266,7 +272,7 @@ pub struct ValuePanelLayout {
 
 /// Thresholds and layout tunables for the results grid's value panel (see
 /// `crate::ui::value_panel`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ValuePanelConfig {
     /// Largest a JSON value's source text may be for the panel to parse it

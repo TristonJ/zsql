@@ -243,6 +243,11 @@ fn apply_keybinding_hint(window: &Window) -> Option<String> {
     )
 }
 
+#[cfg(test)]
+pub(super) fn apply_keybinding_hint_for_test(window: &Window) -> Option<String> {
+    apply_keybinding_hint(window)
+}
+
 /// One keystroke as hint text, e.g. `Ctrl+Shift+Enter`.
 fn keystroke_label(modifiers: Modifiers, key: &str) -> String {
     let mut parts: Vec<String> = Vec::new();

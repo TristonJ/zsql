@@ -6,7 +6,7 @@ use gpui::{
     App, Application, Bounds, Context, Entity, Focusable, Render, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
-use zsql_ui::text_field::{TextFieldState, init};
+use zsql_ui::text_field::{TextFieldBindings, TextFieldState, init};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 const WINDOW_WIDTH: f32 = 420.0;
@@ -73,7 +73,7 @@ impl Render for DemoRoot {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        init(cx);
+        init(cx, &TextFieldBindings::default());
 
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(

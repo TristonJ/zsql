@@ -640,7 +640,7 @@ fn run_query_on_a_whitespace_only_buffer_is_a_noop(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn cmd_enter_and_ctrl_enter_keystrokes_both_dispatch_run_query(cx: &mut TestAppContext) {
-    cx.update(super::init);
+    cx.update(|cx| super::init(cx, &super::EditorBindings::default()));
     let (harness, vcx) = build_harness(cx);
     harness
         .editor
@@ -1153,7 +1153,7 @@ fn undo_on_a_fresh_editor_is_a_noop_and_does_not_fire_the_edit_listener(cx: &mut
 
 #[gpui::test]
 fn secondary_z_keystroke_dispatches_undo(cx: &mut TestAppContext) {
-    cx.update(super::init);
+    cx.update(|cx| super::init(cx, &super::EditorBindings::default()));
     let (harness, vcx) = build_harness(cx);
     vcx.simulate_input("ab");
     harness.editor.update(vcx, |view, _cx| {
@@ -1172,7 +1172,7 @@ fn secondary_z_keystroke_dispatches_undo(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn shift_secondary_z_secondary_y_and_ctrl_y_keystrokes_all_dispatch_redo(cx: &mut TestAppContext) {
-    cx.update(super::init);
+    cx.update(|cx| super::init(cx, &super::EditorBindings::default()));
     let (harness, vcx) = build_harness(cx);
     vcx.simulate_input("ab");
     vcx.dispatch_action(Undo);

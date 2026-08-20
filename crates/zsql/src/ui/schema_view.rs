@@ -6,12 +6,12 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, FontWeight, KeyBinding, Render,
-    Window, actions, div, prelude::*, px, rgb,
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Render, Window,
+    actions, div, prelude::*, px, rgb,
 };
 use zsql_core::{
-    ColumnDetail, ConstraintInfo, ConstraintKind, DefaultKind, KeyCellBadge, RelationKind,
-    RelationSchema, RowCount, classify_default, key_cell_badge,
+    ColumnDetail, ConstraintInfo, KeyCellBadge, RelationKind, RelationSchema, RowCount,
+    key_cell_badge,
 };
 use zsql_ui::grid;
 use zsql_ui::icon::{IconName, icon};
@@ -19,20 +19,13 @@ use zsql_ui::scrollable::{ScrollView, ScrollbarStyle, vertical_scroll};
 use zsql_ui::table::{Table, TableColumn, TableRow, TableSizing, TableState, TableStyle};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
+mod bindings;
+mod cells;
+
+pub(crate) use bindings::SchemaViewBindings;
+
 use super::theme;
 use crate::session::Session;
-
-/// Row height for the Columns, Indexes, and Constraints tables: taller than
-/// the grid's default row height for schema-browsing readability.
-const SCHEMA_TABLE_ROW_HEIGHT: gpui::Pixels = px(36.0);
-
-/// The style shared by the Columns, Indexes, and Constraints tables.
-fn schema_table_style(theme: &Theme) -> TableStyle {
-    TableStyle {
-        row_height: SCHEMA_TABLE_ROW_HEIGHT,
-        ..TableStyle::themed(theme)
-    }
-}
 
 /// What a schema tab currently has to render.
 enum FetchState {
@@ -70,9 +63,13 @@ actions!(zsql_schema_view, [Copy]);
 
 const BINDING_CONTEXT: &str = "schema-tab-vie";
 
-/// Register the schema view's key bindings. Call on startup
-pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-c", Copy, Some(BINDING_CONTEXT))]);
+/// Register the schema view's key bindings from `bindings`. Call on startup.
+pub fn init(cx: &mut App, bindings: &SchemaViewBindings) {
+    let mut keys = Vec::new();
+    crate::keybindings::bind_all(&mut keys, &bindings.copy, &Copy, BINDING_CONTEXT);
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "schema view keybindings registered");
 }
 
 impl SchemaTabView {
@@ -237,7 +234,7 @@ impl SchemaTabView {
                     .border_color(colors.accent_outline())
                     .rounded(px(theme::SCHEMA_KIND_PILL_RADIUS))
                     .px(theme::SCHEMA_KIND_PILL_PADDING_X)
-                    .child(relation_kind_pill_text(self.kind)),
+                    .child(cells::relation_kind_pill_text(self.kind)),
             )
             .child(
                 div()
@@ -247,22 +244,22 @@ impl SchemaTabView {
                     .gap(theme::SCHEMA_STATS_GAP)
                     .text_size(px(theme::SCHEMA_STATS_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
-                    .child(stat_label(
-                        &format_row_count_stat(self.row_count),
+                    .child(cells::stat_label(
+                        &cells::format_row_count_stat(self.row_count),
                         "rows",
                         active_theme,
                     ))
-                    .child(stat_label(
+                    .child(cells::stat_label(
                         &detail.columns.len().to_string(),
                         "columns",
                         active_theme,
                     ))
-                    .child(stat_label(
+                    .child(cells::stat_label(
                         &detail.indexes.len().to_string(),
                         "indexes",
                         active_theme,
                     ))
-                    .child(stat_label(
+                    .child(cells::stat_label(
                         &detail.constraints.len().to_string(),
                         "constraints",
                         active_theme,
@@ -289,7 +286,8 @@ impl SchemaTabView {
             .map(|((column, &width), &grow)| {
                 let table_column = TableColumn::new(
                     width,
-                    header_cell(column.to_string(), active_theme).px(cell_x_padding()),
+                    cells::header_cell(column.to_string(), active_theme)
+                        .px(cells::cell_x_padding()),
                 );
                 if grow {
                     table_column.grow()
@@ -299,13 +297,13 @@ impl SchemaTabView {
             })
             .collect();
 
-        section(
+        cells::section(
             "Columns",
             detail.columns.len(),
             Table::new("schema-columns-table", &self.columns_table)
                 .style(TableStyle {
                     cell_padding_x: px(0.0),
-                    ..schema_table_style(active_theme)
+                    ..cells::schema_table_style(active_theme)
                 })
                 .columns(columns)
                 .row_count(detail.columns.len())
@@ -354,7 +352,7 @@ impl SchemaTabView {
         active_theme: &Theme,
     ) -> Vec<(AnyElement, String)> {
         let column_name = div()
-            .when_some(rail_color(column, active_theme), |el, color| {
+            .when_some(cells::rail_color(column, active_theme), |el, color| {
                 el.child(
                     div()
                         .absolute()
@@ -371,25 +369,29 @@ impl SchemaTabView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(column.name.clone()),
             )
-            .px(cell_x_padding())
+            .px(cells::cell_x_padding())
             .into_any_element();
         let type_name = div()
-            .px(cell_x_padding())
+            .px(cells::cell_x_padding())
             .child(
                 grid::type_tag_accent(&column.type_name, active_theme)
                     .flex_shrink_0()
                     .into_any_element(),
             )
             .into_any_element();
-        let null_label = null_label(column.nullable, active_theme)
-            .px(cell_x_padding())
+        let null_label = cells::null_label(column.nullable, active_theme)
+            .px(cells::cell_x_padding())
             .into_any_element();
-        let default_cell = render_default_cell(column.default.as_deref(), active_theme)
-            .px(cell_x_padding())
+        let default_cell = cells::render_default_cell(column.default.as_deref(), active_theme)
+            .px(cells::cell_x_padding())
             .into_any_element();
         let keys_cell = div()
-            .px(cell_x_padding())
-            .child(render_keys_cell(column, &schema.constraints, active_theme))
+            .px(cells::cell_x_padding())
+            .child(cells::render_keys_cell(
+                column,
+                &schema.constraints,
+                active_theme,
+            ))
             .into_any_element();
         vec![
             (column_name, column.name.clone()),
@@ -432,7 +434,7 @@ impl SchemaTabView {
             .zip(grows.iter())
             .map(|((column, &width), &grow)| {
                 let table_column =
-                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                    TableColumn::new(width, cells::header_cell(column.to_string(), active_theme));
                 if grow {
                     table_column.grow()
                 } else {
@@ -441,11 +443,11 @@ impl SchemaTabView {
             })
             .collect();
 
-        section(
+        cells::section(
             "Indexes",
             detail.indexes.len(),
             Table::new("schema-indexes-table", &self.indexes_table)
-                .style(schema_table_style(active_theme))
+                .style(cells::schema_table_style(active_theme))
                 .columns(columns)
                 .row_count(detail.indexes.len())
                 .rows(Self::render_index_table_row_cells)
@@ -544,7 +546,7 @@ impl SchemaTabView {
             .zip(grows.iter())
             .map(|((column, &width), &grow)| {
                 let table_column =
-                    TableColumn::new(width, header_cell(column.to_string(), active_theme));
+                    TableColumn::new(width, cells::header_cell(column.to_string(), active_theme));
                 if grow {
                     table_column.grow()
                 } else {
@@ -553,11 +555,11 @@ impl SchemaTabView {
             })
             .collect();
 
-        section(
+        cells::section(
             "Constraints",
             detail.constraints.len(),
             Table::new("schema-constraints-table", &self.constraints_table)
-                .style(schema_table_style(active_theme))
+                .style(cells::schema_table_style(active_theme))
                 .columns(columns)
                 .row_count(detail.constraints.len())
                 .rows(Self::render_constraints_table_row_cells)
@@ -604,7 +606,7 @@ impl SchemaTabView {
         active_theme: &Theme,
     ) -> Vec<(AnyElement, String)> {
         let colors = active_theme.colors;
-        let (kind_label, kind_color) = constraint_kind_badge(constraint.kind, active_theme);
+        let (kind_label, kind_color) = cells::constraint_kind_badge(constraint.kind, active_theme);
         vec![
             (
                 div()
@@ -615,7 +617,7 @@ impl SchemaTabView {
                 constraint.name.clone(),
             ),
             (
-                key_badge(kind_label, kind_color, rgb(colors.border)).into_any_element(),
+                cells::key_badge(kind_label, kind_color, rgb(colors.border)).into_any_element(),
                 kind_label.to_string(),
             ),
             (
@@ -787,212 +789,11 @@ impl Render for SchemaTabView {
     }
 }
 
-/// One header stat, e.g. `~1,240` bolded followed by a faint ` rows` label.
-fn stat_label(value: &str, label: &str, active_theme: &Theme) -> impl IntoElement {
-    div()
-        .child(format!("{value} "))
-        .text_color(rgb(active_theme.colors.text_secondary))
-        .child(
-            div()
-                .text_color(rgb(active_theme.colors.text_tertiary))
-                .child(label.to_owned()),
-        )
-}
-
-/// A section: an uppercase label with a trailing count pill, followed by
-/// `table`.
-fn section(
-    label: &str,
-    count: usize,
-    table: impl IntoElement,
-    active_theme: &Theme,
-) -> impl IntoElement {
-    let colors = active_theme.colors;
-    div()
-        .flex()
-        .flex_col()
-        .w(theme::SCHEMA_SECTION_WIDTH)
-        .max_w_full()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .mb(theme::SCHEMA_SECTION_LABEL_MARGIN_BOTTOM)
-                .text_size(px(theme::SCHEMA_SECTION_LABEL_TEXT_SIZE))
-                .text_color(rgb(colors.text_tertiary))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(label.to_uppercase())
-                .child(
-                    div()
-                        .text_color(rgb(colors.text_secondary))
-                        .border_1()
-                        .border_color(rgb(colors.border))
-                        .rounded(px(theme::SCHEMA_SECTION_COUNT_PILL_RADIUS))
-                        .px(theme::SCHEMA_SECTION_COUNT_PILL_PADDING_X)
-                        .child(count.to_string()),
-                ),
-        )
-        .child(table)
-}
-
-/// Get the default cell horizontal padding to use, if needed.
-fn cell_x_padding() -> gpui::Pixels {
-    px(grid::CELL_PADDING_X)
-}
-
-fn header_cell(text: String, active_theme: &Theme) -> gpui::Div {
-    div()
-        .text_color(rgb(active_theme.colors.text_primary))
-        .child(text)
-}
-
-/// The Null cell's text and color for `nullable`.
-fn null_label(nullable: bool, active_theme: &Theme) -> gpui::Div {
-    if nullable {
-        div()
-            .italic()
-            .text_color(rgb(active_theme.colors.text_tertiary))
-            .child(theme::SCHEMA_NULLABLE_LABEL)
-    } else {
-        div()
-            .text_color(rgb(active_theme.colors.text_secondary))
-            .child(theme::SCHEMA_NOT_NULL_LABEL)
-    }
-}
-
-/// The Default cell: violet for a function call, amber for a literal, a
-/// faint dash placeholder for none.
-fn render_default_cell(default: Option<&str>, active_theme: &Theme) -> gpui::Div {
-    let colors = active_theme.colors;
-    match classify_default(default) {
-        DefaultKind::None => div()
-            .text_color(rgb(colors.text_tertiary))
-            .child(theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER),
-        DefaultKind::Literal => div()
-            .text_color(rgb(colors.value_bool))
-            .child(default.unwrap_or_default().to_owned()),
-        DefaultKind::Function => div()
-            .text_color(rgb(colors.value_number))
-            .child(default.unwrap_or_default().to_owned()),
-    }
-}
-
-/// The Keys cell: a PK/unique/check badge, an FK link chip, or nothing.
-fn render_keys_cell(
-    column: &ColumnDetail,
-    constraints: &[ConstraintInfo],
-    active_theme: &Theme,
-) -> gpui::AnyElement {
-    let colors = active_theme.colors;
-    match key_cell_badge(column, constraints) {
-        None => div().into_any_element(),
-        Some(KeyCellBadge::Primary) => key_badge(
-            theme::SCHEMA_BADGE_PK_LABEL,
-            colors.accent,
-            theme::schema_badge_pk_border(active_theme),
-        )
-        .into_any_element(),
-        Some(KeyCellBadge::Unique) => key_badge(
-            theme::SCHEMA_BADGE_UNIQUE_LABEL,
-            colors.value_bool,
-            colors.warn_outline(),
-        )
-        .into_any_element(),
-        Some(KeyCellBadge::Check) => key_badge(
-            theme::SCHEMA_BADGE_CHECK_LABEL,
-            colors.text_secondary,
-            rgb(colors.border),
-        )
-        .into_any_element(),
-        Some(KeyCellBadge::Foreign(target)) => {
-            fk_link_chip(&target, active_theme).into_any_element()
-        }
-    }
-}
-
-/// A small outlined badge for the Keys cell (PK, unique, or check).
-fn key_badge(label: &str, text_color: u32, border_color: gpui::Rgba) -> gpui::Div {
-    div()
-        .text_size(px(theme::SCHEMA_BADGE_TEXT_SIZE))
-        .text_color(rgb(text_color))
-        .border_1()
-        .border_color(border_color)
-        .rounded(px(theme::SCHEMA_BADGE_RADIUS))
-        .px(theme::SCHEMA_BADGE_PADDING_X)
-        .child(label.to_owned())
-}
-
-/// The `-> target.column` foreign-key link chip.
-fn fk_link_chip(target: &str, active_theme: &Theme) -> gpui::Div {
-    let colors = active_theme.colors;
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .text_size(px(theme::SCHEMA_FK_CHIP_TEXT_SIZE))
-        .font_family(&active_theme.fonts.data)
-        .text_color(rgb(colors.key_fk))
-        .bg(colors.fk_wash())
-        .border_1()
-        .border_color(colors.fk_outline())
-        .rounded(px(theme::SCHEMA_FK_CHIP_RADIUS))
-        .px(theme::SCHEMA_BADGE_PADDING_X)
-        .child(theme::SCHEMA_FK_ARROW)
-        .child(target.to_owned())
-}
-
-/// The label and text color a [`ConstraintKind`] renders its type badge
-/// with.
-fn constraint_kind_badge(kind: ConstraintKind, active_theme: &Theme) -> (&'static str, u32) {
-    let colors = active_theme.colors;
-    match kind {
-        ConstraintKind::PrimaryKey => ("PRIMARY KEY", colors.accent),
-        ConstraintKind::ForeignKey => ("FOREIGN KEY", colors.key_fk),
-        ConstraintKind::Unique => ("UNIQUE", colors.value_bool),
-        ConstraintKind::Check => ("CHECK", colors.text_secondary),
-    }
-}
-
-/// The uppercase kind-pill text for a relation's kind.
-fn relation_kind_pill_text(kind: RelationKind) -> &'static str {
-    match kind {
-        RelationKind::Table => "TABLE",
-        RelationKind::View => "VIEW",
-        RelationKind::MatView => "MATERIALIZED VIEW",
-        RelationKind::Partitioned => "PARTITIONED TABLE",
-    }
-}
-
-/// The header stat's row-count text: grouped digits, `~`-prefixed when
-/// estimated, or [`theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER`] while the count
-/// has not arrived yet.
-fn format_row_count_stat(row_count: Option<RowCount>) -> String {
-    row_count.map_or_else(
-        || theme::SCHEMA_DEFAULT_NONE_PLACEHOLDER.to_owned(),
-        RowCount::grouped_display,
-    )
-}
-
-/// The left key-rail tick color for `column`: teal for a primary key, the
-/// link hue for a foreign key, or none.
-fn rail_color(column: &ColumnDetail, active_theme: &Theme) -> Option<u32> {
-    if column.is_primary_key {
-        Some(active_theme.colors.accent)
-    } else if column.foreign_key.is_some() {
-        Some(active_theme.colors.key_fk)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use zsql_core::{ColumnDetail, ForeignKeyRef};
 
-    use super::{rail_color, relation_kind_pill_text};
+    use super::cells;
     use zsql_ui::theme::Theme;
 
     fn plain_column() -> ColumnDetail {
@@ -1019,7 +820,10 @@ mod tests {
             ..plain_column()
         };
         let theme = Theme::default();
-        assert_eq!(rail_color(&column, &theme), Some(theme.colors.accent));
+        assert_eq!(
+            cells::rail_color(&column, &theme),
+            Some(theme.colors.accent)
+        );
     }
 
     #[test]
@@ -1033,25 +837,28 @@ mod tests {
             ..plain_column()
         };
         let theme = Theme::default();
-        assert_eq!(rail_color(&column, &theme), Some(theme.colors.key_fk));
+        assert_eq!(
+            cells::rail_color(&column, &theme),
+            Some(theme.colors.key_fk)
+        );
     }
 
     #[test]
     fn rail_color_is_none_for_a_plain_column() {
-        assert_eq!(rail_color(&plain_column(), &Theme::default()), None);
+        assert_eq!(cells::rail_color(&plain_column(), &Theme::default()), None);
     }
 
     #[test]
     fn relation_kind_pill_text_maps_every_kind() {
         use zsql_core::RelationKind;
-        assert_eq!(relation_kind_pill_text(RelationKind::Table), "TABLE");
-        assert_eq!(relation_kind_pill_text(RelationKind::View), "VIEW");
+        assert_eq!(cells::relation_kind_pill_text(RelationKind::Table), "TABLE");
+        assert_eq!(cells::relation_kind_pill_text(RelationKind::View), "VIEW");
         assert_eq!(
-            relation_kind_pill_text(RelationKind::MatView),
+            cells::relation_kind_pill_text(RelationKind::MatView),
             "MATERIALIZED VIEW"
         );
         assert_eq!(
-            relation_kind_pill_text(RelationKind::Partitioned),
+            cells::relation_kind_pill_text(RelationKind::Partitioned),
             "PARTITIONED TABLE"
         );
     }

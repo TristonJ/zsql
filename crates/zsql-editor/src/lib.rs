@@ -5,11 +5,13 @@
 //! this crate never names an app, driver, or session type -- it depends only
 //! on `gpui` and `zsql-ui` (for the shared color palette).
 
+mod bindings;
 mod buffer;
 mod highlighter;
 mod theme;
 mod view;
 
+pub use bindings::EditorBindings;
 pub use buffer::{Position, Selection, TextBuffer};
 pub use highlighter::{HighlightKind, Highlighter, PlainHighlighter, SqlHighlighter, StyleSpan};
 pub use theme::{EDITOR_LINE_HEIGHT, syntax_color};

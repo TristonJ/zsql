@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
-    MouseDownEvent, Pixels, Render, Stateful, UniformListScrollHandle, Window, actions, div, point,
-    prelude::*, px, rgb, uniform_list,
+    App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, MouseButton, MouseDownEvent,
+    Pixels, Render, Stateful, UniformListScrollHandle, Window, actions, div, point, prelude::*, px,
+    rgb, uniform_list,
 };
 use zsql_core::RelationKind;
 use zsql_ui::context_menu::{ContextMenu, ContextMenuItem};
@@ -37,6 +37,7 @@ use super::time_fmt;
 use crate::session::{SchemaState, Session, SessionState};
 use crate::session_store::{self, SessionDir};
 
+mod bindings;
 mod context_menu;
 mod db_row;
 mod filter;
@@ -45,6 +46,8 @@ mod model;
 mod pane;
 mod scripts;
 mod scripts_refresh;
+
+pub(crate) use bindings::SidebarBindings;
 
 /// The key context the sidebar's own key bindings are scoped to.
 pub const KEY_CONTEXT: &str = "Sidebar";
@@ -56,18 +59,20 @@ actions!(zsql_sidebar, [OpenFind, CloseFind]);
 /// text field (the find row's own input renders within this context).
 const BINDING_CONTEXT: &str = "Sidebar && !TextField";
 
-/// The keystroke that opens the sidebar's find row, shared with
-/// [`crate::ui::workspace`]'s hover-based routing so the two paths can
-/// never diverge.
-pub(crate) const OPEN_FIND_KEYSTROKE: &str = "secondary-f";
-
-/// Register the sidebar's key bindings. Call once at startup, before any
-/// window that hosts a [`SidebarView`] is opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new(OPEN_FIND_KEYSTROKE, OpenFind, Some(BINDING_CONTEXT)),
-        KeyBinding::new("escape", CloseFind, Some(find::KEY_CONTEXT)),
-    ]);
+/// Register the sidebar's key bindings from `bindings`. Call once at
+/// startup, before any window that hosts a [`SidebarView`] is opened.
+pub fn init(cx: &mut App, bindings: &SidebarBindings) {
+    let mut keys = Vec::new();
+    crate::keybindings::bind_all(&mut keys, &bindings.open_find, &OpenFind, BINDING_CONTEXT);
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.close_find,
+        &CloseFind,
+        find::KEY_CONTEXT,
+    );
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "sidebar keybindings registered");
 }
 
 /// What [`SidebarView::render_body`] shows in place of the tree: `None`
@@ -1069,8 +1074,8 @@ mod render_tests {
     use zsql_ui::scrollable::vertical_thumb_debug_selector;
 
     use super::{
-        SidebarPane, SidebarPlaceholder, SidebarView, context_menu, db_row, filter, find,
-        sidebar_placeholder,
+        SidebarBindings, SidebarPane, SidebarPlaceholder, SidebarView, context_menu, db_row,
+        filter, find, sidebar_placeholder,
     };
     use crate::session::{SchemaState, Session, SessionState};
     use crate::ui::results::ResultsView;
@@ -2442,8 +2447,8 @@ mod render_tests {
         schema: SchemaState,
     ) -> (gpui::Entity<SidebarView>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
-            super::init(cx);
-            zsql_ui::text_field::init(cx);
+            super::init(cx, &SidebarBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
         });
         build(cx, schema)
     }

@@ -5,8 +5,8 @@ use super::{LibraryScript, OpenModalEvent, OpenModalView, PickerTarget, SessionS
 
 fn init(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        zsql_ui::text_field::init(cx);
-        super::init(cx);
+        zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        super::init(cx, &super::OpenModalBindings::default());
     });
 }
 

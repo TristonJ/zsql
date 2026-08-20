@@ -4,8 +4,8 @@ use super::{Destination, SaveModalEvent, SaveModalKind, SaveModalView};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        zsql_ui::text_field::init(cx);
-        crate::ui::save_modal::init(cx);
+        zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        crate::ui::save_modal::init(cx, &crate::ui::save_modal::SaveModalBindings::default());
     });
 }
 
