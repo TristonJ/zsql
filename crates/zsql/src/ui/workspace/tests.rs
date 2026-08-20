@@ -4344,7 +4344,7 @@ mod find_routing_tests {
         cx.update(|cx| {
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
-            crate::ui::results::init(cx);
+            crate::ui::results::init(cx, "ctrl-shift-enter");
             crate::ui::sidebar::init(cx);
         });
         let session = sample_schema_session(cx);
