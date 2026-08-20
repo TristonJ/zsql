@@ -24,8 +24,10 @@ pub(super) type RowRenderer<V> =
     Box<dyn Fn(&mut V, Range<usize>, &mut Window, &mut Context<V>) -> Vec<TableRow>>;
 
 /// A caller's [`Table::on_cell_double_click`] callback, given the
-/// double-clicked cell's `(row, col)`.
-type CellDoubleClickHandler<V> = Rc<dyn Fn(&mut V, usize, usize, &mut Window, &mut Context<V>)>;
+/// double-clicked cell's `(row, col)` and the triggering event (e.g. for an
+/// editor popover's anchor position).
+type CellDoubleClickHandler<V> =
+    Rc<dyn Fn(&mut V, usize, usize, &MouseDownEvent, &mut Window, &mut Context<V>)>;
 /// A caller's [`Table::on_cell_right_click`] callback, given the
 /// right-clicked cell's `(row, col)` and the triggering event.
 type CellRightClickHandler<V> =
@@ -111,11 +113,11 @@ pub(super) fn build_double_click_listener<V: Render>(
         let state = state.clone();
         let wrapped = cx.listener(
             move |view: &mut V,
-                  _event: &MouseDownEvent,
+                  event: &MouseDownEvent,
                   window: &mut Window,
                   cx: &mut Context<V>| {
                 if let Some((row, col)) = state.read(cx).focused_cell() {
-                    f(view, row, col, window, cx);
+                    f(view, row, col, event, window, cx);
                 }
             },
         );
@@ -249,15 +251,16 @@ impl<V: Render> Table<V> {
         self
     }
 
-    /// Call `f` with the just-selected cell's `(row, col)` whenever the
-    /// second mouse-down of a double click lands on a data cell. Has no
-    /// effect unless [`Table::selectable`] is also called. `f` runs after
-    /// that click has already updated `TableState`'s focused cell, so it
-    /// always sees the cell that was actually double-clicked.
+    /// Call `f` with the just-selected cell's `(row, col)` and the
+    /// triggering event whenever the second mouse-down of a double click
+    /// lands on a data cell. Has no effect unless [`Table::selectable`] is
+    /// also called. `f` runs after that click has already updated
+    /// `TableState`'s focused cell, so it always sees the cell that was
+    /// actually double-clicked.
     #[must_use]
     pub fn on_cell_double_click(
         mut self,
-        f: impl Fn(&mut V, usize, usize, &mut Window, &mut Context<V>) + 'static,
+        f: impl Fn(&mut V, usize, usize, &MouseDownEvent, &mut Window, &mut Context<V>) + 'static,
     ) -> Self {
         self.on_cell_double_click = Some(Rc::new(f));
         self

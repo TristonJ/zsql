@@ -237,25 +237,29 @@ pub fn quote_sql_string(value: &str) -> String {
     out
 }
 
+/// Render `raw` as a literal SQL value for a column whose backend type is
+/// `type_name`.
+#[must_use]
+pub fn render_literal_value(raw: &str, type_name: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && type_is_numeric_like(type_name) {
+        trimmed.to_owned()
+    } else {
+        quote_sql_string(trimmed)
+    }
+}
+
 /// Classify and render `raw` for a column whose backend type is
 /// `type_name`: a value that parses as an expression (function call,
 /// arithmetic, interval syntax) passes through unquoted and is marked `fx`;
-/// everything else is a plain value, quoted+escaped for a text-like column
-/// or left bare for a numeric-like one (see [`type_is_numeric_like`]). An
-/// empty value is always quoted, even against a numeric-like column, so a
-/// filter left blank still renders as valid (if type-mismatched) SQL rather
-/// than a bare, syntactically invalid right-hand side.
+/// everything else renders per [`render_literal_value`].
 #[must_use]
 pub fn classify_filter_value(raw: &str, type_name: &str) -> FilterValueRender {
     let trimmed = raw.trim();
     if looks_like_expression(trimmed) {
         return FilterValueRender::Expression(trimmed.to_owned());
     }
-    if !trimmed.is_empty() && type_is_numeric_like(type_name) {
-        FilterValueRender::Literal(trimmed.to_owned())
-    } else {
-        FilterValueRender::Literal(quote_sql_string(trimmed))
-    }
+    FilterValueRender::Literal(render_literal_value(trimmed, type_name))
 }
 
 /// Stable identity for one [`FilterState`] condition, unique within that
@@ -523,7 +527,7 @@ pub fn render_where_body(
 mod tests {
     use super::{
         FilterCondition, FilterConnector, FilterOperator, FilterState, FilterValueRender,
-        classify_filter_value, quote_sql_string, render_where_body,
+        classify_filter_value, quote_sql_string, render_literal_value, render_where_body,
     };
 
     // -- quote_sql_string ---------------------------------------------------
@@ -815,6 +819,29 @@ mod tests {
             classify_filter_value("  paid  ", "text"),
             FilterValueRender::Literal("'paid'".to_owned())
         );
+    }
+
+    // -- render_literal_value: forced-literal rendering, no expression check -
+
+    #[test]
+    fn render_literal_value_quotes_a_text_typed_value() {
+        assert_eq!(
+            render_literal_value("shipped", "text"),
+            "'shipped'".to_owned()
+        );
+    }
+
+    #[test]
+    fn render_literal_value_leaves_a_numeric_typed_value_bare() {
+        assert_eq!(render_literal_value("9000", "int4"), "9000".to_owned());
+    }
+
+    #[test]
+    fn render_literal_value_quotes_even_a_value_that_looks_like_an_expression() {
+        // A forced-literal render never runs classify_filter_value's
+        // expression detection: the caller already decided this is a
+        // literal, so `now()` against a text column quotes as a string.
+        assert_eq!(render_literal_value("now()", "text"), "'now()'".to_owned());
     }
 
     #[test]

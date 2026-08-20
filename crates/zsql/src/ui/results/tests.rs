@@ -3131,6 +3131,34 @@ mod staging_tests {
         (view, vcx, calls)
     }
 
+    /// Like [`view_with_pk_schema`], but over `result` instead of
+    /// [`orders_result`], for a test that needs a fixture
+    /// [`view_with_pk_schema`]'s own values don't cover (e.g. a NULL cell).
+    fn view_with_pk_schema_and_result(
+        cx: &mut TestAppContext,
+        result: ResultSet,
+    ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_at: None,
+        });
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_query_test(connection);
+            session.set_result_for_test(result);
+            session
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let controls = preview_controls_recording(recorded);
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(controls), cx);
+        });
+        vcx.run_until_parked();
+        (view, vcx)
+    }
+
     /// Like [`view_with_pk_schema`], but with the grid's own key bindings
     /// registered and window focus moved onto it, so a test can drive Apply
     /// through the real `ctrl-shift-enter` keystroke rather than the
@@ -3921,5 +3949,961 @@ mod staging_tests {
                 "a same-relation window change (page/sort/filter) must preserve staged changes"
             );
         });
+    }
+
+    // -- cell edit popover: eligibility ------------------------------------
+
+    mod cell_edit_tests {
+        use gpui::{AppContext as _, Focusable, Modifiers, point, px};
+        use zsql_ui::table::body_first_cell_debug_selector;
+
+        use super::{
+            FakeConnection, orders_relation_schema, orders_result, relation_schema_with_no_pk,
+            view_with_connection, view_with_pk_schema, view_with_pk_schema_and_result,
+            view_with_pk_schema_focused,
+        };
+        use crate::ui::results::cell_edit::CellEditMode;
+
+        #[gpui::test]
+        fn a_cell_is_not_edit_eligible_without_a_usable_primary_key(cx: &mut gpui::TestAppContext) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: relation_schema_with_no_pk(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx, _recorded) = view_with_connection(cx, connection);
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_eligible_for_test(app, 0, 1));
+            });
+        }
+
+        #[gpui::test]
+        fn a_row_staged_for_delete_is_not_edit_eligible(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update(vcx, |view, cx| {
+                view.stage_or_restore_row_for_test(0, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_eligible_for_test(app, 0, 1));
+            });
+        }
+
+        #[gpui::test]
+        fn unstaging_the_delete_makes_the_row_edit_eligible_again(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update(vcx, |view, cx| {
+                view.stage_or_restore_row_for_test(0, cx);
+                view.stage_or_restore_row_for_test(0, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_eligible_for_test(app, 0, 1));
+            });
+        }
+
+        // -- opening the popover ---------------------------------------------
+
+        #[gpui::test]
+        fn opening_the_popover_prefills_the_input_from_the_cells_current_value(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_is_open_for_test(app));
+                assert_eq!(
+                    view.cell_edit_input_value_for_test(app).as_deref(),
+                    Some("paid"),
+                    "row 0's status column holds \"paid\" in orders_result()"
+                );
+                assert_eq!(
+                    view.cell_edit_mode_for_test(app),
+                    Some(CellEditMode::Literal)
+                );
+                assert_eq!(
+                    view.cell_edit_was_text_for_test(app).as_deref(),
+                    Some("'paid'")
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn the_was_hint_renders_a_numeric_original_value_unquoted(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 0, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.cell_edit_was_text_for_test(app).as_deref(), Some("1"));
+            });
+        }
+
+        #[gpui::test]
+        fn the_was_hint_renders_a_null_original_value_as_the_bare_word_null(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let mut result = orders_result();
+            result.rows[0].0[1] = zsql_core::Value::Null;
+            let (view, vcx) = view_with_pk_schema_and_result(cx, result);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_was_text_for_test(app).as_deref(),
+                    Some("NULL")
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn opening_the_popover_on_a_null_original_value_does_not_pin_null_mode(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let mut result = orders_result();
+            result.rows[0].0[1] = zsql_core::Value::Null;
+            let (view, vcx) = view_with_pk_schema_and_result(cx, result);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_mode_for_test(app),
+                    Some(CellEditMode::Null),
+                    "a NULL cell must open in Null mode by default"
+                );
+            });
+
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_mode_for_test(app),
+                    Some(CellEditMode::Literal),
+                    "typing a replacement value must auto-reclassify away from Null rather than \
+                     staying pinned to it and silently discarding the typed text"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn picking_null_mode_locks_the_input_on_the_word_null(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            let before = view
+                .read_with(vcx, super::ResultsView::cell_edit_input_value_for_test)
+                .expect("the popover must be open");
+
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_mode_for_test(CellEditMode::Null, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_input_value_for_test(app).as_deref(),
+                    Some("NULL")
+                );
+                assert_eq!(view.cell_edit_input_disabled_for_test(app), Some(true));
+            });
+
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_mode_for_test(CellEditMode::Literal, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_input_value_for_test(app),
+                    Some(before.clone()),
+                    "leaving NULL mode must restore what the input held before"
+                );
+                assert_eq!(view.cell_edit_input_disabled_for_test(app), Some(false));
+            });
+        }
+
+        #[gpui::test]
+        fn reopening_a_staged_null_edit_locks_the_input(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_mode_for_test(CellEditMode::Null, cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            vcx.run_until_parked();
+
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.cell_edit_mode_for_test(app), Some(CellEditMode::Null));
+                assert_eq!(
+                    view.cell_edit_input_value_for_test(app).as_deref(),
+                    Some("NULL")
+                );
+                assert_eq!(view.cell_edit_input_disabled_for_test(app), Some(true));
+            });
+        }
+
+        #[gpui::test]
+        fn the_popover_does_not_open_for_an_ineligible_cell(cx: &mut gpui::TestAppContext) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: relation_schema_with_no_pk(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx, _recorded) = view_with_connection(cx, connection);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+            });
+        }
+
+        // -- mode chips ---------------------------------------------------
+
+        #[gpui::test]
+        fn typing_an_expression_looking_value_auto_classifies_to_expression_mode(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("now()", cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_mode_for_test(app),
+                    Some(CellEditMode::Expression),
+                    "an unpinned mode must keep auto-classifying as the input changes"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn clicking_a_mode_chip_pins_it_overriding_further_auto_classification(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_mode_for_test(CellEditMode::Expression, cx);
+            });
+            view.update(vcx, |view, cx| {
+                // Even though this text does not look like an expression,
+                // the pinned mode must not be auto-reclassified away from it.
+                view.set_cell_edit_input_for_test("plain text", cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_mode_for_test(app),
+                    Some(CellEditMode::Expression)
+                );
+            });
+        }
+
+        // -- staging ----------------------------------------------------------
+
+        #[gpui::test]
+        fn enter_stages_the_edit_and_closes_the_popover(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+                assert_eq!(view.staged_count_for_test(app), 1);
+                assert!(view.row_has_staged_update_for_test(app, 0));
+            });
+        }
+
+        #[gpui::test]
+        fn esc_cancels_without_staging_anything(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.cancel_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+                assert_eq!(view.staged_count_for_test(app), 0);
+            });
+        }
+
+        #[gpui::test]
+        fn a_real_enter_keystroke_stages_the_edit_through_the_inputs_own_submit_wiring(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.update(|cx| {
+                zsql_ui::text_field::init(cx);
+            });
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            vcx.run_until_parked();
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+            });
+
+            vcx.simulate_keystrokes("enter");
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+                assert_eq!(view.staged_count_for_test(app), 1);
+                assert!(view.row_has_staged_update_for_test(app, 0));
+            });
+        }
+
+        #[gpui::test]
+        fn staging_via_enter_returns_keyboard_focus_to_the_same_grid_cell(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.update(|cx| {
+                zsql_ui::text_field::init(cx);
+            });
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+            view.update(vcx, |view, cx| {
+                view.table_state
+                    .update(cx, |state, _cx| state.set_focused_cell(0, 1));
+            });
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            vcx.run_until_parked();
+
+            vcx.simulate_keystrokes("enter");
+            vcx.run_until_parked();
+
+            let grid_focus = view.read_with(vcx, Focusable::focus_handle);
+            vcx.update(|window, _cx| {
+                assert!(
+                    grid_focus.is_focused(window),
+                    "staging must return keyboard focus to the grid"
+                );
+            });
+            view.read_with(vcx, |view, cx| {
+                assert_eq!(
+                    view.table_state.read(cx).focused_cell(),
+                    Some((0, 1)),
+                    "the grid's own focused cell must stay on the just-edited cell"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn cancelling_returns_keyboard_focus_to_the_same_grid_cell(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+            view.update(vcx, |view, cx| {
+                view.table_state
+                    .update(cx, |state, _cx| state.set_focused_cell(0, 1));
+            });
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            vcx.run_until_parked();
+
+            vcx.simulate_keystrokes("escape");
+            vcx.run_until_parked();
+
+            let grid_focus = view.read_with(vcx, Focusable::focus_handle);
+            vcx.update(|window, _cx| {
+                assert!(
+                    grid_focus.is_focused(window),
+                    "cancelling must return keyboard focus to the grid"
+                );
+            });
+            view.read_with(vcx, |view, cx| {
+                assert_eq!(
+                    view.table_state.read(cx).focused_cell(),
+                    Some((0, 1)),
+                    "the grid's own focused cell must stay on the just-cancelled cell"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn staging_the_same_cell_twice_replaces_the_staged_edit_not_duplicating_it(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.cell_edit_input_value_for_test(app).as_deref(),
+                    Some("shipped"),
+                    "reopening a staged cell must prefill from the staged value, not the \
+                     original database value"
+                );
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("refunded", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.staged_count_for_test(app),
+                    1,
+                    "restaging the same cell must replace the value, not append a second entry"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn null_mode_stages_a_bare_null_ignoring_whatever_text_is_typed(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_mode_for_test(CellEditMode::Null, cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                let statements = view.staged_statements_for_test(app);
+                assert_eq!(statements.len(), 1);
+                assert!(statements[0].contains("SET \"status\" = NULL"));
+                assert!(!statements[0].contains("'NULL'"));
+                let _ = app;
+            });
+        }
+
+        #[gpui::test]
+        fn a_delete_staged_while_the_popover_is_open_leaves_the_edit_rejected(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                // The row acquires a staged delete while the popover is
+                // still open (the grid stays interactive underneath it).
+                view.stage_or_restore_row_for_test(0, cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+                assert_eq!(
+                    view.staged_count_for_test(app),
+                    1,
+                    "the rejected edit must not add a second entry alongside the row's staged \
+                     delete"
+                );
+                assert!(view.staged_id_for_row_for_test(app, 0).is_some());
+                assert!(!view.row_has_staged_update_for_test(app, 0));
+            });
+        }
+
+        // -- render grammar -----------------------------------------------
+
+        #[gpui::test]
+        fn a_staged_cell_edit_carries_the_amber_grammar_and_the_row_gutter_marker(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(view.row_has_staged_update_for_test(app, 0));
+                assert!(
+                    view.staged_id_for_row_for_test(app, 0).is_none(),
+                    "a row carrying only a staged edit must not read as staged for delete"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn unstaging_a_cell_edit_via_the_ledger_reverts_the_cell(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+                view.toggle_ledger_for_test(cx);
+            });
+            vcx.run_until_parked();
+
+            let id = view
+                .read_with(vcx, super::ResultsView::staged_entry_ids_for_test)
+                .first()
+                .copied()
+                .expect("the staged edit must have an entry id");
+            view.update(vcx, |view, cx| {
+                view.unstage_entry_for_test(id, cx);
+            });
+
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.staged_count_for_test(app), 0);
+                assert!(!view.row_has_staged_update_for_test(app, 0));
+            });
+        }
+
+        #[gpui::test]
+        fn discard_all_reverts_a_staged_cell_edit_too(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            vcx.run_until_parked();
+            view.update(vcx, |view, cx| {
+                view.discard_all_staged_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.staged_count_for_test(app), 0);
+                assert!(!view.row_has_staged_update_for_test(app, 0));
+            });
+        }
+
+        // -- mixed queues: bar summary and ledger order ------------------------
+
+        #[gpui::test]
+        fn the_staging_bar_summary_counts_edits_and_deletes_independently(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+                view.stage_or_restore_row_for_test(1, cx);
+            });
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.staged_edit_count_for_test(app), 1);
+                assert_eq!(view.staged_delete_count_for_test(app), 1);
+            });
+        }
+
+        #[gpui::test]
+        fn the_ledger_interleaves_delete_and_update_lines_in_fifo_staging_order(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+            // delete row 0, edit row 1's status, delete... there are only two
+            // rows in orders_result(), so restage row 0's delete a second
+            // time after unstaging it to get a second delete entry, giving a
+            // delete/edit/delete/edit sequence overall.
+            view.update(vcx, |view, cx| {
+                view.stage_or_restore_row_for_test(0, cx); // delete row 0
+            });
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(1, 1, window, cx); // edit row 1
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.stage_or_restore_row_for_test(0, cx); // unstage row 0's delete
+                view.stage_or_restore_row_for_test(0, cx); // restage it: fresh entry at the end
+            });
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(1, 0, window, cx); // edit row 1's id
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("99", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.staged_entry_kinds_for_test(app),
+                    vec!["update", "delete", "update"],
+                    "the ledger must list staged changes in FIFO staging order regardless of \
+                     kind: the status edit staged first, then the restaged delete, then the id \
+                     edit"
+                );
+                assert_eq!(
+                    view.staged_statements_for_test(app),
+                    vec![
+                        "UPDATE \"public\".\"orders\" SET \"status\" = 'shipped' \
+                         WHERE \"id\" = 2;"
+                            .to_owned(),
+                        "DELETE FROM \"public\".\"orders\" WHERE \"id\" = 1;".to_owned(),
+                        "UPDATE \"public\".\"orders\" SET \"id\" = 99 WHERE \"id\" = 2;".to_owned(),
+                    ],
+                    "the ledger's statement text must match the same FIFO order as the entry \
+                     kinds"
+                );
+            });
+        }
+
+        // -- tab switch / rerun clears the cell edit popover -------------------
+
+        #[gpui::test]
+        fn switching_to_a_snapshot_clears_a_staged_cell_edit(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+            view.read_with(vcx, |view, app| {
+                assert_eq!(view.staged_count_for_test(app), 1);
+            });
+
+            view.update(vcx, |view, cx| {
+                view.show_snapshot(
+                    super::super::super::super::tabs::ResultsSnapshot {
+                        source_label: "public.other".into(),
+                        state: super::SessionState::Results(std::time::Duration::default()),
+                        result: std::rc::Rc::new(orders_result()),
+                    },
+                    cx,
+                );
+            });
+
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.staged_count_for_test(app),
+                    0,
+                    "switching to a different tab's snapshot must clear a staged cell edit"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn rerunning_the_active_tab_clears_a_staged_cell_edit(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema(cx);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            view.update(vcx, |view, cx| {
+                view.set_cell_edit_input_for_test("shipped", cx);
+                view.stage_cell_edit_for_test(cx);
+            });
+
+            view.update(vcx, |view, cx| {
+                view.show_live("public.orders", cx);
+            });
+
+            view.read_with(vcx, |view, app| {
+                assert_eq!(
+                    view.staged_count_for_test(app),
+                    0,
+                    "rerunning the active tab's preview must clear a staged cell edit"
+                );
+            });
+        }
+
+        // -- F2 / double-click entry points -------------------------------
+
+        #[gpui::test]
+        fn f2_opens_the_popover_for_the_grids_focused_cell(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+            view.update(vcx, |view, cx| {
+                view.table_state
+                    .update(cx, |state, _cx| state.set_focused_cell(0, 1));
+            });
+
+            vcx.simulate_keystrokes("f2");
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_is_open_for_test(app));
+            });
+        }
+
+        #[gpui::test]
+        fn f2_with_no_focused_cell_is_a_noop(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+
+            vcx.simulate_keystrokes("f2");
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+            });
+        }
+
+        #[gpui::test]
+        fn escape_while_the_popover_input_is_focused_cancels_it(cx: &mut gpui::TestAppContext) {
+            let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 1, window, cx);
+            });
+            vcx.run_until_parked();
+
+            vcx.simulate_keystrokes("escape");
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+            });
+        }
+
+        /// Like `view_with_connection`, but the session reports
+        /// `SessionState::Results` (not `Connected`) so the data grid
+        /// itself actually paints: needed only by a test that simulates a
+        /// real mouse click on a body cell's own painted bounds.
+        fn view_with_connection_and_painted_grid(
+            cx: &mut gpui::TestAppContext,
+            connection: std::sync::Arc<dyn zsql_core::Connection>,
+        ) -> (
+            gpui::Entity<super::ResultsView>,
+            &mut gpui::VisualTestContext,
+        ) {
+            let session = cx.new(|_cx| {
+                crate::session::Session::new_for_query_test_with_result(
+                    connection,
+                    super::SessionState::Results(std::time::Duration::default()),
+                    orders_result(),
+                )
+            });
+            let (view, vcx) = cx.add_window_view(|_window, cx| {
+                super::ResultsView::new(session, "public.orders", cx)
+            });
+            let controls = crate::ui::results::pager::PreviewControls {
+                state: zsql_core::preview_state::PreviewQueryState::new(200),
+                dispatch: std::rc::Rc::new(|_action, _cx| {}),
+                relation: crate::ui::results::pager::RelationTarget {
+                    schema: "public".to_owned(),
+                    relation: "orders".to_owned(),
+                },
+            };
+            view.update(vcx, |view, cx| {
+                view.set_preview_controls(Some(controls), cx);
+            });
+            vcx.run_until_parked();
+            (view, vcx)
+        }
+
+        #[gpui::test]
+        fn double_clicking_an_eligible_cell_opens_the_edit_popover_not_the_value_panel(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: orders_relation_schema(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx) = view_with_connection_and_painted_grid(cx, connection);
+            let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+            let cell_bounds = vcx
+                .debug_bounds(body_first_cell_debug_selector(&table_state))
+                .expect("the top-of-viewport body cell must be painted");
+            let position = point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            );
+            let mouse_down = |click_count| gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            vcx.simulate_event(mouse_down(1));
+            vcx.simulate_event(mouse_down(2));
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_is_open_for_test(app));
+                assert!(!view.value_panel.read(app).is_open());
+            });
+        }
+
+        #[gpui::test]
+        fn the_popover_anchors_at_the_double_clicked_position_not_a_fixed_corner(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: orders_relation_schema(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx) = view_with_connection_and_painted_grid(cx, connection);
+            let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+            let cell_bounds = vcx
+                .debug_bounds(body_first_cell_debug_selector(&table_state))
+                .expect("the top-of-viewport body cell must be painted");
+            let position = point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            );
+            let mouse_down = |click_count| gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            vcx.simulate_event(mouse_down(1));
+            vcx.simulate_event(mouse_down(2));
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_is_open_for_test(app));
+            });
+            let popover_bounds = vcx
+                .debug_bounds("edit-popover")
+                .expect("the open popover must be painted");
+            assert_eq!(
+                popover_bounds.origin.x, position.x,
+                "the popover must anchor at the click's own x, not a fixed pane-edge offset"
+            );
+            assert_eq!(
+                popover_bounds.origin.y,
+                position.y + crate::ui::theme::EDIT_POPOVER_ANCHOR_GAP_Y,
+                "the popover must anchor just below the click, not a fixed header offset"
+            );
+        }
+
+        #[gpui::test]
+        fn an_f2_opened_popover_anchors_at_the_focused_cells_own_painted_bounds(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: orders_relation_schema(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx) = view_with_connection_and_painted_grid(cx, connection);
+            let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+            let cell_bounds = vcx
+                .debug_bounds(body_first_cell_debug_selector(&table_state))
+                .expect("the top-of-viewport body cell must be painted");
+
+            // A single click focuses (and paints) the cell before F2 opens
+            // it, so the popover must anchor through the focused-cell
+            // bounds probe rather than an explicit click position.
+            let position = point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            );
+            vcx.simulate_event(gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            vcx.run_until_parked();
+
+            view.update_in(vcx, |view, window, cx| {
+                view.open_cell_edit_for_test(0, 0, window, cx);
+            });
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(view.cell_edit_is_open_for_test(app));
+            });
+            let popover_bounds = vcx
+                .debug_bounds("edit-popover")
+                .expect("the open popover must be painted");
+            // The probe records the cell's own padded content box (not the
+            // unpadded shell `body_first_cell_debug_selector` tags), so the
+            // two x origins are close but not byte-for-byte equal.
+            let x_delta = f32::from(popover_bounds.origin.x) - f32::from(cell_bounds.origin.x);
+            assert!(
+                x_delta.abs() < zsql_ui::grid::CELL_PADDING_X + 4.0,
+                "an F2-opened popover must anchor at the focused cell's own x, not a fixed \
+                 pane-edge offset: cell x={:?}, popover x={:?}",
+                cell_bounds.origin.x,
+                popover_bounds.origin.x
+            );
+            let expected_y = cell_bounds.origin.y
+                + cell_bounds.size.height
+                + crate::ui::theme::EDIT_POPOVER_ANCHOR_GAP_Y;
+            let y_delta = f32::from(popover_bounds.origin.y) - f32::from(expected_y);
+            assert!(
+                y_delta.abs() < 2.0,
+                "an F2-opened popover must anchor just below the focused cell's own bottom \
+                 edge: expected y={expected_y:?}, popover y={:?}",
+                popover_bounds.origin.y
+            );
+        }
+
+        #[gpui::test]
+        fn double_clicking_an_ineligible_cell_still_opens_the_value_panel(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let connection = std::sync::Arc::new(FakeConnection {
+                relation_schema: relation_schema_with_no_pk(),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            });
+            let (view, vcx) = view_with_connection_and_painted_grid(cx, connection);
+            let table_state = view.read_with(vcx, |v, _app| v.table_state.clone());
+            let cell_bounds = vcx
+                .debug_bounds(body_first_cell_debug_selector(&table_state))
+                .expect("the top-of-viewport body cell must be painted");
+            let position = point(
+                cell_bounds.origin.x + px(5.0),
+                cell_bounds.origin.y + px(5.0),
+            );
+            let mouse_down = |click_count| gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            vcx.simulate_event(mouse_down(1));
+            vcx.simulate_event(mouse_down(2));
+            vcx.run_until_parked();
+
+            view.read_with(vcx, |view, app| {
+                assert!(!view.cell_edit_is_open_for_test(app));
+                assert!(view.value_panel.read(app).is_open());
+            });
+        }
+
+        #[test]
+        fn orders_relation_schema_is_reused_for_composite_free_orders_fixture() {
+            // A guard against the fixture drifting silently: every cell-edit
+            // test above assumes column 1 is the non-primary-key `status`
+            // column with the value "paid" in row 0.
+            let schema = orders_relation_schema();
+            assert_eq!(schema.columns[1].name, "status");
+            assert!(!schema.columns[1].is_primary_key);
+        }
     }
 }

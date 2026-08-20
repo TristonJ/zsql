@@ -141,6 +141,36 @@ mod tests {
         })
     }
 
+    /// `(id, name)` pairs for every row still present, in id order.
+    async fn row_id_names(
+        session: &gpui::Entity<Session>,
+        cx: &mut TestAppContext,
+    ) -> Vec<(i64, String)> {
+        session
+            .update(cx, |session, cx| {
+                session.run_query("SELECT id, name FROM t ORDER BY id".to_owned(), cx)
+            })
+            .await;
+        session.read_with(cx, |session, _app| {
+            session
+                .result()
+                .rows
+                .iter()
+                .map(|row| {
+                    let id = match &row.0[0] {
+                        zsql_core::Value::Int(id) => *id,
+                        other => panic!("expected an integer id, got {other:?}"),
+                    };
+                    let name = match &row.0[1] {
+                        zsql_core::Value::Text(name) => name.clone(),
+                        other => panic!("expected a text name, got {other:?}"),
+                    };
+                    (id, name)
+                })
+                .collect()
+        })
+    }
+
     #[gpui::test]
     async fn a_successful_batch_commits_every_statement(cx: &mut TestAppContext) {
         let _guard = crate::test_support::serialize_real_io();
@@ -188,6 +218,68 @@ mod tests {
             vec![1, 2],
             "a failed batch must leave the database completely unchanged, including the \
              statement that would have succeeded on its own"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_mixed_batch_of_one_update_and_one_delete_commits_both_in_one_transaction(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = crate::test_support::serialize_real_io();
+        let session = sqlite_session_with_two_rows(cx).await;
+
+        let outcome = session
+            .update(cx, |session, cx| {
+                session.run_in_transaction(
+                    vec![
+                        "UPDATE \"main\".\"t\" SET \"name\" = 'shipped' WHERE \"id\" = 1;"
+                            .to_owned(),
+                        "DELETE FROM \"main\".\"t\" WHERE \"id\" = 2;".to_owned(),
+                    ],
+                    cx,
+                )
+            })
+            .await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            row_id_names(&session, cx).await,
+            vec![(1, "shipped".to_owned())],
+            "the update must take effect on row 1 and the delete must remove row 2, both \
+             committed by the same batch"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_failing_statement_in_a_mixed_batch_rolls_back_both_the_update_and_the_delete(
+        cx: &mut TestAppContext,
+    ) {
+        let _guard = crate::test_support::serialize_real_io();
+        let session = sqlite_session_with_two_rows(cx).await;
+
+        let outcome = session
+            .update(cx, |session, cx| {
+                session.run_in_transaction(
+                    vec![
+                        "UPDATE \"main\".\"t\" SET \"name\" = 'shipped' WHERE \"id\" = 1;"
+                            .to_owned(),
+                        "DELETE FROM \"main\".\"t\" WHERE \"id\" = 2;".to_owned(),
+                        "UPDATE \"main\".\"missing\" SET \"x\" = 1 WHERE \"id\" = 1;".to_owned(),
+                    ],
+                    cx,
+                )
+            })
+            .await;
+
+        let failure = outcome.expect_err("the batch's third statement must fail");
+        assert_eq!(failure.statement_index, Some(2));
+        assert!(!failure.message.is_empty());
+
+        assert_eq!(
+            row_id_names(&session, cx).await,
+            vec![(1, "a".to_owned()), (2, "b".to_owned())],
+            "a failed mixed batch must leave the database completely unchanged: neither the \
+             update nor the delete that would have succeeded on their own"
         );
     }
 

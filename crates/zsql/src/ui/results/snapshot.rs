@@ -6,6 +6,7 @@
 use gpui::{App, Context, SharedString};
 use zsql_core::ResultSet;
 
+use super::cell_edit::CellEditor;
 use super::staging::StagingState;
 use super::{ResultsSnapshot, ResultsView, ViewMode};
 use crate::session::SessionState;
@@ -60,6 +61,7 @@ impl ResultsView {
         self.view_mode_defaulted = false;
         self.filter_editor = None;
         self.filter_column_picker_open = false;
+        self.cell_editor.update(cx, CellEditor::close);
         self.quick_find = None;
         self.text_view.update(cx, |tv, _c| tv.reset());
     }

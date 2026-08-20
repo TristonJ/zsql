@@ -27,7 +27,7 @@ pub use error::CoreError;
 pub use filter::{
     FilterCondition, FilterConditionId, FilterConnector, FilterOperator, FilterState,
     FilterValueRender, MULTILINE_CONDITION_THRESHOLD, classify_filter_value, quote_sql_string,
-    render_where_body,
+    render_literal_value, render_where_body,
 };
 pub use preview_state::PreviewQueryState;
 pub use registry::select_driver;

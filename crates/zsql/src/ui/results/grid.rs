@@ -9,7 +9,8 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, Context, Div, Pixels, StrikethroughStyle, Window, div, prelude::*, px, rgb,
+    AnyElement, Bounds, Context, Div, Pixels, StrikethroughStyle, Window, canvas, div, prelude::*,
+    px, rgb,
 };
 use zsql_core::ColumnMeta;
 use zsql_ui::grid::CELL_PADDING_X;
@@ -41,7 +42,7 @@ impl ResultsView {
             .rows(Self::render_data_row_cells)
             .selectable()
             .focus_on_cell_click(self.focus_handle.clone())
-            .on_cell_double_click(Self::open_value_panel_for)
+            .on_cell_double_click(Self::handle_cell_double_click)
             .on_cell_right_click(|view, row, col, event, _window, cx| {
                 view.open_cell_context_menu(row, col, event.position, cx);
             })
@@ -90,6 +91,10 @@ impl ResultsView {
                     cell.bg(theme::staged_delete_wash(&active_theme))
                         .text_color(rgb(colors.status_error))
                         .child(format!("- {}", ix + 1))
+                } else if self.row_has_staged_update(cx, ix) {
+                    cell.bg(theme::staged_update_wash(&active_theme))
+                        .text_color(rgb(colors.status_warn))
+                        .child(format!("{} {}", theme::STAGED_UPDATE_ROW_MARK, ix + 1))
                 } else {
                     cell.text_color(rgb(colors.text_tertiary))
                         .child((ix + 1).to_string())
@@ -159,11 +164,12 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) -> Vec<TableRow> {
         let active_theme = cx.theme();
+        let focused_cell = self.table_state.read(cx).focused_cell();
         let rows: &[zsql_core::Row] = &self.effective_result(cx).rows;
 
         range
             .map(|ix| {
-                let staged = self.staged_id_for_row(cx, ix).is_some();
+                let staged_delete = self.staged_id_for_row(cx, ix).is_some();
                 let cells = rows
                     .get(ix)
                     .map(|row| {
@@ -171,8 +177,22 @@ impl ResultsView {
                             .iter()
                             .enumerate()
                             .map(|(col, value)| {
-                                let formatted = format_value(value);
-                                let is_null = formatted.kind == ValueKind::Null;
+                                let staged_update = self.staged_update_for_cell(cx, ix, col);
+                                let (display_text, kind_color, is_null) =
+                                    if let Some(update) = &staged_update {
+                                        (
+                                            crate::staging::update_value_display_text(update),
+                                            active_theme.colors.status_warn,
+                                            false,
+                                        )
+                                    } else {
+                                        let formatted = format_value(value);
+                                        (
+                                            formatted.text,
+                                            formatted.kind.color(active_theme),
+                                            formatted.kind == ValueKind::Null,
+                                        )
+                                    };
                                 let highlight = self.quick_find_highlight(ix, col);
                                 let mut cell = div()
                                     .flex()
@@ -181,9 +201,9 @@ impl ResultsView {
                                     .items_start()
                                     .h_full()
                                     .overflow_y_hidden()
-                                    .text_color(rgb(formatted.kind.color(active_theme)))
+                                    .text_color(rgb(kind_color))
                                     .when(is_null, gpui::prelude::Styled::italic);
-                                if staged {
+                                if staged_delete {
                                     cell = cell.text_color(rgb(active_theme.colors.text_tertiary));
                                     // Set directly: line_through() leaves the
                                     // strike at the text color, and gpui's
@@ -195,6 +215,11 @@ impl ResultsView {
                                         thickness: px(1.0),
                                         color: Some(rgb(active_theme.colors.status_error).into()),
                                     });
+                                } else if staged_update.is_some() {
+                                    cell = cell
+                                        .bg(theme::staged_update_wash(active_theme))
+                                        .border_l_2()
+                                        .border_color(rgb(active_theme.colors.status_warn));
                                 } else {
                                     cell = match highlight {
                                         QuickFindHighlight::Current => cell
@@ -207,18 +232,39 @@ impl ResultsView {
                                         QuickFindHighlight::None => cell,
                                     };
                                 }
-                                cell.child(formatted.text).into_any_element()
+                                if focused_cell == Some((ix, col)) {
+                                    cell = cell.child(Self::focused_cell_bounds_probe(
+                                        self.focused_cell_bounds.clone(),
+                                    ));
+                                }
+                                cell.child(display_text).into_any_element()
                             })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
                 let mut table_row = TableRow::new(cells);
-                if staged {
+                if staged_delete {
                     table_row = table_row.background(theme::staged_delete_wash(active_theme));
                 }
                 table_row
             })
             .collect()
+    }
+
+    /// A zero-size overlay that records its own painted window bounds into
+    /// `target` on every frame, so a later render (e.g. opening the cell
+    /// edit popover) can anchor to exactly where this cell last painted.
+    fn focused_cell_bounds_probe(
+        target: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    ) -> gpui::Canvas<()> {
+        canvas(
+            move |bounds: Bounds<Pixels>, _window, _cx| {
+                target.set(Some(bounds));
+            },
+            |_bounds, (), _window, _cx| {},
+        )
+        .absolute()
+        .inset_0()
     }
 }
 

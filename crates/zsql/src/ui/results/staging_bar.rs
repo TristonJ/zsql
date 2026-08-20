@@ -16,7 +16,8 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 /// non-empty.
 #[derive(IntoElement)]
 pub(super) struct StagingBar {
-    count: usize,
+    edit_count: usize,
+    delete_count: usize,
     ledger_open: bool,
     retrying: bool,
     applying: bool,
@@ -29,9 +30,10 @@ pub(super) struct StagingBar {
 }
 
 impl StagingBar {
-    pub(super) fn new(count: usize, ledger_open: bool) -> Self {
+    pub(super) fn new(edit_count: usize, delete_count: usize, ledger_open: bool) -> Self {
         Self {
-            count,
+            edit_count,
+            delete_count,
             ledger_open,
             retrying: false,
             applying: false,
@@ -101,6 +103,43 @@ fn delete_count_label(count: usize) -> String {
     }
 }
 
+/// "1 edit" / "2 edits".
+fn edit_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 edit".to_owned()
+    } else {
+        format!("{count} edits")
+    }
+}
+
+/// The bar's "n edit(s) \u{b7} n delete(s)" summary.
+fn render_summary(edit_count: usize, delete_count: usize, colors: Colors) -> Div {
+    let mut summary = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .text_size(px(theme::STAGING_BAR_TEXT_SIZE));
+    if edit_count > 0 {
+        summary = summary.child(
+            div()
+                .text_color(rgb(colors.status_warn))
+                .child(edit_count_label(edit_count)),
+        );
+    }
+    if edit_count > 0 && delete_count > 0 {
+        summary = summary.child(div().text_color(rgb(colors.text_tertiary)).child("\u{b7}"));
+    }
+    if delete_count > 0 {
+        summary = summary.child(
+            div()
+                .text_color(rgb(colors.status_error))
+                .child(delete_count_label(delete_count)),
+        );
+    }
+    summary
+}
+
 fn render_ledger_toggle(
     ledger_open: bool,
     colors: Colors,
@@ -150,6 +189,31 @@ fn render_discard_all(theme: &Theme, on_discard: Option<ClickHandler>) -> Statef
         el = el.on_click(on_discard);
     }
     el
+}
+
+/// The bar's leading tag: amber "STAGED", or rose "APPLY FAILED" after a
+/// failed Apply.
+fn tag_label(retrying: bool) -> &'static str {
+    if retrying { "APPLY FAILED" } else { "STAGED" }
+}
+
+fn render_tag(retrying: bool, theme: &Theme) -> Div {
+    let colors = theme.colors;
+    let (accent, outline) = if retrying {
+        (colors.status_error, colors.error_outline())
+    } else {
+        (colors.status_warn, colors.warn_outline())
+    };
+    div()
+        .text_size(theme::STAGING_TAG_TEXT_SIZE)
+        .font_family(theme.fonts.data.clone())
+        .px(theme::STAGING_TAG_PADDING_X)
+        .rounded(px(theme::STAGING_TAG_RADIUS))
+        .border_1()
+        .border_color(outline)
+        .bg(Colors::wash(accent, 0x14))
+        .text_color(rgb(accent))
+        .child(tag_label(retrying))
 }
 
 /// "Apply n" / "Retry n", for the Apply control's label.
@@ -273,24 +337,8 @@ impl RenderOnce for StagingBar {
             .gap_3()
             .h(theme::RESULTS_BAR_HEIGHT)
             .px_3()
-            .child(
-                div()
-                    .text_size(theme::STAGING_TAG_TEXT_SIZE)
-                    .font_family(theme.fonts.data.clone())
-                    .px(theme::STAGING_TAG_PADDING_X)
-                    .rounded(px(theme::STAGING_TAG_RADIUS))
-                    .border_1()
-                    .border_color(colors.warn_outline())
-                    .bg(Colors::wash(colors.status_warn, 0x14))
-                    .text_color(rgb(colors.status_warn))
-                    .child("STAGED"),
-            )
-            .child(
-                div()
-                    .text_size(px(theme::STAGING_BAR_TEXT_SIZE))
-                    .text_color(rgb(colors.status_error))
-                    .child(delete_count_label(self.count)),
-            )
+            .child(render_tag(self.retrying, theme))
+            .child(render_summary(self.edit_count, self.delete_count, colors))
             .child(render_ledger_toggle(
                 self.ledger_open,
                 colors,
@@ -299,7 +347,7 @@ impl RenderOnce for StagingBar {
             .child(div().flex_1())
             .child(render_discard_all(theme, self.on_discard_all))
             .child(render_apply(
-                self.count,
+                self.edit_count + self.delete_count,
                 self.retrying,
                 self.applying,
                 apply_hint,
@@ -329,7 +377,13 @@ impl RenderOnce for StagingBar {
 mod tests {
     use gpui::Modifiers;
 
-    use super::{apply_label, delete_count_label, keystroke_label};
+    use super::{apply_label, delete_count_label, edit_count_label, keystroke_label, tag_label};
+
+    #[test]
+    fn the_tag_reads_staged_until_an_apply_fails() {
+        assert_eq!(tag_label(false), "STAGED");
+        assert_eq!(tag_label(true), "APPLY FAILED");
+    }
 
     #[test]
     fn keystroke_label_names_each_held_modifier_and_capitalizes_the_key() {
@@ -355,6 +409,17 @@ mod tests {
     fn delete_count_label_is_plural_for_any_other_count() {
         assert_eq!(delete_count_label(0), "0 deletes");
         assert_eq!(delete_count_label(2), "2 deletes");
+    }
+
+    #[test]
+    fn edit_count_label_is_singular_for_exactly_one() {
+        assert_eq!(edit_count_label(1), "1 edit");
+    }
+
+    #[test]
+    fn edit_count_label_is_plural_for_any_other_count() {
+        assert_eq!(edit_count_label(0), "0 edits");
+        assert_eq!(edit_count_label(2), "2 edits");
     }
 
     #[test]

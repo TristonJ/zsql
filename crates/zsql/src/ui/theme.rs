@@ -824,6 +824,90 @@ pub const LEDGER_UNSTAGE_WIDTH: Pixels = px(30.0);
 /// Tallest the expanded ledger panel grows before it scrolls.
 pub const LEDGER_MAX_HEIGHT: Pixels = px(240.0);
 
+// ---- cell edit popover -------------------------------------------------
+
+/// Background wash for a cell carrying a staged edit.
+#[must_use]
+pub fn staged_update_wash(theme: &Theme) -> gpui::Rgba {
+    Colors::wash(theme.colors.status_warn, 0x1a)
+}
+
+/// The row-number gutter's plus-minus mark for a row carrying a staged
+/// edit.
+pub const STAGED_UPDATE_ROW_MARK: &str = "\u{b1}";
+
+/// Gap between the edited cell's bottom edge and the popover anchored below
+/// it.
+pub const EDIT_POPOVER_ANCHOR_GAP_Y: Pixels = px(4.0);
+
+/// Top offset of the cell edit popover when the edited cell's on-screen
+/// bounds are not yet known (e.g. the very first frame after opening), so
+/// the popover still renders somewhere over the grid rather than off-screen.
+pub const EDIT_POPOVER_FALLBACK_TOP_OFFSET: Pixels = px(40.0);
+/// Right offset of the cell edit popover for that same fallback case.
+pub const EDIT_POPOVER_FALLBACK_RIGHT_OFFSET: Pixels = px(14.0);
+
+/// Width of the cell edit popover.
+pub const EDIT_POPOVER_WIDTH: Pixels = px(316.0);
+
+/// Corner radius of the cell edit popover.
+pub const EDIT_POPOVER_RADIUS: f32 = 7.0;
+
+/// Horizontal padding inside the popover's header row (and every other
+/// section's inset from the popover edge).
+pub const EDIT_POPOVER_HEAD_PADDING_X: Pixels = px(12.0);
+/// Top padding above the popover's header row.
+pub const EDIT_POPOVER_HEAD_PADDING_TOP: Pixels = px(10.0);
+/// Gap between the header's column name and type badge.
+pub const EDIT_POPOVER_HEAD_GAP: Pixels = px(8.0);
+
+/// Text size of the popover's header (column name, type badge, "was" value).
+pub const EDIT_POPOVER_HEAD_TEXT_SIZE: f32 = 12.0;
+
+/// Text size of the popover header's trailing "was <value>" hint.
+pub const EDIT_POPOVER_WAS_TEXT_SIZE: f32 = 10.0;
+
+/// Height of the popover's value input.
+pub const EDIT_POPOVER_INPUT_HEIGHT: Pixels = px(26.0);
+/// Top margin above the popover's value input.
+pub const EDIT_POPOVER_INPUT_MARGIN_TOP: Pixels = px(9.0);
+
+/// Text size of the popover's rendered-line preview.
+pub const EDIT_POPOVER_RENDER_TEXT_SIZE: f32 = 11.5;
+/// Top margin above the rendered-line preview.
+pub const EDIT_POPOVER_RENDER_MARGIN_TOP: Pixels = px(8.0);
+/// Padding inside the popover's rendered-line preview.
+pub const EDIT_POPOVER_RENDER_PADDING_X: Pixels = px(9.0);
+pub const EDIT_POPOVER_RENDER_PADDING_Y: Pixels = px(6.0);
+/// Corner radius of the popover's rendered-line preview.
+pub const EDIT_POPOVER_RENDER_RADIUS: f32 = 5.0;
+
+/// Height of one mode chip (`'abc' literal` / `fx expression` / `set NULL`).
+pub const EDIT_POPOVER_CHIP_HEIGHT: Pixels = px(21.0);
+/// Horizontal padding inside one mode chip.
+pub const EDIT_POPOVER_CHIP_PADDING_X: Pixels = px(8.0);
+/// Corner radius of one mode chip.
+pub const EDIT_POPOVER_CHIP_RADIUS: f32 = 5.0;
+/// Text size of a mode chip's label.
+pub const EDIT_POPOVER_CHIP_TEXT_SIZE: f32 = 10.0;
+/// Gap between the popover's three mode chips.
+pub const EDIT_POPOVER_CHIP_GAP: Pixels = px(6.0);
+/// Gap between a mode chip's own icon glyph and its label.
+pub const EDIT_POPOVER_CHIP_INNER_GAP: Pixels = px(5.0);
+/// Top margin above the mode chips row.
+pub const EDIT_POPOVER_MODES_MARGIN_TOP: Pixels = px(9.0);
+
+/// Text size of the popover's footer keyboard hints ("Enter stage", "Esc
+/// cancel").
+pub const EDIT_POPOVER_FOOT_TEXT_SIZE: f32 = 10.0;
+/// Gap between a footer hint's key glyph and its label.
+pub const EDIT_POPOVER_HINT_GAP: Pixels = px(4.0);
+/// Gap between the footer's two hints.
+pub const EDIT_POPOVER_FOOT_GAP: Pixels = px(12.0);
+/// Vertical padding around the footer hints.
+pub const EDIT_POPOVER_FOOT_PADDING_TOP: Pixels = px(9.0);
+pub const EDIT_POPOVER_FOOT_PADDING_BOTTOM: Pixels = px(11.0);
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -831,7 +915,7 @@ mod tests {
         generated_strip_bg, generated_strip_height, modal_row_active_bg,
         quick_find_current_match_bg, quick_find_match_bg, run_button_disabled_bg, run_button_hint,
         run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, staged_delete_wash,
-        status_disconnected,
+        staged_update_wash, status_disconnected,
     };
     use zsql_ui::theme::Theme;
 
@@ -915,6 +999,19 @@ mod tests {
     fn staged_delete_wash_is_distinct_from_quick_find_and_selection_washes() {
         let theme = Theme::default();
         let staged = staged_delete_wash(&theme);
+        assert_ne!(staged, quick_find_match_bg(&theme));
+        assert_ne!(staged, quick_find_current_match_bg(&theme));
+        assert_ne!(staged, theme.colors.accent_wash());
+    }
+
+    /// The staged-update (cell edit) wash must draw from the amber status
+    /// role and stay visually distinct from the staged-delete (rose) wash,
+    /// so an edited cell's grammar is never mistaken for a deleted row's.
+    #[test]
+    fn staged_update_wash_is_amber_and_distinct_from_the_staged_delete_wash() {
+        let theme = Theme::default();
+        let staged = staged_update_wash(&theme);
+        assert_ne!(staged, staged_delete_wash(&theme));
         assert_ne!(staged, quick_find_match_bg(&theme));
         assert_ne!(staged, quick_find_current_match_bg(&theme));
         assert_ne!(staged, theme.colors.accent_wash());
