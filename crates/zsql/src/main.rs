@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             zsql_editor::init(cx);
             zsql_ui::text_field::init(cx);
             ui::results::init(cx, &cfg.staging.apply_keybinding);
+            ui::sidebar::init(cx);
             ui::schema_view::init(cx);
             ui::save_modal::init(cx);
             ui::open_modal::init(cx);

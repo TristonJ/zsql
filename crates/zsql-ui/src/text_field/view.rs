@@ -223,6 +223,13 @@ impl TextFieldState {
         self.marked_range = None;
     }
 
+    /// Replace the placeholder shown while the field is empty, without
+    /// notifying observers: for a caller whose own notify already covers
+    /// this render (e.g. switching what a shared find input filters).
+    pub fn set_placeholder_quiet(&mut self, placeholder: impl Into<SharedString>) {
+        self.placeholder = placeholder.into();
+    }
+
     /// Whether this field currently displays its content masked.
     #[must_use]
     pub fn is_masked(&self) -> bool {

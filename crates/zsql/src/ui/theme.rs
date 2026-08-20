@@ -143,6 +143,20 @@ pub const SIDEBAR_DB_ROW_NAME_TEXT_SIZE: f32 = 11.5;
 /// Size of the database row's trailing chevron glyph.
 pub const SIDEBAR_DB_ROW_CHEVRON_ICON_SIZE: Pixels = px(9.0);
 
+// ---- sidebar find row (borrows the database row's slot while active) ----
+
+/// Right padding inside the find row (its left padding matches
+/// [`SIDEBAR_DB_ROW_PADDING_X`]; only the trailing close button's side
+/// differs).
+pub const SIDEBAR_FIND_ROW_PADDING_RIGHT: Pixels = px(10.0);
+/// Height of the find row's query input.
+pub const SIDEBAR_FIND_INPUT_HEIGHT: Pixels = px(20.0);
+/// Horizontal padding inside the find row's query input.
+pub const SIDEBAR_FIND_INPUT_PADDING_X: Pixels = px(2.0);
+/// Size of the find row's leading magnifying-glass glyph and trailing
+/// close glyph.
+pub const SIDEBAR_FIND_ROW_ICON_SIZE: Pixels = px(16.0);
+
 // ---- scripts pane: group labels and the library open-dot ----------------
 
 /// Height of a scripts-pane group label ("This connection - name" /
