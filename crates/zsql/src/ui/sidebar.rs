@@ -1376,6 +1376,9 @@ mod render_tests {
             cx.subscribe(&tabs, move |_tabs, evt: &ResultsChanged, cx| {
                 results_for_events.update(cx, |results, cx| match evt {
                     ResultsChanged::Live(label) => results.show_live(label, cx),
+                    ResultsChanged::LiveWindowChanged(label) => {
+                        results.show_live_window(label, cx);
+                    }
                     ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
                 });
             })

@@ -5,7 +5,7 @@ use gpui::Context;
 use zsql_core::preview_state::PreviewQueryState;
 
 use super::{PreviewControlsChanged, TabKind, TabModel};
-use crate::ui::results::pager::{PreviewAction, PreviewControls};
+use crate::ui::results::pager::{PreviewAction, PreviewControls, RelationTarget};
 
 impl TabModel {
     /// Route `action` to whichever tab is currently active
@@ -37,6 +37,7 @@ impl TabModel {
                 self.toggle_filter_connector_active_tab(index, cx);
             }
             PreviewAction::ClearFilters => self.clear_filters_active_tab(cx),
+            PreviewAction::Reload => self.reload_active_tab(cx),
         }
     }
 
@@ -162,6 +163,13 @@ impl TabModel {
         self.rerun_active_generated_tab(cx, true, PreviewQueryState::clear_filters);
     }
 
+    /// Re-run the active tab's current window (sort/page/filters
+    /// unchanged), refetching the total row count. A no-op while the active
+    /// tab is not a live, unedited generated preview.
+    fn reload_active_tab(&mut self, cx: &mut Context<Self>) {
+        self.rerun_active_generated_tab(cx, true, |_state| true);
+    }
+
     /// Apply `mutate` to the active tab's [`PreviewQueryState`] (only while
     /// it is a live, unedited generated preview), and, only when `mutate`
     /// reports it actually changed the window (e.g. `prev_page` at page 1
@@ -244,7 +252,7 @@ impl TabModel {
                 cx,
             )
         });
-        self.dispatch_run(id, format!("{schema}.{relation}"), task, cx);
+        self.dispatch_run(id, format!("{schema}.{relation}"), task, true, cx);
         self.sync_preview_controls(cx);
     }
 
@@ -254,12 +262,21 @@ impl TabModel {
             if tab.dirty {
                 return None;
             }
-            let TabKind::Generated { preview, .. } = &tab.kind else {
+            let TabKind::Generated {
+                schema,
+                relation,
+                preview,
+            } = &tab.kind
+            else {
                 return None;
             };
             Some(PreviewControls {
                 state: preview.clone(),
                 dispatch: self.preview_dispatch.clone(),
+                relation: RelationTarget {
+                    schema: schema.clone(),
+                    relation: relation.clone(),
+                },
             })
         });
         cx.emit(PreviewControlsChanged(controls));

@@ -53,6 +53,9 @@ pub(crate) enum PreviewAction {
     ToggleFilterConnector(usize),
     /// Remove every filter chip in one action.
     ClearFilters,
+    /// Re-run the current preview with its sort/page/filter state
+    /// unchanged, refetching the total row count.
+    Reload,
 }
 
 /// The callback every sort/pager/filter control routes its clicks through.
@@ -60,6 +63,13 @@ pub(crate) enum PreviewAction {
 /// filter chip's edit commits from a [`zsql_ui::text_field::TextFieldEvent`]
 /// subscription, which has no `Window` to offer.
 pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut App)>;
+
+/// The relation a live generated preview shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationTarget {
+    pub schema: String,
+    pub relation: String,
+}
 
 /// The active generated tab's current sort/page snapshot, plus the
 /// dispatcher every pager/sort control routes its clicks through.
@@ -71,6 +81,7 @@ pub(crate) type PreviewDispatch = Rc<dyn Fn(PreviewAction, &mut App)>;
 pub(crate) struct PreviewControls {
     pub state: PreviewQueryState,
     pub dispatch: PreviewDispatch,
+    pub relation: RelationTarget,
 }
 
 /// Whether `column_name`'s header should carry the funnel marker: `controls`
@@ -350,6 +361,10 @@ mod tests {
         PreviewControls {
             state,
             dispatch: Rc::new(|_action, _cx| {}),
+            relation: super::RelationTarget {
+                schema: "public".to_owned(),
+                relation: "orders".to_owned(),
+            },
         }
     }
 

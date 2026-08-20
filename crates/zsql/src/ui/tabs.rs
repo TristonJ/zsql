@@ -261,6 +261,9 @@ pub struct TabModel {
 pub enum ResultsChanged {
     /// Results are live - fetch them from the session
     Live(SharedString),
+    /// The active live preview's window changed (a page, sort, or filter
+    /// navigation) but its relation did not.
+    LiveWindowChanged(SharedString),
     /// Results are loaded from a snapshot
     Snapshot(ResultsSnapshot),
 }
@@ -480,12 +483,24 @@ impl TabModel {
     /// this model's live run: `results` follows `session` live under
     /// `label` until this tab's run completes, at which point its final
     /// state/result are captured into [`Tab::last_run`] for any later
-    /// switch back to it.
-    fn dispatch_run(&mut self, id: TabId, label: String, task: Task<()>, cx: &mut Context<Self>) {
+    /// switch back to it. `window_change` marks a same-relation page/sort/
+    /// filter navigation rather than a fresh query run.
+    fn dispatch_run(
+        &mut self,
+        id: TabId,
+        label: String,
+        task: Task<()>,
+        window_change: bool,
+        cx: &mut Context<Self>,
+    ) {
         let label = SharedString::from(label);
         self.live_owner = Some(id);
 
-        cx.emit(ResultsChanged::Live(label.clone()));
+        cx.emit(if window_change {
+            ResultsChanged::LiveWindowChanged(label.clone())
+        } else {
+            ResultsChanged::Live(label.clone())
+        });
 
         cx.spawn(async move |this, cx| {
             task.await;
@@ -508,24 +523,41 @@ impl TabModel {
         }
         let label = display_label(tab);
         let kind = tab.kind.clone();
-        // A live generated tab is a preview of its relation, so re-running it
-        // must refresh that relation's total row count the same way opening it
-        // did. preview_relation fetches the count; a plain run_query would
-        // leave it cleared. Once edited (kind Script) the tab is an ordinary
-        // query and runs its own text verbatim.
-        let task = match kind {
+        // A live generated tab is a preview of its relation, so re-running
+        // it must replay its current sort/page/filter window and refresh the
+        // relation's total row count, exactly like the pager's own Reload; a
+        // plain run_query would drop the window and clear the count. Once
+        // edited (kind Script) the tab is an ordinary query and runs its own
+        // text verbatim.
+        let (task, window_change) = match kind {
             TabKind::Generated {
-                schema, relation, ..
-            } => self.session.update(cx, |session, cx| {
-                session.preview_relation(&schema, &relation, cx)
-            }),
-            TabKind::Script { .. } => self
-                .session
-                .update(cx, |session, cx| session.run_query(sql, cx)),
+                schema,
+                relation,
+                preview,
+            } => (
+                self.session.update(cx, |session, cx| {
+                    session.preview_relation_windowed(
+                        &schema,
+                        &relation,
+                        preview.sort_pair(),
+                        preview.page_size(),
+                        preview.offset(),
+                        preview.filters(),
+                        true,
+                        cx,
+                    )
+                }),
+                true,
+            ),
+            TabKind::Script { .. } => (
+                self.session
+                    .update(cx, |session, cx| session.run_query(sql, cx)),
+                false,
+            ),
             // A schema tab is read-only and has no query to run.
             TabKind::Schema { .. } => return,
         };
-        self.dispatch_run(id, label, task, cx);
+        self.dispatch_run(id, label, task, window_change, cx);
     }
 
     /// Capture tab `id`'s just-finished run into its [`Tab::last_run`], from

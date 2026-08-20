@@ -15,7 +15,7 @@ use zsql_core::preview_state::PreviewQueryState;
 use super::{
     PreviewControlsChanged, ResultsChanged, ResultsSnapshot, SaveRequested, Tab, TabKind, TabModel,
 };
-use crate::session::Session;
+use crate::session::{Session, SessionState};
 use crate::session_store::{ScriptBacking, ScriptFileName, TabEntrySnapshot, TabSessionSnapshot};
 use crate::ui::results::ResultsView;
 use crate::ui::results::pager::PreviewAction;
@@ -120,6 +120,47 @@ impl Connection for RecordingConnection {
     }
 }
 
+/// A `Connection` double that records each `stream_query` call's SQL text,
+/// letting a test assert exactly what a dispatched run executed rather than
+/// only that it ran. Its runs never resolve.
+struct SqlRecordingConnection {
+    sqls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Connection for SqlRecordingConnection {
+    fn stream_query(&self, sql: String, _sink: BatchSink) -> QueryHandle {
+        self.sqls.lock().expect("sqls lock poisoned").push(sql);
+        let (cancel_tx, _cancel_rx) = flume::unbounded();
+        QueryHandle::new(cancel_tx)
+    }
+
+    async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+        Ok(SchemaTree::default())
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
+        Ok(RowCount::Exact(0))
+    }
+
+    async fn describe_relation(
+        &self,
+        _schema: &str,
+        _relation: &str,
+    ) -> Result<zsql_core::RelationSchema, CoreError> {
+        Ok(zsql_core::RelationSchema::default())
+    }
+}
+
 /// Mirror the workspace's tab-event wiring: a standalone [`ResultsView`]
 /// fed by the model's [`ResultsChanged`]/[`PreviewControlsChanged`] events,
 /// plus the latest total those events would push to the footer's row count.
@@ -137,6 +178,9 @@ fn wire_display(
         cx.subscribe(model, move |_model, evt: &ResultsChanged, cx| {
             results_for_changed.update(cx, |results, cx| match evt {
                 ResultsChanged::Live(label) => results.show_live(label, cx),
+                ResultsChanged::LiveWindowChanged(label) => {
+                    results.show_live_window(label, cx);
+                }
                 ResultsChanged::Snapshot(snap) => results.show_snapshot(snap.clone(), cx),
             });
         })
@@ -195,6 +239,155 @@ fn re_running_a_generated_preview_tab_refreshes_the_relation_row_count(cx: &mut 
             session.row_count(),
             Some(RowCount::Exact(0)),
             "re-running a generated preview tab must refresh its relation row count"
+        );
+    });
+}
+
+#[gpui::test]
+fn re_running_a_generated_preview_tab_keeps_its_sort_window(cx: &mut TestAppContext) {
+    let sqls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(SqlRecordingConnection { sqls: sqls.clone() });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+
+    let id = model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+    dispatch(&model, cx, PreviewAction::Sort("total_cents".to_owned()));
+
+    // The Run button / RunQuery path must replay the sorted window, not
+    // regenerate the relation's plain first-page preview.
+    model.update(cx, |model, cx| {
+        model.run_for_tab(id, "SELECT 1".to_owned(), cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        sqls.lock()
+            .expect("sqls lock poisoned")
+            .last()
+            .map(String::as_str),
+        Some("SELECT * FROM \"public\".\"orders\" ORDER BY \"total_cents\" ASC LIMIT 200"),
+        "re-running a sorted preview must keep its ORDER BY window"
+    );
+}
+
+/// Like [`RecordingConnection`], but its `describe_relation` reports a
+/// single-column primary key, letting a test stage a row delete through a
+/// real [`TabModel`]-driven [`ResultsView`].
+struct PkRecordingConnection {
+    sinks: Arc<Mutex<Vec<BatchSink>>>,
+    total_rows: u64,
+}
+
+#[async_trait]
+impl Connection for PkRecordingConnection {
+    fn stream_query(&self, _sql: String, sink: BatchSink) -> QueryHandle {
+        self.sinks.lock().expect("sinks lock poisoned").push(sink);
+        let (cancel_tx, _cancel_rx) = flume::unbounded();
+        QueryHandle::new(cancel_tx)
+    }
+
+    async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+        Ok(SchemaTree::default())
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    async fn count_rows(
+        &self,
+        _schema: &str,
+        _relation: &str,
+        _filters: &zsql_core::FilterState,
+    ) -> Result<RowCount, CoreError> {
+        Ok(RowCount::Exact(self.total_rows))
+    }
+
+    async fn describe_relation(
+        &self,
+        _schema: &str,
+        _relation: &str,
+    ) -> Result<zsql_core::RelationSchema, CoreError> {
+        Ok(zsql_core::RelationSchema {
+            columns: vec![zsql_core::schema_detail::ColumnDetail {
+                name: "id".to_owned(),
+                type_name: "int8".to_owned(),
+                nullable: false,
+                default: None,
+                is_primary_key: true,
+                is_unique: false,
+                foreign_key: None,
+            }],
+            indexes: vec![],
+            constraints: vec![],
+        })
+    }
+}
+
+/// Sends one row `id` through `sink` as a complete, terminated result.
+fn send_one_id_row(sink: &BatchSink, id: i64) {
+    sink.send(Ok(QueryEvent::Columns(vec![ColumnMeta {
+        name: "id".to_owned(),
+        type_name: "int8".to_owned(),
+        nullable: false,
+    }])))
+    .expect("send failed");
+    sink.send(Ok(QueryEvent::Batch(zsql_core::RowBatch {
+        rows: vec![zsql_core::Row(vec![zsql_core::Value::Int(id)])],
+    })))
+    .expect("send failed");
+    sink.send(Ok(QueryEvent::Done { affected: None }))
+        .expect("send failed");
+}
+
+#[gpui::test]
+fn paging_a_live_generated_tab_preserves_staged_row_deletes(cx: &mut TestAppContext) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(PkRecordingConnection {
+        sinks: sinks.clone(),
+        total_rows: 10_000,
+    });
+    let session = cx.update(|cx| cx.new(|_cx| Session::new_for_query_test(connection)));
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (results, _row_count) = wire_display(&model, session, cx);
+
+    model.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx)
+    });
+    cx.run_until_parked();
+
+    let first_sink = sinks.lock().expect("sinks lock poisoned")[0].clone();
+    send_one_id_row(&first_sink, 1);
+    cx.run_until_parked();
+
+    results.read_with(cx, |view, app| {
+        assert!(
+            view.staging_unavailable_hint_for_test(app).is_none(),
+            "the relation schema fetch must have resolved with a primary key"
+        );
+    });
+
+    results.update(cx, |view, cx| {
+        view.stage_or_restore_row_for_test(0, cx);
+    });
+    results.read_with(cx, |view, app| {
+        assert_eq!(view.staged_count_for_test(app), 1);
+    });
+
+    dispatch(&model, cx, PreviewAction::NextPage);
+
+    let second_sink = sinks.lock().expect("sinks lock poisoned")[1].clone();
+    send_one_id_row(&second_sink, 2);
+    cx.run_until_parked();
+
+    results.read_with(cx, |view, app| {
+        assert_eq!(
+            view.staged_count_for_test(app),
+            1,
+            "paging the same live relation must preserve staged row deletes"
         );
     });
 }
@@ -2304,6 +2497,59 @@ fn a_filtered_sorted_paged_generated_tab_round_trips_through_a_snapshot(cx: &mut
             "a restored preview state never carries its old total row count"
         );
         assert_eq!(restored_state.base_total_rows(), None);
+    });
+}
+
+/// A preview tab restored while the session is still connecting cannot
+/// fetch its relation's schema yet; the fetch must fire once the connection
+/// lands, not stay failed until the tab is closed and reopened.
+#[gpui::test]
+fn a_preview_restored_before_connecting_fetches_its_relation_schema_on_connect(
+    cx: &mut TestAppContext,
+) {
+    // A snapshot holding one live generated tab, via a connected throwaway
+    // model.
+    let (donor, _sinks) = build_model_with_recording_connection(cx);
+    donor.update(cx, |model, cx| {
+        model.open_or_reuse_generated("public", "orders", cx);
+    });
+    cx.run_until_parked();
+    let snapshot = donor.read_with(cx, TabModel::snapshot);
+
+    // Load it into a workspace whose session has not finished connecting.
+    let session = cx.update(|cx| {
+        cx.new(|_cx| {
+            Session::new_for_render_test(SessionState::Connecting, zsql_core::ResultSet::default())
+        })
+    });
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let (results, _row_count) = wire_display(&model, session.clone(), cx);
+    model.update(cx, |model, cx| {
+        model.load_for_connection(Some(&snapshot), cx);
+    });
+    cx.run_until_parked();
+    results.read_with(cx, |view, app| {
+        assert!(
+            view.staging_unavailable_hint_for_test(app).is_some(),
+            "no relation schema can be known before the connection lands"
+        );
+    });
+
+    // The in-flight connect resolves, against a relation with a primary key.
+    let connection: Arc<dyn Connection> = Arc::new(PkRecordingConnection {
+        sinks: Arc::new(Mutex::new(Vec::new())),
+        total_rows: 0,
+    });
+    session.update(cx, |session, cx| {
+        session.attach_connection_for_test(connection, cx);
+    });
+    cx.run_until_parked();
+
+    results.read_with(cx, |view, app| {
+        assert!(
+            view.staging_unavailable_hint_for_test(app).is_none(),
+            "the relation schema fetch must retry once the session connects"
+        );
     });
 }
 

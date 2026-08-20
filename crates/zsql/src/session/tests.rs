@@ -111,6 +111,19 @@ impl Session {
         self.connection.clone()
     }
 
+    /// Attach `connection` to a session built without one, as if an
+    /// in-flight `connect()` just resolved, notifying observers the same
+    /// way the real connect path does.
+    pub(crate) fn attach_connection_for_test(
+        &mut self,
+        connection: Arc<dyn Connection>,
+        cx: &mut Context<Self>,
+    ) {
+        self.connection = Some(connection);
+        self.state = SessionState::Connected;
+        cx.notify();
+    }
+
     /// Build a session already holding `schema` as its introspected schema
     /// state, connected but idle, with no result set
     pub(crate) fn new_for_schema_test(schema: SchemaState) -> Self {

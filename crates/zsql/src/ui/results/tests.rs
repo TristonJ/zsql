@@ -128,6 +128,7 @@ fn preview_controls_for_summary(
     super::pager::PreviewControls {
         state,
         dispatch: std::rc::Rc::new(|_action, _cx| {}),
+        relation: test_relation_target(),
     }
 }
 
@@ -1946,8 +1947,18 @@ fn recording_preview_controls() -> (
         dispatch: std::rc::Rc::new(move |action, _cx| {
             recorded_for_dispatch.borrow_mut().push(action);
         }),
+        relation: test_relation_target(),
     };
     (controls, recorded)
+}
+
+/// A stable, arbitrary relation target for tests that don't care which
+/// relation a [`super::pager::PreviewControls`] names.
+fn test_relation_target() -> super::pager::RelationTarget {
+    super::pager::RelationTarget {
+        schema: "public".to_owned(),
+        relation: "orders".to_owned(),
+    }
 }
 
 #[gpui::test]
@@ -2019,6 +2030,7 @@ fn preview_controls_with_filters(
         dispatch: std::rc::Rc::new(move |action, _cx| {
             recorded_for_dispatch.borrow_mut().push(action);
         }),
+        relation: test_relation_target(),
     };
     (controls, recorded)
 }
@@ -2098,7 +2110,7 @@ fn typing_a_space_into_the_filter_value_editor_inserts_it_instead_of_driving_the
     // registered so this test exercises the contention between the grid's
     // `space` binding and plain text insertion.
     cx.update(|cx| {
-        super::init(cx);
+        super::init(cx, "ctrl-shift-enter");
         zsql_ui::text_field::init(cx);
     });
     let (controls, _recorded) = recording_preview_controls();
@@ -2414,7 +2426,7 @@ mod quick_find_tests {
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
-            super::super::init(cx);
+            super::super::init(cx, "ctrl-shift-enter");
             zsql_ui::text_field::init(cx);
         });
         let state = SessionState::Results(std::time::Duration::from_millis(1));
@@ -2823,6 +2835,1090 @@ mod quick_find_tests {
                 view.quick_find_current_number_for_test(),
                 Some(1),
                 "the current match survives a sync that still contains its cell"
+            );
+        });
+    }
+}
+
+mod staging_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use gpui::{AppContext as _, Focusable as _, Modifiers, TestAppContext, point, px};
+    use zsql_core::schema_detail::{ColumnDetail, RelationSchema};
+    use zsql_core::{
+        BatchSink, ColumnMeta, Connection, CoreError, FilterState, QueryEvent, QueryHandle,
+        ResultSet, Row, RowCount, SchemaTree, Value,
+    };
+
+    use super::{ResultsView, SessionState};
+    use crate::session::Session;
+    use crate::ui::results::pager::{PreviewAction, PreviewControls, RelationTarget};
+
+    /// Leaks `selector` so it can be passed to
+    /// `VisualTestContext::debug_bounds`, which requires a `&'static str`.
+    /// A per-entity selector (a staged change's id folded into its ledger
+    /// line's lookup key) cannot be a literal, and this is test-only code:
+    /// one small leak per call, never reached outside `#[cfg(test)]`.
+    fn leak_selector(selector: String) -> &'static str {
+        Box::leak(selector.into_boxed_str())
+    }
+
+    fn orders_result() -> ResultSet {
+        ResultSet {
+            columns: vec![
+                ColumnMeta {
+                    name: "id".to_owned(),
+                    type_name: "int8".to_owned(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "status".to_owned(),
+                    type_name: "text".to_owned(),
+                    nullable: true,
+                },
+            ],
+            rows: vec![
+                Row(vec![Value::Int(1), Value::Text("paid".to_owned())]),
+                Row(vec![Value::Int(2), Value::Text("pending".to_owned())]),
+            ],
+            affected: None,
+            notices: Vec::new(),
+        }
+    }
+
+    fn orders_relation_schema() -> RelationSchema {
+        RelationSchema {
+            columns: vec![
+                ColumnDetail {
+                    name: "id".to_owned(),
+                    type_name: "int8".to_owned(),
+                    nullable: false,
+                    default: None,
+                    is_primary_key: true,
+                    is_unique: false,
+                    foreign_key: None,
+                },
+                ColumnDetail {
+                    name: "status".to_owned(),
+                    type_name: "text".to_owned(),
+                    nullable: true,
+                    default: None,
+                    is_primary_key: false,
+                    is_unique: false,
+                    foreign_key: None,
+                },
+            ],
+            indexes: vec![],
+            constraints: vec![],
+        }
+    }
+
+    fn relation_schema_with_no_pk() -> RelationSchema {
+        RelationSchema {
+            columns: vec![ColumnDetail {
+                name: "status".to_owned(),
+                type_name: "text".to_owned(),
+                nullable: true,
+                default: None,
+                is_primary_key: false,
+                is_unique: false,
+                foreign_key: None,
+            }],
+            indexes: vec![],
+            constraints: vec![],
+        }
+    }
+
+    /// A connection double whose `describe_relation` resolves with a fixed
+    /// schema and whose `stream_query` resolves each statement it is sent
+    /// immediately, recording every statement's SQL text in call order and
+    /// failing exactly the call at `fail_at`, if any.
+    struct FakeConnection {
+        relation_schema: RelationSchema,
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_at: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for FakeConnection {
+        fn stream_query(&self, sql: String, sink: BatchSink) -> QueryHandle {
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            let index = {
+                let mut calls = self.calls.lock().expect("test lock is never poisoned");
+                calls.push(sql);
+                calls.len() - 1
+            };
+            if self.fail_at == Some(index) {
+                let _ = sink.send(Err(CoreError::query("boom")));
+            } else {
+                let _ = sink.send(Ok(QueryEvent::Done { affected: Some(1) }));
+            }
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &FilterState,
+        ) -> Result<RowCount, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<RelationSchema, CoreError> {
+            Ok(self.relation_schema.clone())
+        }
+    }
+
+    /// A connection double whose `describe_relation` always fails, so a
+    /// test can exercise [`ResultsView`]'s reaction to a failed relation
+    /// schema fetch.
+    struct DescribeRelationFailsConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for DescribeRelationFailsConnection {
+        fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &FilterState,
+        ) -> Result<RowCount, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<RelationSchema, CoreError> {
+            Err(CoreError::query("relation schema fetch failed"))
+        }
+    }
+
+    /// A connection double whose `describe_relation` never resolves on its
+    /// own: each call parks a sender in `senders` (in call order) and the
+    /// test resolves them manually, in whatever order it chooses, letting a
+    /// test force a stale, superseded fetch to resolve after the current one.
+    type DescribeRelationSender = flume::Sender<Result<RelationSchema, CoreError>>;
+
+    struct ControllableDescribeConnection {
+        senders: Arc<Mutex<Vec<DescribeRelationSender>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for ControllableDescribeConnection {
+        fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+            let (cancel_tx, _cancel_rx) = flume::unbounded();
+            QueryHandle::new(cancel_tx)
+        }
+
+        async fn introspect(&self) -> Result<SchemaTree, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &FilterState,
+        ) -> Result<RowCount, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<RelationSchema, CoreError> {
+            let (tx, rx) = flume::bounded(1);
+            self.senders
+                .lock()
+                .expect("test lock is never poisoned")
+                .push(tx);
+            rx.recv_async()
+                .await
+                .unwrap_or_else(|_| Err(CoreError::query("sender dropped")))
+        }
+    }
+
+    fn preview_controls_recording(recorded: Rc<RefCell<Vec<PreviewAction>>>) -> PreviewControls {
+        PreviewControls {
+            state: zsql_core::preview_state::PreviewQueryState::new(200),
+            dispatch: Rc::new(move |action, _cx| {
+                recorded.borrow_mut().push(action);
+            }),
+            relation: RelationTarget {
+                schema: "public".to_owned(),
+                relation: "orders".to_owned(),
+            },
+        }
+    }
+
+    /// A view over `orders_result()`, connected to `connection`, with its
+    /// relation schema already resolved via a real `describe_relation`
+    /// round trip through `set_preview_controls` (so `vcx` must be parked
+    /// once before staging is available).
+    fn view_with_connection(
+        cx: &mut TestAppContext,
+        connection: Arc<dyn Connection>,
+    ) -> (
+        gpui::Entity<ResultsView>,
+        &mut gpui::VisualTestContext,
+        Rc<RefCell<Vec<PreviewAction>>>,
+    ) {
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_query_test(connection);
+            session.set_result_for_test(orders_result());
+            session
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let controls = preview_controls_recording(recorded.clone());
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(controls), cx);
+        });
+        vcx.run_until_parked();
+        (view, vcx, recorded)
+    }
+
+    fn view_with_pk_schema(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<ResultsView>,
+        &mut gpui::VisualTestContext,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: calls.clone(),
+            fail_at: None,
+        });
+        let (view, vcx, _recorded) = view_with_connection(cx, connection);
+        (view, vcx, calls)
+    }
+
+    /// Like [`view_with_pk_schema`], but with the grid's own key bindings
+    /// registered and window focus moved onto it, so a test can drive Apply
+    /// through the real `ctrl-shift-enter` keystroke rather than the
+    /// `_for_test` accessor. `fail_at` lets a test fail a specific
+    /// `stream_query` call (0 is the batch's own `BEGIN`).
+    fn view_with_pk_schema_focused(
+        cx: &mut TestAppContext,
+        fail_at: Option<usize>,
+    ) -> (
+        gpui::Entity<ResultsView>,
+        &mut gpui::VisualTestContext,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        cx.update(|cx| {
+            super::super::init(cx, "ctrl-shift-enter");
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: calls.clone(),
+            fail_at,
+        });
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_query_test(connection);
+            session.set_result_for_test(orders_result());
+            session
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let view = ResultsView::new(session, "public.orders", cx);
+            window.focus(&view.focus_handle(cx));
+            view
+        });
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let controls = preview_controls_recording(recorded);
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(controls), cx);
+        });
+        vcx.run_until_parked();
+        (view, vcx, calls)
+    }
+
+    // -- staging eligibility -------------------------------------------
+
+    #[gpui::test]
+    fn staging_is_unavailable_with_no_active_preview(cx: &mut TestAppContext) {
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                SessionState::Results(Duration::default()),
+                orders_result(),
+            )
+        });
+        let (view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staging_unavailable_hint(app),
+                Some("needs a primary key")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn staging_is_unavailable_when_the_relation_schema_has_no_primary_key(cx: &mut TestAppContext) {
+        let connection = Arc::new(FakeConnection {
+            relation_schema: relation_schema_with_no_pk(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_at: None,
+        });
+        let (view, vcx, _recorded) = view_with_connection(cx, connection);
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staging_unavailable_hint(app),
+                Some("needs a primary key")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn staging_becomes_available_once_the_relation_schema_resolves_with_a_primary_key(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+        view.read_with(vcx, |view, app| {
+            assert!(view.staging_unavailable_hint(app).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_relation_schema_fetch_leaves_staging_unavailable(cx: &mut TestAppContext) {
+        let connection: Arc<dyn Connection> = Arc::new(DescribeRelationFailsConnection);
+        let (view, vcx, _recorded) = view_with_connection(cx, connection);
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staging_unavailable_hint(app),
+                Some("needs a primary key"),
+                "a failed describe_relation must leave staging unavailable rather than panic \
+                 or silently succeed"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_relation_schema_fetch_superseded_by_a_new_relation_is_dropped_on_late_arrival(
+        cx: &mut TestAppContext,
+    ) {
+        let senders = Arc::new(Mutex::new(Vec::new()));
+        let connection: Arc<dyn Connection> = Arc::new(ControllableDescribeConnection {
+            senders: senders.clone(),
+        });
+        let session = cx.new(|_cx| {
+            let mut session = Session::new_for_query_test(connection);
+            session.set_result_for_test(orders_result());
+            session
+        });
+        let (view, vcx) =
+            cx.add_window_view(|_window, cx| ResultsView::new(session, "public.orders", cx));
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(preview_controls_recording(recorded.clone())), cx);
+        });
+        vcx.run_until_parked();
+
+        let mut shipments = preview_controls_recording(recorded.clone());
+        shipments.relation = RelationTarget {
+            schema: "public".to_owned(),
+            relation: "shipments".to_owned(),
+        };
+        view.update(vcx, |view, cx| {
+            view.set_preview_controls(Some(shipments), cx);
+        });
+        vcx.run_until_parked();
+
+        // Two fetches are now in flight: index 0 for "orders" (stale, since
+        // the active relation is now "shipments") and index 1 for
+        // "shipments" (current). Resolve the current one first, then the
+        // stale one, to prove a late-arriving stale result cannot clobber
+        // the current relation's already-resolved state.
+        {
+            let senders = senders.lock().expect("test lock is never poisoned");
+            assert_eq!(
+                senders.len(),
+                2,
+                "expected exactly two describe_relation calls"
+            );
+            senders[1]
+                .send(Ok(orders_relation_schema()))
+                .expect("send failed");
+        }
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, app| {
+            assert!(
+                view.staging_unavailable_hint(app).is_none(),
+                "the current relation's fetch must resolve staging as available"
+            );
+        });
+
+        {
+            let senders = senders.lock().expect("test lock is never poisoned");
+            senders[0]
+                .send(Ok(relation_schema_with_no_pk()))
+                .expect("send failed");
+        }
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, app| {
+            assert!(
+                view.staging_unavailable_hint(app).is_none(),
+                "a stale relation-schema fetch that resolves after being superseded must be \
+                 dropped, not overwrite the current relation's already-resolved state"
+            );
+        });
+    }
+
+    // -- stage / restore / discard --------------------------------------
+
+    #[gpui::test]
+    fn staging_a_row_adds_one_change_and_sends_no_sql(cx: &mut TestAppContext) {
+        let (view, vcx, calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 1);
+        });
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "staging must never send SQL to the connection"
+        );
+    }
+
+    #[gpui::test]
+    fn a_staged_row_carries_the_staged_delete_grammar(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert!(view.staged_id_for_row_for_test(app, 0).is_some());
+            assert!(
+                view.staged_id_for_row_for_test(app, 1).is_none(),
+                "only the row actually staged must carry the grammar"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn staging_the_same_row_twice_restores_it_instead_of_staging_a_second_time(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 0);
+            assert!(view.staged_id_for_row_for_test(app, 0).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn multiple_distinct_rows_can_be_staged_independently(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 2);
+            assert!(view.staged_id_for_row_for_test(app, 0).is_some());
+            assert!(view.staged_id_for_row_for_test(app, 1).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn discard_all_clears_every_staged_row_in_one_action(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+            view.discard_all_staged_for_test(cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 0);
+            assert!(view.staged_id_for_row_for_test(app, 0).is_none());
+            assert!(view.staged_id_for_row_for_test(app, 1).is_none());
+        });
+    }
+
+    // -- the ledger -------------------------------------------------------
+
+    #[gpui::test]
+    fn the_ledger_opens_and_closes_via_toggle_ledger(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert!(!view.staged_ledger_open_for_test(app));
+        });
+
+        view.update(vcx, ResultsView::toggle_ledger_for_test);
+        view.read_with(vcx, |view, app| {
+            assert!(view.staged_ledger_open_for_test(app));
+        });
+
+        view.update(vcx, ResultsView::toggle_ledger_for_test);
+        view.read_with(vcx, |view, app| {
+            assert!(!view.staged_ledger_open_for_test(app));
+        });
+    }
+
+    #[gpui::test]
+    fn the_ledger_closes_automatically_once_the_queue_empties(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.toggle_ledger_for_test(cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert!(view.staged_ledger_open_for_test(app));
+        });
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert!(!view.staged_ledger_open_for_test(app));
+        });
+    }
+
+    // -- right-click menu wiring -------------------------------------------
+
+    #[gpui::test]
+    fn right_clicking_a_row_and_clicking_delete_row_stages_it(cx: &mut TestAppContext) {
+        let (view, vcx, calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(0, 0, point(px(20.0), px(20.0)), cx);
+        });
+        vcx.run_until_parked();
+
+        let bounds = vcx
+            .debug_bounds("Delete row")
+            .expect("the delete-row item must render for a staging-eligible row");
+        vcx.simulate_click(bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert!(view.staged_id_for_row_for_test(app, 0).is_some());
+        });
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Reopening the menu on the same, now-staged row offers Restore
+        // instead.
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(0, 0, point(px(20.0), px(20.0)), cx);
+        });
+        vcx.run_until_parked();
+        let restore_bounds = vcx
+            .debug_bounds("Restore row")
+            .expect("a staged row's menu must offer Restore row");
+        vcx.simulate_click(restore_bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert!(view.staged_id_for_row_for_test(app, 0).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn the_menu_disables_delete_row_with_a_hint_when_no_primary_key_is_available(
+        cx: &mut TestAppContext,
+    ) {
+        let connection = Arc::new(FakeConnection {
+            relation_schema: relation_schema_with_no_pk(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_at: None,
+        });
+        let (view, vcx, _recorded) = view_with_connection(cx, connection);
+
+        view.update(vcx, |view, cx| {
+            view.open_cell_context_menu(0, 0, point(px(20.0), px(20.0)), cx);
+        });
+        vcx.run_until_parked();
+
+        let bounds = vcx
+            .debug_bounds("Delete row")
+            .expect("Delete row still renders, disabled");
+        vcx.simulate_click(bounds.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                0,
+                "clicking a disabled Delete row must stage nothing"
+            );
+            assert!(view.staged_id_for_row_for_test(app, 0).is_none());
+        });
+    }
+
+    // -- apply -------------------------------------------------------------
+
+    #[gpui::test]
+    fn apply_sends_the_ledgers_statements_in_fifo_order_and_clears_the_queue_on_success(
+        cx: &mut TestAppContext,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: calls.clone(),
+            fail_at: None,
+        });
+        let (view, vcx, dispatched) = view_with_connection(cx, connection);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+            view.apply_staged_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        let recorded_calls = calls.lock().unwrap();
+        assert_eq!(recorded_calls[0], "BEGIN");
+        assert_eq!(
+            recorded_calls[1],
+            "DELETE FROM \"public\".\"orders\" WHERE \"id\" = 1;"
+        );
+        assert_eq!(
+            recorded_calls[2],
+            "DELETE FROM \"public\".\"orders\" WHERE \"id\" = 2;"
+        );
+        assert_eq!(recorded_calls[3], "COMMIT");
+        drop(recorded_calls);
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 0);
+            assert!(!view.staged_ledger_open_for_test(app));
+        });
+        assert!(
+            dispatched.borrow().contains(&PreviewAction::Reload),
+            "a successful apply must reload the active preview"
+        );
+    }
+
+    #[gpui::test]
+    fn a_failing_statement_leaves_the_queue_staged_and_marks_apply_as_retrying(
+        cx: &mut TestAppContext,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: calls.clone(),
+            // Index 2 is the second DELETE statement (0: BEGIN, 1: first
+            // delete, 2: second delete).
+            fail_at: Some(2),
+        });
+        let (view, vcx, dispatched) = view_with_connection(cx, connection);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+            view.apply_staged_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                2,
+                "a failed apply must leave every staged row queued"
+            );
+            assert!(view.staged_id_for_row_for_test(app, 0).is_some());
+            assert!(view.staged_id_for_row_for_test(app, 1).is_some());
+            assert!(view.apply_is_retrying_for_test(app));
+        });
+        assert!(
+            !dispatched.borrow().contains(&PreviewAction::Reload),
+            "a failed apply must not reload the active preview"
+        );
+        assert_eq!(
+            calls.lock().unwrap().last().map(String::as_str),
+            Some("ROLLBACK"),
+            "a failed batch must roll back rather than commit"
+        );
+    }
+
+    // -- staging bar / ledger rendering -------------------------------------
+
+    #[gpui::test]
+    fn the_staging_bar_is_absent_until_a_row_is_staged_then_appears(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("staging-bar").is_none(),
+            "the bar must not render with an empty queue"
+        );
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("staging-bar").is_some(),
+            "the bar must render once the queue is non-empty"
+        );
+    }
+
+    #[gpui::test]
+    fn the_staging_bar_disappears_once_discard_all_empties_the_queue(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("staging-bar").is_some());
+
+        view.update(vcx, |view, cx| {
+            view.discard_all_staged_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("staging-bar").is_none(),
+            "the bar must disappear the instant discard all empties the queue"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_review_sql_expands_the_ledger_and_hide_sql_collapses_it(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("staged-ledger").is_none());
+
+        let toggle = vcx
+            .debug_bounds("staging-bar-review-sql")
+            .expect("the review sql toggle must render while the bar is showing");
+        vcx.simulate_click(toggle.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("staged-ledger").is_some(),
+            "clicking review sql must expand the ledger"
+        );
+
+        let toggle = vcx
+            .debug_bounds("staging-bar-review-sql")
+            .expect("the toggle (now reading hide sql) must still render");
+        vcx.simulate_click(toggle.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert!(
+                !view.staged_ledger_open_for_test(app),
+                "clicking hide sql must collapse the ledger"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_ledger_lists_one_line_per_staged_row_and_a_per_line_unstage_removes_only_that_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+            view.toggle_ledger_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        let first_id = view
+            .read_with(vcx, |view, app| view.staged_id_for_row_for_test(app, 0))
+            .expect("row 0 must be staged");
+        let second_id = view
+            .read_with(vcx, |view, app| view.staged_id_for_row_for_test(app, 1))
+            .expect("row 1 must be staged");
+
+        assert!(
+            vcx.debug_bounds(leak_selector(format!("ledger-line-{first_id}")))
+                .is_some()
+        );
+        assert!(
+            vcx.debug_bounds(leak_selector(format!("ledger-line-{second_id}")))
+                .is_some()
+        );
+
+        let unstage_first = vcx
+            .debug_bounds(leak_selector(format!("ledger-unstage-{first_id}")))
+            .expect("the first row's ledger line must carry an unstage control");
+        vcx.simulate_click(unstage_first.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, app| {
+            assert!(
+                view.staged_id_for_row_for_test(app, 0).is_none(),
+                "unstaging the first row's ledger line must unstage exactly that row"
+            );
+            assert!(
+                view.staged_id_for_row_for_test(app, 1).is_some(),
+                "the second row must remain staged"
+            );
+            assert_eq!(view.staged_count_for_test(app), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_applys_error_renders_on_only_the_failing_ledger_line(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = Arc::new(FakeConnection {
+            relation_schema: orders_relation_schema(),
+            calls: calls.clone(),
+            // Index 2 is the second DELETE statement (0: BEGIN, 1: first
+            // delete, 2: second delete).
+            fail_at: Some(2),
+        });
+        let (view, vcx, _recorded) = view_with_connection(cx, connection);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.stage_or_restore_row_for_test(1, cx);
+            view.toggle_ledger_for_test(cx);
+            view.apply_staged_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        let failing_id = view
+            .read_with(vcx, |view, app| view.staged_id_for_row_for_test(app, 1))
+            .expect("row 1 (the second staged entry) must still be staged after the failure");
+        let surviving_id = view
+            .read_with(vcx, |view, app| view.staged_id_for_row_for_test(app, 0))
+            .expect("row 0 must also still be staged after the failure");
+
+        assert!(
+            vcx.debug_bounds(leak_selector(format!("ledger-error-{failing_id}")))
+                .is_some(),
+            "the failing entry's ledger line must carry the error text"
+        );
+        assert!(
+            vcx.debug_bounds(leak_selector(format!("ledger-error-{surviving_id}")))
+                .is_none(),
+            "an unrelated entry's ledger line must not carry an error"
+        );
+    }
+
+    #[gpui::test]
+    fn a_begin_failure_renders_as_a_general_error_on_the_bar_not_a_ledger_line(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, vcx, _calls) = view_with_pk_schema_focused(cx, Some(0));
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.toggle_ledger_for_test(cx);
+            view.apply_staged_for_test(cx);
+        });
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("staging-bar-error").is_some(),
+            "an index-less apply failure must surface as a general error on the bar"
+        );
+        let staged_id = view
+            .read_with(vcx, |view, app| view.staged_id_for_row_for_test(app, 0))
+            .expect("the row must remain staged after the failure");
+        assert!(
+            vcx.debug_bounds(leak_selector(format!("ledger-error-{staged_id}")))
+                .is_none(),
+            "an index-less failure has no specific statement to attach an error to"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_enter_applies_the_staged_queue_through_the_real_keybinding(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, vcx, calls) = view_with_pk_schema_focused(cx, None);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("ctrl-shift-enter");
+        vcx.run_until_parked();
+
+        let recorded_calls = calls.lock().unwrap();
+        assert_eq!(recorded_calls.first().map(String::as_str), Some("BEGIN"));
+        assert!(
+            recorded_calls
+                .iter()
+                .any(|call| call.starts_with("DELETE FROM")),
+            "the keybinding must reach Apply and send the staged DELETE"
+        );
+        assert_eq!(recorded_calls.last().map(String::as_str), Some("COMMIT"));
+        drop(recorded_calls);
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 0);
+        });
+    }
+
+    // -- staging while an apply is in flight --------------------------------
+
+    #[gpui::test]
+    fn stage_unstage_and_discard_are_no_ops_while_an_apply_is_in_flight(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+            view.apply_staged_for_test(cx);
+        });
+
+        // The apply task is a background-spawned future: nothing has been
+        // parked yet, so it has not resolved and `apply_state` is still
+        // `Applying` here.
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(1, cx);
+            view.discard_all_staged_for_test(cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                1,
+                "stage/discard must be ignored while an apply is in flight"
+            );
+        });
+    }
+
+    // -- tab switch / rerun clears the queue -------------------------------
+
+    #[gpui::test]
+    fn switching_to_a_snapshot_clears_the_staged_queue(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 1);
+        });
+
+        view.update(vcx, |view, cx| {
+            view.show_snapshot(
+                super::super::super::tabs::ResultsSnapshot {
+                    source_label: "public.other".into(),
+                    state: SessionState::Results(Duration::default()),
+                    result: std::rc::Rc::new(orders_result()),
+                },
+                cx,
+            );
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                0,
+                "switching to a different tab's snapshot must clear the staged queue"
+            );
+            assert!(
+                view.staged_id_for_row_for_test(app, 0).is_none(),
+                "no staged grammar may survive a tab switch"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn rerunning_the_active_tab_clears_the_staged_queue(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 1);
+        });
+
+        view.update(vcx, |view, cx| {
+            view.show_live("public.orders", cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                0,
+                "rerunning the active tab's preview must clear the staged queue"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn paging_the_same_live_relation_preserves_the_staged_queue(cx: &mut TestAppContext) {
+        let (view, vcx, _calls) = view_with_pk_schema(cx);
+
+        view.update(vcx, |view, cx| {
+            view.stage_or_restore_row_for_test(0, cx);
+        });
+        view.read_with(vcx, |view, app| {
+            assert_eq!(view.staged_count_for_test(app), 1);
+        });
+
+        view.update(vcx, |view, cx| {
+            view.show_live_window("public.orders", cx);
+        });
+
+        view.read_with(vcx, |view, app| {
+            assert_eq!(
+                view.staged_count_for_test(app),
+                1,
+                "a same-relation window change (page/sort/filter) must preserve staged changes"
             );
         });
     }

@@ -473,6 +473,14 @@ pub fn quick_find_current_match_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_hover()
 }
 
+/// Background wash for a row staged for delete: the same rose hue as its
+/// strike line, at low opacity, for both the data cells and the row-number
+/// gutter cell.
+#[must_use]
+pub fn staged_delete_wash(theme: &Theme) -> gpui::Rgba {
+    Colors::wash(theme.colors.status_error, 0x1a)
+}
+
 /// Horizontal padding around the generated strip's trailing "generated" tag
 /// and hint text.
 pub const GENERATED_STRIP_TRAILING_PADDING_X: f32 = 14.0;
@@ -765,13 +773,65 @@ pub const MINI_STATUS_HEIGHT: Pixels = px(24.0);
 /// Text size of the mini preview's status strip.
 pub const MINI_STATUS_TEXT_SIZE: f32 = 9.5;
 
+// ---- staged-changes bar & ledger -------------------------------------
+
+/// Text size of the staging bar's amber "STAGED" tag and Discard-all/Apply
+/// buttons.
+pub const STAGING_TAG_TEXT_SIZE: Rems = Rems(0.667);
+
+pub const STAGING_BUTTON_TEXT_SIZE: Rems = Rems(0.75);
+
+/// Horizontal padding inside the staging bar's "STAGED" tag pill.
+pub const STAGING_TAG_PADDING_X: Pixels = px(6.0);
+
+/// Corner radius of the staging bar's "STAGED" tag pill.
+pub const STAGING_TAG_RADIUS: f32 = 4.0;
+
+/// Text size of the staging bar's summary ("2 deletes") and controls.
+pub const STAGING_BAR_TEXT_SIZE: f32 = 11.5;
+
+/// Height of the Discard-all/Apply controls in the staging bar.
+pub const STAGING_BUTTON_HEIGHT: Pixels = px(24.0);
+
+/// Horizontal padding inside the Discard-all/Apply controls.
+pub const STAGING_BUTTON_PADDING_X: Pixels = px(10.0);
+
+/// Corner radius of the Discard-all/Apply controls.
+pub const STAGING_BUTTON_RADIUS: f32 = 5.0;
+
+/// Text size of the Apply control's keybinding hint.
+pub const STAGING_APPLY_HINT_TEXT_SIZE: f32 = 9.5;
+
+/// Height of one ledger line.
+pub const LEDGER_ROW_HEIGHT: Pixels = px(28.0);
+
+/// Width of a ledger line's leading gutter mark.
+pub const LEDGER_GUTTER_WIDTH: Pixels = px(34.0);
+
+/// Height of the ledger's header row.
+pub const LEDGER_HEAD_HEIGHT: Pixels = px(28.0);
+
+/// Text size of a ledger line's statement text.
+pub const LEDGER_TEXT_SIZE: f32 = 12.0;
+
+/// Text size of a ledger line's source-row reference and the ledger
+/// header's caption.
+pub const LEDGER_META_TEXT_SIZE: f32 = 10.0;
+
+/// Width of a ledger line's trailing per-line unstage control.
+pub const LEDGER_UNSTAGE_WIDTH: Pixels = px(30.0);
+
+/// Tallest the expanded ledger panel grows before it scrolls.
+pub const LEDGER_MAX_HEIGHT: Pixels = px(240.0);
+
 #[cfg(test)]
 mod tests {
     use super::{
         GENERATED_STRIP_HEIGHT, GENERATED_STRIP_MAX_LINES, generated_strip_accent,
         generated_strip_bg, generated_strip_height, modal_row_active_bg,
         quick_find_current_match_bg, quick_find_match_bg, run_button_disabled_bg, run_button_hint,
-        run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, status_disconnected,
+        run_button_hover_bg, schema_badge_pk_border, sidebar_selected_bg, staged_delete_wash,
+        status_disconnected,
     };
     use zsql_ui::theme::Theme;
 
@@ -846,5 +906,17 @@ mod tests {
             theme.colors.accent_wash(),
             "the current match's wash must differ from the grid's own focused-cell selection wash"
         );
+    }
+
+    /// The staged-delete wash must stay visually distinct from the
+    /// quick-find match wash and the grid's own selection wash, so a staged
+    /// row's grammar is never mistaken for either.
+    #[test]
+    fn staged_delete_wash_is_distinct_from_quick_find_and_selection_washes() {
+        let theme = Theme::default();
+        let staged = staged_delete_wash(&theme);
+        assert_ne!(staged, quick_find_match_bg(&theme));
+        assert_ne!(staged, quick_find_current_match_bg(&theme));
+        assert_ne!(staged, theme.colors.accent_wash());
     }
 }

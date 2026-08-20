@@ -58,7 +58,7 @@ impl TabModel {
         let task = self.session.update(cx, |session, cx| {
             session.preview_relation(schema, relation, cx)
         });
-        self.dispatch_run(id, format!("{schema}.{relation}"), task, cx);
+        self.dispatch_run(id, format!("{schema}.{relation}"), task, false, cx);
         self.sync_preview_controls(cx);
 
         tracing::info!(tab_id = id, schema, relation, "opened generated tab");

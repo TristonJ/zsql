@@ -14,6 +14,7 @@ pub mod schema;
 pub mod schema_detail;
 pub mod sql;
 pub mod tls_verify;
+pub mod transaction;
 pub mod value;
 
 pub use accumulate::{AccumulateStatus, ResultAccumulator, row_limit_reached};
@@ -41,4 +42,5 @@ pub use sql::{
     default_preview_query, quote_ident,
 };
 pub use tls_verify::TlsVerify;
+pub use transaction::Transaction;
 pub use value::{ColumnMeta, ResultSet, Row, RowBatch, Value};

@@ -61,6 +61,9 @@ pub struct Config {
     pub autosave: AutosaveConfig,
     /// Timing for the sidebar's own periodic housekeeping.
     pub sidebar: SidebarConfig,
+    /// The results grid's staged-changes queue: the keybinding that applies
+    /// it.
+    pub staging: StagingConfig,
 }
 
 /// Timing for autosave/draft persistence
@@ -142,6 +145,25 @@ impl SidebarConfig {
     #[must_use]
     pub fn scripts_relative_time_refresh(&self) -> Duration {
         Duration::from_millis(self.scripts_relative_time_refresh_ms)
+    }
+}
+
+/// The results grid's staged-changes queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StagingConfig {
+    /// The key chord that applies the staged-changes queue, in `gpui`
+    /// keystroke syntax (e.g. `ctrl-shift-enter`).
+    pub apply_keybinding: String,
+}
+
+const DEFAULT_STAGING_APPLY_KEYBINDING: &str = "ctrl-shift-enter";
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self {
+            apply_keybinding: DEFAULT_STAGING_APPLY_KEYBINDING.to_owned(),
+        }
     }
 }
 
