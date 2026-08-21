@@ -1209,3 +1209,425 @@ fn shift_secondary_z_secondary_y_and_ctrl_y_keystrokes_all_dispatch_redo(cx: &mu
         );
     });
 }
+
+mod find_tests {
+    use gpui::{Focusable as _, Hsla};
+    use zsql_ui::theme::ActiveTheme as _;
+
+    use super::super::{EditorView, FindNext, FindPrev, OpenFind};
+    use super::{MoveDocumentEnd, Position, build_harness};
+
+    const SEEDED_TEXT: &str =
+        "select * from orders\nwhere orders.id > 1\nunion select * from orders";
+
+    /// A harness with the editor's and the shared `TextField`'s own
+    /// keybindings registered (so `simulate_keystrokes` reaches both the
+    /// editor pane and the find bar's query input), seeded with
+    /// [`SEEDED_TEXT`]: `"orders"` matches once on each of its three lines.
+    fn find_harness(
+        cx: &mut gpui::TestAppContext,
+    ) -> (super::Harness, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::init(cx, &crate::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        });
+        let (harness, vcx) = build_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test(SEEDED_TEXT);
+        });
+        (harness, vcx)
+    }
+
+    #[gpui::test]
+    fn secondary_f_opens_the_bar_with_its_input_focused(cx: &mut gpui::TestAppContext) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert!(view.find_is_open_for_test());
+        });
+        let input_focus = harness
+            .editor
+            .read_with(vcx, EditorView::find_input_focus_handle_for_test)
+            .expect("the bar must be open");
+        vcx.update(|window, _cx| {
+            assert!(
+                input_focus.is_focused(window),
+                "opening the bar must move window focus into its query input"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn opening_the_bar_twice_only_refocuses_the_existing_session(cx: &mut gpui::TestAppContext) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_match_count_for_test(), Some(3));
+        });
+
+        let editor_focus = harness.editor.read_with(vcx, EditorView::focus_handle);
+        vcx.update(|window, _cx| window.focus(&editor_focus));
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_match_count_for_test(),
+                Some(3),
+                "opening the bar again must refocus the existing session, not replace it \
+                 with a fresh, empty-query one"
+            );
+        });
+        let input_focus = harness
+            .editor
+            .read_with(vcx, EditorView::find_input_focus_handle_for_test)
+            .expect("the bar must still be open");
+        vcx.update(|window, _cx| {
+            assert!(
+                input_focus.is_focused(window),
+                "opening the bar again while it is already open must refocus its query input"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn typing_a_query_lands_the_cursor_on_the_first_match_with_no_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_match_count_for_test(), Some(3));
+            assert_eq!(view.find_current_number_for_test(), Some(1));
+            let buffer = view.buffer_for_test();
+            assert_eq!(
+                buffer.cursor(),
+                Position::new(0, 14),
+                "the cursor must land on the first match's start"
+            );
+            assert!(
+                !buffer.has_selection(),
+                "landing on a match must not create a real selection"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_query_has_no_matches_and_no_current_match(cx: &mut gpui::TestAppContext) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_match_count_for_test(), Some(0));
+            assert_eq!(view.find_current_number_for_test(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn enter_and_shift_enter_navigate_matches_with_wraparound_and_never_insert_a_newline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_current_number_for_test(), Some(1));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_current_number_for_test(), Some(2));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_current_number_for_test(), Some(3));
+        });
+
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_current_number_for_test(),
+                Some(1),
+                "Enter from the last match must wrap to the first"
+            );
+        });
+
+        vcx.simulate_keystrokes("shift-enter");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_current_number_for_test(),
+                Some(3),
+                "Shift+Enter from the first match must wrap to the last"
+            );
+            assert_eq!(
+                view.buffer_for_test().text(),
+                SEEDED_TEXT,
+                "Enter/Shift+Enter while the find input is focused must never insert a \
+                 newline into the buffer"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_the_case_toggle_recomputes_matches_case_sensitively(cx: &mut gpui::TestAppContext) {
+        let (harness, vcx) = find_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("select * from ORDERS\nwhere orders.id > 1");
+        });
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_case_sensitive_for_test(),
+                Some(false),
+                "case-sensitivity starts off"
+            );
+            assert_eq!(view.find_match_count_for_test(), Some(2));
+        });
+
+        let case_bounds = vcx
+            .debug_bounds("editor-find-bar-case")
+            .expect("the bar must paint its case toggle");
+        vcx.simulate_click(case_bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_case_sensitive_for_test(), Some(true));
+            assert_eq!(
+                view.find_match_count_for_test(),
+                Some(1),
+                "case-sensitive \"orders\" must no longer match \"ORDERS\""
+            );
+        });
+
+        vcx.simulate_click(case_bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_case_sensitive_for_test(), Some(false));
+            assert_eq!(
+                view.find_match_count_for_test(),
+                Some(2),
+                "toggling case back off must restore the case-insensitive matches"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn find_next_and_find_prev_actions_navigate_with_wraparound(cx: &mut gpui::TestAppContext) {
+        // Exercises the same handler the bar's next/previous buttons invoke
+        // on click.
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(FindNext);
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_current_number_for_test(), Some(2));
+        });
+
+        vcx.dispatch_action(FindPrev);
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(view.find_current_number_for_test(), Some(1));
+        });
+
+        vcx.dispatch_action(FindPrev);
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_current_number_for_test(),
+                Some(3),
+                "previous from the first match must wrap to the last"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_bar_clears_matches_and_restores_editor_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        let landed_cursor = harness
+            .editor
+            .read_with(vcx, |view, _app| view.buffer_for_test().cursor());
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert!(!view.find_is_open_for_test());
+            assert_eq!(
+                view.find_match_count_for_test(),
+                None,
+                "closing the bar must clear every highlight"
+            );
+            assert_eq!(
+                view.buffer_for_test().cursor(),
+                landed_cursor,
+                "closing the bar must leave the cursor at the last current match, not reset it"
+            );
+        });
+        let editor_focus = harness.editor.read_with(vcx, EditorView::focus_handle);
+        vcx.update(|window, _cx| {
+            assert!(
+                editor_focus.is_focused(window),
+                "closing the bar must return window focus to the editor pane's own focus handle"
+            );
+        });
+    }
+
+    #[gpui::test]
+    // Line counts here are always tiny, so the `usize -> f32` conversion
+    // below cannot lose meaningful precision.
+    #[allow(clippy::cast_precision_loss)]
+    fn stepping_to_a_match_below_the_fold_scrolls_it_into_view(cx: &mut gpui::TestAppContext) {
+        let (harness, vcx) = find_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            let mut lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+            lines.push("needle".to_owned());
+            view.set_text_for_test(&lines.join("\n"));
+        });
+        vcx.run_until_parked();
+
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("n e e d l e");
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            let viewport = view.scroll_handle.bounds().size.height;
+            assert!(
+                viewport > gpui::px(0.0),
+                "the pane has a measured height after paint"
+            );
+            let scroll = -view.scroll_handle.offset().y;
+            let line_height = gpui::px(crate::theme::EDITOR_LINE_HEIGHT);
+            let match_line = view.buffer_for_test().cursor().line;
+            let match_top =
+                gpui::px(crate::theme::EDITOR_PADDING_Y) + line_height * match_line as f32;
+            assert!(
+                match_top >= scroll && match_top + line_height <= scroll + viewport + gpui::px(1.0),
+                "the found match's line must be scrolled into the viewport"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn editing_the_buffer_while_the_bar_is_open_updates_the_match_count(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, vcx) = find_harness(cx);
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("z z z");
+        vcx.run_until_parked();
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_match_count_for_test(),
+                Some(0),
+                "\"zzz\" does not appear anywhere in the seeded buffer yet"
+            );
+        });
+
+        vcx.dispatch_action(MoveDocumentEnd);
+        harness.editor.update(vcx, |view, cx| {
+            view.insert_text_for_test("zzz", cx);
+        });
+        vcx.run_until_parked();
+
+        harness.editor.read_with(vcx, |view, _app| {
+            assert_eq!(
+                view.find_match_count_for_test(),
+                Some(1),
+                "an edit to the buffer while the find bar is open must recompute matches live"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn matches_paint_a_background_over_exactly_their_matched_characters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, vcx) = find_harness(cx);
+        harness.editor.update(vcx, |view, _cx| {
+            view.set_text_for_test("select orders from orders");
+        });
+        vcx.dispatch_action(OpenFind);
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("o r d e r s");
+        vcx.run_until_parked();
+
+        let (font, base_color) = vcx.update(|window, _cx| {
+            let style = window.text_style();
+            (style.font(), style.color)
+        });
+
+        harness.editor.update(vcx, |view, cx| {
+            let active_theme = cx.theme();
+            let runs = super::build_runs(
+                view,
+                0,
+                "select orders from orders",
+                &font,
+                base_color,
+                active_theme,
+            );
+
+            let current_bg = Hsla::from(crate::theme::find_current_match_bg(active_theme));
+            let match_bg = Hsla::from(crate::theme::find_match_bg(active_theme));
+            assert_ne!(
+                current_bg, match_bg,
+                "the current match and a plain match must paint distinct backgrounds"
+            );
+
+            // "select orders from orders" -- the first "orders" (bytes
+            // 7..13) is the current match, the second (19..25) is not.
+            // Every other run must paint no background, regardless of how
+            // the syntax highlighter itself split up the surrounding text.
+            let mut offset = 0usize;
+            for run in &runs {
+                let range = offset..offset + run.len;
+                let expected = match (range.start, range.end) {
+                    (7, 13) => Some(current_bg),
+                    (19, 25) => Some(match_bg),
+                    _ => None,
+                };
+                assert_eq!(
+                    run.background_color, expected,
+                    "run at byte range {range:?} has an unexpected background"
+                );
+                offset += run.len;
+            }
+            assert_eq!(offset, "select orders from orders".len());
+        });
+    }
+}

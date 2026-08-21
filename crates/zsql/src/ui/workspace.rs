@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent,
+    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable,
     KeybindingKeystroke, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathPromptOptions, Pixels, Render, Task, Window, canvas, div, prelude::*, px, rems, rgb,
 };
@@ -247,6 +247,7 @@ impl WorkspaceView {
         let tab_bar_state = tab_bar::TabBarState::new(cx);
 
         Self::subscribe_to_connection_and_tab_changes(&connections, &appearance, &tabs, cx);
+        Self::install_find_key_routing(cx);
 
         Self {
             session: header_session,
@@ -811,15 +812,37 @@ impl WorkspaceView {
 }
 
 impl WorkspaceView {
-    /// Routes Ctrl+F to the sidebar's own find row when the pointer sits
-    /// over the sidebar and the sidebar does not already have keyboard
-    /// focus (that case dispatches through the sidebar's own key binding
-    /// normally). Pre-empts whatever the currently focused view's own
-    /// binding would otherwise do, including the results grid's quick
-    /// find, so a hover always wins over an unrelated focus elsewhere.
+    /// Install the app-level interceptor [`Self::route_find_key`] runs
+    /// through. Registered once at construction via `App::intercept_keystrokes`
+    /// rather than an element's `capture_key_down`: a raw key event's capture
+    /// phase never runs once the keystroke already resolves to a bound
+    /// action for the currently focused view (the editor's or results
+    /// grid's own open-find binding, for instance), so only an interceptor
+    /// -- which runs before any binding resolves -- can reliably pre-empt
+    /// those bindings on a sidebar hover.
+    fn install_find_key_routing(cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.route_find_key(event, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Routes an open-find keystroke to the sidebar's own find row when the
+    /// pointer sits over the sidebar and the sidebar does not already have
+    /// keyboard focus (that case dispatches through the sidebar's own key
+    /// binding normally). Pre-empts whatever the currently focused view's
+    /// own binding would otherwise do, including the editor's and the
+    /// results grid's own find, so a hover always wins over an unrelated
+    /// focus elsewhere.
     fn route_find_key(
         &mut self,
-        event: &KeyDownEvent,
+        event: &gpui::KeystrokeEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -864,7 +887,6 @@ impl Render for WorkspaceView {
             .flex()
             .flex_col()
             .size_full()
-            .capture_key_down(cx.listener(Self::route_find_key))
             .bg(rgb(colors.bg_app))
             .font_family(&cx.theme().fonts.ui)
             .child(

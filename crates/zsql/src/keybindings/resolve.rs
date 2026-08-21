@@ -8,9 +8,9 @@ use zsql_ui::text_field::TextFieldBindings;
 
 use super::Keystrokes;
 use super::config::{
-    CellEditKeybindings, EditorKeybindings, OpenModalKeybindings, QuickFindKeybindings,
-    ResultsKeybindings, SaveModalKeybindings, SchemaViewKeybindings, SidebarKeybindings,
-    TextFieldKeybindings, ValuePanelKeybindings,
+    CellEditKeybindings, EditorFindKeybindings, EditorKeybindings, OpenModalKeybindings,
+    QuickFindKeybindings, ResultsKeybindings, SaveModalKeybindings, SchemaViewKeybindings,
+    SidebarKeybindings, TextFieldKeybindings, ValuePanelKeybindings,
 };
 use crate::config::{Config, StagingConfig};
 use crate::ui::open_modal::OpenModalBindings;
@@ -53,7 +53,7 @@ pub struct ResolvedKeybindings {
 #[tracing::instrument(name = "resolve_keybindings", skip(config))]
 pub fn resolve(config: &Config) -> ResolvedKeybindings {
     ResolvedKeybindings {
-        editor: resolve_editor(&config.keybindings.editor),
+        editor: resolve_editor(&config.keybindings.editor, &config.keybindings.editor_find),
         text_field: resolve_text_field(&config.keybindings.text_field),
         results: resolve_results(
             &config.keybindings.results,
@@ -144,7 +144,7 @@ fn resolve_apply_staged(
     default.to_vec()
 }
 
-fn resolve_editor(cfg: &EditorKeybindings) -> EditorBindings {
+fn resolve_editor(cfg: &EditorKeybindings, find_cfg: &EditorFindKeybindings) -> EditorBindings {
     let d = EditorBindings::default();
     EditorBindings {
         move_left: resolve!(cfg, d, "editor", move_left),
@@ -177,6 +177,22 @@ fn resolve_editor(cfg: &EditorKeybindings) -> EditorBindings {
         browse_script_files: resolve!(cfg, d, "editor", browse_script_files),
         undo: resolve!(cfg, d, "editor", undo),
         redo: resolve!(cfg, d, "editor", redo),
+        open_find: resolve!(cfg, d, "editor", open_find),
+        find_next: resolve_field(
+            find_cfg.next.as_ref(),
+            "keybindings.editor_find.next",
+            &d.find_next,
+        ),
+        find_prev: resolve_field(
+            find_cfg.prev.as_ref(),
+            "keybindings.editor_find.prev",
+            &d.find_prev,
+        ),
+        close_find: resolve_field(
+            find_cfg.close.as_ref(),
+            "keybindings.editor_find.close",
+            &d.close_find,
+        ),
     }
 }
 
@@ -309,14 +325,14 @@ mod tests {
             run_query: Some(keystrokes(&["f5"])),
             ..Default::default()
         };
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, vec!["f5".to_owned()]);
     }
 
     #[test]
     fn an_unset_field_falls_back_to_the_default() {
         let cfg = EditorKeybindings::default();
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, EditorBindings::default().run_query);
     }
 
@@ -326,7 +342,7 @@ mod tests {
             run_query: Some(keystrokes(&["not-a-key"])),
             ..Default::default()
         };
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, EditorBindings::default().run_query);
     }
 
@@ -336,7 +352,7 @@ mod tests {
             run_query: Some(keystrokes(&["f5", "not-a-key", "f6"])),
             ..Default::default()
         };
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, vec!["f5".to_owned(), "f6".to_owned()]);
     }
 
@@ -346,7 +362,7 @@ mod tests {
             run_query: Some(keystrokes(&["not-a-key", "also-not-a-key"])),
             ..Default::default()
         };
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, EditorBindings::default().run_query);
     }
 
@@ -356,7 +372,7 @@ mod tests {
             run_query: Some(Keystrokes(Vec::new())),
             ..Default::default()
         };
-        let resolved = resolve_editor(&cfg);
+        let resolved = resolve_editor(&cfg, &EditorFindKeybindings::default());
         assert_eq!(resolved.run_query, EditorBindings::default().run_query);
     }
 
@@ -381,6 +397,31 @@ mod tests {
         assert_eq!(resolved.editor.save_script, default.save_script);
         assert_eq!(resolved.editor.undo, default.undo);
         assert_eq!(resolved.editor.redo, default.redo);
+        assert_eq!(resolved.editor.open_find, default.open_find);
+        assert_eq!(resolved.editor.find_next, default.find_next);
+        assert_eq!(resolved.editor.find_prev, default.find_prev);
+        assert_eq!(resolved.editor.close_find, default.close_find);
+    }
+
+    #[test]
+    fn a_toml_doc_overriding_only_editor_find_next_leaves_every_other_keybinding_at_its_default() {
+        let config: crate::config::Config =
+            toml::from_str("[keybindings.editor_find]\nnext = \"f7\"\n").unwrap();
+        let resolved = resolve(&config);
+
+        assert_eq!(resolved.editor.find_next, vec!["f7".to_owned()]);
+        let editor_default = EditorBindings::default();
+        assert_eq!(resolved.editor.open_find, editor_default.open_find);
+        assert_eq!(resolved.editor.find_prev, editor_default.find_prev);
+        assert_eq!(resolved.editor.close_find, editor_default.close_find);
+        assert_eq!(resolved.editor.run_query, editor_default.run_query);
+        assert_eq!(resolved.text_field, TextFieldBindings::default());
+        assert_eq!(resolved.results, ResultsBindings::default());
+        assert_eq!(resolved.value_panel, ValuePanelBindings::default());
+        assert_eq!(resolved.sidebar, SidebarBindings::default());
+        assert_eq!(resolved.schema_view, SchemaViewBindings::default());
+        assert_eq!(resolved.open_modal, OpenModalBindings::default());
+        assert_eq!(resolved.save_modal, SaveModalBindings::default());
     }
 
     #[test]
@@ -613,6 +654,10 @@ mod tests {
                 "ctrl-y".to_owned(),
             ]
         );
+        assert_eq!(d.open_find, one("secondary-f"));
+        assert_eq!(d.find_next, one("enter"));
+        assert_eq!(d.find_prev, one("shift-enter"));
+        assert_eq!(d.close_find, one("escape"));
     }
 
     #[test]

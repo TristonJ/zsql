@@ -7,6 +7,7 @@
 
 mod bindings;
 mod buffer;
+mod find;
 mod highlighter;
 mod theme;
 mod view;

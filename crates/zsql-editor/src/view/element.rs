@@ -14,6 +14,7 @@ use zsql_ui::text_input::{self, SelectionLineSpan};
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use super::EditorView;
+use crate::find::MatchSpan;
 use crate::theme;
 use crate::{Position, Selection, TextBuffer};
 
@@ -161,6 +162,10 @@ impl Element for EditorContentElement {
                 bounds.left(),
                 text_input::line_top(bounds.top(), line_height, line_index),
             );
+            // Run backgrounds (find-match washes) are a separate paint pass:
+            // `paint` alone draws only the glyphs.
+            line.paint_background(origin, line_height, window, cx)
+                .expect("shaped editor line backgrounds should paint");
             line.paint(origin, line_height, window, cx)
                 .expect("shaped editor line should paint");
         }
@@ -270,11 +275,27 @@ pub(super) fn build_runs(
     let line_char_len = raw_line.chars().count();
     let spans = editor.highlighter.spans_for_line(line_index);
     let marked_range = active_marked_range_on_line(editor, line_index, line_char_len);
+    let find_matches_on_line: Vec<MatchSpan> = editor
+        .find
+        .as_ref()
+        .map(|find| {
+            find.matches()
+                .iter()
+                .copied()
+                .filter(|m| m.line == line_index)
+                .collect()
+        })
+        .unwrap_or_default();
+    let current_find_match = editor
+        .find
+        .as_ref()
+        .and_then(super::find::EditorFindState::current)
+        .filter(|m| m.line == line_index);
 
-    // Every span/marked-range boundary that falls inside this line, plus the
-    // line's own ends. Between any two consecutive boundaries the set of
-    // spans/marked-range covering the text cannot change, so each such
-    // interval becomes exactly one run.
+    // Every span/marked-range/find-match boundary that falls inside this
+    // line, plus the line's own ends. Between any two consecutive
+    // boundaries the set of spans/marked-range/matches covering the text
+    // cannot change, so each such interval becomes exactly one run.
     let mut boundaries: Vec<usize> = vec![0, line_char_len];
     for span in spans {
         boundaries.push(span.start.min(line_char_len));
@@ -283,6 +304,10 @@ pub(super) fn build_runs(
     if let Some(marked) = &marked_range {
         boundaries.push(marked.start);
         boundaries.push(marked.end);
+    }
+    for m in &find_matches_on_line {
+        boundaries.push(m.start.min(line_char_len));
+        boundaries.push(m.end.min(line_char_len));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -310,6 +335,15 @@ pub(super) fn build_runs(
             .as_ref()
             .is_some_and(|marked| marked.start <= start && end <= marked.end);
 
+        let covers = |m: &MatchSpan| m.start <= start && end <= m.end;
+        let background_color = if current_find_match.is_some_and(|m| covers(&m)) {
+            Some(Hsla::from(theme::find_current_match_bg(active_theme)))
+        } else if find_matches_on_line.iter().any(covers) {
+            Some(Hsla::from(theme::find_match_bg(active_theme)))
+        } else {
+            None
+        };
+
         let byte_start = editor
             .buffer
             .line_byte_offset(Position::new(line_index, start));
@@ -320,13 +354,17 @@ pub(super) fn build_runs(
             len: byte_end - byte_start,
             font: font.clone(),
             color: run_color,
-            background_color: None,
+            background_color,
             underline: underlined.then_some(underline_style),
             strikethrough: None,
         };
 
         match runs.last_mut() {
-            Some(last) if last.color == run.color && last.underline == run.underline => {
+            Some(last)
+                if last.color == run.color
+                    && last.underline == run.underline
+                    && last.background_color == run.background_color =>
+            {
                 last.len += run.len;
             }
             _ => runs.push(run),

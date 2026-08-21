@@ -35,6 +35,29 @@ pub fn selection_bg(theme: &Theme) -> gpui::Rgba {
     theme.colors.accent_wash_hover()
 }
 
+// -- find bar ------------------------------------------------------------
+
+/// Top offset of the find bar, floating over the editor pane's top-right.
+pub const FIND_BAR_TOP_OFFSET: Pixels = px(10.0);
+/// Right offset of the find bar from the editor pane's edge.
+pub const FIND_BAR_RIGHT_OFFSET: Pixels = px(14.0);
+
+/// Background wash for a find match: the amber value/warn hue at low
+/// opacity, distinct from the current match's stronger accent wash and from
+/// [`selection_bg`].
+#[must_use]
+pub fn find_match_bg(theme: &Theme) -> gpui::Rgba {
+    zsql_ui::theme::Colors::wash(theme.colors.status_warn, 0x2e)
+}
+
+/// Background wash for the current find match: a stronger accent wash than
+/// [`selection_bg`], so the two stay visually distinct even when the
+/// current match sits inside an active text selection.
+#[must_use]
+pub fn find_current_match_bg(theme: &Theme) -> gpui::Rgba {
+    zsql_ui::theme::Colors::wash(theme.colors.accent, 0x59)
+}
+
 // -- syntax highlighting -----------------------------------------------
 //
 // One color per `crate::HighlightKind`, matching the style guide's syntax
@@ -64,9 +87,32 @@ pub fn syntax_color(theme: &Theme, kind: crate::HighlightKind) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::syntax_color;
+    use super::{find_current_match_bg, find_match_bg, selection_bg, syntax_color};
     use crate::HighlightKind;
     use zsql_ui::theme::Theme;
+
+    /// The find match and current-match washes must draw from the amber and
+    /// accent roles respectively, and stay pairwise distinct from each
+    /// other and from the editor's own text-selection wash.
+    #[test]
+    fn find_washes_are_amber_for_a_match_and_a_distinct_accent_for_the_current_one() {
+        let theme = Theme::default();
+        assert_eq!(
+            find_match_bg(&theme),
+            zsql_ui::theme::Colors::wash(theme.colors.status_warn, 0x2e)
+        );
+        assert_ne!(find_match_bg(&theme), find_current_match_bg(&theme));
+        assert_ne!(
+            find_current_match_bg(&theme),
+            selection_bg(&theme),
+            "the current match's wash must differ from the editor's own selection wash"
+        );
+        assert_ne!(
+            find_match_bg(&theme),
+            selection_bg(&theme),
+            "a plain match's wash must differ from the editor's own selection wash"
+        );
+    }
 
     /// Each `HighlightKind` maps to its own named role, not the role another
     /// kind also happens to read -- pinned against the role fields directly
