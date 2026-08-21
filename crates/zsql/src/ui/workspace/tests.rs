@@ -4420,6 +4420,41 @@ mod find_routing_tests {
     }
 
     #[gpui::test]
+    fn ctrl_f_with_the_editor_focused_and_the_sidebar_not_hovered_opens_the_editor_find(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, vcx) = build(cx);
+        vcx.run_until_parked();
+
+        let editor_focus = workspace
+            .read_with(vcx, WorkspaceView::editor_focus_handle)
+            .expect("a workspace always opens with an active editor");
+        vcx.update(|window, _cx| window.focus(&editor_focus));
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let editor = workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .expect("a workspace always opens with an active tab")
+                .editor();
+            assert!(
+                editor.read(cx).find_is_open_for_test(),
+                "Ctrl+F with the editor focused and the sidebar not hovered must open the \
+                 editor's own find bar"
+            );
+            assert!(
+                !workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the sidebar's find row must not have opened"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn ctrl_f_with_the_sidebar_neither_focused_nor_hovered_still_opens_the_results_quick_find(
         cx: &mut TestAppContext,
     ) {

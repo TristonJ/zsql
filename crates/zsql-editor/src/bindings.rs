@@ -38,6 +38,10 @@ pub struct EditorBindings {
     pub browse_script_files: Vec<String>,
     pub undo: Vec<String>,
     pub redo: Vec<String>,
+    pub open_find: Vec<String>,
+    pub find_next: Vec<String>,
+    pub find_prev: Vec<String>,
+    pub close_find: Vec<String>,
 }
 
 fn one(s: &str) -> Vec<String> {
@@ -81,6 +85,10 @@ impl Default for EditorBindings {
                 "secondary-y".to_owned(),
                 "ctrl-y".to_owned(),
             ],
+            open_find: one("secondary-f"),
+            find_next: one("enter"),
+            find_prev: one("shift-enter"),
+            close_find: one("escape"),
         }
     }
 }
@@ -107,5 +115,14 @@ mod tests {
                 "ctrl-y".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn find_actions_default_to_the_shared_quick_find_keystrokes() {
+        let bindings = EditorBindings::default();
+        assert_eq!(bindings.open_find, vec!["secondary-f".to_owned()]);
+        assert_eq!(bindings.find_next, vec!["enter".to_owned()]);
+        assert_eq!(bindings.find_prev, vec!["shift-enter".to_owned()]);
+        assert_eq!(bindings.close_find, vec!["escape".to_owned()]);
     }
 }

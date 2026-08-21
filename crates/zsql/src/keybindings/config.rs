@@ -28,6 +28,8 @@ pub struct KeybindingsConfig {
     #[serde(skip_serializing_if = "is_default")]
     pub quick_find: QuickFindKeybindings,
     #[serde(skip_serializing_if = "is_default")]
+    pub editor_find: EditorFindKeybindings,
+    #[serde(skip_serializing_if = "is_default")]
     pub cell_edit: CellEditKeybindings,
     #[serde(skip_serializing_if = "is_default")]
     pub value_panel: ValuePanelKeybindings,
@@ -106,6 +108,8 @@ pub struct EditorKeybindings {
     pub undo: Option<Keystrokes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redo: Option<Keystrokes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_find: Option<Keystrokes>,
 }
 
 /// `[keybindings.text_field]`: the shared single-line `TextField`'s
@@ -187,6 +191,18 @@ pub struct QuickFindKeybindings {
     pub prev: Option<Keystrokes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<Keystrokes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close: Option<Keystrokes>,
+}
+
+/// `[keybindings.editor_find]`: the SQL editor pane's inline find bar.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindKeybindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<Keystrokes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev: Option<Keystrokes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close: Option<Keystrokes>,
 }
@@ -276,7 +292,18 @@ mod tests {
         let parsed: KeybindingsConfig = toml::from_str("[editor]\nrun_query = \"f5\"\n").unwrap();
         assert_eq!(parsed.editor.run_query.unwrap().0, vec!["f5".to_owned()]);
         assert!(parsed.editor.save_script.is_none());
+        assert!(parsed.editor.open_find.is_none());
         assert!(parsed.results.copy.is_none());
         assert!(parsed.sidebar.open_find.is_none());
+        assert!(parsed.editor_find.next.is_none());
+    }
+
+    #[test]
+    fn a_partial_editor_find_only_override_leaves_every_other_field_unset() {
+        let parsed: KeybindingsConfig = toml::from_str("[editor_find]\nnext = \"f7\"\n").unwrap();
+        assert_eq!(parsed.editor_find.next.unwrap().0, vec!["f7".to_owned()]);
+        assert!(parsed.editor_find.prev.is_none());
+        assert!(parsed.editor_find.close.is_none());
+        assert!(parsed.editor.open_find.is_none());
     }
 }

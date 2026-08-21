@@ -85,6 +85,10 @@ actions!(
         Paste,
         Undo,
         Redo,
+        OpenFind,
+        FindNext,
+        FindPrev,
+        CloseFind,
     ]
 );
 
@@ -96,11 +100,21 @@ fn bind_each(
     keystrokes: &[String],
     action: &(impl gpui::Action + Clone),
 ) {
+    bind_each_in(keys, keystrokes, action, KEY_CONTEXT);
+}
+
+/// Like [`bind_each`], but scoped to `context` instead of [`KEY_CONTEXT`].
+fn bind_each_in(
+    keys: &mut Vec<KeyBinding>,
+    keystrokes: &[String],
+    action: &(impl gpui::Action + Clone),
+    context: &'static str,
+) {
     for keystroke in keystrokes {
         keys.push(KeyBinding::new(
             keystroke,
             Clone::clone(action),
-            Some(KEY_CONTEXT),
+            Some(context),
         ));
     }
 }
@@ -144,6 +158,15 @@ pub fn init(cx: &mut App, bindings: &EditorBindings) {
     bind_each(&mut keys, &bindings.browse_script_files, &BrowseScriptFiles);
     bind_each(&mut keys, &bindings.undo, &Undo);
     bind_each(&mut keys, &bindings.redo, &Redo);
+    bind_each(&mut keys, &bindings.open_find, &OpenFind);
+    bind_each_in(&mut keys, &bindings.find_next, &FindNext, find::KEY_CONTEXT);
+    bind_each_in(&mut keys, &bindings.find_prev, &FindPrev, find::KEY_CONTEXT);
+    bind_each_in(
+        &mut keys,
+        &bindings.close_find,
+        &CloseFind,
+        find::KEY_CONTEXT,
+    );
     let registered = keys.len();
     cx.bind_keys(keys);
     tracing::debug!(registered, "zsql_editor keybindings registered");
@@ -188,6 +211,9 @@ pub struct EditorView {
     /// Cursor position at the last autoscroll. Autoscroll only fires when the
     /// cursor moves, so it never fights a manual scroll.
     last_autoscroll_cursor: Option<Position>,
+    /// The open find session, if any. `None` renders no find bar and paints
+    /// no match highlights.
+    find: Option<find::EditorFindState>,
 }
 
 impl EditorView {
@@ -213,6 +239,7 @@ impl EditorView {
             last_bounds: None,
             scroll_handle: ScrollHandle::new(),
             last_autoscroll_cursor: None,
+            find: None,
         }
     }
 
@@ -222,6 +249,7 @@ impl EditorView {
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer = TextBuffer::from_text(text);
         self.sync_highlighter();
+        self.sync_find_matches(cx);
         cx.notify();
     }
 
@@ -286,6 +314,7 @@ impl EditorView {
     /// [`EditListener`].
     fn notify_edit(&mut self, cx: &mut Context<Self>) {
         self.sync_highlighter();
+        self.sync_find_matches(cx);
         cx.notify();
         if let Some(on_edit) = &self.on_edit {
             on_edit(cx);
@@ -688,6 +717,7 @@ impl Render for EditorView {
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
+            .relative()
             .flex()
             .flex_col()
             // Height comes from the parent workspace column: that wrapper
@@ -726,6 +756,7 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::save_script_as))
             .on_action(cx.listener(Self::open_script))
             .on_action(cx.listener(Self::browse_script_files))
+            .on_action(cx.listener(Self::open_find))
             .child(
                 div()
                     .id("sql-editor-code")
@@ -768,6 +799,7 @@ impl Render for EditorView {
                             ),
                     ),
             )
+            .children(self.render_find_overlay(cx))
     }
 }
 
@@ -825,6 +857,7 @@ impl EditorView {
 }
 
 mod element;
+mod find;
 mod input;
 
 #[cfg(test)]
