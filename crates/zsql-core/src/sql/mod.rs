@@ -4,6 +4,8 @@ use std::fmt::Write as _;
 
 use crate::filter::{FilterState, render_where_body};
 
+pub mod params;
+
 /// Arguments for generating preview queries
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewQueryArgs {

@@ -111,6 +111,10 @@ pub struct ConnectionFooterView {
     /// The transient save confirmation or error shown after an explicit or
     /// automatic script save, if one is currently visible
     save_confirmation: Option<SaveStatus>,
+    /// The detected parameter count to show in place of the normal query
+    /// message, while the "Run with parameters" modal is open for the
+    /// active tab's run.
+    waiting_params_count: Option<usize>,
 }
 
 /// The footer's transient post-save message
@@ -143,7 +147,15 @@ impl ConnectionFooterView {
             result_snapshot: None,
             row_count: None,
             save_confirmation: None,
+            waiting_params_count: None,
         }
+    }
+
+    /// Show (or, with `None`, clear) the detected parameter count while the
+    /// "Run with parameters" modal is open for the active tab's run.
+    pub fn set_waiting_params_count(&mut self, count: Option<usize>, cx: &mut Context<Self>) {
+        self.waiting_params_count = count;
+        cx.notify();
     }
 
     /// Show the transient "saved <file>" confirmation, replacing any
@@ -187,6 +199,11 @@ impl ConnectionFooterView {
     #[cfg(test)]
     pub(crate) fn save_error_showing_for_test(&self) -> bool {
         matches!(self.save_confirmation, Some(SaveStatus::Error(_)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_params_count_for_test(&self) -> Option<usize> {
+        self.waiting_params_count
     }
 
     /// Force the footer to render a certain result rather than reading from the
@@ -365,6 +382,12 @@ impl ConnectionFooterView {
             .font_family(&cx.theme().fonts.data)
             .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
             .text_color(rgb(cx.theme().colors.text_secondary));
+        if let Some(count) = self.waiting_params_count {
+            return view.child(format!(
+                "{count} parameter{}",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
         let state = self.effective_state(cx);
         let result = self.effective_result(cx);
         let error_message = match state {

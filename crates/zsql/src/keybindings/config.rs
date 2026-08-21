@@ -41,6 +41,8 @@ pub struct KeybindingsConfig {
     pub open_modal: OpenModalKeybindings,
     #[serde(skip_serializing_if = "is_default")]
     pub save_modal: SaveModalKeybindings,
+    #[serde(skip_serializing_if = "is_default")]
+    pub parameters_modal: ParametersModalKeybindings,
 }
 
 /// `[keybindings.editor]`: the SQL editor pane's move/select/edit/run/save
@@ -275,6 +277,17 @@ pub struct SaveModalKeybindings {
     pub select_previous_destination: Option<Keystrokes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub select_next_destination: Option<Keystrokes>,
+}
+
+/// `[keybindings.parameters_modal]`: the "Run with parameters" modal's
+/// field-to-field focus navigation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParametersModalKeybindings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_field: Option<Keystrokes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_field: Option<Keystrokes>,
 }
 
 #[cfg(test)]

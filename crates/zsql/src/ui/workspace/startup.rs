@@ -51,6 +51,15 @@ pub struct WorkspaceStartup {
     /// config the same way the sidebar's own binding is (typically
     /// `crate::keybindings::resolve`'s result's `sidebar.open_find`).
     pub open_find_keystrokes: Vec<String>,
+    /// Maximum past values the "Run with parameters" modal remembers per
+    /// (connection, script, parameter) (typically
+    /// [`crate::config::ParametersConfig::max_history_per_param`]).
+    pub param_history_max: usize,
+    /// The "Run with parameters" modal's Tab/Shift-Tab field-navigation
+    /// keystrokes, resolved the same way every other registration site's
+    /// bindings are (typically `crate::keybindings::resolve`'s result's
+    /// `parameters_modal`).
+    pub parameters_modal_bindings: crate::ui::parameters_modal::ParametersModalBindings,
 }
 
 impl Default for WorkspaceStartup {
@@ -67,6 +76,9 @@ impl Default for WorkspaceStartup {
             scripts_relative_time_refresh: crate::config::SidebarConfig::default()
                 .scripts_relative_time_refresh(),
             open_find_keystrokes: crate::ui::sidebar::SidebarBindings::default().open_find,
+            param_history_max: crate::config::ParametersConfig::default().max_history_per_param,
+            parameters_modal_bindings:
+                crate::ui::parameters_modal::ParametersModalBindings::default(),
         }
     }
 }

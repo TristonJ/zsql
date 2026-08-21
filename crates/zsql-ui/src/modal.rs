@@ -19,6 +19,8 @@ type ModalCloseHandler = Rc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App)>;
 pub struct Modal<H: IntoElement + 'static, B: IntoElement + 'static> {
     id: ElementId,
     size: ModalSize,
+    /// Overrides [`ModalSize::width`] when set; see [`Modal::width`].
+    width_override: Option<Pixels>,
     head: H,
     body: B,
     has_close_icon: bool,
@@ -72,6 +74,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         Modal {
             id: id.clone(),
             size: ModalSize::Small,
+            width_override: None,
             head: div(),
             body: div(),
             has_close_icon: true,
@@ -83,6 +86,14 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
     #[must_use]
     pub fn size(mut self, size: ModalSize) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Use an exact panel width instead of [`ModalSize::width`]'s preset,
+    /// keeping the size's radius and head height.
+    #[must_use]
+    pub fn width(mut self, width: Pixels) -> Self {
+        self.width_override = Some(width);
         self
     }
 
@@ -114,6 +125,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         Modal {
             id: self.id,
             size: self.size,
+            width_override: self.width_override,
             head: self.head,
             body: child,
             has_close_icon: self.has_close_icon,
@@ -126,6 +138,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> Modal<H, B> {
         Modal {
             id: self.id,
             size: self.size,
+            width_override: self.width_override,
             head: child,
             body: self.body,
             has_close_icon: self.has_close_icon,
@@ -143,7 +156,11 @@ impl<H: IntoElement, B: IntoElement> Modal<H, B> {
             .flex_row()
             .items_center()
             .flex_shrink_0()
-            .h(self.size.head_height())
+            // min-height, not a fixed height: a taller head (eyebrow +
+            // title + subtitle) grows the container instead of bleeding
+            // past it.
+            .min_h(self.size.head_height())
+            .py(px(12.0))
             .px_3()
             .border_b_1()
             .border_color(rgb(colors.border_soft))
@@ -214,7 +231,7 @@ impl<H: IntoElement + 'static, B: IntoElement + 'static> RenderOnce for Modal<H,
         let panel = div()
             .id((id.clone(), "panel"))
             .debug_selector(|| format!("{}-{}", id, "panel"))
-            .w(self.size.width())
+            .w(self.width_override.unwrap_or_else(|| self.size.width()))
             .bg(rgb(colors.bg_panel))
             .border_1()
             .border_color(rgb(colors.border))

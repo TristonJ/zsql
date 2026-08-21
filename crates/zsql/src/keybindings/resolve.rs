@@ -9,11 +9,12 @@ use zsql_ui::text_field::TextFieldBindings;
 use super::Keystrokes;
 use super::config::{
     CellEditKeybindings, EditorFindKeybindings, EditorKeybindings, OpenModalKeybindings,
-    QuickFindKeybindings, ResultsKeybindings, SaveModalKeybindings, SchemaViewKeybindings,
-    SidebarKeybindings, TextFieldKeybindings, ValuePanelKeybindings,
+    ParametersModalKeybindings, QuickFindKeybindings, ResultsKeybindings, SaveModalKeybindings,
+    SchemaViewKeybindings, SidebarKeybindings, TextFieldKeybindings, ValuePanelKeybindings,
 };
 use crate::config::{Config, StagingConfig};
 use crate::ui::open_modal::OpenModalBindings;
+use crate::ui::parameters_modal::ParametersModalBindings;
 use crate::ui::results::ResultsBindings;
 use crate::ui::save_modal::SaveModalBindings;
 use crate::ui::schema_view::SchemaViewBindings;
@@ -45,6 +46,7 @@ pub struct ResolvedKeybindings {
     pub schema_view: SchemaViewBindings,
     pub open_modal: OpenModalBindings,
     pub save_modal: SaveModalBindings,
+    pub parameters_modal: ParametersModalBindings,
 }
 
 /// Resolve `config`'s `[keybindings]` section (plus the legacy
@@ -66,6 +68,7 @@ pub fn resolve(config: &Config) -> ResolvedKeybindings {
         schema_view: resolve_schema_view(&config.keybindings.schema_view),
         open_modal: resolve_open_modal(&config.keybindings.open_modal),
         save_modal: resolve_save_modal(&config.keybindings.save_modal),
+        parameters_modal: resolve_parameters_modal(&config.keybindings.parameters_modal),
     }
 }
 
@@ -310,6 +313,14 @@ fn resolve_save_modal(cfg: &SaveModalKeybindings) -> SaveModalBindings {
     }
 }
 
+fn resolve_parameters_modal(cfg: &ParametersModalKeybindings) -> ParametersModalBindings {
+    let d = ParametersModalBindings::default();
+    ParametersModalBindings {
+        next_field: resolve!(cfg, d, "parameters_modal", next_field),
+        previous_field: resolve!(cfg, d, "parameters_modal", previous_field),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +445,10 @@ mod tests {
         assert_eq!(resolved.schema_view, SchemaViewBindings::default());
         assert_eq!(resolved.open_modal, OpenModalBindings::default());
         assert_eq!(resolved.save_modal, SaveModalBindings::default());
+        assert_eq!(
+            resolved.parameters_modal,
+            ParametersModalBindings::default()
+        );
     }
 
     #[test]
@@ -454,6 +469,10 @@ mod tests {
         assert_eq!(resolved.schema_view, SchemaViewBindings::default());
         assert_eq!(resolved.open_modal, OpenModalBindings::default());
         assert_eq!(resolved.save_modal, SaveModalBindings::default());
+        assert_eq!(
+            resolved.parameters_modal,
+            ParametersModalBindings::default()
+        );
     }
 
     #[test]
@@ -602,6 +621,15 @@ mod tests {
         assert_eq!(resolved.save_modal, SaveModalBindings::default());
     }
 
+    #[test]
+    fn resolving_a_default_config_wires_the_parameters_modal_areas_own_default_impl() {
+        let resolved = resolve(&crate::config::Config::default());
+        assert_eq!(
+            resolved.parameters_modal,
+            ParametersModalBindings::default()
+        );
+    }
+
     // -- pinning: resolved defaults match today's hardcoded keystrokes,
     // asserted literally so a typo in an area's `Default` impl (e.g.
     // "secondry-c") is caught even though it would still equal itself in
@@ -743,5 +771,24 @@ mod tests {
         let d = resolve(&crate::config::Config::default()).save_modal;
         assert_eq!(d.select_previous_destination, one("up"));
         assert_eq!(d.select_next_destination, one("down"));
+    }
+
+    #[test]
+    fn parameters_modal_defaults_pin_every_action_to_its_historical_keystroke() {
+        let d = resolve(&crate::config::Config::default()).parameters_modal;
+        assert_eq!(d.next_field, one("tab"));
+        assert_eq!(d.previous_field, one("shift-tab"));
+    }
+
+    #[test]
+    fn a_toml_doc_overriding_the_parameters_modal_fields_carries_each_to_its_own_output() {
+        let config: crate::config::Config = toml::from_str(
+            "[keybindings.parameters_modal]\nnext_field = \"f7\"\nprevious_field = \"f8\"\n",
+        )
+        .unwrap();
+        let resolved = resolve(&config);
+
+        assert_eq!(resolved.parameters_modal.next_field, one("f7"));
+        assert_eq!(resolved.parameters_modal.previous_field, one("f8"));
     }
 }

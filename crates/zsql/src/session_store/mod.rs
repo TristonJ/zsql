@@ -4,7 +4,7 @@
 //! reconnect (or app restart) can rebuild the same tabs.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -14,6 +14,7 @@ mod disk;
 pub mod external;
 pub mod library;
 pub mod migration;
+mod param_history;
 mod save_claim;
 mod session_dir;
 mod snapshot;
@@ -25,6 +26,7 @@ pub(crate) use disk::{
     draft_file_name, is_unsafe_script_name, script_file_name, unique_script_file_name,
 };
 pub use library::LibraryDir;
+pub use param_history::{PARAM_HISTORY_FILE_NAME, ParamHistoryFile};
 pub use save_claim::{SaveClaim, SaveClaimFactory};
 pub(crate) use session_dir::SCRIPTS_DIR_NAME;
 pub use session_dir::SessionDir;
@@ -99,6 +101,7 @@ pub struct SessionStore {
     last_active_connection: Option<ActiveConnection>,
     suppress_next_save: bool,
     session_cache: HashMap<ConnectionKey, Arc<TabSessionSnapshot>>,
+    param_history_cache: HashMap<PathBuf, Arc<ParamHistoryFile>>,
     claims: SaveClaimFactory,
 }
 
@@ -115,6 +118,7 @@ impl SessionStore {
             last_active_connection: None,
             suppress_next_save: false,
             session_cache: HashMap::new(),
+            param_history_cache: HashMap::new(),
             claims: SaveClaimFactory::new(),
         }
     }
@@ -225,5 +229,46 @@ impl SessionStore {
         let snapshot = Arc::new(snapshot);
         self.session_cache.insert(key, Arc::clone(&snapshot));
         Some((root, key, snapshot, claim))
+    }
+
+    /// `path`'s remembered parameter values: served from this store's own
+    /// cache once loaded, so a lookup right after
+    /// [`Self::record_param_run`] never races that call's own background
+    /// write to disk. Loads and caches from disk (or starts empty) the
+    /// first time this store sees `path`.
+    pub fn param_history(&mut self, path: &Path) -> Arc<ParamHistoryFile> {
+        if let Some(file) = self.param_history_cache.get(path) {
+            return Arc::clone(file);
+        }
+        let file = ParamHistoryFile::load(path).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to load remembered parameter values");
+            ParamHistoryFile::default()
+        });
+        let file = Arc::new(file);
+        self.param_history_cache
+            .insert(path.to_path_buf(), Arc::clone(&file));
+        file
+    }
+
+    /// Record `values` as `script_key`'s most recent run against `path`'s
+    /// cached remembered values, updating the cache synchronously (so the
+    /// merged state is visible to the very next [`Self::param_history`]
+    /// call, before any write reaches disk) and minting the claim its
+    /// caller's write to disk must run under, so two rapid calls can never
+    /// let an older write clobber a newer one.
+    pub fn record_param_run(
+        &mut self,
+        path: &Path,
+        script_key: &str,
+        values: &HashMap<String, String>,
+        max_history: usize,
+    ) -> (Arc<ParamHistoryFile>, SaveClaim) {
+        let mut file = (*self.param_history(path)).clone();
+        file.record_run(script_key, values, max_history);
+        let file = Arc::new(file);
+        self.param_history_cache
+            .insert(path.to_path_buf(), Arc::clone(&file));
+        let claim = self.claims.mint(path);
+        (file, claim)
     }
 }

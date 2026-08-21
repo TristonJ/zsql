@@ -2082,6 +2082,460 @@ mod header_tests {
             );
         });
     }
+
+    fn temp_sessions_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "zsql-workspace-param-history-test-{label}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// Build a workspace over a fresh, query-recording session, connected
+    /// to `active` and pointed at `sessions_root`. Standing in for both
+    /// "a workspace connects" and, called again with the same
+    /// `sessions_root`/`active`, "the app restarts and reconnects".
+    fn connected_param_test_workspace<'a>(
+        sessions_root: &std::path::Path,
+        active: crate::ui::connections::ActiveConnection,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<WorkspaceView>, &'a mut gpui::VisualTestContext) {
+        let (session, _queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    sessions_root: Some(sessions_root.to_path_buf()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(active, cx);
+        });
+        vcx.run_until_parked();
+        (workspace, vcx)
+    }
+
+    /// Running a parameterized query end to end (Run button, fill in the
+    /// field, confirm) remembers the value; a completely fresh
+    /// workspace/session pointed at the same sessions root and reconnected
+    /// to the same connection -- standing in for an app restart -- restores
+    /// the same script and, running it again, reopens the parameters modal
+    /// with that value already prefilled.
+    #[gpui::test]
+    fn parameter_values_persist_across_a_simulated_reload(cx: &mut TestAppContext) {
+        use crate::ui::connections::ActiveConnection;
+
+        cx.update(|cx| {
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        });
+
+        let sessions_root = temp_sessions_dir("param-persist");
+        let active = ActiveConnection {
+            id: None,
+            name: "conn".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let sql = "select * from orders where status = :status";
+
+        {
+            let (workspace, vcx) =
+                connected_param_test_workspace(&sessions_root, active.clone(), cx);
+
+            let editor = workspace.read_with(vcx, |workspace, cx| {
+                workspace
+                    .tabs
+                    .read(cx)
+                    .active_tab()
+                    .unwrap()
+                    .editor()
+                    .clone()
+            });
+            editor.update(vcx, |editor, cx| editor.set_text(sql, cx));
+            workspace.update(vcx, WorkspaceView::save_active_tab_session);
+            vcx.run_until_parked();
+
+            workspace.update(vcx, WorkspaceView::run_active_tab);
+            vcx.run_until_parked();
+            workspace.read_with(vcx, |workspace, cx| {
+                assert!(
+                    workspace.parameters_modal.read(cx).is_open(),
+                    "a parameterized run must open the parameters modal"
+                );
+            });
+
+            vcx.simulate_input("shipped");
+            vcx.simulate_keystrokes("enter");
+            vcx.run_until_parked();
+            workspace.read_with(vcx, |workspace, cx| {
+                assert!(
+                    !workspace.parameters_modal.read(cx).is_open(),
+                    "confirming with every field filled must close the modal"
+                );
+            });
+        }
+
+        // Simulate an app restart: a brand-new workspace/session pointed at
+        // the same sessions root reconnects to the same connection.
+        let (workspace, vcx) = connected_param_test_workspace(&sessions_root, active, cx);
+
+        workspace.read_with(vcx, |workspace, cx| {
+            let text = workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .editor()
+                .read(cx)
+                .text();
+            assert_eq!(
+                text, sql,
+                "the restored tab's SQL must survive the simulated reload"
+            );
+        });
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(workspace.parameters_modal.read(cx).is_open());
+            assert_eq!(
+                workspace
+                    .parameters_modal
+                    .read(cx)
+                    .field_value_for_test(0, cx),
+                "shipped",
+                "reopening the modal for the same script must prefill its remembered value"
+            );
+        });
+
+        std::fs::remove_dir_all(&sessions_root).ok();
+    }
+
+    /// While the parameters modal is open, the results pane shows the
+    /// waiting-for-parameters placeholder and the footer shows the
+    /// detected parameter count; cancelling (Escape) clears both and
+    /// restores the results pane to what it held before the run was
+    /// intercepted.
+    #[gpui::test]
+    fn the_waiting_state_shows_while_open_and_clears_on_cancel(cx: &mut TestAppContext) {
+        use crate::ui::connections::ActiveConnection;
+
+        cx.update(|cx| {
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        });
+
+        let sessions_root = temp_sessions_dir("param-waiting-state");
+        let active = ActiveConnection {
+            id: None,
+            name: "conn".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let (workspace, vcx) = connected_param_test_workspace(&sessions_root, active, cx);
+
+        workspace.read_with(vcx, |workspace, cx| {
+            assert_eq!(
+                workspace.results.read(cx).waiting_for_params_for_test(),
+                None
+            );
+            assert_eq!(
+                workspace.footer.read(cx).waiting_params_count_for_test(),
+                None
+            );
+        });
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.set_text("select * from orders where status = :status", cx);
+        });
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(workspace.parameters_modal.read(cx).is_open());
+            assert_eq!(
+                workspace.results.read(cx).waiting_for_params_for_test(),
+                Some(1),
+                "the results pane must show the waiting placeholder while the modal is open"
+            );
+            assert_eq!(
+                workspace.footer.read(cx).waiting_params_count_for_test(),
+                Some(1),
+                "the footer must show the detected parameter count while the modal is open"
+            );
+        });
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(!workspace.parameters_modal.read(cx).is_open());
+            assert_eq!(
+                workspace.results.read(cx).waiting_for_params_for_test(),
+                None,
+                "cancelling must clear the waiting placeholder"
+            );
+            assert_eq!(
+                workspace.footer.read(cx).waiting_params_count_for_test(),
+                None,
+                "cancelling must clear the footer's parameter count"
+            );
+        });
+
+        std::fs::remove_dir_all(&sessions_root).ok();
+    }
+
+    /// Two confirmed runs in a row both land: the second's remembered value
+    /// is never dropped by the first's own background write to disk, and
+    /// reopening the modal right after a confirm already reflects it --
+    /// both read through the session store's own in-memory cache, never a
+    /// background read racing its own write.
+    #[gpui::test]
+    fn two_confirmed_runs_in_a_row_never_drop_a_remembered_value(cx: &mut TestAppContext) {
+        use crate::ui::connections::ActiveConnection;
+
+        cx.update(|cx| {
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        });
+
+        let sessions_root = temp_sessions_dir("param-rapid-confirm");
+        let active = ActiveConnection {
+            id: None,
+            name: "conn".to_owned(),
+            url: "postgres://localhost/a".to_owned(),
+        };
+        let (workspace, vcx) = connected_param_test_workspace(&sessions_root, active, cx);
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| {
+            editor.set_text("select * from orders where status = :status", cx);
+        });
+        workspace.update(vcx, WorkspaceView::save_active_tab_session);
+        vcx.run_until_parked();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        vcx.simulate_input("pending");
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .parameters_modal
+                    .read(cx)
+                    .field_value_for_test(0, cx),
+                "pending",
+                "reopening right after a confirm must already show its just-entered value"
+            );
+        });
+        vcx.simulate_keystrokes("secondary-a");
+        vcx.simulate_input("shipped");
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .parameters_modal
+                    .read(cx)
+                    .field_value_for_test(0, cx),
+                "shipped",
+                "the most recent confirm's value must be remembered"
+            );
+        });
+
+        std::fs::remove_dir_all(&sessions_root).ok();
+    }
+
+    /// A store with two saved connections (`conn-a` then `conn-b`,
+    /// index-order matching add-order) at a unique temp path (returned so
+    /// the test can remove it), plus a sessions root this test owns
+    /// exclusively.
+    fn isolation_test_store_and_sessions_root(
+        label: &str,
+    ) -> (ConnectionStore, std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::connections::ConnectionArgs;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let connections_path = std::env::temp_dir().join(format!(
+            "zsql-workspace-param-{label}-{}-{n}.toml",
+            std::process::id()
+        ));
+        let mut store = ConnectionStore::load(&connections_path)
+            .expect("loading a nonexistent path must succeed empty");
+        for (name, url) in [
+            ("conn-a", "postgres://localhost/a"),
+            ("conn-b", "postgres://localhost/b"),
+        ] {
+            store
+                .add(ConnectionArgs {
+                    name: name.to_owned(),
+                    url: url.to_owned(),
+                    ssh: None,
+                    ssh_secret: None,
+                })
+                .unwrap_or_else(|_| panic!("add {name} must succeed"));
+        }
+        (store, connections_path, temp_sessions_dir(label))
+    }
+
+    /// Set the active tab's SQL to `sql`, save its session, run it, and
+    /// confirm the resulting parameters modal by typing `value` into its
+    /// (only) field.
+    fn run_and_confirm_single_param(
+        workspace: &Entity<WorkspaceView>,
+        vcx: &mut gpui::VisualTestContext,
+        sql: &str,
+        value: &str,
+    ) {
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| editor.set_text(sql, cx));
+        workspace.update(vcx, WorkspaceView::save_active_tab_session);
+        vcx.run_until_parked();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        vcx.simulate_input(value);
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+    }
+
+    /// Two different saved connections never share remembered parameter
+    /// values, even for the same script SQL under the same `sessions_root`:
+    /// each connection's history lives in its own session directory.
+    #[gpui::test]
+    fn remembered_values_never_leak_between_connections(cx: &mut TestAppContext) {
+        use crate::ui::connections::ActiveConnection;
+
+        cx.update(|cx| {
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+        });
+
+        let (store, connections_path, sessions_root) =
+            isolation_test_store_and_sessions_root("connection-isolation");
+        let saved_ids: Vec<uuid::Uuid> = store.connections().iter().map(|c| c.id).collect();
+
+        let (session, _queries) = recording_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                store,
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    sessions_root: Some(sessions_root.clone()),
+                    active_theme_name: "zsql-dark".to_owned(),
+                    themes_dir: None,
+                    config_path: None,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+
+        let sql = "select * from orders where status = :status";
+
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(
+                ActiveConnection {
+                    id: Some(saved_ids[0]),
+                    name: "conn-a".to_owned(),
+                    url: "postgres://localhost/a".to_owned(),
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        run_and_confirm_single_param(&workspace, vcx, sql, "shipped");
+
+        // Switch to a different saved connection: same sessions_root, same
+        // script SQL, but its own session directory.
+        workspace.update(vcx, |workspace, cx| {
+            workspace.set_active_connection(
+                ActiveConnection {
+                    id: Some(saved_ids[1]),
+                    name: "conn-b".to_owned(),
+                    url: "postgres://localhost/b".to_owned(),
+                },
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+
+        let editor = workspace.read_with(vcx, |workspace, cx| {
+            workspace
+                .tabs
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .editor()
+                .clone()
+        });
+        editor.update(vcx, |editor, cx| editor.set_text(sql, cx));
+        workspace.update(vcx, WorkspaceView::save_active_tab_session);
+        vcx.run_until_parked();
+
+        workspace.update(vcx, WorkspaceView::run_active_tab);
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(workspace.parameters_modal.read(cx).is_open());
+            assert_eq!(
+                workspace
+                    .parameters_modal
+                    .read(cx)
+                    .field_value_for_test(0, cx),
+                "",
+                "a different connection's remembered value must not leak into this one's modal"
+            );
+        });
+
+        std::fs::remove_file(&connections_path).ok();
+        std::fs::remove_dir_all(&sessions_root).ok();
+    }
 }
 
 mod save_flow_tests {

@@ -274,6 +274,11 @@ pub struct ResultsView {
     /// edits; `None` before that cell has ever painted (e.g. a test that
     /// opens the popover without a real render pass).
     focused_cell_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The detected parameter count while the "Run with parameters" modal
+    /// is open for the active tab's run, in place of `None`'s normal
+    /// state-driven rendering. Cleared once the modal closes (run or
+    /// cancel); see [`ResultsView::show_waiting_for_params`].
+    waiting_for_params: Option<usize>,
 }
 
 /// A results grid cell's open right-click context menu: the triggering
@@ -370,6 +375,7 @@ impl ResultsView {
             cell_editor,
             pending_grid_refocus: false,
             focused_cell_bounds: Rc::new(Cell::new(None)),
+            waiting_for_params: None,
         };
         view.sync_dimensions(cx);
         view
@@ -427,6 +433,11 @@ impl ResultsView {
         self.preview
             .as_ref()
             .and_then(|preview| preview.state.last_page_number())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_for_params_for_test(&self) -> Option<usize> {
+        self.waiting_for_params
     }
 
     /// [`PrevPage`]'s handler: step the active preview's pager back one
@@ -580,6 +591,15 @@ impl ResultsView {
     /// [`ResultsView::render_grid_or_text`] never reassembles it.
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active_theme = cx.theme();
+        if let Some(count) = self.waiting_for_params {
+            return Self::render_placeholder(
+                active_theme.colors.text_tertiary,
+                "Waiting for parameters...",
+                &snapshot::waiting_for_params_detail(count),
+                active_theme,
+            )
+            .into_any_element();
+        }
         let state = self.effective_state(cx).clone();
         let has_columns = !self.effective_result(cx).columns.is_empty();
 

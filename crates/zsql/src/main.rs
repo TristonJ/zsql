@@ -54,6 +54,7 @@ fn build_workspace_window(
     cfg: &Config,
     connection_store: ConnectionStore,
     open_find_keystrokes: Vec<String>,
+    parameters_modal_bindings: ui::parameters_modal::ParametersModalBindings,
 ) -> gpui::Entity<WorkspaceView> {
     let session = cx.new(|_cx| Session::new(cfg));
 
@@ -72,6 +73,8 @@ fn build_workspace_window(
         edit_debounce: cfg.autosave.edit_debounce(),
         scripts_relative_time_refresh: cfg.sidebar.scripts_relative_time_refresh(),
         open_find_keystrokes,
+        param_history_max: cfg.parameters.max_history_per_param,
+        parameters_modal_bindings,
     };
     let workspace = cx.new(|cx| {
         WorkspaceView::new(
@@ -176,7 +179,14 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    build_workspace_window(window, cx, &cfg, connection_store, open_find_keystrokes)
+                    build_workspace_window(
+                        window,
+                        cx,
+                        &cfg,
+                        connection_store,
+                        open_find_keystrokes,
+                        bindings.parameters_modal,
+                    )
                 },
             )
             .expect("failed to open window");

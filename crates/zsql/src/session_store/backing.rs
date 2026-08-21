@@ -190,6 +190,19 @@ impl ScriptBacking {
         }
     }
 
+    /// A stable identity for this backing's remembered parameter values,
+    /// distinct across every kind of backing so switching tabs or scripts
+    /// never shows another script's history.
+    #[must_use]
+    pub fn param_history_key(&self) -> String {
+        match self {
+            Self::SessionScratch { file } => format!("scratch:{}", file.as_str()),
+            Self::SessionNamed { file } => format!("session:{}", file.as_str()),
+            Self::Library { name, .. } => format!("library:{}", name.as_str()),
+            Self::External { path, .. } => format!("external:{}", path.display()),
+        }
+    }
+
     /// What pressing Save does for a tab with this backing.
     #[must_use]
     pub fn save_action(&self) -> SaveAction {
@@ -508,6 +521,46 @@ mod tests {
             saved_text: Some("select 1;".to_owned()),
         };
         assert_eq!(backing.save_action(), SaveAction::WriteExternal);
+    }
+
+    #[test]
+    fn param_history_key_distinguishes_every_kind_of_backing() {
+        let scratch = ScriptBacking::SessionScratch {
+            file: file("query-1.sql"),
+        };
+        let named = ScriptBacking::SessionNamed {
+            file: file("query-1.sql"),
+        };
+        let library = ScriptBacking::Library {
+            name: lib_name("query-1"),
+            saved_text: None,
+        };
+        let external = ScriptBacking::External {
+            path: PathBuf::from("/tmp/query-1.sql"),
+            saved_text: None,
+        };
+        let keys = [
+            scratch.param_history_key(),
+            named.param_history_key(),
+            library.param_history_key(),
+            external.param_history_key(),
+        ];
+        let mut unique = keys.to_vec();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "every backing kind must key uniquely: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn param_history_key_is_stable_for_the_same_backing() {
+        let backing = ScriptBacking::SessionNamed {
+            file: file("orders.sql"),
+        };
+        assert_eq!(backing.param_history_key(), backing.param_history_key());
     }
 
     #[test]

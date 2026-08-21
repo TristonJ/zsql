@@ -13,7 +13,8 @@ use zsql_core::{
 use zsql_core::preview_state::PreviewQueryState;
 
 use super::{
-    PreviewControlsChanged, ResultsChanged, ResultsSnapshot, SaveRequested, Tab, TabKind, TabModel,
+    ParametersRequested, PreviewControlsChanged, ResultsChanged, ResultsSnapshot, SaveRequested,
+    Tab, TabKind, TabModel,
 };
 use crate::session::{Session, SessionState};
 use crate::session_store::{ScriptBacking, ScriptFileName, TabEntrySnapshot, TabSessionSnapshot};
@@ -3964,4 +3965,133 @@ fn subscribe_save_events(
         .detach();
     });
     events
+}
+
+/// Subscribes to `model`'s [`ParametersRequested`] events, returning a
+/// shared log of every event emitted after this call.
+fn subscribe_parameters_events(
+    model: &Entity<TabModel>,
+    cx: &mut TestAppContext,
+) -> Rc<RefCell<Vec<ParametersRequested>>> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let events_for_sub = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(model, move |_model, evt: &ParametersRequested, _cx| {
+            events_for_sub.borrow_mut().push(evt.clone());
+        })
+        .detach();
+    });
+    events
+}
+
+/// A `Script` tab's run whose SQL has no detected parameters must dispatch
+/// through `Session::run_query` exactly as it did before parameterized
+/// queries existed: one `stream_query` call, and no
+/// [`ParametersRequested`] event.
+#[gpui::test]
+fn running_a_script_tab_with_no_parameters_dispatches_run_query_exactly_as_before(
+    cx: &mut TestAppContext,
+) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let events = subscribe_parameters_events(&model, cx);
+
+    model.update(cx, |model, cx| {
+        model.run_for_tab(id, "SELECT * FROM orders".to_owned(), cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        1,
+        "a parameter-free run must dispatch to Session::run_query exactly once"
+    );
+    assert!(
+        events.borrow().is_empty(),
+        "a parameter-free run must never open the parameters modal"
+    );
+}
+
+/// A `Script` tab's run whose SQL has one or more detected `:name`
+/// parameters must open the parameters modal instead of dispatching: no
+/// `stream_query` call, and exactly one [`ParametersRequested`] event
+/// naming every detected parameter.
+#[gpui::test]
+fn running_a_script_tab_with_parameters_opens_the_modal_instead_of_dispatching(
+    cx: &mut TestAppContext,
+) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+    let events = subscribe_parameters_events(&model, cx);
+
+    model.update(cx, |model, cx| {
+        model.run_for_tab(
+            id,
+            "SELECT * FROM orders WHERE status = :status".to_owned(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        0,
+        "a parameterized run must never reach Session::run_query directly"
+    );
+    let events = events.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tab_id, id);
+    assert_eq!(events[0].parameters.len(), 1);
+    assert_eq!(events[0].parameters[0].name, "status");
+}
+
+/// [`TabModel::run_confirmed_params`] (the parameters modal's "Run query"
+/// seam) dispatches exactly like an ordinary parameter-free run.
+#[gpui::test]
+fn run_confirmed_params_dispatches_through_run_query_like_an_ordinary_run(cx: &mut TestAppContext) {
+    let (model, sinks) = build_model_with_recording_connection(cx);
+    let id = model.update(cx, TabModel::new_script_tab);
+
+    model.update(cx, |model, cx| {
+        model.run_confirmed_params(
+            id,
+            "SELECT * FROM orders WHERE status = 'shipped'".to_owned(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    assert_eq!(sinks.lock().expect("sinks lock poisoned").len(), 1);
+}
+
+/// [`TabModel::run_confirmed_params`] while the session holds no live
+/// connection must return without dispatching anything: the session's
+/// state stays exactly as it was, where any dispatch would have moved it
+/// to `Running` (or `Error`, had the run reached `Session::run_query`).
+#[gpui::test]
+fn run_confirmed_params_while_not_connected_never_dispatches(cx: &mut TestAppContext) {
+    let session = cx.update(|cx| {
+        cx.new(|_cx| {
+            Session::new_for_render_test(SessionState::Empty, zsql_core::ResultSet::default())
+        })
+    });
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session.clone(), cx)));
+    let id = model.update(cx, TabModel::new_script_tab);
+
+    model.update(cx, |model, cx| {
+        model.run_confirmed_params(
+            id,
+            "SELECT * FROM orders WHERE status = 'shipped'".to_owned(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    session.read_with(cx, |session, _cx| {
+        assert_eq!(
+            session.state(),
+            &SessionState::Empty,
+            "a confirmed-parameters run while not connected must never dispatch"
+        );
+    });
 }

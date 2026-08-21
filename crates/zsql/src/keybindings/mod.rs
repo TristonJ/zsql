@@ -7,11 +7,13 @@
 mod bind;
 pub mod config;
 mod keystrokes;
+mod parse;
 mod resolve;
 
 pub(crate) use bind::bind_all;
 pub use config::KeybindingsConfig;
 pub use keystrokes::Keystrokes;
+pub(crate) use parse::parse_keystrokes;
 pub use resolve::resolve;
 
 #[cfg(test)]

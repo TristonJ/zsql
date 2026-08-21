@@ -66,6 +66,8 @@ pub struct Config {
     /// The results grid's staged-changes queue: the keybinding that applies
     /// it.
     pub staging: StagingConfig,
+    /// The "Run with parameters" modal's remembered-value history.
+    pub parameters: ParametersConfig,
     /// Overrides for the keyboard shortcuts every registration site binds by
     /// default.
     #[serde(skip_serializing_if = "crate::keybindings::config::is_default")]
@@ -169,6 +171,24 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             apply_keybinding: DEFAULT_STAGING_APPLY_KEYBINDING.to_owned(),
+        }
+    }
+}
+
+/// The "Run with parameters" modal's remembered-value history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParametersConfig {
+    /// Maximum past values remembered per (connection, script, parameter).
+    pub max_history_per_param: usize,
+}
+
+const DEFAULT_MAX_HISTORY_PER_PARAM: usize = 10;
+
+impl Default for ParametersConfig {
+    fn default() -> Self {
+        Self {
+            max_history_per_param: DEFAULT_MAX_HISTORY_PER_PARAM,
         }
     }
 }

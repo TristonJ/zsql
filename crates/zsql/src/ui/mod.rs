@@ -6,6 +6,7 @@ pub mod editor_adapter;
 pub mod footer;
 pub mod format;
 pub mod open_modal;
+pub mod parameters_modal;
 pub mod results;
 pub mod save_modal;
 pub mod schema_view;

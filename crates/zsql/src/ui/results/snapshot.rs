@@ -39,6 +39,24 @@ impl ResultsView {
         cx.notify();
     }
 
+    /// Show the "Waiting for parameters..." placeholder, naming `count`
+    /// detected parameters, in place of the grid or any stale prior result.
+    /// Shown while the "Run with parameters" modal is open for the active
+    /// tab's run.
+    pub fn show_waiting_for_params(&mut self, count: usize, cx: &mut Context<Self>) {
+        self.waiting_for_params = Some(count);
+        cx.notify();
+    }
+
+    /// Clear the waiting-for-parameters placeholder, if shown, restoring
+    /// whatever this view already held underneath (its live or frozen
+    /// state is untouched by showing/clearing the placeholder).
+    pub fn clear_waiting_for_params(&mut self, cx: &mut Context<Self>) {
+        if self.waiting_for_params.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Freeze the grid to `snapshot` instead of following `session` live,
     /// e.g. when switching to a tab that is not the one `session` is
     /// currently running a query for. Clears the staged-changes queue.
@@ -84,4 +102,13 @@ impl ResultsView {
             None => self.session.read(cx).state(),
         }
     }
+}
+
+/// The waiting-for-parameters placeholder's detail line, naming `count`
+/// with correct singular/plural.
+pub(super) fn waiting_for_params_detail(count: usize) -> String {
+    format!(
+        "{count} parameter{} found. Fill them in to run this query.",
+        if count == 1 { "" } else { "s" }
+    )
 }

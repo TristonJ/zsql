@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Task};
 use zsql_core::ResultSet;
+use zsql_core::sql::params::Parameter;
 use zsql_editor::{EditorView, QueryRunner};
 
 use super::editor_adapter;
@@ -269,8 +270,26 @@ pub enum ResultsChanged {
 }
 pub struct PreviewControlsChanged(pub Option<PreviewControls>);
 
+/// A Script tab's run was intercepted because its SQL contains one or more
+/// detected `:name` parameters, emitted instead of dispatching so a host
+/// can open the "Run with parameters" modal in place of reaching
+/// `Session::run_query` directly.
+#[derive(Debug, Clone)]
+pub struct ParametersRequested {
+    pub tab_id: TabId,
+    /// The tab's own title, for the modal's eyebrow.
+    pub script_label: String,
+    /// The SQL the run was requested with, `:name` tokens intact.
+    pub sql: String,
+    pub parameters: Vec<Parameter>,
+    /// Scopes where confirming this run remembers its values; see
+    /// `crate::session_store::ScriptBacking::param_history_key`.
+    pub history_key: String,
+}
+
 impl EventEmitter<ResultsChanged> for TabModel {}
 impl EventEmitter<PreviewControlsChanged> for TabModel {}
+impl EventEmitter<ParametersRequested> for TabModel {}
 
 impl TabModel {
     /// Build an empty tab model over `session`/`results`, the same pair
@@ -513,6 +532,12 @@ impl TabModel {
     /// seam every tab's editor is wired to (see [`TabModel::build_editor`]).
     /// A no-op while `session` holds no live connection, so a keystroke or
     /// click reaching here without a connection never dispatches.
+    ///
+    /// A `Script` tab's `sql` containing one or more detected `:name`
+    /// parameters emits [`ParametersRequested`] instead of dispatching: the
+    /// caller opens the "Run with parameters" modal, then routes the
+    /// user's filled-in run back through [`Self::run_confirmed_params`].
+    #[tracing::instrument(name = "tab_model_run_for_tab", skip(self, sql, cx), fields(tab_id = id))]
     fn run_for_tab(&mut self, id: TabId, sql: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tab(id) else {
             return;
@@ -549,15 +574,62 @@ impl TabModel {
                 }),
                 true,
             ),
-            TabKind::Script { .. } => (
-                self.session
-                    .update(cx, |session, cx| session.run_query(sql, cx)),
-                false,
-            ),
+            TabKind::Script { backing } => {
+                let parameters = zsql_core::sql::params::detect_parameters(&sql);
+                if parameters.is_empty() {
+                    (
+                        self.session
+                            .update(cx, |session, cx| session.run_query(sql, cx)),
+                        false,
+                    )
+                } else {
+                    tracing::debug!(
+                        tab_id = id,
+                        parameter_count = parameters.len(),
+                        "run intercepted: opening the parameters modal"
+                    );
+                    cx.emit(ParametersRequested {
+                        tab_id: id,
+                        script_label: tab.title().to_owned(),
+                        sql,
+                        parameters,
+                        history_key: backing.param_history_key(),
+                    });
+                    return;
+                }
+            }
             // A schema tab is read-only and has no query to run.
             TabKind::Schema { .. } => return,
         };
         self.dispatch_run(id, label, task, window_change, cx);
+    }
+
+    /// Run `sql` (already parameter-substituted by the "Run with
+    /// parameters" modal) for tab `id`, exactly like a parameter-free
+    /// [`Self::run_for_tab`] would have dispatched it.
+    #[tracing::instrument(name = "tab_model_run_confirmed_params", skip(self, sql, cx), fields(tab_id = id))]
+    pub fn run_confirmed_params(&mut self, id: TabId, sql: String, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        if !self.session.read(cx).is_connected() {
+            tracing::debug!(
+                tab_id = id,
+                "confirmed-parameters run rejected: not connected"
+            );
+            return;
+        }
+        let label = display_label(tab);
+        let task = self
+            .session
+            .update(cx, |session, cx| session.run_query(sql, cx));
+        self.dispatch_run(id, label, task, false, cx);
+    }
+
+    /// Re-point `results` at the active tab's current state, without
+    /// dispatching a run.
+    pub fn resync_results(&mut self, cx: &mut Context<Self>) {
+        self.sync_results_to_active(cx);
     }
 
     /// Capture tab `id`'s just-finished run into its [`Tab::last_run`], from

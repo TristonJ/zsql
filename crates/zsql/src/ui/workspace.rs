@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent,
     KeybindingKeystroke, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathPromptOptions, Pixels, Render, Task, Window, canvas, div, prelude::*, px, rems, rgb,
 };
@@ -18,6 +18,7 @@ use super::appearance::AppearanceModalView;
 use super::connections::{ConnectionManagerView, UNSAVED_CONNECTION_LABEL};
 use super::footer::ConnectionFooterView;
 use super::open_modal::OpenModalView;
+use super::parameters_modal::ParametersModalView;
 use super::results::ResultsView;
 use super::sidebar::SidebarView;
 use super::tab_bar;
@@ -123,6 +124,12 @@ pub struct WorkspaceView {
     pub(crate) save_modal: Entity<crate::ui::save_modal::SaveModalView>,
     /// The Open Script picker.
     pub(crate) open_modal: Entity<OpenModalView>,
+    /// The "Run with parameters" modal.
+    pub(crate) parameters_modal: Entity<ParametersModalView>,
+    /// Maximum past values [`Self::parameters_modal`] remembers per
+    /// (connection, script, parameter); see
+    /// [`crate::config::ParametersConfig::max_history_per_param`].
+    param_history_max: usize,
     /// The platform open-file dialog seam; see [`OpenFilesPrompt`].
     open_files_prompt: OpenFilesPrompt,
     /// The platform save-file dialog seam; see [`SaveFilePrompt`].
@@ -181,21 +188,13 @@ impl WorkspaceView {
             edit_debounce,
             scripts_relative_time_refresh,
             open_find_keystrokes,
+            param_history_max,
+            parameters_modal_bindings,
         } = startup;
-        let open_find_keystrokes = open_find_keystrokes
-            .iter()
-            .filter_map(|s| match Keystroke::parse(s) {
-                Ok(keystroke) => Some(KeybindingKeystroke::from_keystroke(keystroke)),
-                Err(error) => {
-                    tracing::warn!(
-                        keystroke = s.as_str(),
-                        %error,
-                        "open-find forwarding: invalid keystroke, skipping"
-                    );
-                    None
-                }
-            })
-            .collect();
+        let open_find_keystrokes = crate::keybindings::parse_keystrokes(
+            &open_find_keystrokes,
+            "keybindings.sidebar.open_find",
+        );
         let header_session = session.clone();
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         results.update(cx, |results, cx| {
@@ -211,6 +210,10 @@ impl WorkspaceView {
         );
         let save_modal = cx.new(crate::ui::save_modal::SaveModalView::new);
         let open_modal = cx.new(OpenModalView::new);
+        let parameters_modal = cx.new(ParametersModalView::new);
+        parameters_modal.update(cx, |modal, _cx| {
+            modal.configure_keybindings(&parameters_modal_bindings);
+        });
 
         let sidebar = Self::build_sidebar(
             &session,
@@ -234,6 +237,7 @@ impl WorkspaceView {
         Self::subscribe_to_tab_events(&tabs, &results, &footer, cx);
         Self::subscribe_to_save_events(&tabs, &save_modal, cx);
         Self::subscribe_to_open_events(&tabs, &open_modal, cx);
+        Self::subscribe_to_parameters_events(&tabs, &parameters_modal, cx);
 
         // Every workspace opens with one empty script tab so the editor
         // pane is never blank
@@ -268,6 +272,8 @@ impl WorkspaceView {
             library_dir: library_root,
             save_modal,
             open_modal,
+            parameters_modal,
+            param_history_max,
             open_files_prompt: Box::new(default_open_files_prompt),
             save_file_prompt: Box::new(default_save_file_prompt),
             save_confirmation_duration,
@@ -962,6 +968,9 @@ impl Render for WorkspaceView {
             .when(self.open_modal.read(cx).is_open(), |el| {
                 el.child(self.open_modal.clone())
             })
+            .when(self.parameters_modal.read(cx).is_open(), |el| {
+                el.child(self.parameters_modal.clone())
+            })
     }
 }
 
@@ -984,6 +993,7 @@ impl WorkspaceView {
 }
 
 mod open_flow;
+mod parameters_flow;
 mod resize;
 mod save_flow;
 mod startup;
