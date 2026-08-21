@@ -47,6 +47,10 @@ pub struct WorkspaceStartup {
     /// relative-modified-time label (typically
     /// [`crate::config::SidebarConfig::scripts_relative_time_refresh`]).
     pub scripts_relative_time_refresh: Duration,
+    /// The keystroke(s) that open the sidebar's find row, resolved from
+    /// config the same way the sidebar's own binding is (typically
+    /// `crate::keybindings::resolve`'s result's `sidebar.open_find`).
+    pub open_find_keystrokes: Vec<String>,
 }
 
 impl Default for WorkspaceStartup {
@@ -62,6 +66,7 @@ impl Default for WorkspaceStartup {
             edit_debounce: crate::config::AutosaveConfig::default().edit_debounce(),
             scripts_relative_time_refresh: crate::config::SidebarConfig::default()
                 .scripts_relative_time_refresh(),
+            open_find_keystrokes: crate::ui::sidebar::SidebarBindings::default().open_find,
         }
     }
 }

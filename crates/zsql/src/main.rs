@@ -5,6 +5,7 @@ mod connections;
 #[cfg(all(test, feature = "driver-integration-tests"))]
 mod database_switch_live_tests;
 mod drivers;
+mod keybindings;
 mod keyring;
 mod observability;
 mod reveal;
@@ -52,6 +53,7 @@ fn build_workspace_window(
     cx: &mut App,
     cfg: &Config,
     connection_store: ConnectionStore,
+    open_find_keystrokes: Vec<String>,
 ) -> gpui::Entity<WorkspaceView> {
     let session = cx.new(|_cx| Session::new(cfg));
 
@@ -69,6 +71,7 @@ fn build_workspace_window(
         save_confirmation_duration: cfg.status.save_confirmation_duration(),
         edit_debounce: cfg.autosave.edit_debounce(),
         scripts_relative_time_refresh: cfg.sidebar.scripts_relative_time_refresh(),
+        open_find_keystrokes,
     };
     let workspace = cx.new(|cx| {
         WorkspaceView::new(
@@ -151,13 +154,15 @@ fn main() -> anyhow::Result<()> {
             let available_fonts = cx.text_system().all_font_names().join(",");
             tracing::debug!("all available fonts are: {}", available_fonts);
 
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            ui::results::init(cx, &cfg.staging.apply_keybinding);
-            ui::sidebar::init(cx);
-            ui::schema_view::init(cx);
-            ui::save_modal::init(cx);
-            ui::open_modal::init(cx);
+            let bindings = keybindings::resolve(&cfg);
+            zsql_editor::init(cx, &bindings.editor);
+            zsql_ui::text_field::init(cx, &bindings.text_field);
+            ui::results::init(cx, &bindings.results, &bindings.value_panel);
+            ui::sidebar::init(cx, &bindings.sidebar);
+            ui::schema_view::init(cx, &bindings.schema_view);
+            ui::save_modal::init(cx, &bindings.save_modal);
+            ui::open_modal::init(cx, &bindings.open_modal);
+            let open_find_keystrokes = bindings.sidebar.open_find;
 
             let bounds = Bounds::maximized(None, cx);
             cx.open_window(
@@ -170,7 +175,9 @@ fn main() -> anyhow::Result<()> {
                     app_id: Some(APP_ID.to_owned()),
                     ..Default::default()
                 },
-                |window, cx| build_workspace_window(window, cx, &cfg, connection_store),
+                |window, cx| {
+                    build_workspace_window(window, cx, &cfg, connection_store, open_find_keystrokes)
+                },
             )
             .expect("failed to open window");
             cx.activate(true);

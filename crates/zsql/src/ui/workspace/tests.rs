@@ -2215,9 +2215,9 @@ mod save_flow_tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::save_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::save_modal::init(cx, &crate::ui::save_modal::SaveModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -2289,9 +2289,9 @@ mod save_flow_tests {
     #[gpui::test]
     fn secondary_o_opens_the_open_script_picker(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -2339,9 +2339,9 @@ mod save_flow_tests {
     #[gpui::test]
     fn an_open_library_tab_appears_in_the_picker_once_under_library_only(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let (workspace, _paths, vcx) =
             workspace_with_active_connection("open-library-tab-picker", cx);
@@ -2404,9 +2404,9 @@ mod save_flow_tests {
     #[gpui::test]
     fn shift_secondary_o_triggers_the_browse_files_flow_directly(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -2461,9 +2461,9 @@ mod save_flow_tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -2518,9 +2518,9 @@ mod save_flow_tests {
     #[gpui::test]
     fn a_second_browse_trigger_before_the_first_resolves_is_ignored(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -2578,9 +2578,9 @@ mod save_flow_tests {
     #[gpui::test]
     fn browsing_to_a_non_utf8_file_never_opens_a_tab_or_touches_the_file(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::open_modal::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::open_modal::init(cx, &crate::ui::open_modal::OpenModalBindings::default());
         });
         let session = session_for_test(cx);
         let (workspace, vcx) = cx.add_window_view(|_window, cx| {
@@ -4192,8 +4192,8 @@ mod save_flow_tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
-            zsql_ui::text_field::init(cx);
-            crate::ui::save_modal::init(cx);
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::save_modal::init(cx, &crate::ui::save_modal::SaveModalBindings::default());
         });
         let (workspace, _paths, vcx) = workspace_with_active_connection("rename-collision", cx);
 
@@ -4341,11 +4341,28 @@ mod find_routing_tests {
     fn build(
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<WorkspaceView>, &mut gpui::VisualTestContext) {
+        build_with_open_find_bindings(cx, &crate::ui::sidebar::SidebarBindings::default())
+    }
+
+    /// Like [`build`], but registers the sidebar with `sidebar_bindings`
+    /// (rather than its defaults) and threads its `open_find` keystrokes
+    /// into [`WorkspaceStartup`] the same way `main.rs` does from resolved
+    /// config, so a non-default open-find keystroke drives both the
+    /// sidebar's own binding and the workspace's hover-based forwarding.
+    fn build_with_open_find_bindings<'a>(
+        cx: &'a mut TestAppContext,
+        sidebar_bindings: &crate::ui::sidebar::SidebarBindings,
+    ) -> (gpui::Entity<WorkspaceView>, &'a mut gpui::VisualTestContext) {
+        let open_find_keystrokes = sidebar_bindings.open_find.clone();
         cx.update(|cx| {
-            zsql_editor::init(cx);
-            zsql_ui::text_field::init(cx);
-            crate::ui::results::init(cx, "ctrl-shift-enter");
-            crate::ui::sidebar::init(cx);
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::results::init(
+                cx,
+                &crate::ui::results::ResultsBindings::default(),
+                &crate::ui::value_panel::ValuePanelBindings::default(),
+            );
+            crate::ui::sidebar::init(cx, sidebar_bindings);
         });
         let session = sample_schema_session(cx);
         cx.add_window_view(|_window, cx| {
@@ -4356,7 +4373,10 @@ mod find_routing_tests {
                 empty_store_for_test(),
                 Duration::from_secs(2),
                 zsql_core::DEFAULT_QUERY_BATCH_SIZE,
-                WorkspaceStartup::default(),
+                WorkspaceStartup {
+                    open_find_keystrokes,
+                    ..Default::default()
+                },
                 cx,
             )
         })
@@ -4423,6 +4443,137 @@ mod find_routing_tests {
             assert!(
                 !workspace.sidebar.read(cx).find_is_open_for_test(),
                 "the sidebar's find row must not have opened"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_configured_open_find_keystroke_drives_both_the_sidebar_binding_and_workspace_forwarding(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, vcx) = build_with_open_find_bindings(
+            cx,
+            &crate::ui::sidebar::SidebarBindings {
+                open_find: vec!["ctrl-shift-f".to_owned()],
+                ..Default::default()
+            },
+        );
+        vcx.run_until_parked();
+
+        let editor_focus = workspace
+            .read_with(vcx, WorkspaceView::editor_focus_handle)
+            .expect("a workspace always opens with an active editor");
+        vcx.update(|window, _cx| window.focus(&editor_focus));
+        vcx.run_until_parked();
+
+        let sidebar_bounds = vcx
+            .debug_bounds("sidebar-root")
+            .expect("the sidebar must be painted");
+        vcx.simulate_mouse_move(sidebar_bounds.center(), None, Modifiers::default());
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("secondary-f");
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                !workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the old default keystroke must no longer open the find row \
+                 once a different one is configured"
+            );
+        });
+
+        vcx.simulate_keystrokes("ctrl-shift-f");
+        vcx.run_until_parked();
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the configured keystroke must open the find row via the \
+                 workspace's hover-based forwarding"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_configured_open_find_keystroke_opens_find_via_the_sidebars_own_binding_when_focused(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, vcx) = build_with_open_find_bindings(
+            cx,
+            &crate::ui::sidebar::SidebarBindings {
+                open_find: vec!["ctrl-shift-f".to_owned()],
+                ..Default::default()
+            },
+        );
+        let focus_handle = workspace.read_with(vcx, |workspace, cx| {
+            workspace.sidebar.read(cx).focus_handle(cx)
+        });
+        vcx.update(|window, _cx| window.focus(&focus_handle));
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("ctrl-shift-f");
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the sidebar's own registered binding must fire on the \
+                 configured keystroke"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_unparseable_open_find_keystroke_is_skipped_without_panicking_at_construction(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            zsql_editor::init(cx, &zsql_editor::EditorBindings::default());
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
+            crate::ui::results::init(
+                cx,
+                &crate::ui::results::ResultsBindings::default(),
+                &crate::ui::value_panel::ValuePanelBindings::default(),
+            );
+            crate::ui::sidebar::init(cx, &crate::ui::sidebar::SidebarBindings::default());
+        });
+        let session = sample_schema_session(cx);
+        let (workspace, vcx) = cx.add_window_view(|_window, cx| {
+            WorkspaceView::new(
+                session,
+                LayoutConfig::default(),
+                ValuePanelConfig::default(),
+                empty_store_for_test(),
+                Duration::from_secs(2),
+                zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                WorkspaceStartup {
+                    open_find_keystrokes: vec!["not-a-key".to_owned(), "ctrl-shift-f".to_owned()],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        let editor_focus = workspace
+            .read_with(vcx, WorkspaceView::editor_focus_handle)
+            .expect("a workspace always opens with an active editor");
+        vcx.update(|window, _cx| window.focus(&editor_focus));
+        vcx.run_until_parked();
+
+        let sidebar_bounds = vcx
+            .debug_bounds("sidebar-root")
+            .expect("the sidebar must be painted");
+        vcx.simulate_mouse_move(sidebar_bounds.center(), None, Modifiers::default());
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("ctrl-shift-f");
+        vcx.run_until_parked();
+
+        workspace.read_with(vcx, |workspace, cx| {
+            assert!(
+                workspace.sidebar.read(cx).find_is_open_for_test(),
+                "the valid entry in a mixed list must still forward once the \
+                 unparseable entry is dropped"
             );
         });
     }

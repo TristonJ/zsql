@@ -2110,8 +2110,12 @@ fn typing_a_space_into_the_filter_value_editor_inserts_it_instead_of_driving_the
     // registered so this test exercises the contention between the grid's
     // `space` binding and plain text insertion.
     cx.update(|cx| {
-        super::init(cx, "ctrl-shift-enter");
-        zsql_ui::text_field::init(cx);
+        super::init(
+            cx,
+            &super::ResultsBindings::default(),
+            &super::super::value_panel::ValuePanelBindings::default(),
+        );
+        zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
     });
     let (controls, _recorded) = recording_preview_controls();
     let (view, vcx) = view_with_sample_result_and_controls(cx, Some(controls));
@@ -2426,8 +2430,12 @@ mod quick_find_tests {
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<ResultsView>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
-            super::super::init(cx, "ctrl-shift-enter");
-            zsql_ui::text_field::init(cx);
+            super::super::init(
+                cx,
+                &super::super::ResultsBindings::default(),
+                &super::super::super::value_panel::ValuePanelBindings::default(),
+            );
+            zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
         });
         let state = SessionState::Results(std::time::Duration::from_millis(1));
         let session = cx.new(|_cx| Session::new_for_render_test(state, refunds_result()));
@@ -3173,7 +3181,11 @@ mod staging_tests {
         Arc<Mutex<Vec<String>>>,
     ) {
         cx.update(|cx| {
-            super::super::init(cx, "ctrl-shift-enter");
+            super::super::init(
+                cx,
+                &super::super::ResultsBindings::default(),
+                &super::super::super::value_panel::ValuePanelBindings::default(),
+            );
         });
         let calls = Arc::new(Mutex::new(Vec::new()));
         let connection = Arc::new(FakeConnection {
@@ -3693,6 +3705,69 @@ mod staging_tests {
                 "clicking hide sql must collapse the ledger"
             );
         });
+    }
+
+    #[gpui::test]
+    fn the_apply_hint_reflects_a_configured_apply_staged_keystroke(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::ui::results::init(
+                cx,
+                &crate::ui::results::ResultsBindings {
+                    apply_staged: vec!["f5".to_owned()],
+                    ..crate::ui::results::ResultsBindings::default()
+                },
+                &crate::ui::value_panel::ValuePanelBindings::default(),
+            );
+        });
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                SessionState::Results(Duration::default()),
+                orders_result(),
+            )
+        });
+        let (_view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+
+        let hint = vcx.update(|window, _cx| {
+            crate::ui::results::staging_bar::apply_keybinding_hint_for_test(window)
+        });
+        assert_eq!(
+            hint.as_deref(),
+            Some("F5"),
+            "the apply hint must read whatever chord keybindings.results.apply_staged resolves to"
+        );
+    }
+
+    #[gpui::test]
+    fn the_apply_hint_reflects_the_legacy_staging_apply_keybinding_when_the_canonical_key_is_unset(
+        cx: &mut TestAppContext,
+    ) {
+        let config = crate::config::Config {
+            staging: crate::config::StagingConfig {
+                apply_keybinding: "f5".to_owned(),
+            },
+            ..Default::default()
+        };
+        let resolved = crate::keybindings::resolve(&config);
+        cx.update(|cx| {
+            crate::ui::results::init(cx, &resolved.results, &resolved.value_panel);
+        });
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                SessionState::Results(Duration::default()),
+                orders_result(),
+            )
+        });
+        let (_view, vcx) = cx.add_window_view(|_window, cx| ResultsView::new(session, "t", cx));
+
+        let hint = vcx.update(|window, _cx| {
+            crate::ui::results::staging_bar::apply_keybinding_hint_for_test(window)
+        });
+        assert_eq!(
+            hint.as_deref(),
+            Some("F5"),
+            "the legacy staging.apply_keybinding must still drive the hint when the canonical \
+             key is unset"
+        );
     }
 
     #[gpui::test]
@@ -4249,7 +4324,7 @@ mod staging_tests {
             cx: &mut gpui::TestAppContext,
         ) {
             cx.update(|cx| {
-                zsql_ui::text_field::init(cx);
+                zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
             });
             let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
             view.update_in(vcx, |view, window, cx| {
@@ -4275,7 +4350,7 @@ mod staging_tests {
             cx: &mut gpui::TestAppContext,
         ) {
             cx.update(|cx| {
-                zsql_ui::text_field::init(cx);
+                zsql_ui::text_field::init(cx, &zsql_ui::text_field::TextFieldBindings::default());
             });
             let (view, vcx, _calls) = view_with_pk_schema_focused(cx, None);
             view.update(vcx, |view, cx| {

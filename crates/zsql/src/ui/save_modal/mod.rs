@@ -5,13 +5,15 @@
 //! field, the same construction idiom as the connection-manager modal (see
 //! `crate::ui::connections::form`).
 
+mod bindings;
 mod logic;
 
 use std::path::PathBuf;
 
+pub(crate) use bindings::SaveModalBindings;
 use gpui::{
     App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyBinding, Render, SharedString, Window, actions, div, prelude::*, px, rgb, rgba,
+    Render, SharedString, Window, actions, div, prelude::*, px, rgb, rgba,
 };
 pub use logic::{Destination, NameError, SQL_SUFFIX, validate_for_save};
 use zsql_ui::button::{primary_button, secondary_button};
@@ -36,14 +38,26 @@ actions!(
     [SelectPreviousDestination, SelectNextDestination]
 );
 
-/// Register this modal's destination Up/Down navigation key bindings. Call
-/// once at startup, before any window that hosts a [`SaveModalView`] is
-/// opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", SelectPreviousDestination, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", SelectNextDestination, Some(KEY_CONTEXT)),
-    ]);
+/// Register this modal's destination Up/Down navigation key bindings from
+/// `bindings`. Call once at startup, before any window that hosts a
+/// [`SaveModalView`] is opened.
+pub fn init(cx: &mut App, bindings: &SaveModalBindings) {
+    let mut keys = Vec::new();
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.select_previous_destination,
+        &SelectPreviousDestination,
+        KEY_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.select_next_destination,
+        &SelectNextDestination,
+        KEY_CONTEXT,
+    );
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "save modal keybindings registered");
 }
 
 /// What the modal is doing. Save and Save-as both show the destination rows

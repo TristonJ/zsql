@@ -28,6 +28,7 @@ use crate::connections::ConnectionStore;
 use crate::session::Session;
 use crate::session_store::{self, SessionStore};
 use crate::ui::tabs::{PreviewControlsChanged, ResultsChanged};
+use resize::{clamp_editor_height, clamp_sidebar_width};
 pub use startup::WorkspaceStartup;
 
 /// The platform open-file dialog function "Browse files..." invokes
@@ -138,6 +139,10 @@ pub struct WorkspaceView {
     pub(crate) refocus_editor_on_next_render: bool,
     /// Set while a "Browse files..." native dialog is open
     pub(crate) browse_dialog_in_flight: Rc<Cell<bool>>,
+    /// The sidebar's open-find keystroke(s), parsed once at construction;
+    /// see [`WorkspaceStartup::open_find_keystrokes`]. Entries that fail to
+    /// parse are skipped.
+    open_find_keystrokes: Vec<KeybindingKeystroke>,
 }
 
 impl WorkspaceView {
@@ -175,7 +180,22 @@ impl WorkspaceView {
             save_confirmation_duration,
             edit_debounce,
             scripts_relative_time_refresh,
+            open_find_keystrokes,
         } = startup;
+        let open_find_keystrokes = open_find_keystrokes
+            .iter()
+            .filter_map(|s| match Keystroke::parse(s) {
+                Ok(keystroke) => Some(KeybindingKeystroke::from_keystroke(keystroke)),
+                Err(error) => {
+                    tracing::warn!(
+                        keystroke = s.as_str(),
+                        %error,
+                        "open-find forwarding: invalid keystroke, skipping"
+                    );
+                    None
+                }
+            })
+            .collect();
         let header_session = session.clone();
         let results = cx.new(|cx| ResultsView::new(session.clone(), "", cx));
         results.update(cx, |results, cx| {
@@ -253,6 +273,7 @@ impl WorkspaceView {
             save_confirmation_generation: Rc::new(Cell::new(0)),
             refocus_editor_on_next_render: false,
             browse_dialog_in_flight: Rc::new(Cell::new(false)),
+            open_find_keystrokes,
         }
     }
 
@@ -789,42 +810,6 @@ impl WorkspaceView {
     }
 }
 
-/// New sidebar width after dragging its divider by `delta` from `current`,
-/// clamped to `[min, max]`. Pure and gpui-free so drag math is unit
-/// testable without a window.
-///
-/// `max` is widened to `min` first: `Pixels::clamp` asserts `min <= max`,
-/// and a misconfigured `sidebar_max_width < sidebar_min_width` must not
-/// crash the app on the first drag.
-#[must_use]
-fn clamp_sidebar_width(current: Pixels, delta: Pixels, min: Pixels, max: Pixels) -> Pixels {
-    let max = max.max(min);
-    (current + delta).clamp(min, max)
-}
-
-/// New editor-pane height after dragging the editor/results divider by
-/// `delta` from `current`, given the column's total available height.
-///
-/// The editor is never allowed to grow past
-/// `container_height - divider_thickness - min_results_height`, so the
-/// results pane always keeps at least `min_results_height` regardless of how
-/// far the drag requests. If the container itself is too small to fit both
-/// panes' minimums, the editor's own minimum wins and the results pane
-/// shrinks below its target -- there is no space left to honor both.
-#[must_use]
-fn clamp_editor_height(
-    container_height: Pixels,
-    current: Pixels,
-    delta: Pixels,
-    min_editor_height: Pixels,
-    min_results_height: Pixels,
-    divider_thickness: Pixels,
-) -> Pixels {
-    let max_editor_height =
-        (container_height - divider_thickness - min_results_height).max(min_editor_height);
-    (current + delta).clamp(min_editor_height, max_editor_height)
-}
-
 impl WorkspaceView {
     /// Routes Ctrl+F to the sidebar's own find row when the pointer sits
     /// over the sidebar and the sidebar does not already have keyboard
@@ -847,11 +832,11 @@ impl WorkspaceView {
         if sidebar_focused || !sidebar_hovered {
             return;
         }
-        let target = KeybindingKeystroke::from_keystroke(
-            Keystroke::parse(super::sidebar::OPEN_FIND_KEYSTROKE)
-                .expect("the sidebar's open-find keystroke must parse"),
-        );
-        if !event.keystroke.should_match(&target) {
+        let matches_open_find = self
+            .open_find_keystrokes
+            .iter()
+            .any(|target| event.keystroke.should_match(target));
+        if !matches_open_find {
             return;
         }
         self.sidebar.update(cx, |sidebar, cx| {
@@ -977,6 +962,7 @@ impl WorkspaceView {
 }
 
 mod open_flow;
+mod resize;
 mod save_flow;
 mod startup;
 

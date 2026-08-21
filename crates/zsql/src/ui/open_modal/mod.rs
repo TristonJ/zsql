@@ -4,11 +4,13 @@
 //! the same construction idiom as the Save Script modal (see
 //! `crate::ui::save_modal`).
 
+mod bindings;
 mod logic;
 
+pub(crate) use bindings::OpenModalBindings;
 use gpui::{
-    App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    Render, Window, actions, div, prelude::*, px, rgb, rgba,
+    App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
+    actions, div, prelude::*, px, rgb, rgba,
 };
 pub use logic::{
     LibraryScript, PickerRow, PickerRowMeta, PickerSection, PickerTarget, SessionScript,
@@ -32,13 +34,26 @@ pub const KEY_CONTEXT: &str = "OpenModal";
 
 actions!(open_modal, [SelectPreviousRow, SelectNextRow]);
 
-/// Register this modal's arrow-key navigation bindings. Call once at
-/// startup, before any window that hosts an [`OpenModalView`] is opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", SelectPreviousRow, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", SelectNextRow, Some(KEY_CONTEXT)),
-    ]);
+/// Register this modal's arrow-key navigation bindings from `bindings`.
+/// Call once at startup, before any window that hosts an [`OpenModalView`]
+/// is opened.
+pub fn init(cx: &mut App, bindings: &OpenModalBindings) {
+    let mut keys = Vec::new();
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.select_previous_row,
+        &SelectPreviousRow,
+        KEY_CONTEXT,
+    );
+    crate::keybindings::bind_all(
+        &mut keys,
+        &bindings.select_next_row,
+        &SelectNextRow,
+        KEY_CONTEXT,
+    );
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "open modal keybindings registered");
 }
 
 /// What [`OpenModalView`] asks its parent (`ui::workspace::WorkspaceView`)

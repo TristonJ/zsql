@@ -5,6 +5,7 @@
 //! `gpui` and this crate's own color palette, so it knows nothing about any
 //! app, driver, or session type.
 
+mod bindings;
 mod model;
 mod scroll;
 // Crate-visible (not just module-private) so the shared theme's metric
@@ -12,5 +13,6 @@ mod scroll;
 pub(crate) mod theme;
 mod view;
 
+pub use bindings::TextFieldBindings;
 pub use model::{BlinkState, CURSOR_BLINK_INTERVAL, CURSOR_BLINK_RESUME_DELAY, FieldModel};
 pub use view::{KEY_CONTEXT, TextFieldEvent, TextFieldState, TextFieldStyle, init};

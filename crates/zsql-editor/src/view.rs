@@ -15,7 +15,7 @@ use gpui::{
 use zsql_ui::theme::{ActiveTheme, Theme};
 
 use crate::theme;
-use crate::{Highlighter, Position, SqlHighlighter, TextBuffer};
+use crate::{EditorBindings, Highlighter, Position, SqlHighlighter, TextBuffer};
 
 use element::EditorContentElement;
 
@@ -40,18 +40,16 @@ pub type QueryRunner = Box<dyn Fn(String, &mut Context<EditorView>)>;
 /// anything about tabs, relations, or sessions.
 pub type EditListener = Box<dyn Fn(&mut Context<EditorView>)>;
 
-/// Invoked on `SaveScript` (`secondary-s`) or `SaveScriptAs`
-/// (`shift-secondary-s`). The same seam pattern as [`QueryRunner`]: the
-/// embedding app decides what "save" means for a given tab (open a modal,
-/// write a file, or nothing at all), keeping this crate free of any
-/// session, file-store, or tab type.
+/// Invoked on `SaveScript` or `SaveScriptAs`. The same seam pattern as
+/// [`QueryRunner`]: the embedding app decides what "save" means for a given
+/// tab (open a modal, write a file, or nothing at all), keeping this crate
+/// free of any session, file-store, or tab type.
 pub type SaveRequester = Box<dyn Fn(&mut Context<EditorView>)>;
 
-/// Invoked on `OpenScript` (`secondary-o`) or `BrowseScriptFiles`
-/// (`shift-secondary-o`). The same seam pattern as [`SaveRequester`]: the
-/// embedding app decides what "open" means (a picker, a native file dialog,
-/// or nothing at all), keeping this crate free of any session, file-store,
-/// or tab type.
+/// Invoked on `OpenScript` or `BrowseScriptFiles`. The same seam pattern as
+/// [`SaveRequester`]: the embedding app decides what "open" means (a
+/// picker, a native file dialog, or nothing at all), keeping this crate
+/// free of any session, file-store, or tab type.
 pub type OpenRequester = Box<dyn Fn(&mut Context<EditorView>)>;
 
 actions!(
@@ -90,52 +88,65 @@ actions!(
     ]
 );
 
-/// Register the editor's actions and key bindings. Call once at startup,
-/// before any window that hosts an [`EditorView`] is opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("left", MoveLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("right", MoveRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("up", MoveUp, Some(KEY_CONTEXT)),
-        KeyBinding::new("down", MoveDown, Some(KEY_CONTEXT)),
-        KeyBinding::new("home", MoveLineStart, Some(KEY_CONTEXT)),
-        KeyBinding::new("end", MoveLineEnd, Some(KEY_CONTEXT)),
-        // "secondary-" is gpui's cross-platform primary-modifier prefix: cmd
-        // on macOS, ctrl elsewhere (see `Modifiers::secondary`). Using it
-        // here means these bindings work as Ctrl+<key> on Linux without a
-        // separate ctrl- binding, unlike `RunQuery` below which deliberately
-        // dual-binds cmd-enter and ctrl-enter explicitly.
-        KeyBinding::new("secondary-up", MoveDocumentStart, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-down", MoveDocumentEnd, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-left", SelectLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-right", SelectRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-up", SelectUp, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-down", SelectDown, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-home", SelectLineStart, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-end", SelectLineEnd, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-secondary-up", SelectDocumentStart, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-secondary-down", SelectDocumentEnd, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-a", SelectAll, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", Backspace, Some(KEY_CONTEXT)),
-        KeyBinding::new("delete", DeleteForward, Some(KEY_CONTEXT)),
-        KeyBinding::new("enter", Newline, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-x", Cut, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-v", Paste, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-s", SaveScript, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-secondary-s", SaveScriptAs, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-o", OpenScript, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-secondary-o", BrowseScriptFiles, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-z", Undo, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-secondary-z", Redo, Some(KEY_CONTEXT)),
-        // Ctrl-Y is a common redo shortcut in its own right, distinct from
-        // secondary-y's cross-platform cmd-y -- both are bound explicitly,
-        // the same dual-bind pattern cmd-enter/ctrl-enter use above.
-        KeyBinding::new("secondary-y", Redo, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-y", Redo, Some(KEY_CONTEXT)),
-    ]);
+/// Push one `KeyBinding` per entry in `keystrokes` for `action`, so an
+/// action bound to more than one chord (e.g. `RunQuery`) registers all of
+/// them.
+fn bind_each(
+    keys: &mut Vec<KeyBinding>,
+    keystrokes: &[String],
+    action: &(impl gpui::Action + Clone),
+) {
+    for keystroke in keystrokes {
+        keys.push(KeyBinding::new(
+            keystroke,
+            Clone::clone(action),
+            Some(KEY_CONTEXT),
+        ));
+    }
+}
+
+/// Register the editor's actions and key bindings from `bindings`. Call
+/// once at startup, before any window that hosts an [`EditorView`] is
+/// opened.
+pub fn init(cx: &mut App, bindings: &EditorBindings) {
+    let mut keys = Vec::new();
+    bind_each(&mut keys, &bindings.move_left, &MoveLeft);
+    bind_each(&mut keys, &bindings.move_right, &MoveRight);
+    bind_each(&mut keys, &bindings.move_up, &MoveUp);
+    bind_each(&mut keys, &bindings.move_down, &MoveDown);
+    bind_each(&mut keys, &bindings.move_line_start, &MoveLineStart);
+    bind_each(&mut keys, &bindings.move_line_end, &MoveLineEnd);
+    bind_each(&mut keys, &bindings.move_document_start, &MoveDocumentStart);
+    bind_each(&mut keys, &bindings.move_document_end, &MoveDocumentEnd);
+    bind_each(&mut keys, &bindings.select_left, &SelectLeft);
+    bind_each(&mut keys, &bindings.select_right, &SelectRight);
+    bind_each(&mut keys, &bindings.select_up, &SelectUp);
+    bind_each(&mut keys, &bindings.select_down, &SelectDown);
+    bind_each(&mut keys, &bindings.select_line_start, &SelectLineStart);
+    bind_each(&mut keys, &bindings.select_line_end, &SelectLineEnd);
+    bind_each(
+        &mut keys,
+        &bindings.select_document_start,
+        &SelectDocumentStart,
+    );
+    bind_each(&mut keys, &bindings.select_document_end, &SelectDocumentEnd);
+    bind_each(&mut keys, &bindings.select_all, &SelectAll);
+    bind_each(&mut keys, &bindings.backspace, &Backspace);
+    bind_each(&mut keys, &bindings.delete_forward, &DeleteForward);
+    bind_each(&mut keys, &bindings.newline, &Newline);
+    bind_each(&mut keys, &bindings.copy, &Copy);
+    bind_each(&mut keys, &bindings.cut, &Cut);
+    bind_each(&mut keys, &bindings.paste, &Paste);
+    bind_each(&mut keys, &bindings.run_query, &RunQuery);
+    bind_each(&mut keys, &bindings.save_script, &SaveScript);
+    bind_each(&mut keys, &bindings.save_script_as, &SaveScriptAs);
+    bind_each(&mut keys, &bindings.open_script, &OpenScript);
+    bind_each(&mut keys, &bindings.browse_script_files, &BrowseScriptFiles);
+    bind_each(&mut keys, &bindings.undo, &Undo);
+    bind_each(&mut keys, &bindings.redo, &Redo);
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "zsql_editor keybindings registered");
 }
 
 /// The SQL editor pane: owns the buffer, the OS input handler state, and the
@@ -232,26 +243,26 @@ impl EditorView {
         self.on_edit = Some(listener);
     }
 
-    /// Install the seam `SaveScript` (`secondary-s`) invokes, replacing any
+    /// Install the seam `SaveScript` invokes, replacing any
     /// previously-installed one.
     pub fn set_save_requester(&mut self, requester: SaveRequester) {
         self.save = Some(requester);
     }
 
-    /// Install the seam `SaveScriptAs` (`shift-secondary-s`) invokes,
-    /// replacing any previously-installed one.
+    /// Install the seam `SaveScriptAs` invokes, replacing any
+    /// previously-installed one.
     pub fn set_save_as_requester(&mut self, requester: SaveRequester) {
         self.save_as = Some(requester);
     }
 
-    /// Install the seam `OpenScript` (`secondary-o`) invokes, replacing any
+    /// Install the seam `OpenScript` invokes, replacing any
     /// previously-installed one.
     pub fn set_open_requester(&mut self, requester: OpenRequester) {
         self.open = Some(requester);
     }
 
-    /// Install the seam `BrowseScriptFiles` (`shift-secondary-o`) invokes,
-    /// replacing any previously-installed one.
+    /// Install the seam `BrowseScriptFiles` invokes, replacing any
+    /// previously-installed one.
     pub fn set_browse_requester(&mut self, requester: OpenRequester) {
         self.browse = Some(requester);
     }

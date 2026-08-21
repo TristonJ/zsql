@@ -6,14 +6,13 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla,
-    InspectorElementId, IsZero, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px,
-    relative, rgb,
+    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, IsZero, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString,
+    UTF16Selection, Window, actions, div, point, prelude::*, px, rgb,
 };
 
+use crate::text_field::TextFieldBindings;
 use crate::text_field::model::{
     BlinkState, CURSOR_BLINK_INTERVAL, FieldModel, byte_offset_for_char_count, char_count_before,
     should_show_placeholder,
@@ -59,28 +58,43 @@ actions!(
     ]
 );
 
-/// Register the field's actions and key bindings. Call once at startup,
-/// before any window that hosts a `TextField` is opened.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("left", MoveLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("right", MoveRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("home", MoveHome, Some(KEY_CONTEXT)),
-        KeyBinding::new("end", MoveEnd, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-left", SelectLeft, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-right", SelectRight, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-home", SelectHome, Some(KEY_CONTEXT)),
-        KeyBinding::new("shift-end", SelectEnd, Some(KEY_CONTEXT)),
-        // "secondary-" is gpui's cross-platform primary-modifier prefix: cmd
-        // on macOS, ctrl elsewhere.
-        KeyBinding::new("secondary-a", SelectAll, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", Backspace, Some(KEY_CONTEXT)),
-        KeyBinding::new("delete", DeleteForward, Some(KEY_CONTEXT)),
-        KeyBinding::new("enter", Submit, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-c", Copy, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-x", Cut, Some(KEY_CONTEXT)),
-        KeyBinding::new("secondary-v", Paste, Some(KEY_CONTEXT)),
-    ]);
+/// Push one `KeyBinding` per entry in `keystrokes` for `action`.
+fn bind_each(
+    keys: &mut Vec<KeyBinding>,
+    keystrokes: &[String],
+    action: &(impl gpui::Action + Clone),
+) {
+    for keystroke in keystrokes {
+        keys.push(KeyBinding::new(
+            keystroke,
+            Clone::clone(action),
+            Some(KEY_CONTEXT),
+        ));
+    }
+}
+
+/// Register the field's actions and key bindings from `bindings`. Call once
+/// at startup, before any window that hosts a `TextField` is opened.
+pub fn init(cx: &mut App, bindings: &TextFieldBindings) {
+    let mut keys = Vec::new();
+    bind_each(&mut keys, &bindings.move_left, &MoveLeft);
+    bind_each(&mut keys, &bindings.move_right, &MoveRight);
+    bind_each(&mut keys, &bindings.move_home, &MoveHome);
+    bind_each(&mut keys, &bindings.move_end, &MoveEnd);
+    bind_each(&mut keys, &bindings.select_left, &SelectLeft);
+    bind_each(&mut keys, &bindings.select_right, &SelectRight);
+    bind_each(&mut keys, &bindings.select_home, &SelectHome);
+    bind_each(&mut keys, &bindings.select_end, &SelectEnd);
+    bind_each(&mut keys, &bindings.select_all, &SelectAll);
+    bind_each(&mut keys, &bindings.backspace, &Backspace);
+    bind_each(&mut keys, &bindings.delete_forward, &DeleteForward);
+    bind_each(&mut keys, &bindings.submit, &Submit);
+    bind_each(&mut keys, &bindings.copy, &Copy);
+    bind_each(&mut keys, &bindings.cut, &Cut);
+    bind_each(&mut keys, &bindings.paste, &Paste);
+    let registered = keys.len();
+    cx.bind_keys(keys);
+    tracing::debug!(registered, "zsql_ui text_field keybindings registered");
 }
 
 /// Events a `TextField` emits. Mirrors the shape of `gpui-component`'s
@@ -651,10 +665,10 @@ impl Render for TextFieldState {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .child(TextFieldContentElement {
-                field: cx.entity(),
-                style: self.style,
-            })
+            .child(element::TextFieldContentElement::new(
+                cx.entity(),
+                self.style,
+            ))
     }
 }
 
@@ -760,265 +774,7 @@ impl EntityInputHandler for TextFieldState {
     }
 }
 
-/// The custom `Element` that shapes and paints the field's text, cursor, and
-/// selection, and wires OS text input into `TextFieldState` via
-/// `window.handle_input`.
-struct TextFieldContentElement {
-    field: Entity<TextFieldState>,
-    style: TextFieldStyle,
-}
-
-struct TextFieldPrepaintState {
-    line: ShapedLine,
-    cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
-    /// The horizontal scroll offset this frame's geometry was computed
-    /// against, so `paint` shifts the shaped line's paint origin to match
-    /// the already-offset cursor and selection quads.
-    scroll_offset: Pixels,
-}
-
-impl IntoElement for TextFieldContentElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for TextFieldContentElement {
-    type RequestLayoutState = ();
-    type PrepaintState = TextFieldPrepaintState;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.size.width = relative(1.0).into();
-        style.size.height = self.style.line_height.into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let theme_colors = cx.theme().colors;
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let font = text_style.font();
-
-        // Pulled into owned/copied locals up front so the field's read
-        // borrow ends before this frame's new scroll offset is written back
-        // to it below.
-        let field = self.field.read(cx);
-        let content = field.model.text().to_owned();
-        let showing_placeholder = should_show_placeholder(&content);
-        let masked = field.masked;
-        let disabled = field.disabled;
-        let placeholder = field.placeholder.clone();
-        let marked_range = field.marked_range.clone();
-        let focused = field.focus_handle.is_focused(window);
-        let blink_visible = field.blink.visible();
-        let cursor_offset = field.model.cursor();
-        let active_selection = field.model.selection();
-        let old_scroll_offset = field.scroll_offset;
-        let cursor_moved = field.last_followed_cursor != Some(cursor_offset);
-
-        let (display_text, runs): (SharedString, Vec<TextRun>) = if showing_placeholder {
-            let run = TextRun {
-                len: placeholder.len(),
-                font: font.clone(),
-                color: rgb(theme_colors.text_secondary).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            (placeholder, vec![run])
-        } else if masked {
-            let text = SharedString::from(MASK_GLYPH.to_string().repeat(content.chars().count()));
-            let run = TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color: text_style.color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            (text, vec![run])
-        } else {
-            let text = SharedString::from(content.clone());
-            let runs = build_runs(marked_range.as_ref(), &text, &font, text_style.color);
-            (text, runs)
-        };
-
-        // The display index into `display_text`, which is `content` itself
-        // unless masked (in which case it is content's char count, since
-        // `MASK_GLYPH` is one ASCII byte per char -- see `char_count_before`).
-        let display_index = |byte_offset: usize| {
-            if masked {
-                char_count_before(&content, byte_offset)
-            } else {
-                byte_offset
-            }
-        };
-
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
-
-        // Re-clamped every paint against the content just shaped and this
-        // frame's own layout bounds (already resolved by the time
-        // `prepaint` runs, so no measurement lag across frames) so an edit
-        // or a resize never leaves a stale offset. Only nudged to keep the
-        // caret visible when the cursor has actually moved since the last
-        // paint that did so -- otherwise a manual wheel-scroll would be
-        // re-snapped back to the caret on its very next repaint.
-        let caret_x = line.x_for_index(display_index(cursor_offset));
-        let mut scroll_offset =
-            scroll::clamp_scroll_offset(old_scroll_offset, line.width, bounds.size.width);
-        if cursor_moved {
-            scroll_offset =
-                scroll::follow_caret(scroll_offset, caret_x, line.width, bounds.size.width);
-        }
-        self.field.update(cx, |field, _cx| {
-            field.scroll_offset = scroll_offset;
-            field.last_followed_cursor = Some(cursor_offset);
-        });
-
-        let cursor = (focused && blink_visible && !disabled).then(|| {
-            text_input::caret_quad(
-                bounds,
-                caret_x - scroll_offset,
-                0,
-                self.style.line_height,
-                self.style.cursor_width,
-                rgb(theme_colors.accent),
-            )
-        });
-
-        let selection = active_selection.map(|range| {
-            let span = text_input::SelectionLineSpan {
-                line_index: 0,
-                start_x: line.x_for_index(display_index(range.start)) - scroll_offset,
-                end_x: line.x_for_index(display_index(range.end)) - scroll_offset,
-            };
-            text_input::selection_quad(
-                &span,
-                bounds,
-                self.style.line_height,
-                theme_colors.accent_wash_hover(),
-            )
-        });
-
-        TextFieldPrepaintState {
-            line,
-            cursor,
-            selection,
-            scroll_offset,
-        }
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let focus_handle = self.field.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.field.clone()),
-            cx,
-        );
-
-        if let Some(quad) = prepaint.selection.take() {
-            window.paint_quad(quad);
-        }
-
-        let origin = point(bounds.left() - prepaint.scroll_offset, bounds.top());
-        prepaint
-            .line
-            .paint(origin, theme::FIELD_LINE_HEIGHT, window, cx)
-            .expect("shaped text-field line should paint");
-
-        if let Some(cursor) = prepaint.cursor.take() {
-            window.paint_quad(cursor);
-        }
-
-        let line = std::mem::take(&mut prepaint.line);
-        self.field.update(cx, |field, _cx| {
-            field.last_line = Some(line);
-            field.last_bounds = Some(bounds);
-        });
-    }
-}
-
-/// Style runs for the field's displayed text: an underlined run for the
-/// active IME composition (if any), plain runs either side of it.
-fn build_runs(
-    marked_range: Option<&Range<usize>>,
-    text: &str,
-    font: &Font,
-    color: Hsla,
-) -> Vec<TextRun> {
-    let base_run = |len: usize| TextRun {
-        len,
-        font: font.clone(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-
-    let Some(marked_range) = marked_range else {
-        return vec![base_run(text.len())];
-    };
-
-    let start = marked_range.start.min(text.len());
-    let end = marked_range.end.min(text.len());
-    if start >= end {
-        return vec![base_run(text.len())];
-    }
-
-    let mut runs = Vec::with_capacity(3);
-    if start > 0 {
-        runs.push(base_run(start));
-    }
-    runs.push(TextRun {
-        underline: Some(UnderlineStyle {
-            color: Some(color),
-            thickness: MARKED_TEXT_UNDERLINE_WIDTH,
-            wavy: false,
-        }),
-        ..base_run(end - start)
-    });
-    if end < text.len() {
-        runs.push(base_run(text.len() - end));
-    }
-    runs
-}
+mod element;
 
 #[cfg(test)]
 mod tests;
