@@ -403,7 +403,7 @@ fn saving_an_edit_updates_the_row_in_place_without_appending_a_duplicate(cx: &mu
 #[gpui::test]
 async fn connect_and_close_connects_and_clears_is_open(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-close");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -441,7 +441,7 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("row-enter");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -488,7 +488,7 @@ fn enter_on_a_focused_row_connects_and_closes_the_modal_the_same_as_a_click(
 #[gpui::test]
 async fn connect_updates_active_synchronously_before_the_connect_resolves(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-sync-active");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -524,7 +524,7 @@ async fn connect_and_close_updates_active_synchronously_before_the_connect_resol
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-and-close-sync-active");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -562,7 +562,7 @@ async fn a_failed_connect_does_not_revert_active_to_the_previous_connection(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-fail-keeps-active");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -628,7 +628,7 @@ async fn a_failed_connect_does_not_revert_active_to_the_previous_connection(
 #[gpui::test]
 async fn connect_unsaved_connects_without_persisting_and_closes_the_modal(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-unsaved");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -672,7 +672,7 @@ async fn connect_unsaved_updates_active_synchronously_before_the_connect_resolve
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-unsaved-sync-active");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -703,7 +703,7 @@ async fn a_failed_connect_unsaved_does_not_revert_active_and_leaves_the_modal_op
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-unsaved-fail-keeps-active");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -752,7 +752,7 @@ async fn a_failed_connect_unsaved_does_not_revert_active_and_leaves_the_modal_op
 #[gpui::test]
 fn showing_the_edit_form_or_deleting_a_row_never_touches_the_session(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("edit-delete-no-connect");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -810,7 +810,7 @@ async fn switching_database_in_session_does_not_mutate_the_stored_connection(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("switch-no-mutate");
     let mut store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -873,7 +873,7 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("test-button");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -915,7 +915,7 @@ async fn running_test_never_mutates_the_sessions_active_connection_or_persists(
 #[gpui::test]
 async fn a_failed_test_reports_the_drivers_error_inline(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("test-button-fail");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -1467,7 +1467,7 @@ async fn run_test_with_an_unreachable_ssh_host_reports_an_ssh_layer_failure(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("test-ssh-unreachable");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");
@@ -1518,7 +1518,7 @@ async fn run_test_with_an_unreachable_ssh_host_reports_an_ssh_layer_failure(
 #[gpui::test]
 async fn connect_unsaved_does_not_silently_ignore_the_forms_ssh_section(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let temp = TempStorePath::new("connect-unsaved-ssh-ordering");
     let store = ConnectionStore::load(&temp.0).expect("load must succeed");

@@ -173,7 +173,7 @@ mod tests {
 
     #[gpui::test]
     async fn a_successful_batch_commits_every_statement(cx: &mut TestAppContext) {
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
         let session = sqlite_session_with_two_rows(cx).await;
 
         let outcome = session
@@ -194,7 +194,7 @@ mod tests {
 
     #[gpui::test]
     async fn a_failing_statement_rolls_back_every_statement_in_the_batch(cx: &mut TestAppContext) {
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
         let session = sqlite_session_with_two_rows(cx).await;
 
         let outcome = session
@@ -225,7 +225,7 @@ mod tests {
     async fn a_mixed_batch_of_one_update_and_one_delete_commits_both_in_one_transaction(
         cx: &mut TestAppContext,
     ) {
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
         let session = sqlite_session_with_two_rows(cx).await;
 
         let outcome = session
@@ -254,7 +254,7 @@ mod tests {
     async fn a_failing_statement_in_a_mixed_batch_rolls_back_both_the_update_and_the_delete(
         cx: &mut TestAppContext,
     ) {
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
         let session = sqlite_session_with_two_rows(cx).await;
 
         let outcome = session
@@ -342,7 +342,7 @@ mod tests {
     async fn a_begin_failure_fails_with_no_statement_index_and_sends_no_statement(
         cx: &mut TestAppContext,
     ) {
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
         let connection: std::sync::Arc<dyn zsql_core::Connection> =
             std::sync::Arc::new(BeginFailsConnection);
         let session = cx.new(|_cx| Session::new_for_query_test(connection));

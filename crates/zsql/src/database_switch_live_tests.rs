@@ -110,7 +110,7 @@ fn terminate_other_sessions(conn: &dyn Connection, database: &str) {
 #[gpui::test]
 async fn switch_database_re_introspects_into_the_new_databases_own_schema(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let original_url = live_database_url();
     seed_second_database(&original_url);
@@ -200,7 +200,7 @@ async fn switch_database_to_a_nonexistent_database_leaves_the_session_on_the_ori
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let original_url = live_database_url();
     let original_database = zsql_core::ConnectionUrl::parse(&original_url)
