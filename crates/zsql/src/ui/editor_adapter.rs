@@ -91,7 +91,7 @@ mod tests {
     async fn dispatching_run_query_reaches_live_results_when_configured(cx: &mut TestAppContext) {
         let url = in_memory_database_url();
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));

@@ -748,7 +748,7 @@ mod render_tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let (session, workspace, vcx, generated_id) =
             build_switch_fixture(cx, "connect-index-sync-reset", "sqlite::memory:");
@@ -833,7 +833,7 @@ mod render_tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let (session, workspace, vcx, generated_id) =
             build_switch_fixture(cx, "connect-index-sync-reset-fail", "cassandra://host/db");

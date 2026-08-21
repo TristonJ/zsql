@@ -85,7 +85,7 @@ fn mssql_verify_full_url() -> String {
 
 async fn connect_and_run_select_one(cx: &mut TestAppContext, url: String) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let session = cx.new(|_cx| Session::new(&crate::config::Config::default()));
     session
@@ -164,7 +164,7 @@ async fn killing_the_tunnel_but_not_the_database_makes_the_next_probe_unreachabl
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
-    let _guard = crate::test_support::serialize_real_io();
+    let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
     let session = cx.new(|_cx| Session::new(&crate::config::Config::default()));
     session

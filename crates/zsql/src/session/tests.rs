@@ -929,7 +929,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn connect_to_an_unreachable_host_reports_a_readable_error(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -959,7 +959,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn a_tunnel_that_cannot_open_errors_without_connecting(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         // Bind then immediately release a loopback port so a connect to it is
         // deterministically refused, rather than depending on a port happening
@@ -1009,7 +1009,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn connect_resolves_a_sqlite_url_and_actually_opens_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -1037,7 +1037,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         // No configured URL at all: `connect_to` must still work on its own.
         let session = cx.new(|_cx| Session::new(&Config::default()));
@@ -1062,7 +1062,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn a_failed_connect_switch_clears_the_previous_connection(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let session = cx.new(|_cx| Session::new(&Config::default()));
 
@@ -1114,7 +1114,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let close_calls = Arc::new(AtomicUsize::new(0));
         let outgoing: Arc<dyn Connection> =
@@ -1149,7 +1149,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let close_calls = Arc::new(AtomicUsize::new(0));
         let outgoing: Arc<dyn Connection> =
@@ -1274,7 +1274,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         for prior in [
             SchemaState::NotLoaded,
@@ -1315,7 +1315,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let session =
             cx.new(|_cx| Session::new_for_schema_test(SchemaState::Ready(SchemaTree::default())));
@@ -1350,7 +1350,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let session =
             cx.new(|_cx| Session::new_for_render_test(SessionState::Running, ResultSet::default()));
@@ -2453,7 +2453,7 @@ mod gpui_tests {
         use zsql_core::Driver as _;
 
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = zsql_core::ConnConfig::from_url("sqlite::memory:").unwrap();
         let conn = zsql_sqlite::SqliteDriver
@@ -2521,7 +2521,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn a_successful_switch_drops_the_previous_tunnel(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let open_count = Arc::new(AtomicUsize::new(0));
         let session = cx.new(|_cx| session_with_no_url());
@@ -2553,7 +2553,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn a_failed_switch_drops_the_previous_tunnel(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let open_count = Arc::new(AtomicUsize::new(0));
         let session = cx.new(|_cx| session_with_no_url());
@@ -2590,7 +2590,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let open_count = Arc::new(AtomicUsize::new(0));
         let session = cx.new(|_cx| session_with_no_url());
@@ -2677,7 +2677,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn session_connects_and_streams_a_live_query_when_configured(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -2741,7 +2741,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let mut cfg = Config::default();
         cfg.query.max_result_rows = 100;
@@ -2804,7 +2804,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -2828,7 +2828,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -2868,7 +2868,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn session_introspects_and_previews_a_relation_when_configured(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let cfg = Config::default();
         let session = cx.new(|_cx| Session::new(&cfg));
@@ -2933,7 +2933,7 @@ mod gpui_tests {
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let mut cfg = Config::default();
         cfg.liveness.probe_interval_ms = 100;
@@ -3009,7 +3009,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn switch_database_performs_the_swap_and_reset_sequence(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let close_calls = Arc::new(AtomicUsize::new(0));
         let outgoing: Arc<dyn Connection> =
@@ -3128,7 +3128,7 @@ mod gpui_tests {
     #[gpui::test]
     async fn switch_database_does_not_disturb_unrelated_session_config(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        let _guard = crate::test_support::serialize_real_io();
+        let _guard = crate::test_support::serialize_real_io_with_kicker(cx.executor());
 
         let session = cx.new(|_cx| {
             let mut session = Session::new_for_switch_test(
