@@ -92,8 +92,9 @@ query limits, etc. These are stored in your platform-specific configuration dire
 On Linux, this is typically `~/.config/zsql/config.toml`. On MacOS, this is typically
 `~/Library/Application Support/zsql/config.toml`.
 
-To see the full list of configuration options, see the `Config` struct in
-`./crates/zsql/src/config.rs`. For example, to set the theme and fonts:
+For the full list of configuration options, see [`docs/config.example.toml`](./docs/config.example.toml),
+which documents every option at its default value. Every key is optional and
+omitted keys keep their defaults. For example, to set the theme and fonts:
 ```toml
 [theme]
 name = "zsql-dark"

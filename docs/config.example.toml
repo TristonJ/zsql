@@ -1,0 +1,172 @@
+# Every option zsql reads, set to its default value. All keys are optional;
+# omit a key to keep its default. Lives in your platform's config directory,
+# e.g. ~/.config/zsql/config.toml on Linux.
+
+[theme]
+# Built-in: "zsql-dark", "catppuccin-latte", "catppuccin-frappe", "catppuccin-macchiato", "catppuccin-mocha".
+# Custom JSON color themes can be added to `./themes` in the config directory
+name = "zsql-dark"
+
+[theme.fonts]
+# Monospace font for SQL, values, and tables.
+data = "JetBrains Mono"
+# Font for UI labels and controls.
+ui = "IBM Plex Sans"
+
+[query]
+# Rows per streamed batch pushed to the UI.
+batch_size = 500
+# Default LIMIT for table quick-previews.
+preview_limit = 200
+# Page sizes the preview pager cycles through.
+preview_page_sizes = [100, 200, 500, 1000]
+# A query is cancelled and its result truncated past this many rows.
+max_result_rows = 5_000_000
+
+[liveness]
+# How often the idle-connection health probe runs.
+probe_interval_ms = 5000
+probe_timeout_ms = 2000
+
+# Pane sizes in logical pixels; min/max bound how far a divider can drag.
+[layout]
+sidebar_default_width = 300.0
+sidebar_min_width = 180.0
+sidebar_max_width = 560.0
+editor_default_height = 500.0
+editor_min_height = 120.0
+results_min_height = 120.0
+# Hit-target thickness of a draggable pane divider.
+divider_thickness = 4.0
+# Width of each tab in the tab strip.
+tab_width = 160.0
+
+[layout.value_panel]
+default_width = 360.0
+min_width = 240.0
+max_width = 720.0
+
+[value_panel]
+# JSON larger than this opens in Raw view instead of parsing eagerly.
+json_eager_parse_threshold_bytes = 2_097_152
+# How much of an oversized JSON value the Raw view previews.
+json_oversized_preview_bytes = 65_536
+hex_bytes_per_row = 16
+
+[status]
+# How long the "saved" confirmation stays in the status bar.
+save_confirmation_duration_ms = 2500
+
+[autosave]
+# Delay between an edit and the autosave it schedules.
+edit_debounce_ms = 400
+
+[sidebar]
+# How often the Scripts pane refreshes its "2m"/"3h" modified labels.
+scripts_relative_time_refresh_ms = 30_000
+
+[staging]
+# Applies the staged-changes queue; superseded by keybindings.results.apply_staged.
+apply_keybinding = "ctrl-shift-enter"
+
+[keybindings]
+# "secondary" means ctrl on Linux/Windows and cmd on macOS.
+# Each action accepts one keystroke string or an array of alternatives.
+# An unset action keeps its built-in default, shown commented below.
+
+[keybindings.editor]
+# move_left = "left"
+# move_right = "right"
+# move_up = "up"
+# move_down = "down"
+# move_line_start = "home"
+# move_line_end = "end"
+# move_document_start = "secondary-up"
+# move_document_end = "secondary-down"
+# select_left = "shift-left"
+# select_right = "shift-right"
+# select_up = "shift-up"
+# select_down = "shift-down"
+# select_line_start = "shift-home"
+# select_line_end = "shift-end"
+# select_document_start = "shift-secondary-up"
+# select_document_end = "shift-secondary-down"
+# select_all = "secondary-a"
+# backspace = "backspace"
+# delete_forward = "delete"
+# newline = "enter"
+# copy = "secondary-c"
+# cut = "secondary-x"
+# paste = "secondary-v"
+# run_query = ["cmd-enter", "ctrl-enter"]
+# save_script = "secondary-s"
+# save_script_as = "shift-secondary-s"
+# open_script = "secondary-o"
+# browse_script_files = "shift-secondary-o"
+# undo = "secondary-z"
+# redo = ["shift-secondary-z", "secondary-y", "ctrl-y"]
+
+[keybindings.text_field]
+# move_left = "left"
+# move_right = "right"
+# move_home = "home"
+# move_end = "end"
+# select_left = "shift-left"
+# select_right = "shift-right"
+# select_home = "shift-home"
+# select_end = "shift-end"
+# select_all = "secondary-a"
+# backspace = "backspace"
+# delete_forward = "delete"
+# submit = "enter"
+# copy = "secondary-c"
+# cut = "secondary-x"
+# paste = "secondary-v"
+
+[keybindings.results]
+# copy = "secondary-c"
+# cell_up = "up"
+# cell_down = "down"
+# cell_left = "left"
+# cell_right = "right"
+# toggle_value_panel = "space"
+# close_value_panel = "escape"
+# focus_value_panel = "tab"
+# prev_page = "ctrl-["
+# next_page = "ctrl-]"
+# open_quick_find = "secondary-f"
+# apply_staged = "ctrl-shift-enter"
+# edit_cell = "f2"
+
+[keybindings.quick_find]
+# prev = ["shift-enter", "up"]
+# next = "down"
+# close = "escape"
+
+[keybindings.cell_edit]
+# cancel = "escape"
+
+[keybindings.value_panel]
+# tree_up = "up"
+# tree_down = "down"
+# tree_collapse = "left"
+# tree_expand = "right"
+# copy_tree_node_value = "secondary-c"
+# copy_tree_node_path = "shift-secondary-c"
+# close_panel_from_panel = "escape"
+# focus_grid_from_panel = "tab"
+
+[keybindings.sidebar]
+# open_find = "secondary-f"
+# close_find = "escape"
+
+[keybindings.schema_view]
+# copy = "secondary-c"
+
+[keybindings.open_modal]
+# select_previous_row = "up"
+# select_next_row = "down"
+
+[keybindings.save_modal]
+# select_previous_destination = "up"
+# select_next_destination = "down"

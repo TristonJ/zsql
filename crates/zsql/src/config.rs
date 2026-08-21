@@ -896,4 +896,57 @@ mod tests {
         let reloaded = Config::load_or_default(&temp.0).expect("reload must succeed");
         assert_eq!(reloaded.theme.name, "catppuccin-mocha");
     }
+
+    const EXAMPLE_CONFIG: &str = include_str!("../../../docs/config.example.toml");
+
+    /// The example file with every commented-out `# key = value` default
+    /// line enabled, leaving prose comments untouched.
+    fn uncomment_documented_defaults(text: &str) -> String {
+        text.lines()
+            .map(|line| {
+                let Some(rest) = line.strip_prefix("# ") else {
+                    return line;
+                };
+                match rest.split_once(" = ") {
+                    Some((key, _))
+                        if !key.is_empty()
+                            && key.chars().all(|c| c.is_ascii_lowercase() || c == '_') =>
+                    {
+                        rest
+                    }
+                    _ => line,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_example_config_parses_to_exactly_the_default_config() {
+        let parsed: Config =
+            toml::from_str(EXAMPLE_CONFIG).expect("docs/config.example.toml must parse");
+        assert_eq!(
+            parsed,
+            Config::default(),
+            "docs/config.example.toml has drifted from Config::default()"
+        );
+    }
+
+    #[test]
+    fn enabling_the_example_configs_commented_keybindings_changes_no_resolved_binding() {
+        let uncommented = uncomment_documented_defaults(EXAMPLE_CONFIG);
+        let parsed: Config = toml::from_str(&uncommented)
+            .expect("docs/config.example.toml with its commented defaults enabled must parse");
+
+        let from_example = crate::keybindings::resolve(&parsed);
+        let builtin = crate::keybindings::resolve(&Config::default());
+        assert_eq!(from_example.editor, builtin.editor);
+        assert_eq!(from_example.text_field, builtin.text_field);
+        assert_eq!(from_example.results, builtin.results);
+        assert_eq!(from_example.value_panel, builtin.value_panel);
+        assert_eq!(from_example.sidebar, builtin.sidebar);
+        assert_eq!(from_example.schema_view, builtin.schema_view);
+        assert_eq!(from_example.open_modal, builtin.open_modal);
+        assert_eq!(from_example.save_modal, builtin.save_modal);
+    }
 }
