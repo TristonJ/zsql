@@ -4,7 +4,8 @@
 //! [`ConnectionManagerView`] modal.
 
 use gpui::{
-    ClickEvent, Context, Entity, FontWeight, Render, SharedString, Window, div, prelude::*, px, rgb,
+    App, ClickEvent, Context, Entity, FontWeight, Render, SharedString, Window, div, prelude::*,
+    px, rgb,
 };
 use zsql_core::{RowCount, group_thousands};
 use zsql_ui::grid::{self, status_dot_outline};
@@ -18,6 +19,18 @@ use crate::ui::format::host_label;
 use crate::ui::tabs::ResultsSnapshot;
 
 mod appearance_trigger;
+
+/// Element id and debug selector for the status bar's version label, so
+/// tests can locate its painted bounds.
+const CONNECTION_FOOTER_VERSION_ID: &str = "connection-footer-version";
+
+/// Element id and debug selector for the transient save confirmation, so
+/// tests can locate its painted bounds.
+const CONNECTION_FOOTER_SAVE_CONFIRMATION_ID: &str = "connection-footer-save-confirmation";
+
+/// The status bar's version label text, compiled from the zsql crate's own
+/// `Cargo.toml` version.
+const FOOTER_VERSION_TEXT: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// What the connection footer should render, derived from the session's
 /// lifecycle state and whichever connection (if any) is currently tracked as
@@ -304,7 +317,8 @@ impl ConnectionFooterView {
         };
         Some(
             div()
-                .id("connection-footer-save-confirmation")
+                .id(CONNECTION_FOOTER_SAVE_CONFIRMATION_ID)
+                .debug_selector(|| CONNECTION_FOOTER_SAVE_CONFIRMATION_ID.to_owned())
                 .flex()
                 .flex_row()
                 .flex_shrink_0()
@@ -344,6 +358,8 @@ impl ConnectionFooterView {
         let mut view = div()
             .flex()
             .flex_row()
+            .flex_1()
+            .min_w_0()
             .items_center()
             .gap_4()
             .font_family(&cx.theme().fonts.data)
@@ -406,6 +422,7 @@ impl Render for ConnectionFooterView {
                     .flex()
                     .flex_row()
                     .flex_1()
+                    .min_w_0()
                     .gap_2()
                     .items_center()
                     .h_full()
@@ -413,8 +430,22 @@ impl Render for ConnectionFooterView {
                     .child(self.render_current_query_result(window, cx)),
             )
             .children(self.render_save_confirmation(cx))
+            .child(render_version(cx))
             .child(self.render_appearance_trigger(window, cx))
     }
+}
+
+/// The status bar's crate version label. Non-interactive.
+fn render_version(cx: &App) -> impl IntoElement {
+    div()
+        .id(CONNECTION_FOOTER_VERSION_ID)
+        .debug_selector(|| CONNECTION_FOOTER_VERSION_ID.to_owned())
+        .flex_shrink_0()
+        .px_3()
+        .font_family(&cx.theme().fonts.data)
+        .text_size(px(theme::STATUS_BAR_TEXT_SIZE))
+        .text_color(rgb(cx.theme().colors.text_tertiary))
+        .child(FOOTER_VERSION_TEXT)
 }
 
 fn status_dot_color(state: &SessionState, liveness: &LivenessState, active_theme: &Theme) -> u32 {
@@ -476,6 +507,7 @@ fn format_total_row_count(row_count: Option<RowCount>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use gpui::{AppContext as _, TestAppContext};
+    use zsql_core::{BatchSink, Connection, CoreError, FilterState, QueryHandle};
 
     use super::{ActiveConnection, ConnectionFooterView, FooterDisplay, footer_display};
     use crate::connections::ConnectionStore;
@@ -487,6 +519,42 @@ mod tests {
             id: None,
             name: "zsql local".to_owned(),
             url: "postgres://localhost:5432/zsql".to_owned(),
+        }
+    }
+
+    /// A [`Connection`] double whose methods are never invoked: it exists
+    /// only so a session can hold a live connection.
+    struct NoopConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for NoopConnection {
+        fn stream_query(&self, _sql: String, _sink: BatchSink) -> QueryHandle {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn introspect(&self) -> Result<zsql_core::SchemaTree, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn ping(&self) -> Result<(), CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn count_rows(
+            &self,
+            _schema: &str,
+            _relation: &str,
+            _filters: &FilterState,
+        ) -> Result<zsql_core::RowCount, CoreError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn describe_relation(
+            &self,
+            _schema: &str,
+            _relation: &str,
+        ) -> Result<zsql_core::RelationSchema, CoreError> {
+            unimplemented!("not exercised by this test")
         }
     }
 
@@ -615,6 +683,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn footer_version_text_matches_the_crate_version() {
+        assert_eq!(
+            super::FOOTER_VERSION_TEXT,
+            format!("v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     fn empty_store_for_test(label: &str) -> ConnectionStore {
         let path = std::env::temp_dir().join(format!(
             "zsql-footer-render-test-{label}-{}.toml",
@@ -624,7 +700,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn renders_without_panicking_when_connected_and_when_disconnected(cx: &mut TestAppContext) {
+    fn renders_the_version_label_when_disconnected(cx: &mut TestAppContext) {
         let session = cx.new(|_cx| Session::new(&crate::config::Config::default()));
         let session_for_connections = session.clone();
         let (footer, vcx) = cx.add_window_view(|_window, cx| {
@@ -658,10 +734,16 @@ mod tests {
                 "a freshly built session must start Empty"
             );
         });
+
+        assert!(
+            vcx.debug_bounds(super::CONNECTION_FOOTER_VERSION_ID)
+                .is_some(),
+            "the version label must be painted while disconnected"
+        );
     }
 
     #[gpui::test]
-    fn renders_without_panicking_when_connecting(cx: &mut TestAppContext) {
+    fn renders_the_version_label_when_connecting(cx: &mut TestAppContext) {
         let session = cx.new(|_cx| {
             Session::new_for_render_test(
                 crate::session::SessionState::Connecting,
@@ -700,6 +782,166 @@ mod tests {
                 "the footer must keep reflecting the session's Connecting state"
             );
         });
+
+        assert!(
+            vcx.debug_bounds(super::CONNECTION_FOOTER_VERSION_ID)
+                .is_some(),
+            "the version label must be painted while connecting"
+        );
+    }
+
+    #[gpui::test]
+    fn renders_the_version_label_when_connected(cx: &mut TestAppContext) {
+        let session = cx
+            .new(|_cx| Session::new_connected_for_render_test(std::sync::Arc::new(NoopConnection)));
+        let session_for_connections = session.clone();
+
+        let (footer, vcx) = cx.add_window_view(|_window, cx| {
+            let connections = cx.new(|cx| {
+                let mut connections = ConnectionManagerView::new(
+                    session_for_connections,
+                    empty_store_for_test("render-connected"),
+                    crate::config::Config::default().liveness.probe_timeout(),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                    cx,
+                );
+                connections.set_active(Some(sample_active_connection()), cx);
+                connections
+            });
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
+        });
+        vcx.run_until_parked();
+
+        footer.read_with(vcx, |footer, cx| {
+            assert!(
+                footer.session.read(cx).is_connected(),
+                "new_connected_for_render_test must leave the session connected"
+            );
+        });
+
+        let version_bounds = vcx
+            .debug_bounds(super::CONNECTION_FOOTER_VERSION_ID)
+            .expect("the version label must be painted while connected");
+        let trigger_bounds = vcx
+            .debug_bounds(super::appearance_trigger::THEME_TRIGGER_ID)
+            .expect("the theme trigger must be painted while connected");
+        assert!(
+            version_bounds.origin.x < trigger_bounds.origin.x,
+            "the version label must sit to the left of the theme trigger"
+        );
+    }
+
+    #[gpui::test]
+    fn the_save_confirmation_paints_left_of_the_version_label_which_paints_left_of_the_theme_trigger(
+        cx: &mut TestAppContext,
+    ) {
+        let session = cx.new(|_cx| Session::new(&crate::config::Config::default()));
+        let session_for_connections = session.clone();
+        let (footer, vcx) = cx.add_window_view(|_window, cx| {
+            let connections = cx.new(|cx| {
+                ConnectionManagerView::new(
+                    session_for_connections,
+                    empty_store_for_test("render-save-confirmation"),
+                    crate::config::Config::default().liveness.probe_timeout(),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                    cx,
+                )
+            });
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
+        });
+        vcx.run_until_parked();
+
+        footer.update(vcx, |footer, cx| {
+            footer.show_saved_confirmation("query.sql", cx);
+        });
+        vcx.run_until_parked();
+
+        let save_bounds = vcx
+            .debug_bounds(super::CONNECTION_FOOTER_SAVE_CONFIRMATION_ID)
+            .expect("the save confirmation must be painted once shown");
+        let version_bounds = vcx
+            .debug_bounds(super::CONNECTION_FOOTER_VERSION_ID)
+            .expect("the version label must still be painted alongside the save confirmation");
+        let trigger_bounds = vcx
+            .debug_bounds(super::appearance_trigger::THEME_TRIGGER_ID)
+            .expect("the theme trigger must still be painted alongside the save confirmation");
+
+        assert!(
+            save_bounds.origin.x < version_bounds.origin.x,
+            "the save confirmation must sit left of the version label"
+        );
+        assert!(
+            version_bounds.origin.x < trigger_bounds.origin.x,
+            "the version label must sit left of the theme trigger"
+        );
+    }
+
+    #[gpui::test]
+    fn the_version_label_and_theme_trigger_hold_position_when_the_left_cluster_overflows(
+        cx: &mut TestAppContext,
+    ) {
+        let session = cx.new(|_cx| {
+            Session::new_for_render_test(
+                crate::session::SessionState::Error("x".repeat(500)),
+                zsql_core::ResultSet::default(),
+            )
+        });
+        let session_for_connections = session.clone();
+        let (_footer, vcx) = cx.add_window_view(|_window, cx| {
+            let connections = cx.new(|cx| {
+                ConnectionManagerView::new(
+                    session_for_connections,
+                    empty_store_for_test("render-overflow"),
+                    crate::config::Config::default().liveness.probe_timeout(),
+                    zsql_core::DEFAULT_QUERY_BATCH_SIZE,
+                    cx,
+                )
+            });
+            let appearance = cx.new(|cx| {
+                crate::ui::appearance::AppearanceModalView::new(
+                    "zsql-dark".to_owned(),
+                    None,
+                    None,
+                    cx,
+                )
+            });
+            ConnectionFooterView::new(session, connections, appearance, cx)
+        });
+        vcx.run_until_parked();
+
+        let viewport_width = vcx.update(|window, _cx| window.viewport_size().width);
+
+        let version_bounds = vcx
+            .debug_bounds(super::CONNECTION_FOOTER_VERSION_ID)
+            .expect("the version label must be painted even when the left cluster overflows");
+        let trigger_bounds = vcx
+            .debug_bounds(super::appearance_trigger::THEME_TRIGGER_ID)
+            .expect("the theme trigger must be painted even when the left cluster overflows");
+
+        assert!(
+            version_bounds.origin.x < trigger_bounds.origin.x,
+            "the version label must stay left of the theme trigger under overflow"
+        );
+        assert!(
+            trigger_bounds.origin.x + trigger_bounds.size.width <= viewport_width,
+            "the theme trigger must stay within the window instead of being pushed offscreen"
+        );
     }
 
     #[test]

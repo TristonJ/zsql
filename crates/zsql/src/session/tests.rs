@@ -57,6 +57,15 @@ impl Session {
         }
     }
 
+    /// Build a session already `Connected` and holding `connection`, without
+    /// going through a real connect.
+    pub(crate) fn new_connected_for_render_test(connection: Arc<dyn Connection>) -> Self {
+        Self {
+            connection: Some(connection),
+            ..Self::new_for_render_test(SessionState::Connected, ResultSet::default())
+        }
+    }
+
     /// Replace the accumulated result set in place, simulating another
     /// batch (or a fresh result)
     pub(crate) fn set_result_for_test(&mut self, result: ResultSet) {
