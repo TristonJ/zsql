@@ -419,6 +419,7 @@ mod tests {
             display_kind: "postgres".to_owned(),
             display_host: "localhost".to_owned(),
             ssh: None,
+            sanitized_url: None,
         }
     }
 

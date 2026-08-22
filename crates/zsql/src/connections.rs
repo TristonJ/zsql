@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use zsql_core::ConnectionUrl;
 
 use crate::{drivers::detect_driver_name, ui::format::host_label};
 
@@ -34,6 +35,12 @@ pub struct StoredConnection {
     /// support existed.
     #[serde(default)]
     pub ssh: Option<StoredSsh>,
+    /// The connection URL with its password cleared, kept alongside the
+    /// keyring-only secret so a lost keyring entry can still be rebuilt
+    /// once a password is re-entered. Absent for connections saved before
+    /// this field existed, and never carries a password itself.
+    #[serde(default)]
+    pub sanitized_url: Option<String>,
 }
 
 /// Non-secret SSH tunnel settings for a [`StoredConnection`]. The SSH
@@ -103,6 +110,7 @@ impl ConnectionArgs {
                 .to_owned(),
             display_host: host_label(&self.url),
             ssh: self.ssh,
+            sanitized_url: sanitize_url(&self.url),
         };
         stored.set_url(&self.url)?;
         if let Some(secret) = &self.ssh_secret {
@@ -112,11 +120,22 @@ impl ConnectionArgs {
     }
 }
 
+/// The password-cleared form of `url` to persist as
+/// [`StoredConnection::sanitized_url`]. `None` when `url` fails to parse,
+/// never a partially-scrubbed string.
+pub(crate) fn sanitize_url(url: &str) -> Option<String> {
+    let mut parsed = ConnectionUrl::parse(url).ok()?;
+    parsed.set_password("");
+    Some(parsed.to_url_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh};
+    use super::{
+        ConnectionArgs, HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh, sanitize_url,
+    };
 
     /// Non-secret SSH settings used by tests that don't care about specific
     /// field values, just that a tunnel is configured.
@@ -140,6 +159,7 @@ mod tests {
             display_kind: "postgres".to_owned(),
             display_host: "localhost".to_owned(),
             ssh: None,
+            sanitized_url: Some("postgres://user@localhost/app".to_owned()),
         };
         let text = toml::to_string(&connection).expect("must serialize");
         let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
@@ -154,6 +174,7 @@ mod tests {
             display_kind: "sqlite".to_owned(),
             display_host: "local file".to_owned(),
             ssh: None,
+            sanitized_url: None,
         };
         let text = toml::to_string(&connection).expect("must serialize");
         let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
@@ -192,6 +213,7 @@ mod tests {
                     key_path,
                     host_key_policy,
                 }),
+                sanitized_url: None,
             };
             let text = toml::to_string(&connection).expect("must serialize");
             let parsed: StoredConnection = toml::from_str(&text).expect("must parse back");
@@ -208,6 +230,7 @@ mod tests {
             display_kind: "postgres".to_owned(),
             display_host: "bastion.example.com".to_owned(),
             ssh: Some(sample_ssh()),
+            sanitized_url: None,
         };
         // The password never has anywhere to go on `StoredConnection` or
         // `StoredSsh` in the first place; this pins that down at the
@@ -217,6 +240,59 @@ mod tests {
         assert!(
             !text.contains(secret),
             "the SSH password must never appear in the serialized TOML, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_clears_the_password_but_keeps_every_other_part() {
+        let sanitized =
+            sanitize_url("postgres://readonly:hunter2@db.internal:5432/analytics?sslmode=require")
+                .expect("a well-formed URL must sanitize");
+        assert!(
+            !sanitized.contains("hunter2"),
+            "the sanitized URL must not contain the password, got: {sanitized}"
+        );
+        assert!(sanitized.contains("readonly"));
+        assert!(sanitized.contains("db.internal"));
+        assert!(sanitized.contains("analytics"));
+    }
+
+    #[test]
+    fn sanitize_url_is_none_for_an_unparseable_url() {
+        assert_eq!(sanitize_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn into_stored_populates_sanitized_url_with_the_password_cleared() {
+        let args = ConnectionArgs {
+            name: "prod".to_owned(),
+            url: "postgres://readonly:hunter2@db.internal:5432/analytics".to_owned(),
+            ssh: None,
+            ssh_secret: None,
+        };
+        let stored = args.into_stored().expect("into_stored must succeed");
+        let sanitized = stored
+            .sanitized_url
+            .expect("sanitized_url must be populated");
+        assert!(!sanitized.contains("hunter2"));
+        assert!(sanitized.contains("db.internal"));
+    }
+
+    #[test]
+    fn a_saved_connections_serialized_toml_never_contains_the_plaintext_password_anywhere() {
+        let secret = "hunter2-super-secret-password";
+        let args = ConnectionArgs {
+            name: "prod".to_owned(),
+            url: format!("postgres://readonly:{secret}@db.internal:5432/analytics"),
+            ssh: None,
+            ssh_secret: None,
+        };
+        let stored = args.into_stored().expect("into_stored must succeed");
+        let text = toml::to_string(&stored).expect("must serialize");
+        assert!(
+            !text.contains(secret),
+            "the password must never appear anywhere in the serialized TOML, \
+             including in sanitized_url, got:\n{text}"
         );
     }
 }

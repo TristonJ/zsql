@@ -270,12 +270,46 @@ pub fn host_label(url: &str) -> String {
     }
 }
 
+/// A connection's `user@host:port/db` summary line for display, parsed from
+/// its sanitized (password-cleared) URL. Falls back to `display_host` when
+/// there is no sanitized URL to parse, it fails to parse, or it names a
+/// sqlite-path connection (which has no user/host/port/database of its own).
+#[must_use]
+pub fn connection_summary_line(sanitized_url: Option<&str>, display_host: &str) -> String {
+    let Some(parsed) = sanitized_url.and_then(|url| zsql_core::ConnectionUrl::parse(url).ok())
+    else {
+        return display_host.to_owned();
+    };
+    if parsed.is_sqlite() {
+        return display_host.to_owned();
+    }
+
+    let mut line = String::new();
+    let user = parsed.user();
+    if !user.is_empty() {
+        line.push_str(&user);
+        line.push('@');
+    }
+    line.push_str(&parsed.host().unwrap_or_default());
+    if let Some(port) = parsed.port() {
+        let _ = write!(line, ":{port}");
+    }
+    let database = parsed.database();
+    if !database.is_empty() {
+        line.push('/');
+        line.push_str(&database);
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use zsql_core::{ColumnMeta, Row, Value, value::UnknownValue};
     use zsql_ui::theme::Theme;
 
-    use super::{ValueKind, base64_encode, format_value, row_as_json, value_to_json};
+    use super::{
+        ValueKind, base64_encode, connection_summary_line, format_value, row_as_json, value_to_json,
+    };
 
     fn column(name: &str, type_name: &str) -> ColumnMeta {
         ColumnMeta {
@@ -543,6 +577,51 @@ mod tests {
         assert_eq!(
             csv,
             "simple,\"with,comma\",\"with\"\"quote\",\"with\nnewline\""
+        );
+    }
+
+    #[test]
+    fn connection_summary_line_builds_user_host_port_db_from_a_sanitized_url() {
+        let line = connection_summary_line(
+            Some("postgres://readonly@db.internal:5432/analytics"),
+            "unused",
+        );
+        assert_eq!(line, "readonly@db.internal:5432/analytics");
+    }
+
+    #[test]
+    fn connection_summary_line_omits_the_user_segment_when_the_url_has_none() {
+        let line = connection_summary_line(Some("postgres://db.internal/analytics"), "unused");
+        assert_eq!(line, "db.internal/analytics");
+    }
+
+    #[test]
+    fn connection_summary_line_omits_the_port_when_the_url_has_none() {
+        let line = connection_summary_line(Some("postgres://user@db.internal/analytics"), "unused");
+        assert_eq!(line, "user@db.internal/analytics");
+    }
+
+    #[test]
+    fn connection_summary_line_falls_back_to_display_host_with_no_sanitized_url() {
+        assert_eq!(
+            connection_summary_line(None, "localhost:5432"),
+            "localhost:5432"
+        );
+    }
+
+    #[test]
+    fn connection_summary_line_falls_back_to_display_host_for_an_unparseable_sanitized_url() {
+        assert_eq!(
+            connection_summary_line(Some("not-a-url"), "fallback-host"),
+            "fallback-host"
+        );
+    }
+
+    #[test]
+    fn connection_summary_line_falls_back_to_display_host_for_a_sqlite_url() {
+        assert_eq!(
+            connection_summary_line(Some("sqlite:///tmp/app.db"), "app.db"),
+            "app.db"
         );
     }
 }

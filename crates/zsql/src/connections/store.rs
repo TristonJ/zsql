@@ -46,6 +46,17 @@ pub enum ConnectionStoreError {
     Keyring(#[from] crate::keyring::Error),
 }
 
+impl ConnectionStoreError {
+    /// Whether this error is a keyring failure meaning no credential is
+    /// stored for the account accessed, as opposed to some other store or
+    /// keyring-access failure. Programmatic classification: never decide
+    /// this from the error's [`std::fmt::Display`] text.
+    #[must_use]
+    pub fn is_keyring_absent(&self) -> bool {
+        matches!(self, Self::Keyring(err) if err.is_absent())
+    }
+}
+
 /// The persisted list of [`StoredConnection`]s, backed by a single TOML
 /// file. Every mutation saves immediately: there is no separate "dirty"
 /// state to forget to flush.
@@ -151,6 +162,7 @@ impl ConnectionStore {
                 None
             },
         };
+        let prior_sanitized_url = conn.sanitized_url.clone();
         // Attempt to update the keyring first
         conn.set_url(&args.url)?;
         match &args.ssh_secret {
@@ -159,6 +171,7 @@ impl ConnectionStore {
         }
         conn.ssh = args.ssh;
         conn.name = args.name;
+        conn.sanitized_url = super::sanitize_url(&args.url);
         // Now try to save - undoing the keyring change if it fails
         if let Err(err) = self.save() {
             let conn = self
@@ -172,6 +185,7 @@ impl ConnectionStore {
             }
             conn.ssh = prior_args.ssh;
             conn.name = prior_args.name;
+            conn.sanitized_url = prior_sanitized_url;
             return Err(err);
         }
         Ok(())
@@ -248,7 +262,9 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), ConnectionStoreError> 
 mod tests {
     use std::path::PathBuf;
 
-    use super::super::{ConnectionArgs, HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh};
+    use super::super::{
+        ConnectionArgs, HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh, sanitize_url,
+    };
     use super::ConnectionStore;
 
     /// A temp file path this test owns exclusively, removed on drop so
@@ -342,6 +358,25 @@ mod tests {
             ConnectionStore::load(&temp.0).expect("a store with no ssh key must still parse");
         assert_eq!(store.connections().len(), 1);
         assert_eq!(store.connections()[0].ssh, None);
+    }
+
+    #[test]
+    fn loading_a_store_file_written_before_sanitized_url_existed_defaults_it_to_none() {
+        let temp = TempStorePath::new("pre-sanitized-url-store");
+        let id = uuid::Uuid::new_v4();
+        let pre_field_toml = format!(
+            "[[connections]]\n\
+             id = \"{id}\"\n\
+             name = \"legacy\"\n\
+             display_kind = \"postgres\"\n\
+             display_host = \"localhost\"\n"
+        );
+        std::fs::write(&temp.0, pre_field_toml).expect("setup write failed");
+
+        let store = ConnectionStore::load(&temp.0)
+            .expect("a store with no sanitized_url key must still parse");
+        assert_eq!(store.connections().len(), 1);
+        assert_eq!(store.connections()[0].sanitized_url, None);
     }
 
     #[test]
@@ -621,6 +656,41 @@ mod tests {
     }
 
     #[test]
+    fn updating_a_connection_refreshes_its_sanitized_url() {
+        let temp = TempStorePath::new("update-sanitized-url");
+        let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
+        store
+            .add(ConnectionArgs {
+                name: "first".to_owned(),
+                url: "postgres://user:hunter2@host/a".to_owned(),
+                ssh: None,
+                ssh_secret: None,
+            })
+            .expect("add must succeed");
+        let id = store.connections()[0].id;
+
+        store
+            .update(
+                id,
+                ConnectionArgs {
+                    name: "first".to_owned(),
+                    url: "postgres://otheruser:hunter3@otherhost/b".to_owned(),
+                    ssh: None,
+                    ssh_secret: None,
+                },
+            )
+            .expect("update must succeed");
+
+        let sanitized = store.connections()[0]
+            .sanitized_url
+            .clone()
+            .expect("sanitized_url must be populated after an update");
+        assert!(sanitized.contains("otheruser"));
+        assert!(sanitized.contains("otherhost"));
+        assert!(!sanitized.contains("hunter3"));
+    }
+
+    #[test]
     fn updating_a_connection_changes_its_ssh_settings_and_secret() {
         let temp = TempStorePath::new("update-ssh");
         let mut store = ConnectionStore::load(&temp.0).expect("initial load must succeed");
@@ -761,6 +831,11 @@ mod tests {
             "update must fail when the store file cannot be overwritten"
         );
         assert_connection_eq(&store.connections()[0], &sample());
+        assert_eq!(
+            store.connections()[0].sanitized_url,
+            sanitize_url(&sample().url),
+            "a rolled-back update must also restore the original sanitized_url"
+        );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("teardown: restore file permissions");
@@ -864,6 +939,7 @@ mod tests {
             display_kind: String::new(),
             display_host: String::new(),
             ssh: None,
+            sanitized_url: None,
         };
         let secret_result = fresh.get_ssh_secret();
         assert!(
@@ -991,6 +1067,7 @@ mod tests {
             display_kind: String::new(),
             display_host: String::new(),
             ssh: None,
+            sanitized_url: None,
         };
         let result = fresh.get_ssh_secret();
         assert!(
