@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Entity, FocusHandle, KeyDownEvent, Task, Window, prelude::*};
 use uuid::Uuid;
-use zsql_core::Connection;
+use zsql_core::{Connection, ConnectionUrl};
 use zsql_ui::scrollable::ScrollView;
 
 use crate::connections::{
@@ -30,6 +30,9 @@ use crate::ui::format::host_label;
 
 mod form;
 mod list;
+mod password_prompt;
+
+use password_prompt::{PasswordPrompt, PasswordPromptEvent};
 
 /// Which panel the connection-manager modal currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,19 @@ pub struct ConnectionManagerView {
     form: Entity<ConnectionForm>,
     /// We need to refocus the modal's own focus handle
     refocus_modal: bool,
+    /// Whether the edit form's name field still needs focusing on the next
+    /// render, for open paths that run without a [`Window`] to focus with
+    /// synchronously.
+    pending_form_focus: bool,
+    /// The password prompt shown when connecting hits a connection whose
+    /// keyring secret is absent but whose sanitized URL can rebuild it once
+    /// a password is re-entered. `None` when no prompt is open. A fresh
+    /// entity is created every time the prompt opens, so an in-flight
+    /// connect attempt started by one prompt can tell (by comparing this
+    /// field's entity identity) that it has been superseded (cancelled and
+    /// possibly reopened for the same connection) rather than acting on a
+    /// discarded password.
+    password_prompt: Option<Entity<PasswordPrompt>>,
     /// Vertical scroll for the saved-connections list, capped at
     /// `theme::MODAL_LIST_MAX_HEIGHT`: persists here (rather than being
     /// rebuilt per-render) so drag and first-frame measurement state survive
@@ -166,6 +182,8 @@ impl ConnectionManagerView {
             batch_size,
             form,
             refocus_modal: false,
+            pending_form_focus: false,
+            password_prompt: None,
             list_scroll: ScrollView::new(cx),
         }
     }
@@ -192,10 +210,11 @@ impl ConnectionManagerView {
         self.form.read(cx).focus_order(cx)
     }
 
-    /// Whether the modal overlay is currently mounted/visible.
+    /// Whether the modal overlay is currently mounted/visible: either the
+    /// list/form modal, or the password prompt shown on top of it.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.open
+        self.open || self.password_prompt.is_some()
     }
 
     /// Which panel the modal currently shows.
@@ -305,19 +324,35 @@ impl ConnectionManagerView {
     }
 
     /// Switch the open modal to the edit form for the connection at `index`,
-    /// pre-filled from its stored name/url.
+    /// pre-filled from its stored name/url, and focus its name field.
     pub fn show_edit_form(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.begin_edit(id, cx) {
+            self.form.read(cx).name_focus_handle(cx).focus(window);
+        }
+    }
+
+    /// Switch the open modal to the edit form for the connection at `id`,
+    /// pre-filled from its stored name/ssh and, when readable, its URL.
+    ///
+    /// A connection whose keyring secret is absent opens the form anyway,
+    /// with the URL field left blank for the user to re-enter. Any other
+    /// keyring or store error is still reported through [`Self::status`]
+    /// without opening the form. Returns whether the form was opened, so a
+    /// caller that also needs to focus a field (which requires a [`Window`])
+    /// can skip doing so on failure.
+    fn begin_edit(&mut self, id: Uuid, cx: &mut Context<Self>) -> bool {
         let Some(row) = self.rows.iter().find(|r| r.connection.id == id) else {
             tracing::warn!(id = %id, "edit requested for a non-existing row");
-            return;
+            return false;
         };
         let url = match row.connection.get_url() {
             Ok(url) => url,
-            Err(e) => {
-                tracing::warn!(id = %id, "edit requested for a row with an invalid URL: {e}");
-                self.status = Some(format!("Cannot edit: {e}"));
+            Err(err) if err.is_keyring_absent() => String::new(),
+            Err(err) => {
+                tracing::warn!(id = %id, "edit requested for a row with an invalid URL: {err}");
+                self.status = Some(format!("Cannot edit: {err}"));
                 cx.notify();
-                return;
+                return false;
             }
         };
         let name = row.connection.name.clone();
@@ -333,8 +368,8 @@ impl ConnectionManagerView {
         self.form.update(cx, |form, cx| {
             form.begin_edit(id, name, url, ssh, ssh_secret, cx);
         });
-        self.form.read(cx).name_focus_handle(cx).focus(window);
         cx.notify();
+        true
     }
 
     /// Cancel out of the form back to the list, discarding whatever was
@@ -418,6 +453,17 @@ pub(super) fn driver_display_label(driver_id: &str) -> &'static str {
         "mariadb" => "MariaDB",
         _ => "unrecognized",
     }
+}
+
+/// `connection`'s sanitized URL, if it parses as a sqlite-path URL: one with
+/// no password to lose, so a lost keyring entry can be repaired by
+/// reconnecting directly instead of prompting for one.
+fn sqlite_sanitized_url(connection: &StoredConnection) -> Option<String> {
+    let sanitized = connection.sanitized_url.as_deref()?;
+    ConnectionUrl::parse(sanitized)
+        .ok()
+        .filter(ConnectionUrl::is_sqlite)
+        .map(|_| sanitized.to_owned())
 }
 
 fn build_rows(connections: &[StoredConnection]) -> Vec<ConnectionRow> {
@@ -608,6 +654,13 @@ impl ConnectionManagerView {
     /// with the final outcome once the whole sequence settles. Does not
     /// itself close the modal; see [`Self::connect_and_close`] for the
     /// row-click/Enter path that does.
+    ///
+    /// An absent keyring secret (see [`ConnectionStoreError::is_keyring_absent`])
+    /// skips [`Self::status`]: a sqlite connection (no password to lose)
+    /// reconnects with its sanitized URL directly; any other connection with
+    /// one opens the password prompt; one without (pre-dating that field)
+    /// opens the edit form blank. Any other keyring error still reports
+    /// "Failed to connect" through [`Self::status`].
     #[tracing::instrument(name = "connection_manager_connect", skip_all)]
     pub fn connect(&mut self, id: Uuid, cx: &mut Context<Self>) -> Task<()> {
         let Some(row) = self.rows.iter().find(|r| r.connection.id == id) else {
@@ -615,8 +668,22 @@ impl ConnectionManagerView {
             return Task::ready(());
         };
         let name = row.connection.name.clone();
-        let url = match row.connection.get_url() {
+        let connection = row.connection.clone();
+        let mut restore_sqlite_keyring = false;
+        let url = match connection.get_url() {
             Ok(url) => url,
+            Err(err) if err.is_keyring_absent() => {
+                if let Some(url) = sqlite_sanitized_url(&connection) {
+                    restore_sqlite_keyring = true;
+                    url
+                } else {
+                    if !self.open_password_prompt(&connection, cx) && self.begin_edit(id, cx) {
+                        self.pending_form_focus = true;
+                        cx.notify();
+                    }
+                    return Task::ready(());
+                }
+            }
             Err(err) => {
                 tracing::error!(error = %err, "unable to read connection URL");
                 self.status = Some(format!("Failed to connect to {name}: {err}"));
@@ -624,7 +691,7 @@ impl ConnectionManagerView {
                 return Task::ready(());
             }
         };
-        let ssh = match row.connection.ssh_config() {
+        let ssh = match connection.ssh_config() {
             Ok(ssh) => ssh,
             Err(err) => {
                 tracing::error!(error = %err, "unable to read SSH tunnel secret");
@@ -636,12 +703,43 @@ impl ConnectionManagerView {
         tracing::info!(name = %name, "connecting to saved connection");
         self.status = Some("connecting...".to_string());
         self.active = Some(ActiveConnection {
-            id: Some(row.connection.id),
+            id: Some(connection.id),
             name: name.clone(),
             url: url.clone(),
         });
         cx.notify();
 
+        self.spawn_connect(url.clone(), ssh, cx, move |view, outcome, cx| {
+            view.status = Some(match outcome {
+                Ok(()) => {
+                    let mut status = format!("Connected to {name}.");
+                    if restore_sqlite_keyring && let Err(err) = connection.set_url(&url) {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to restore sqlite connection's keyring entry"
+                        );
+                        status = format!(
+                            "Connected to {name}. The keyring entry could not be restored: {err}"
+                        );
+                    }
+                    status
+                }
+                Err(reason) => format!("Failed to connect to {name}: {reason}"),
+            });
+            cx.notify();
+        })
+    }
+
+    /// Connect the session to `url` (through `ssh`'s tunnel, if given) and,
+    /// on success, introspect it. Once the attempt settles, `on_settled`
+    /// runs with its outcome, provided the view is still around.
+    fn spawn_connect(
+        &mut self,
+        url: String,
+        ssh: Option<zsql_ssh::SshConfig>,
+        cx: &mut Context<Self>,
+        on_settled: impl FnOnce(&mut Self, Result<(), String>, &mut Context<Self>) + 'static,
+    ) -> Task<()> {
         let connect_task = self
             .session
             .update(cx, |session, cx| session.connect_to_with_ssh(url, ssh, cx));
@@ -664,21 +762,149 @@ impl ConnectionManagerView {
                 introspect_task.await;
             }
 
-            let _ = this.update(cx, |view, cx| {
-                view.status = Some(match outcome {
-                    Ok(()) => format!("Connected to {name}."),
-                    Err(reason) => format!("Failed to connect to {name}: {reason}"),
-                });
-                cx.notify();
-            });
+            let _ = this.update(cx, |view, cx| on_settled(view, outcome, cx));
         })
     }
 
-    /// Connect to the row with `id` (see [`Self::connect`]) and close the modal
+    /// Connect to the row with `id` (see [`Self::connect`]) and close the
+    /// modal, unless `connect` opened the password prompt or the legacy
+    /// edit-form fallback instead of actually connecting: in that case that
+    /// takes over as the modal's content and must stay open.
     pub fn connect_and_close(&mut self, id: Uuid, cx: &mut Context<Self>) -> Task<()> {
         let task = self.connect(id, cx);
-        self.close(cx);
+        if self.password_prompt.is_none() && matches!(self.view, ManagerView::List) {
+            self.close(cx);
+        }
         task
+    }
+
+    /// Open the password prompt for `connection`'s absent-keyring connect
+    /// failure. Returns `false` without opening anything when `connection`
+    /// has no sanitized URL to rebuild from (a connection saved before that
+    /// field existed), so the caller can fall back to the edit form.
+    fn open_password_prompt(
+        &mut self,
+        connection: &StoredConnection,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sanitized_url) = connection.sanitized_url.clone() else {
+            return false;
+        };
+
+        let prompt = cx.new(|cx| PasswordPrompt::new(connection.clone(), sanitized_url, cx));
+        cx.subscribe(&prompt, |view, prompt, event, cx| {
+            view.on_password_prompt_event(&prompt, event, cx);
+        })
+        .detach();
+
+        self.password_prompt = Some(prompt);
+        self.status = None;
+        cx.notify();
+        true
+    }
+
+    /// React to a [`PasswordPromptEvent`] emitted by `prompt`: `Cancel`
+    /// discards it and closes the modal; `Connect` hands off to
+    /// [`Self::attempt_password_prompt_connect`]. Ignored for `Cancel` when
+    /// `prompt` no longer matches [`Self::password_prompt`] (superseded by a
+    /// later prompt for the same connection), so a stale event can never
+    /// close a prompt it does not belong to.
+    #[tracing::instrument(name = "password_prompt_connect", skip_all)]
+    fn on_password_prompt_event(
+        &mut self,
+        prompt: &Entity<PasswordPrompt>,
+        event: &PasswordPromptEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let PasswordPromptEvent::Connect {
+            password,
+            save_to_keyring,
+        } = event
+        else {
+            if self.password_prompt.as_ref() == Some(prompt) {
+                self.password_prompt = None;
+                self.close(cx);
+            }
+            return;
+        };
+        self.attempt_password_prompt_connect(prompt.clone(), password, *save_to_keyring, cx)
+            .detach();
+    }
+
+    /// Rebuild the connection's full URL from `prompt`'s sanitized URL and
+    /// `password`, then attempt the connect. On success, writes the password
+    /// to the keyring only if `save_to_keyring` was set, then closes the
+    /// prompt; on failure (including a URL or tunnel secret that cannot be
+    /// resolved, without a connect ever being attempted), nothing is written
+    /// and the prompt stays open with an inline error. A stale outcome
+    /// (`prompt` no longer matches [`Self::password_prompt`]) is dropped.
+    fn attempt_password_prompt_connect(
+        &mut self,
+        prompt: Entity<PasswordPrompt>,
+        password: &str,
+        save_to_keyring: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let (connection, sanitized_url) = {
+            let state = prompt.read(cx);
+            (state.connection().clone(), state.sanitized_url().to_owned())
+        };
+        let Ok(mut parsed_url) = ConnectionUrl::parse(&sanitized_url) else {
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_error(Some("Saved connection URL is invalid.".to_owned()), cx);
+            });
+            return Task::ready(());
+        };
+        parsed_url.set_password(password);
+        let full_url = parsed_url.to_url_string();
+
+        let ssh = match connection.ssh_config() {
+            Ok(ssh) => ssh,
+            Err(err) => {
+                prompt.update(cx, |prompt, cx| {
+                    prompt.set_error(Some(format!("Failed to read tunnel secret: {err}")), cx);
+                });
+                return Task::ready(());
+            }
+        };
+        let name = connection.name.clone();
+        self.active = Some(ActiveConnection {
+            id: Some(connection.id),
+            name: name.clone(),
+            url: full_url.clone(),
+        });
+        cx.notify();
+
+        self.spawn_connect(full_url.clone(), ssh, cx, move |view, outcome, cx| {
+            let still_current = view.password_prompt.as_ref() == Some(&prompt);
+            if !still_current {
+                return;
+            }
+            match outcome {
+                Ok(()) => {
+                    let mut status = format!("Connected to {name}.");
+                    if save_to_keyring && let Err(err) = connection.set_url(&full_url) {
+                        tracing::error!(
+                            error = %err,
+                            "failed to save the entered password to the keyring"
+                        );
+                        status = format!(
+                            "Connected to {name}. The password could not be saved to the \
+                             keyring: {err}"
+                        );
+                    }
+                    view.password_prompt = None;
+                    view.close(cx);
+                    view.status = Some(status);
+                }
+                Err(reason) => {
+                    prompt.update(cx, |prompt, cx| {
+                        prompt.set_error(Some(reason), cx);
+                    });
+                }
+            }
+            cx.notify();
+        })
     }
 
     /// Connect to the form's current URL through the session, without
@@ -814,6 +1040,96 @@ impl ConnectionManagerView {
                 form.set_test_outcome(Some(outcome), cx);
             });
         })
+    }
+}
+
+/// Test-only accessors/drivers for the password prompt: nothing outside
+/// this crate's tests reads or drives it through them.
+#[cfg(test)]
+impl ConnectionManagerView {
+    fn password_prompt_is_open(&self) -> bool {
+        self.password_prompt.is_some()
+    }
+
+    fn password_prompt_entity(&self) -> Option<Entity<PasswordPrompt>> {
+        self.password_prompt.clone()
+    }
+
+    fn password_prompt_error(&self, cx: &App) -> Option<String> {
+        self.password_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.read(cx).error().map(ToOwned::to_owned))
+    }
+
+    fn password_prompt_save_checked(&self, cx: &App) -> bool {
+        self.password_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.read(cx).save_checked())
+    }
+
+    fn password_prompt_connecting(&self, cx: &App) -> bool {
+        self.password_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.read(cx).connecting())
+    }
+
+    fn password_prompt_field_is_masked(&self, cx: &App) -> bool {
+        self.password_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.read(cx).field_is_masked(cx))
+    }
+
+    fn password_prompt_field_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        self.password_prompt
+            .as_ref()
+            .map(|prompt| prompt.read(cx).field_focus_handle(cx))
+    }
+
+    fn set_password_prompt_input(&mut self, value: impl AsRef<str>, cx: &mut App) {
+        let Some(prompt) = self.password_prompt.clone() else {
+            return;
+        };
+        let field = prompt.read(cx).password_field();
+        field.update(cx, |field, cx| field.set_value(value, cx));
+    }
+
+    fn toggle_password_prompt_save(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.password_prompt.clone() else {
+            return;
+        };
+        prompt.update(cx, PasswordPrompt::toggle_save);
+    }
+
+    fn cancel_password_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.password_prompt.clone() else {
+            return;
+        };
+        prompt.update(cx, |_prompt, cx| PasswordPrompt::cancel(cx));
+    }
+
+    /// Mirrors what clicking Connect (or pressing Enter) does, but returns
+    /// the resulting connect attempt's Task directly (rather than the
+    /// production path's detached one), so a test can await it to
+    /// completion instead of guessing how many executor ticks a real
+    /// connect takes.
+    fn submit_password_prompt(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let Some(prompt) = self.password_prompt.clone() else {
+            return Task::ready(());
+        };
+        let password = prompt
+            .read(cx)
+            .password_field()
+            .read(cx)
+            .value()
+            .to_string();
+        if password.trim().is_empty() {
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_error(Some(password_prompt::EMPTY_PASSWORD_MESSAGE.to_owned()), cx);
+            });
+            return Task::ready(());
+        }
+        let save_to_keyring = prompt.read(cx).save_checked();
+        self.attempt_password_prompt_connect(prompt, &password, save_to_keyring, cx)
     }
 }
 

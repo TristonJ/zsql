@@ -15,10 +15,20 @@ impl Render for ConnectionManagerView {
     /// The connection manager modal. The caller (`ui::workspace::WorkspaceView`) is
     /// responsible for conditionally mounting this entity in the first place, so `render`
     /// does not re-check `open` itself.
+    ///
+    /// The password prompt, when open, takes over this modal's entire
+    /// content in place of the list/form panels.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(prompt) = self.password_prompt.clone() {
+            return prompt.into_any_element();
+        }
+
         // Refocus the modal if we need to
         if std::mem::take(&mut self.refocus_modal) {
             self.modal_focus.focus(window);
+        }
+        if std::mem::take(&mut self.pending_form_focus) {
+            self.form.read(cx).name_focus_handle(cx).focus(window);
         }
         let mut body = div().on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
             view.handle_modal_key_down(event, window, cx);
@@ -37,6 +47,7 @@ impl Render for ConnectionManagerView {
             .on_close(cx.listener(|view, (), _w, cx| view.close(cx)))
             .head(self.render_modal_head(cx))
             .body(body)
+            .into_any_element()
     }
 }
 

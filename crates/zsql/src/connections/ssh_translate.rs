@@ -87,6 +87,7 @@ mod tests {
             display_kind: "postgres".to_owned(),
             display_host: "localhost".to_owned(),
             ssh: None,
+            sanitized_url: None,
         };
         assert!(connection.ssh_config().unwrap().is_none());
     }
@@ -102,6 +103,7 @@ mod tests {
                 enabled: false,
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         assert!(connection.ssh_config().unwrap().is_none());
     }
@@ -117,6 +119,7 @@ mod tests {
                 auth_kind: SshAuthKind::Agent,
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         let cfg = connection
             .ssh_config()
@@ -139,6 +142,7 @@ mod tests {
                 auth_kind: SshAuthKind::Password,
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         connection
             .set_ssh_secret("tunnel-password")
@@ -165,6 +169,7 @@ mod tests {
                 auth_kind: SshAuthKind::Password,
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         assert!(connection.ssh_config().is_err());
     }
@@ -181,6 +186,7 @@ mod tests {
                 key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         connection
             .set_ssh_secret("key-passphrase")
@@ -211,6 +217,7 @@ mod tests {
                 key_path: Some(PathBuf::from("/home/user/.ssh/id_ed25519")),
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
 
         let cfg = connection
@@ -239,6 +246,7 @@ mod tests {
                 )),
                 ..sample_ssh()
             }),
+            sanitized_url: None,
         };
         let cfg = connection
             .ssh_config()

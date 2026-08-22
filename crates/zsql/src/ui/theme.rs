@@ -572,6 +572,37 @@ pub fn connection_test_pending_bg(theme: &Theme) -> gpui::Rgba {
     Colors::wash(theme.colors.status_warn, 0x1f)
 }
 
+// ---- password prompt modal ---------------------------------------------
+
+/// Text size of the password prompt's "CONNECTION - name" eyebrow.
+pub const PASSWORD_PROMPT_EYEBROW_TEXT_SIZE: f32 = 10.0;
+/// Vertical gap between the password prompt head's eyebrow and title lines.
+pub const PASSWORD_PROMPT_HEAD_GAP: Pixels = px(6.0);
+/// Text size of the password prompt's subtitle explaining why it opened.
+pub const PASSWORD_PROMPT_SUBTITLE_TEXT_SIZE: f32 = 12.5;
+/// Vertical gap between the password prompt's body sections (intro, card,
+/// field, checkbox).
+pub const PASSWORD_PROMPT_BODY_GAP: Pixels = px(14.0);
+/// Height of the password prompt's connection summary card.
+pub const PASSWORD_PROMPT_CARD_HEIGHT: Pixels = px(40.0);
+/// Corner radius of the password prompt's connection summary card.
+pub const PASSWORD_PROMPT_CARD_RADIUS: f32 = 8.0;
+/// Horizontal gap between the password prompt card's kind badge, name, and
+/// summary line.
+pub const PASSWORD_PROMPT_CARD_GAP: Pixels = px(10.0);
+/// Width and height of the "save to keyring" checkbox.
+pub const PASSWORD_PROMPT_CHECKBOX_SIZE: Pixels = px(15.0);
+/// Corner radius of the "save to keyring" checkbox.
+pub const PASSWORD_PROMPT_CHECKBOX_RADIUS: f32 = 4.0;
+/// Text size of the password prompt's inline error and hint text.
+pub const PASSWORD_PROMPT_HINT_TEXT_SIZE: f32 = 11.0;
+/// Text size of the footer's Enter/Esc key chips.
+pub const PASSWORD_PROMPT_KEY_CHIP_TEXT_SIZE: f32 = 10.5;
+/// Corner radius of the footer's Enter/Esc key chips.
+pub const PASSWORD_PROMPT_KEY_CHIP_RADIUS: f32 = 5.0;
+/// Horizontal padding inside the footer's Enter/Esc key chips.
+pub const PASSWORD_PROMPT_KEY_CHIP_PADDING_X: f32 = 5.0;
+
 // ---- results grid value panel ------------------------------------------
 
 /// Height of the value panel's header (column name + pin/expand/close).

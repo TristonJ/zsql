@@ -65,6 +65,27 @@ fn keyring_entry(
 }
 
 #[cfg(test)]
+impl StoredConnection {
+    /// Corrupt this connection's URL keyring entry so `get_url` fails with a
+    /// non-absent [`crate::keyring::Error`], for tests exercising a keyring
+    /// access failure distinctly from "no credential stored".
+    pub(crate) fn corrupt_url_for_test(&self) {
+        keyring_entry(CONNECTION_KEYRING_ACCOUNT_PREFIX, self.id)
+            .expect("mock keyring entry construction cannot fail")
+            .corrupt_for_test();
+    }
+
+    /// Force this connection's `set_url` to fail with a non-absent error,
+    /// without affecting `get_url`, for tests exercising a keyring write
+    /// failure after an otherwise-successful connect.
+    pub(crate) fn block_url_writes_for_test(&self) {
+        keyring_entry(CONNECTION_KEYRING_ACCOUNT_PREFIX, self.id)
+            .expect("mock keyring entry construction cannot fail")
+            .block_writes_for_test();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::{HostKeyPolicy, SshAuthKind, StoredConnection, StoredSsh};
 
@@ -90,6 +111,7 @@ mod tests {
             display_kind: "postgres".to_owned(),
             display_host: "bastion.example.com".to_owned(),
             ssh: Some(sample_ssh()),
+            sanitized_url: None,
         };
         connection
             .set_url("postgres://host/db")
