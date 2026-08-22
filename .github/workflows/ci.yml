@@ -62,11 +62,11 @@ jobs:
 
       - name: Test
         if: github.event_name == 'pull_request'
-        run: cargo test --workspace -- --test-threads=1
+        run: cargo test --workspace
 
       - name: Test with coverage
         if: github.event_name != 'pull_request'
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
+        run: ZSQL_COVERAGE_FILE=lcov.info ./scripts/test-all.sh
 
       - name: Upload coverage to Codecov
         if: github.event_name != 'pull_request'

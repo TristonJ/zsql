@@ -6,8 +6,7 @@
 # whatever it started.
 #
 # zsql-mysql's own suite runs twice: once against MySQL as part of the main
-# workspace run below, then again on its own against MariaDB -- one sqlx
-# `MySql` driver serves both engines, and this is what proves it.
+# workspace run below, then again on its own against MariaDB
 #
 # Containers already running are reused and left running; only the ones this
 # script starts are stopped on exit. Set ZSQL_KEEP_DB=1 to keep those too.
@@ -36,6 +35,9 @@ MYSQL_NAME="${ZSQL_MYSQL_NAME:-zsql-dev-mysql}"
 MARIADB_NAME="${ZSQL_MARIADB_NAME:-zsql-dev-mariadb}"
 MYSQL_PASSWORD="${ZSQL_MYSQL_PASSWORD:-zsql}"
 MYSQL_DB="${ZSQL_MYSQL_DB:-zsql}"
+
+# Setting this writes a code coverage report to the given path
+ZSQL_COVERAGE_FILE="${ZSQL_COVERAGE_FILE:-}"
 
 # Entries of "script|extra-args-for-down", one per container this script
 # itself started (and so must stop on exit).
@@ -123,9 +125,16 @@ export ZSQL_TEST_MSSQL_URL="mssql://sa:${MSSQL_PASSWORD}@localhost:${MSSQL_PORT}
 export ZSQL_TEST_MYSQL_URL="mysql://root:${MYSQL_PASSWORD}@localhost:${MYSQL_PORT}/${MYSQL_DB}"
 
 echo "running workspace tests with database tests enabled (postgres, mssql, mysql)"
-cargo test --manifest-path "$HERE/../Cargo.toml" --workspace \
-  --features zsql-postgres/driver-integration-tests,zsql-mssql/driver-integration-tests,zsql-mysql/driver-integration-tests,zsql/driver-integration-tests \
-  "$@"
+FEATURES="zsql-postgres/driver-integration-tests,zsql-mssql/driver-integration-tests,zsql-mysql/driver-integration-tests,zsql/driver-integration-tests"
+if [[ -n "$ZSQL_COVERAGE_FILE" ]]; then
+  cargo llvm-cov  --manifest-path "$HERE/../Cargo.toml"  --workspace --lcov --output-path "$ZSQL_COVERAGE_FILE" \
+    --features $FEATURES \
+    "$@"
+else
+  cargo test --manifest-path "$HERE/../Cargo.toml" --workspace \
+    --features $FEATURES \
+    "$@"
+fi
 
 echo "re-running zsql-mysql's own suite against MariaDB"
 env ZSQL_TEST_MYSQL_URL="mysql://root:${MYSQL_PASSWORD}@localhost:${MARIADB_PORT}/${MYSQL_DB}" \
