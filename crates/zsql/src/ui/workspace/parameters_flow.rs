@@ -13,11 +13,6 @@ use crate::session_store;
 use crate::ui::parameters_modal::{ParametersModalEvent, ParametersModalView};
 use crate::ui::tabs::{ParametersRequested, TabModel};
 
-/// Fallback driver id when the active connection's URL cannot be resolved
-/// to a registered driver (e.g. none is connected yet): standard SQL string
-/// literal escaping, never the MySQL-specific one.
-const UNKNOWN_DRIVER_ID: &str = "unknown";
-
 impl WorkspaceView {
     /// Wire `tabs`' [`ParametersRequested`] event and `parameters_modal`'s
     /// own confirm/cancel events together.
@@ -45,7 +40,6 @@ impl WorkspaceView {
     /// bar until it closes.
     #[tracing::instrument(name = "workspace_handle_parameters_requested", skip(self, evt, cx))]
     fn handle_parameters_requested(&mut self, evt: &ParametersRequested, cx: &mut Context<Self>) {
-        let driver_id = self.active_driver_id(cx);
         let history = self.load_param_history(&evt.history_key, &evt.parameters);
         self.parameters_modal.update(cx, |modal, cx| {
             modal.open(
@@ -55,7 +49,7 @@ impl WorkspaceView {
                 evt.parameters.clone(),
                 history,
                 evt.history_key.clone(),
-                driver_id,
+                evt.driver_id,
                 cx,
             );
         });
@@ -67,18 +61,6 @@ impl WorkspaceView {
             footer.set_waiting_params_count(Some(count), cx);
         });
         cx.notify();
-    }
-
-    /// The active connection's driver id, for deciding how a confirmed run
-    /// escapes its substituted values. Falls back to
-    /// [`UNKNOWN_DRIVER_ID`] (standard escaping) when nothing is connected
-    /// or its URL does not resolve to a registered driver.
-    fn active_driver_id(&self, cx: &Context<Self>) -> &'static str {
-        self.connections
-            .read(cx)
-            .active()
-            .and_then(|active| crate::drivers::detect_driver_id(&active.url).ok())
-            .unwrap_or(UNKNOWN_DRIVER_ID)
     }
 
     /// Each of `parameters`' remembered values for `history_key`, most
@@ -98,10 +80,9 @@ impl WorkspaceView {
         parameters
             .iter()
             .map(|parameter| {
-                (
-                    parameter.name.clone(),
-                    file.history_for(history_key, &parameter.name).to_vec(),
-                )
+                let key = parameter.storage_key();
+                let values = file.history_for(history_key, &key).to_vec();
+                (key, values)
             })
             .collect()
     }

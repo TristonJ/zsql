@@ -4043,6 +4043,80 @@ fn running_a_script_tab_with_parameters_opens_the_modal_instead_of_dispatching(
     assert_eq!(events[0].tab_id, id);
     assert_eq!(events[0].parameters.len(), 1);
     assert_eq!(events[0].parameters[0].name, "status");
+    assert_eq!(
+        events[0].driver_id, "unknown",
+        "a session with no resolvable connection URL must fall back to the unknown driver id"
+    );
+}
+
+/// A `Script` tab's run on an active `mssql` connection detects that
+/// driver's native `@name` syntax and reports its own driver id, not the
+/// `unknown` fallback.
+#[gpui::test]
+fn a_script_tabs_run_on_an_mssql_connection_detects_an_at_name_parameter_and_reports_the_mssql_driver_id(
+    cx: &mut TestAppContext,
+) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks: sinks.clone(),
+        total_rows: 0,
+    });
+    let session = cx.update(|cx| {
+        cx.new(|_cx| Session::new_for_switch_test(connection, "mssql://user@host/db"))
+    });
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+    let id = model.update(cx, TabModel::new_script_tab);
+    let events = subscribe_parameters_events(&model, cx);
+
+    model.update(cx, |model, cx| {
+        model.run_for_tab(
+            id,
+            "SELECT * FROM orders WHERE start_date >= @start_date".to_owned(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        sinks.lock().expect("sinks lock poisoned").len(),
+        0,
+        "a parameterized mssql run must never reach Session::run_query directly"
+    );
+    let events = events.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].driver_id, "mssql");
+    assert_eq!(events[0].parameters.len(), 1);
+    assert_eq!(events[0].parameters[0].name, "start_date");
+}
+
+/// A `Script` tab's run on an active `mysql` connection detects that
+/// driver's native positional `?` syntax and reports its own driver id.
+#[gpui::test]
+fn a_script_tabs_run_on_a_mysql_connection_detects_a_positional_parameter_and_reports_the_mysql_driver_id(
+    cx: &mut TestAppContext,
+) {
+    let sinks: Arc<Mutex<Vec<BatchSink>>> = Arc::new(Mutex::new(Vec::new()));
+    let connection: Arc<dyn Connection> = Arc::new(RecordingConnection {
+        sinks: sinks.clone(),
+        total_rows: 0,
+    });
+    let session = cx.update(|cx| {
+        cx.new(|_cx| Session::new_for_switch_test(connection, "mysql://user@host/db"))
+    });
+    let model = cx.update(|cx| cx.new(|cx| TabModel::new(session, cx)));
+    let id = model.update(cx, TabModel::new_script_tab);
+    let events = subscribe_parameters_events(&model, cx);
+
+    model.update(cx, |model, cx| {
+        model.run_for_tab(id, "SELECT * FROM orders WHERE status = ?".to_owned(), cx);
+    });
+    cx.run_until_parked();
+
+    let events = events.borrow();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].driver_id, "mysql");
+    assert_eq!(events[0].parameters.len(), 1);
+    assert_eq!(events[0].parameters[0].name, "?1");
 }
 
 /// [`TabModel::run_confirmed_params`] (the parameters modal's "Run query"

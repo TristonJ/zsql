@@ -169,6 +169,16 @@ impl Session {
         self.connection.is_some()
     }
 
+    /// The active connection's driver id ([`zsql_core::Driver::id`]), or
+    /// `None` before any successful connect or if its URL resolves to no
+    /// registered driver.
+    #[must_use]
+    pub fn driver_id(&self) -> Option<&'static str> {
+        self.current_url
+            .as_deref()
+            .and_then(|url| crate::drivers::detect_driver_id(url).ok())
+    }
+
     /// Whether a query is currently running
     #[must_use]
     pub fn is_running(&self) -> bool {
