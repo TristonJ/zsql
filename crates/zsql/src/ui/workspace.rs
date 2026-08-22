@@ -6,8 +6,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, KeyDownEvent,
-    KeybindingKeystroke, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    KeybindingKeystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathPromptOptions, Pixels, Render, Task, Window, canvas, div, prelude::*, px, rems, rgb,
 };
 use zsql_ui::button::secondary_link_button;

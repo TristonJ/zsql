@@ -15,6 +15,12 @@ use zsql_mysql::MysqlDriver;
 use zsql_postgres::PostgresDriver;
 use zsql_sqlite::SqliteDriver;
 
+/// Fallback driver id when a connection URL cannot be resolved to a
+/// registered driver (e.g. nothing is connected yet): standard SQL string
+/// literal escaping and `:name`-only parameter detection, never a specific
+/// driver's own dialect.
+pub const UNKNOWN_DRIVER_ID: &str = "unknown";
+
 /// This binary's registered drivers, built once and shared by every caller.
 static REGISTERED_DRIVERS: LazyLock<Vec<Arc<dyn Driver>>> = LazyLock::new(|| {
     vec![

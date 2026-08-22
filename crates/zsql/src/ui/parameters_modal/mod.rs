@@ -1,7 +1,8 @@
-//! The "Run with parameters" modal: one row per detected `:name` parameter,
-//! each showing its inferred type, the query line it comes from with the
-//! token highlighted, and a `zsql_ui` text field prefilled from the last
-//! run.
+//! The "Run with parameters" modal: one row per detected parameter (`:name`
+//! on every driver, `@name` on mssql, or a positional `?1`/`?2`/... on
+//! mysql and sqlite), each showing its inferred type, the query line it
+//! comes from with the real token highlighted, and a `zsql_ui` text field
+//! prefilled from the last run.
 
 mod bindings;
 mod logic;
@@ -14,7 +15,7 @@ use gpui::{
     KeybindingKeystroke, Render, Window, div, prelude::*, px, rgb, rgba,
 };
 use logic::RowContext;
-use zsql_core::sql::params::{ParamType, Parameter, substitute_params};
+use zsql_core::sql::params::{ParamKind, ParamType, Parameter, substitute_params};
 use zsql_ui::button::{primary_button, secondary_button};
 use zsql_ui::icon::{IconName, icon};
 use zsql_ui::modal::{Modal, ModalSize};
@@ -37,8 +38,8 @@ struct OpenState {
     tab_id: TabId,
     /// The eyebrow's script name (the tab's own title).
     script_label: String,
-    /// The raw SQL, `:name` tokens intact, that [`Self::parameters`] was
-    /// detected from.
+    /// The raw SQL, every parameter token intact, that [`Self::parameters`]
+    /// was detected from.
     sql: String,
     parameters: Vec<Parameter>,
     /// The remembered-values scope this run's fields save into on confirm;
@@ -55,11 +56,12 @@ pub enum ParametersModalEvent {
     /// The user filled in every field and confirmed (Enter or "Run query").
     Confirmed {
         tab_id: TabId,
-        /// `sql` with every `:name` token replaced by its field's value.
+        /// `sql` with every parameter token replaced by its field's value.
         substituted_sql: String,
         history_key: String,
-        /// The raw (unsubstituted) values entered, keyed by parameter name,
-        /// for the caller to remember for next time.
+        /// The raw (unsubstituted) values entered, keyed by each
+        /// parameter's own storage key, for the caller to remember for
+        /// next time.
         values: HashMap<String, String>,
     },
     /// The user cancelled (Escape, the close icon, or Cancel). No query was
@@ -142,10 +144,11 @@ impl ParametersModalView {
     /// detected by the caller (see
     /// `zsql_core::sql::params::detect_parameters`). `history` holds each
     /// parameter's remembered values (most recent first), keyed by
-    /// parameter name; a name with no entry seeds an empty field.
-    /// `history_key` scopes where confirming this run saves new values back
-    /// to. `driver_id` is the active connection's driver id, deciding how
-    /// confirming this run escapes each value.
+    /// `zsql_core::sql::params::Parameter::storage_key`; a key with no
+    /// entry seeds an empty field. `history_key` scopes where confirming
+    /// this run saves new values back to. `driver_id` is the active
+    /// connection's driver id, deciding how confirming this run escapes
+    /// each value.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "parameters_modal_open",
@@ -167,7 +170,7 @@ impl ParametersModalView {
             .into_iter()
             .map(|row| {
                 let initial = history
-                    .remove(&row.name)
+                    .remove(&row.key)
                     .unwrap_or_default()
                     .into_iter()
                     .next()
@@ -238,7 +241,7 @@ impl ParametersModalView {
             .iter()
             .map(|field| {
                 (
-                    field.row.name.clone(),
+                    field.row.key.clone(),
                     field.field.read(cx).value().to_string(),
                 )
             })
@@ -346,7 +349,7 @@ impl ParametersModalView {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_size(px(13.0))
                             .text_color(rgb(colors.accent))
-                            .child(format!(":{}", row.name)),
+                            .child(row_label(&row)),
                     )
                     .child(
                         div()
@@ -459,6 +462,17 @@ impl ParametersModalView {
                     button.opacity(theme::CONNECTION_FORM_DIM_OPACITY)
                 }
             })
+    }
+}
+
+/// The row's own display label: `:name` for a colon parameter, `@name` for
+/// a T-SQL one, or the bare `?1`/`?2`/... a positional row's name already
+/// is.
+fn row_label(row: &RowContext) -> String {
+    match row.kind {
+        ParamKind::Colon => format!(":{}", row.name),
+        ParamKind::At => format!("@{}", row.name),
+        ParamKind::Positional => row.name.clone(),
     }
 }
 

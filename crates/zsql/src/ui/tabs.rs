@@ -271,20 +271,24 @@ pub enum ResultsChanged {
 pub struct PreviewControlsChanged(pub Option<PreviewControls>);
 
 /// A Script tab's run was intercepted because its SQL contains one or more
-/// detected `:name` parameters, emitted instead of dispatching so a host
-/// can open the "Run with parameters" modal in place of reaching
-/// `Session::run_query` directly.
+/// detected parameters, emitted instead of dispatching so a host can open
+/// the "Run with parameters" modal in place of reaching `Session::run_query`
+/// directly.
 #[derive(Debug, Clone)]
 pub struct ParametersRequested {
     pub tab_id: TabId,
     /// The tab's own title, for the modal's eyebrow.
     pub script_label: String,
-    /// The SQL the run was requested with, `:name` tokens intact.
+    /// The SQL the run was requested with, every parameter token intact.
     pub sql: String,
     pub parameters: Vec<Parameter>,
     /// Scopes where confirming this run remembers its values; see
     /// `crate::session_store::ScriptBacking::param_history_key`.
     pub history_key: String,
+    /// The active connection's driver id, deciding both which native
+    /// parameter syntax `parameters` was detected with and how the modal's
+    /// own substitution escapes each value on confirm.
+    pub driver_id: &'static str,
 }
 
 impl EventEmitter<ResultsChanged> for TabModel {}
@@ -533,10 +537,12 @@ impl TabModel {
     /// A no-op while `session` holds no live connection, so a keystroke or
     /// click reaching here without a connection never dispatches.
     ///
-    /// A `Script` tab's `sql` containing one or more detected `:name`
-    /// parameters emits [`ParametersRequested`] instead of dispatching: the
-    /// caller opens the "Run with parameters" modal, then routes the
-    /// user's filled-in run back through [`Self::run_confirmed_params`].
+    /// A `Script` tab's `sql` containing one or more parameters detected
+    /// for the active connection's driver id (see
+    /// `zsql_core::sql::params::detect_parameters`) emits
+    /// [`ParametersRequested`] instead of dispatching: the caller opens the
+    /// "Run with parameters" modal, then routes the user's filled-in run
+    /// back through [`Self::run_confirmed_params`].
     #[tracing::instrument(name = "tab_model_run_for_tab", skip(self, sql, cx), fields(tab_id = id))]
     fn run_for_tab(&mut self, id: TabId, sql: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tab(id) else {
@@ -575,7 +581,12 @@ impl TabModel {
                 true,
             ),
             TabKind::Script { backing } => {
-                let parameters = zsql_core::sql::params::detect_parameters(&sql);
+                let driver_id = self
+                    .session
+                    .read(cx)
+                    .driver_id()
+                    .unwrap_or(crate::drivers::UNKNOWN_DRIVER_ID);
+                let parameters = zsql_core::sql::params::detect_parameters(&sql, driver_id);
                 if parameters.is_empty() {
                     (
                         self.session
@@ -586,6 +597,7 @@ impl TabModel {
                     tracing::debug!(
                         tab_id = id,
                         parameter_count = parameters.len(),
+                        driver_id,
                         "run intercepted: opening the parameters modal"
                     );
                     cx.emit(ParametersRequested {
@@ -594,6 +606,7 @@ impl TabModel {
                         sql,
                         parameters,
                         history_key: backing.param_history_key(),
+                        driver_id,
                     });
                     return;
                 }
