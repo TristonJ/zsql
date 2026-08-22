@@ -10,8 +10,9 @@ use gpui::{
     Render, Window, div, prelude::*, px, rgb,
 };
 use zsql_ui::{
-    button::secondary_button,
+    button::{primary_button, secondary_button},
     grid,
+    icon::{IconName, icon},
     modal::{Modal, ModalSize},
     text_field::{TextFieldEvent, TextFieldState},
     theme::ActiveTheme,
@@ -198,14 +199,12 @@ impl PasswordPrompt {
                     .text_color(rgb(colors.text_primary))
                     .child("Password required"),
             )
-    }
-
-    fn render_intro(cx: &App) -> Div {
-        let colors = cx.theme().colors;
-        div()
-            .text_size(px(theme::PASSWORD_PROMPT_SUBTITLE_TEXT_SIZE))
-            .text_color(rgb(colors.text_secondary))
-            .child("No password was found in your system keyring for this connection.")
+            .child(
+                div()
+                    .text_size(px(theme::PASSWORD_PROMPT_SUBTITLE_TEXT_SIZE))
+                    .text_color(rgb(colors.text_secondary))
+                    .child("No password was found in your system keyring for this connection."),
+            )
     }
 
     fn render_connection_card(&self, cx: &App) -> Div {
@@ -226,6 +225,7 @@ impl PasswordPrompt {
             .border_1()
             .border_color(rgb(colors.border_soft))
             .rounded(px(theme::PASSWORD_PROMPT_CARD_RADIUS))
+            .text_size(px(theme::MODAL_ROW_NAME_TEXT_SIZE))
             .child(grid::type_tag_accent(
                 &self.connection.display_kind,
                 active_theme,
@@ -242,6 +242,7 @@ impl PasswordPrompt {
                     .min_w_0()
                     .overflow_x_hidden()
                     .text_ellipsis()
+                    .text_size(px(theme::MODAL_ROW_URL_TEXT_SIZE))
                     .font_family(active_theme.fonts.data.clone())
                     .text_color(rgb(colors.text_tertiary))
                     .child(summary_line),
@@ -275,10 +276,11 @@ impl PasswordPrompt {
     fn render_save_checkbox(&self, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let checkbox = if self.save_to_keyring {
-            div()
-                .bg(rgb(colors.accent))
-                .text_color(rgb(colors.bg_app))
-                .child("\u{2713}")
+            div().bg(rgb(colors.accent)).child(icon(
+                IconName::Check,
+                theme::PASSWORD_PROMPT_CHECK_ICON_SIZE,
+                colors.bg_app,
+            ))
         } else {
             div().border_1().border_color(rgb(colors.border))
         };
@@ -289,44 +291,38 @@ impl PasswordPrompt {
             .rounded(px(theme::PASSWORD_PROMPT_CHECKBOX_RADIUS))
             .flex()
             .items_center()
-            .justify_center()
-            .text_size(px(theme::PASSWORD_PROMPT_HINT_TEXT_SIZE));
+            .justify_center();
 
-        let hint = if self.save_to_keyring {
-            "Stored under the same keyring entry the connection form writes."
-        } else {
-            "Used for this session only; the keyring is left untouched and this prompt \
-             returns next time."
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .id("password-prompt-save-checkbox")
-                    .debug_selector(|| "password-prompt-save-checkbox".to_owned())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .text_size(px(theme::PASSWORD_PROMPT_SUBTITLE_TEXT_SIZE))
-                    .text_color(rgb(colors.text_secondary))
-                    .child(checkbox)
-                    .child("Save to system keyring")
-                    .on_click(cx.listener(|prompt, _e: &ClickEvent, _w, cx| {
-                        prompt.toggle_save(cx);
-                    })),
-            )
-            .child(
+        let mut column = div().flex().flex_col().gap_1().child(
+            div()
+                .id("password-prompt-save-checkbox")
+                .debug_selector(|| "password-prompt-save-checkbox".to_owned())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .text_size(px(theme::PASSWORD_PROMPT_SUBTITLE_TEXT_SIZE))
+                .text_color(rgb(colors.text_secondary))
+                .child(checkbox)
+                .child("Save to system keyring")
+                .on_click(cx.listener(|prompt, _e: &ClickEvent, _w, cx| {
+                    prompt.toggle_save(cx);
+                })),
+        );
+        if !self.save_to_keyring {
+            column = column.child(
                 div()
                     .pl(theme::PASSWORD_PROMPT_CHECKBOX_SIZE + theme::PASSWORD_PROMPT_CARD_GAP)
                     .text_size(px(theme::PASSWORD_PROMPT_HINT_TEXT_SIZE))
                     .text_color(rgb(colors.text_tertiary))
-                    .child(hint),
-            )
+                    .child(
+                        "Used for this session only; the keyring is left untouched and this \
+                         prompt returns next time.",
+                    ),
+            );
+        }
+        column
     }
 
     /// A bordered key chip (e.g. "Enter") followed by what it does (e.g.
@@ -398,33 +394,30 @@ impl PasswordPrompt {
                                 Self::cancel(cx);
                             })),
                     )
-                    .child(
-                        div()
-                            .id("password-prompt-connect")
+                    .child({
+                        let button = primary_button("password-prompt-connect", window, cx)
                             .debug_selector(|| "password-prompt-connect".to_owned())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(theme::RUN_BUTTON_HEIGHT)
-                            .px(px(theme::RUN_BUTTON_PADDING_X))
-                            .rounded(px(theme::RUN_BUTTON_RADIUS))
+                            // Solid like the toolbar Run button, not the
+                            // outline primary style.
                             .bg(rgb(connect_bg))
-                            .text_size(px(theme::RUN_BUTTON_TEXT_SIZE))
+                            .border_color(rgb(connect_bg))
                             .text_color(rgb(colors.bg_app))
-                            .when(!connecting, |el| {
-                                el.cursor_pointer()
-                                    .hover(|style| style.bg(rgb(connect_hover_bg)))
-                                    .on_click(cx.listener(|prompt, _e: &ClickEvent, _w, cx| {
-                                        prompt.submit(cx);
-                                    }))
-                            })
-                            .when(connecting, gpui::Styled::cursor_not_allowed)
+                            .font_weight(gpui::FontWeight::BOLD)
                             .child(if connecting {
                                 "Connecting..."
                             } else {
                                 "Connect"
-                            }),
-                    ),
+                            });
+                        if connecting {
+                            button.cursor_not_allowed()
+                        } else {
+                            button
+                                .hover(move |style| style.bg(rgb(connect_hover_bg)))
+                                .on_click(cx.listener(|prompt, _e: &ClickEvent, _w, cx| {
+                                    prompt.submit(cx);
+                                }))
+                        }
+                    }),
             )
     }
 }
@@ -441,7 +434,6 @@ impl Render for PasswordPrompt {
             .gap(theme::PASSWORD_PROMPT_BODY_GAP)
             .px_3()
             .py_3()
-            .child(Self::render_intro(cx))
             .child(self.render_connection_card(cx))
             .child(self.render_password_field(cx))
             .child(self.render_save_checkbox(cx));

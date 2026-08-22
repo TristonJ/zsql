@@ -594,6 +594,8 @@ pub const PASSWORD_PROMPT_CARD_GAP: Pixels = px(10.0);
 pub const PASSWORD_PROMPT_CHECKBOX_SIZE: Pixels = px(15.0);
 /// Corner radius of the "save to keyring" checkbox.
 pub const PASSWORD_PROMPT_CHECKBOX_RADIUS: f32 = 4.0;
+/// Size of the checkmark icon inside a checked "save to keyring" checkbox.
+pub const PASSWORD_PROMPT_CHECK_ICON_SIZE: Pixels = px(10.0);
 /// Text size of the password prompt's inline error and hint text.
 pub const PASSWORD_PROMPT_HINT_TEXT_SIZE: f32 = 11.0;
 /// Text size of the footer's Enter/Esc key chips.

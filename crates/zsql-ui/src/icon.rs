@@ -46,12 +46,14 @@ pub enum IconName {
     Edit,
     /// Open a file from outside the app's own storage.
     FolderOpen,
+    /// A checked/affirmative state, e.g. inside a checkbox.
+    Check,
 }
 
 impl IconName {
     /// Every registered icon, in declaration order. Used to build the asset
     /// source's directory listing and to iterate every icon in tests.
-    pub const ALL: [IconName; 15] = [
+    pub const ALL: [IconName; 16] = [
         IconName::ChevronRight,
         IconName::ChevronDown,
         IconName::Database,
@@ -67,6 +69,7 @@ impl IconName {
         IconName::Refresh,
         IconName::Edit,
         IconName::FolderOpen,
+        IconName::Check,
     ];
 
     /// The logical asset path this icon resolves to, exactly as passed to
@@ -89,6 +92,7 @@ impl IconName {
             IconName::Refresh => "icons/refresh.svg",
             IconName::Edit => "icons/edit.svg",
             IconName::FolderOpen => "icons/folder-open.svg",
+            IconName::Check => "icons/check.svg",
         }
     }
 
@@ -117,6 +121,7 @@ impl IconName {
             IconName::Refresh => include_bytes!("../assets/icons/refresh.svg") as &[u8],
             IconName::Edit => include_bytes!("../assets/icons/edit.svg") as &[u8],
             IconName::FolderOpen => include_bytes!("../assets/icons/folder-open.svg") as &[u8],
+            IconName::Check => include_bytes!("../assets/icons/check.svg") as &[u8],
         }
     }
 
