@@ -67,7 +67,22 @@ case "${1:-up}" in
       printf '.'; sleep 0.5
     done
     echo
-    docker exec -i "$NAME" psql -v ON_ERROR_STOP=1 -U postgres -d "$DB" < "$HERE/../dev/seed.sql"
+
+    # pg_isready can report ready against the postgres image entrypoint's
+    # transient init-time server (used to create $DB and run
+    # docker-entrypoint-initdb.d scripts) before that server has actually
+    # finished creating $DB, or during the gap while it swaps to the final
+    # server. Retry the seed rather than trusting readiness once.
+    SEED_DEADLINE=$((SECONDS + 30))
+    until docker exec -i "$NAME" psql -v ON_ERROR_STOP=1 -U postgres -d "$DB" \
+      < "$HERE/../dev/seed.sql" 2>/dev/null; do
+      if (( SECONDS >= SEED_DEADLINE )); then
+        docker exec -i "$NAME" psql -v ON_ERROR_STOP=1 -U postgres -d "$DB" < "$HERE/../dev/seed.sql"
+        echo "postgres never finished creating database $DB" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
     enable_tls
     echo "postgres up on localhost:${PORT}"
     echo "export DATABASE_URL=postgres://postgres:${PASSWORD}@localhost:${PORT}/${DB}"
